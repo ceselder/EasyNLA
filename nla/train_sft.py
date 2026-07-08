@@ -1062,11 +1062,16 @@ def main():
                       for n, p in model.named_parameters()
                       if ("lora_" in n) or n.startswith("value_head")}
                 save_file(sd, str(out_dir / "ar_lora_value_head.safetensors"))
+                from nla.utils.arch_adapters import resolve_attn_target_modules
                 (out_dir / "ar_meta.json").write_text(json.dumps({
                     "ar_num_layers": args.ar_num_layers,
                     "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
                     "quant": args.quant,
-                    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    # Resolve from the arch, not a hardcoded llama-family list:
+                    # qwen3_5 adapts deltanet in_proj_qkv/in_proj_z/out_proj too,
+                    # and merge_ar rebuilds the LoRA from THIS list — a wrong list
+                    # makes load_state_dict see the deltanet adapters as unexpected.
+                    "target_modules": resolve_attn_target_modules(model.backbone.config),
                     # Whether the backbone's final RMSNorm was stripped at init.
                     # RL must rebuild the critic the same way or predictions
                     # silently shift (pre-2026-06 ckpts: norm kept = False).

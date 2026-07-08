@@ -59,10 +59,14 @@ def merge_ar(base_ckpt: str, ar_dir: Path, out: Path):
         base_ckpt, n_layers, torch.bfloat16, None,
         device_map=None, max_memory=None, strip_final_norm=strip,
     ).to("cuda")
+    # Fall back to the arch resolver for pre-fix checkpoints whose ar_meta.json
+    # carried the hardcoded llama-family list (missing qwen3_5 deltanet modules).
+    from nla.utils.arch_adapters import resolve_attn_target_modules
+    _tm = meta.get("target_modules") or resolve_attn_target_modules(critic.backbone.config)
     inject_adapter_in_model(LoraConfig(
         r=meta["lora_r"], lora_alpha=meta["lora_alpha"], lora_dropout=0.0,
         bias="none", task_type="CAUSAL_LM", use_rslora=True,
-        target_modules=meta["target_modules"],
+        target_modules=_tm,
     ), critic.backbone)
     sd = load_file(str(ar_dir / "ar_lora_value_head.safetensors"))
     miss, unexp = critic.load_state_dict(sd, strict=False)
