@@ -190,7 +190,8 @@ def av_generate_samples(model, tokenizer, rows, cfg, device, *,
             if isinstance(m.get("content"), str) else m
             for m in row["prompt"]
         ]
-        ptxt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        ptxt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         ids = tokenizer.encode(ptxt, add_special_tokens=False)
         pt = torch.tensor([ids], dtype=torch.long, device=device)
         act = torch.tensor(row["activation_vector"], dtype=torch.float32).unsqueeze(0).to(device)
@@ -399,7 +400,7 @@ def _av_prepare_chunk(rows, tokenizer, inject_char, device, max_len=1024):
             for m in row["prompt"]
         ]
         prompt_str = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True,
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
         )
         prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
         # Response gets a trailing EOS so the model learns to stop.

@@ -11,9 +11,9 @@ requires-python = ">=3.10"
 license = {file = "LICENSE"}
 dependencies = [
     "torch",
-    # ==4.57.1: transformers v5's apply_chat_template API break crashes the
-    # trainers; the marker tokenization itself is stable across versions.
-    "transformers==4.57.1",
+    # qwen3_5 (Qwen3.5/3.6 hybrid) landed in transformers 5.2; vLLM 0.20-0.23
+    # accept >=5.5.1. The v4 pin (4.57.1) predates qwen3_5 support entirely.
+    "transformers>=5.5.1,<5.6",
     "safetensors",
     "httpx",
     "orjson",

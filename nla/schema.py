@@ -222,6 +222,9 @@ def compute_canonical_neighbors(
         [{"role": "user", "content": content}],
         tokenize=True,
         add_generation_prompt=True,
+        # Must render identically to build_prompt_text / train_sft — see
+        # nla/utils/prompts.py for why thinking is disabled.
+        enable_thinking=False,
     )
     # transformers v5 returns a BatchEncoding (dict-like) here; v4 returned a
     # plain list[int]. Normalise so `enumerate` walks token ids, not dict keys.

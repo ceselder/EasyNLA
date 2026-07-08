@@ -187,6 +187,13 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
     model_type = getattr(resolve_text_config(config), "model_type", "")
     if model_type in _LLAMA_FAMILY_MODEL_TYPES:
         return ["q_proj", "k_proj", "v_proj", "o_proj"]
+    if model_type in ("qwen3_5", "qwen3_5_text"):
+        # Hybrid: full attention every 4th layer (q/k/v/o_proj), gated-deltanet
+        # linear attention elsewhere. Adapt the token-mixing projections of BOTH
+        # block types; skip in_proj_a/in_proj_b (delta-rule decay dynamics,
+        # tiny out-dims where r=128 LoRA is degenerate).
+        return ["q_proj", "k_proj", "v_proj", "o_proj",
+                "in_proj_qkv", "in_proj_z", "out_proj"]
     if model_type == "gpt2":
         return ["c_attn", "c_proj"]
     if model_type in ("falcon", "gpt_neox"):

@@ -328,7 +328,24 @@ def _vllm_load_weights_ipc(model, handle_chunk):
     _torch.cuda.synchronize()
 
 
-def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
+def _wrapper_key_qwen3_5(k: str) -> str:
+    """Text-only actor state_dict name -> multimodal-wrapper checkpoint name.
+
+    vLLM's registry only knows Qwen3_5ForConditionalGeneration, so the engine
+    serves the ORIGINAL wrapper checkpoint whose text weights live under
+    `model.language_model.*` (lm_head stays top-level). The HF actor is the
+    text-only Qwen3_5ForCausalLM (`model.*`). The weight sync must speak the
+    wrapper's names or load_weights silently matches nothing.
+    """
+    if k.startswith("model."):
+        return "model.language_model." + k[len("model."):]
+    return k  # lm_head.weight and friends
+
+
+_VLLM_NAME_MAPS = {"none": None, "qwen3_5_wrapper": _wrapper_key_qwen3_5}
+
+
+def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True, name_map=None):
     """Colocate weight sync: push the LoRA-merged state to vLLM, OUT-OF-PLACE.
 
     Unlike TRL's merge_adapter() -> push -> unmerge_adapter() pattern, this never
@@ -426,11 +443,15 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
             # norm, lm_head) go to "_other". Arch-aware: with a hardcoded prefix
             # a GPT-arch model dumps ~16GB into one "_other" chunk and blows
             # msgspec's 4GB single-encode cap on the CPU-pickle path.
+            # Bucket by layer on the ACTOR name (model.layers.N); push under the
+            # name_map-translated name (e.g. qwen3_5 wrapper: model.* ->
+            # model.language_model.*) so vLLM's loader matches.
+            push_k = name_map(new_k) if name_map is not None else new_k
             _m_layer = re.match(r"(?:model\.layers|transformer\.h)\.(\d+)\.", new_k)
             if _m_layer:
-                buckets[f"layer_{int(_m_layer.group(1)):03d}"].append((new_k, t))
+                buckets[f"layer_{int(_m_layer.group(1)):03d}"].append((push_k, t))
             else:
-                buckets["_other"].append((new_k, t))
+                buckets["_other"].append((push_k, t))
         # Push _other first (small), then each layer in order.
         import functools as _ft
         if ipc:
@@ -877,6 +898,18 @@ def main():
     p.add_argument("--av-ckpt", required=True,
                    help="Merged bf16 /hf AV warm-start model. Loaded into the vLLM "
                         "engine (rollout serving) and used for the tokenizer.")
+    p.add_argument("--vllm-model", default=None,
+                   help="Model the vLLM engine serves (default: --av-ckpt). Use when the AV "
+                        "ckpt's arch string is not in vLLM's registry (e.g. text-only "
+                        "Qwen3_5ForCausalLM): serve the ORIGINAL wrapper checkpoint here and "
+                        "the merged AV weights are pushed in via a forced initial sync.")
+    p.add_argument("--vllm-name-map", choices=sorted(_VLLM_NAME_MAPS), default="none",
+                   help="Actor->vLLM weight-name translation for the sync. 'qwen3_5_wrapper': "
+                        "text-only actor names (model.*) -> wrapper names (model.language_model.*).")
+    p.add_argument("--vllm-attn-backend", default=None,
+                   help="Force a vLLM attention backend (e.g. FLASH_ATTN). None = auto. Use "
+                        "FLASH_ATTN where the auto-picked FLASHINFER backend would JIT-compile "
+                        "(needs ninja + nvcc matching torch's CUDA).")
     p.add_argument("--ar-ckpt", required=True,
                    help="AR critic warm-start (bf16 /hf dir from train_sft --mode ar).")
     p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B",
@@ -1373,8 +1406,13 @@ def main():
                    "TORCHELASTIC_USE_AGENT_STORE", "TORCHELASTIC_MAX_RESTARTS"):
             os.environ.pop(_k, None)
     from vllm import LLM as VLLM
+    _vllm_extra = {}
+    if args.vllm_attn_backend:
+        from vllm.config.attention import AttentionConfig
+        _vllm_extra["attention_config"] = AttentionConfig(backend=args.vllm_attn_backend)
     llm = VLLM(
-        model=args.av_ckpt,
+        **_vllm_extra,
+        model=args.vllm_model or args.av_ckpt,
         tokenizer=args.av_ckpt,
         dtype="bfloat16",
         gpu_memory_utilization=args.vllm_gpu_mem,
@@ -1394,13 +1432,22 @@ def main():
     # At step 0 the LoRA is zero AND vLLM already loaded the same merged ckpt, so
     # this is a true no-op (~180s wasted). OFF by default; --initial-sync-warmup
     # re-enables it purely to smoke-test the sync path early.
+    _name_map = _VLLM_NAME_MAPS[args.vllm_name_map]
+    if args.vllm_model and args.vllm_model != args.av_ckpt and not args.resume_from_lora:
+        # vLLM loaded the RAW --vllm-model (e.g. the base wrapper), NOT the AV
+        # warm-start — the initial sync is a CORRECTNESS requirement here, not a
+        # warm-up: without it step-0 rollouts come from the base policy. (Safe
+        # under only_adapted: AV-SFT touched only the adapted modules, so the
+        # frozen weights vLLM has from the base wrapper already match av_merged.)
+        print("[vllm] --vllm-model != --av-ckpt: forcing initial weight sync", flush=True)
+        args.initial_sync_warmup = True
     if args.initial_sync_warmup or args.resume_from_lora is not None:
         # MANDATORY on resume: the HF actor holds the resumed RL LoRA but vLLM
         # just loaded the SFT --av-ckpt — without this sync, step 0's rollouts
         # would come from the SFT policy (off-policy under our no-ratio surrogate).
         why = "resume" if args.resume_from_lora is not None else "warm-up"
         print(f"[vllm] initial weight sync ({why})", flush=True)
-        sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync)
+        sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync, name_map=_name_map)
         print(f"[vllm] initial sync done in {sync_secs:.1f}s", flush=True)
     else:
         print(f"[vllm] skipping initial sync warm-up (fresh run: vLLM already "
@@ -1900,7 +1947,7 @@ def main():
         # nothing (at grad_accum=4 that's 3 wasted syncs per real update). ----
         vllm_sync_secs = 0.0
         if is_accum_end:
-            vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync)
+            vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync, name_map=_name_map)
             print(f"  [vllm sync@{step+1}] {vllm_sync_secs:.1f}s", flush=True)
 
         # ---- AR critic co-training (paper-faithful, optional) ----
