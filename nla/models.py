@@ -86,6 +86,15 @@ class NLACriticModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_flex_attn = True
 
+    @classmethod
+    def _can_set_experts_implementation(cls) -> bool:
+        # Same story as attention for MoE backbones (gemma4 etc.): the
+        # backbone's own expert modules dispatch on their config; this wrapper
+        # only needs to pass transformers' source-sniffing gate, which would
+        # otherwise raise at __init__ when the (copied) config already carries
+        # _experts_implementation_internal="grouped_mm" from the base load.
+        return True
+
     def __init__(self, config, backbone: PreTrainedModel):
         super().__init__(config)
         self.backbone = backbone

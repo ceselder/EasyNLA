@@ -29,3 +29,18 @@ def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
     last_h = backbone_last[torch.arange(bs, device=input_ids.device), last_idx].float()
     last_h_norm = normalize_activation(last_h, mse_scale_f)
     return critic.value_head(last_h_norm.to(critic.value_head.weight.dtype)).float()
+
+
+def maybe_prepend_bos(ids, tokenizer):
+    """NLA_CRITIC_BOS=1: prepend BOS to critic inputs (list of token ids).
+
+    Gemma backbones degrade without their BOS attention anchor (+0.8pp held-out
+    FVE measured on gemma-4-26B); Qwen has no BOS so the upstream
+    add_special_tokens=False convention never surfaced this. EVERY critic
+    tokenization site (AR-SFT train, AR-SFT heldout, RL scoring, RL critic
+    co-training, RL eval) must route through this so train and reward match.
+    """
+    import os
+    if os.environ.get("NLA_CRITIC_BOS") == "1" and tokenizer.bos_token_id is not None:
+        return [tokenizer.bos_token_id] + list(ids)
+    return list(ids)

@@ -9,16 +9,18 @@ set -euo pipefail
 VENV=${1:-$HOME/envs/vllm-lens}
 
 uv venv "$VENV" --python 3.12
-# vllm==0.19.0 + vllm-lens==1.1.0: the matched pair where the injection hook
+# vllm==0.19.1 + vllm-lens==1.1.0: 0.19.x is the range where the injection hook
 #   fires (vLLM 0.22+ refactored GPUModelRunner -> hook silently no-ops).
+#   0.19.1 (not .0) because 0.19.0 pins transformers<5 while gemma4 needs >=5.5;
+#   0.19.1 relaxed the pin to >=4.56,!=5.0-5.4.*,!=5.5.0.
 # --torch-backend=cu128: targets CUDA 12.8 (driver >=570); the default cu130
 #   wheel needs driver >=580 and fails at import on older drivers.
-# transformers==4.57.1 (repo-wide pin): vllm's resolver otherwise pulls v5,
-#   whose apply_chat_template break crashes the trainers. peft/bitsandbytes/wandb
-#   are needed by nla.train_rl_vllm itself (this venv runs the trainer).
+# transformers==5.5.4 (repo-wide pin, see pyproject.toml): gemma4 support.
+#   peft/bitsandbytes/wandb are needed by nla.train_rl_vllm itself (this venv
+#   runs the trainer).
 uv pip install --python "$VENV/bin/python" \
-  "vllm==0.19.0" "vllm-lens==1.1.0" \
-  "transformers==4.57.1" "peft" "bitsandbytes" "wandb" \
+  "vllm==0.19.1" "vllm-lens==1.1.0" \
+  "transformers==5.5.4" "peft" "bitsandbytes" "wandb" \
   --torch-backend=cu128
 
 echo "=== verify (imports vllm._C -> exercises libcudart) ==="

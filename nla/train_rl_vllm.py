@@ -100,6 +100,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import wandb
 
+from nla.utils.critic import maybe_prepend_bos
 from nla.utils import rl_logging
 from nla.utils import build_prompt_text, cjk_fraction, critic_predict, register_karvonen_hook
 from nla.utils.vllm_steer import read_reset_steer_count
@@ -423,7 +424,8 @@ def score_with_critic(
     for i, expl in enumerate(explanations):
         if expl is None:
             continue
-        ids = tokenizer.encode(template.format(explanation=expl), add_special_tokens=False)
+        ids = maybe_prepend_bos(tokenizer.encode(
+            template.format(explanation=expl), add_special_tokens=False), tokenizer)
         if 0 < len(ids) <= 1024:
             ids_list[i] = ids
     valid = [i for i in range(n) if ids_list[i] is not None]
@@ -1090,10 +1092,10 @@ def main():
         actor = AutoModelForCausalLM.from_pretrained(
             args.av_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         ).to(device)
-        from nla.utils.arch_adapters import resolve_attn_target_modules
+        from nla.utils.arch_adapters import resolve_lora_target_modules
         lora_cfg = LoraConfig(
             r=args.lora_r, lora_alpha=args.lora_alpha,
-            target_modules=resolve_attn_target_modules(actor.config),
+            target_modules=resolve_lora_target_modules(actor.config),
             lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
             use_rslora=args.use_rslora,
         )
@@ -1168,10 +1170,10 @@ def main():
             # _inner_transformer(self.backbone) path intact (get_peft_model would
             # wrap it and break that). Zero-init LoRA -> starts == warmstart.
             from peft import LoraConfig as _ARLoraCfg, inject_adapter_in_model
-            from nla.utils.arch_adapters import resolve_attn_target_modules
+            from nla.utils.arch_adapters import resolve_lora_target_modules
             inject_adapter_in_model(
                 _ARLoraCfg(r=args.ar_lora_r, lora_alpha=args.ar_lora_alpha,
-                           target_modules=resolve_attn_target_modules(critic.backbone.config),
+                           target_modules=resolve_lora_target_modules(critic.backbone.config),
                            lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
                            use_rslora=True),
                 critic.backbone)
@@ -1581,10 +1583,15 @@ def main():
         # A rollout failing EITHER is dropped from the AV update, the AR co-training,
         # and the GRPO group baseline below.
         cjk_fail = [cjk_fraction(t) > 0.05 for t in all_response_text]
+        # Check the FULL sequence (prompt+response), not just the prompt: the GRPO
+        # logprob forward runs on full ids, so a marker the policy ECHOES into its
+        # response (with canonical neighbors — e.g. verbatim "<concept>㊗</concept>")
+        # adds a second valid injection site and crashes the hook's vec_idx
+        # bookkeeping. Observed at step 224 on gemma-4-26B (KL≈0.9 drift):
+        # IndexError index 4 out of bounds for size 4. Echo rollouts are dropped
+        # like cjk failures and counted in n_marker_bad.
         marker_ok = [
-            marker_well_formed(
-                all_full_ids[i][: all_prompt_lens[i]].tolist(), inj_id, left_id, right_id
-            )
+            marker_well_formed(all_full_ids[i].tolist(), inj_id, left_id, right_id)
             for i in range(len(all_full_ids))
         ]
         inject_ok = [
@@ -1752,7 +1759,7 @@ def main():
                 if expl is None:
                     continue
                 text = template.format(explanation=expl)
-                ids = tokenizer.encode(text, add_special_tokens=False)
+                ids = maybe_prepend_bos(tokenizer.encode(text, add_special_tokens=False), tokenizer)
                 if len(ids) > 1024 or len(ids) == 0:
                     continue
                 crit_inputs.append(torch.tensor(ids, dtype=torch.long))
@@ -1980,7 +1987,7 @@ def main():
                 e_reward = -2.0
                 if expl is not None:
                     ctext = template.format(explanation=expl)
-                    cids = tokenizer.encode(ctext, add_special_tokens=False)
+                    cids = maybe_prepend_bos(tokenizer.encode(ctext, add_special_tokens=False), tokenizer)
                     if 0 < len(cids) <= 1024:
                         x = torch.tensor([cids], dtype=torch.long, device=device)
                         with torch.no_grad():

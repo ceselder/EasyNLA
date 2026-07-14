@@ -38,6 +38,7 @@ import wandb
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
+from nla.utils.critic import maybe_prepend_bos
 from nla.utils import critic_predict, register_karvonen_hook
 from nla.utils.run_config import add_config_arg, apply_config_defaults, save_resolved_config
 from nla.config import load_nla_config
@@ -134,8 +135,8 @@ def heldout_fve_mse(critic, tokenizer, pairs, template, mse_scale_f, device,
         chunk = pairs[cs:cs + micro_batch]
         ids_list, golds = [], []
         for expl, act in chunk:
-            ids = tokenizer.encode(template.format(explanation=expl),
-                                   add_special_tokens=False)
+            ids = maybe_prepend_bos(tokenizer.encode(
+                template.format(explanation=expl), add_special_tokens=False), tokenizer)
             if not 0 < len(ids) <= max_len:
                 continue
             ids_list.append(torch.tensor(ids, dtype=torch.long))
@@ -447,7 +448,8 @@ def _ar_prepare_chunk(rows, tokenizer, device, max_len=1024):
         # add_special_tokens=False matches RL-time critic scoring and stage-3's
         # build-time suffix verification (True is a no-op on Qwen but prepends
         # BOS on Llama/Gemma-family tokenizers → train/reward token mismatch).
-        ids = tokenizer.encode(row["prompt"], add_special_tokens=False)
+        ids = maybe_prepend_bos(
+            tokenizer.encode(row["prompt"], add_special_tokens=False), tokenizer)
         if len(ids) > max_len:
             # Right-truncating would cut the "</text> <summary>" suffix and the
             # last-token extraction would land mid-explanation — silently wrong.
@@ -491,7 +493,12 @@ def main():
     p.add_argument("--sidecar", default=None,
                    help="Sidecar source (defaults to --parquet for the dataset sidecar)")
     p.add_argument("--save-dir", required=True)
-    p.add_argument("--num-steps", type=int, default=200)
+    p.add_argument("--num-steps", type=int, default=None,
+                   help="Optimizer steps. Default (None) = exactly ONE EPOCH of the "
+                        "dataset: ceil(rows / (batch_size × grad_accum)). The docs' "
+                        "guidance is 'train one epoch — a second overfits'; a fixed "
+                        "step default silently under/overtrains as dataset size "
+                        "changes (1000 steps was ~1/4 epoch on a 250k-row split).")
     p.add_argument("--batch-size", type=int, default=64,
                    help="Per-forward batch (= 'micro batch'). Effective batch = "
                         "batch_size × gradient_accumulation_steps.")
@@ -619,11 +626,11 @@ def main():
                 model = prepare_model_for_kbit_training(
                     model, use_gradient_checkpointing=args.gradient_checkpointing,
                 )
-            from nla.utils.arch_adapters import resolve_attn_target_modules
+            from nla.utils.arch_adapters import resolve_lora_target_modules
             model = get_peft_model(model, LoraConfig(
                 r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                 bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=resolve_attn_target_modules(model.config),
+                target_modules=resolve_lora_target_modules(model.config),
             ))
             model.print_trainable_parameters()
         vectors_ref = [None]
@@ -687,11 +694,11 @@ def main():
                 model.backbone = prepare_model_for_kbit_training(
                     model.backbone, use_gradient_checkpointing=args.gradient_checkpointing,
                 )
-            from nla.utils.arch_adapters import resolve_attn_target_modules
+            from nla.utils.arch_adapters import resolve_lora_target_modules
             inject_adapter_in_model(LoraConfig(
                 r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                 bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=resolve_attn_target_modules(model.backbone.config),
+                target_modules=resolve_lora_target_modules(model.backbone.config),
             ), model.backbone)
             # Train ONLY the LoRA adapters + the value_head; freeze the rest.
             for n_, p_ in model.named_parameters():
@@ -715,6 +722,12 @@ def main():
     print(f"[data] loading {args.parquet} (max_rows={args.max_rows})", flush=True)
     rows = load_sft_dataset(args.parquet, n_max=args.max_rows, mode=args.mode)
     print(f"[data] {len(rows)} rows", flush=True)
+    if args.num_steps is None:
+        eff_batch = args.batch_size * args.gradient_accumulation_steps
+        args.num_steps = math.ceil(len(rows) / eff_batch)
+        print(f"[steps] --num-steps not given → one epoch: "
+              f"ceil({len(rows)} rows / {eff_batch} eff. batch) = {args.num_steps} steps",
+              flush=True)
     if args.mode == "ar" and cfg.critic_suffix_ids:
         # One-time suffix-anchor sanity check (the sidecar field's stated
         # purpose): the tokenized critic prompt must end with the expected
@@ -878,7 +891,8 @@ def main():
             try:
                 (loss / grad_accum).backward()
             finally:
-                vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
+                if vectors_ref is not None:  # AR mode has no injection ref
+                    vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
             accum_loss += loss.item()
             accum_n += 1
 
@@ -1008,11 +1022,16 @@ def main():
                       for n, p in model.named_parameters()
                       if ("lora_" in n) or n.startswith("value_head")}
                 save_file(sd, str(out_dir / "ar_lora_value_head.safetensors"))
+                from nla.utils.arch_adapters import resolve_lora_target_modules
                 (out_dir / "ar_meta.json").write_text(json.dumps({
                     "ar_num_layers": args.ar_num_layers,
                     "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
                     "quant": args.quant,
-                    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    # Echo the ACTUAL resolved targets (list or regex str; both
+                    # json-safe and both accepted by LoraConfig at merge time) —
+                    # a hardcoded list here silently broke fused-QKV archs and
+                    # would mis-merge all-linear adapters as attn-only.
+                    "target_modules": resolve_lora_target_modules(model.backbone.config),
                     # Whether the backbone's final RMSNorm was stripped at init.
                     # RL must rebuild the critic the same way or predictions
                     # silently shift (pre-2026-06 ckpts: norm kept = False).

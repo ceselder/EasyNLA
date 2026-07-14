@@ -42,6 +42,26 @@ def resolve_text_config(config: Any) -> Any:
     return config
 
 
+def _find_nested_text_model(model: Any) -> Any | None:
+    """Locate the nested text model of a multimodal wrapper, or None.
+
+    Two nesting depths exist in the wild:
+      - Gemma-3 style:  ForConditionalGeneration.language_model
+      - Gemma-4 style (transformers ≥5.5): ForConditionalGeneration.model.language_model
+        (top level has .model=Gemma4Model + .lm_head; no .language_model property)
+    Plain CausalLMs: `model.model` is the bare backbone (no .language_model) and
+    there's no top-level .language_model → returns None.
+    """
+    for holder in (model, getattr(model, "model", None)):
+        if holder is None:
+            continue
+        for attr in _WRAPPER_MODEL_ATTRS:
+            nested = getattr(holder, attr, None)
+            if nested is not None:
+                return nested
+    return None
+
+
 def resolve_text_model(model: Any) -> Any:
     """Return the text-side CausalLM for multimodal wrappers; pass-through otherwise.
 
@@ -58,10 +78,8 @@ def resolve_text_model(model: Any) -> Any:
     Qwen/Llama/Mistral have no .language_model → pass through unchanged
     (already CausalLM-shaped).
     """
-    for attr in _WRAPPER_MODEL_ATTRS:
-        nested = getattr(model, attr, None)
-        if nested is None:
-            continue
+    nested = _find_nested_text_model(model)
+    if nested is not None:
         if hasattr(nested, "lm_head"):
             return nested  # already CausalLM-shaped
         # Bare TextModel — wrap in CausalLM so keys roundtrip. meta device
@@ -107,10 +125,10 @@ def resolve_decoder_layers(model: Any) -> torch.nn.ModuleList:
 
 def is_multimodal_wrapper(config_or_model: Any) -> bool:
     """True if this is a known multimodal wrapper (has nested text config/model)."""
-    for attr in (*_WRAPPER_CONFIG_ATTRS, *_WRAPPER_MODEL_ATTRS):
+    for attr in _WRAPPER_CONFIG_ATTRS:
         if getattr(config_or_model, attr, None) is not None:
             return True
-    return False
+    return _find_nested_text_model(config_or_model) is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -134,6 +152,10 @@ def is_multimodal_wrapper(config_or_model: Any) -> bool:
 _SCALED_EMBED_MODEL_TYPES: dict[str, str] = {
     "gemma3": "sqrt_d_model",
     "gemma3_text": "sqrt_d_model",
+    # Gemma-4 keeps Gemma4TextScaledWordEmbedding (√d_model), verified in
+    # transformers 5.5 modeling_gemma4.py (embed_tokens.weight × hidden_size**0.5).
+    "gemma4": "sqrt_d_model",
+    "gemma4_text": "sqrt_d_model",
     "gemma2": "sqrt_d_model",
     "gemma": "sqrt_d_model",
     "t5": "sqrt_d_model",
@@ -172,13 +194,22 @@ def resolve_embed_scale(config: Any) -> float:
 _LLAMA_FAMILY_MODEL_TYPES = {
     "llama", "llama4", "mistral", "mixtral",
     "qwen2", "qwen2_5", "qwen2_5_vl", "qwen3", "qwen3_moe",
-    "gemma", "gemma2", "gemma3", "gemma3_text",
+    # gemma4: attention keeps q/k/v/o_proj naming. Caveat: on full-attention
+    # layers with attention_k_eq_v=true there is NO v_proj module (V is derived
+    # from K) — PEFT matches by suffix over named_modules, so those layers just
+    # get q/k/o adapted. The MoE experts (fused nn.Parameter, not Linear) are
+    # never targeted, same as qwen3_moe.
+    "gemma", "gemma2", "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "phi", "internlm2", "olmo", "olmo2",
 }
 
 
 def resolve_attn_target_modules(config: Any) -> list[str]:
     """Attention-projection module names for LoRA, resolved by model_type.
+
+    LEGACY: kept for older checkpoints whose ar_meta.json recorded attn-only
+    targets. New training should use resolve_lora_target_modules (attention +
+    dense MLP), which converges meaningfully better for the same rank.
 
     Unwraps multimodal configs first (Gemma-3 nests model_type under
     text_config). Raises loudly for unknown archs instead of letting PEFT
@@ -196,4 +227,33 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
     raise AssertionError(
         f"model_type={model_type!r}: unknown attention module naming — extend "
         f"arch_adapters.resolve_attn_target_modules for this architecture."
+    )
+
+
+def resolve_lora_target_modules(config: Any) -> list[str] | str:
+    """ALL-linear LoRA targets (attention + dense MLP), resolved by model_type.
+
+    Returns either a suffix list or a fullmatch-regex string — peft.LoraConfig
+    accepts both. The llama family gets a REGEX, not suffixes, deliberately:
+    MoE members (qwen3_moe) name their per-expert Linears gate/up/down_proj
+    too, and suffix matching would wrap every expert (128 × 3 adapters per
+    layer — param blowup and glacial merges). The regex anchors MLP names to
+    the dense `.mlp.` path, so expert submodules (`.mlp.experts.N.*`) and
+    fused-Parameter experts (gemma4) are left alone. Archs where some layers
+    lack a listed module (gemma4 full-attention layers have no v_proj) are
+    fine — a pattern that matches nothing on a layer simply skips it.
+    """
+    model_type = getattr(resolve_text_config(config), "model_type", "")
+    if model_type in _LLAMA_FAMILY_MODEL_TYPES:
+        return (r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
+                r"|.*\.mlp\.(gate_proj|up_proj|down_proj)")
+    if model_type == "gpt2":
+        return ["c_attn", "c_proj", "c_fc"]
+    if model_type in ("falcon", "gpt_neox"):
+        return ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+    if model_type == "phi3":
+        return ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+    raise AssertionError(
+        f"model_type={model_type!r}: unknown module naming — extend "
+        f"arch_adapters.resolve_lora_target_modules for this architecture."
     )
