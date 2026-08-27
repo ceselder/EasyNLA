@@ -23,7 +23,8 @@ outputs are judged — during a format collapse the degenerate outputs drop out
 of the judged pool, so read these means TOGETHER with eval/extraction_rate
 (the collapse shows up there, not here). Enable with `--evals base_fve text_judges`;
 cadence via `--text-judges-every` (a multiple of --eval-every). Needs
-ANTHROPIC_API_KEY. Cost: n_eval_prompts x 6 judge calls per round.
+ANTHROPIC_API_KEY. Cost: n_eval_prompts x 8 judge calls per round (7 rubrics + source_match).
+hallucination is skipped for rows with no source text.
 
 NB: no `temperature` kwarg on the judge calls — newer models reject it.
 """
@@ -40,6 +41,8 @@ import numpy as np
 JUDGE_MODEL = "claude-opus-4-8"
 MAX_EXPL_CHARS = 6000      # judge-input cap per explanation
 MATCH_SNIPPET_CHARS = 700  # per-candidate source tail for source_match
+GROUNDING_SOURCE_CHARS = 1500  # source tail for hallucination — needs more
+                               # context than the multiple-choice task
 N_MATCH_OPTIONS = 4        # 1 true + 3 distractors (chance = 0.25)
 _LETTERS = "ABCDEFGH"
 
@@ -96,7 +99,50 @@ Count BOTH surface repetition (repeated words/phrases/boilerplate sentence struc
 
 EXPLANATION:
 {text}""",
+    "interestingness": """Below is an explanation of a language model's internal activation while reading some text. Rate how INTERESTING the explanation is — how much it tells a researcher they could not have guessed from the raw text alone — on an integer scale 1-10:
+
+1-2 = vacuous. Restates the topic, or says only "the model is processing text about X".
+3-4 = generic. Describes surface content; any competent reader of the text would say the same.
+5-6 = mildly informative. Names a concrete feature or relation, but an obvious one.
+7-8 = genuinely informative. Identifies a specific representation, tension, expectation, or structural role that is not obvious from a first read.
+9-10 = striking. Surfaces something a researcher would want to follow up — an unexpected feature, a prediction the model seems to be making, a surprising abstraction.
+
+Judge INTEREST, not correctness or prose quality: a dull but accurate explanation scores low. Do not reward vagueness dressed up as depth — an explanation that sounds profound while committing to nothing scores 1-2.
+
+Respond with ONLY the integer.
+
+EXPLANATION:
+{text}""",
 }
+
+# Rubrics needing the SOURCE as well as the explanation. Same 1-10 integer
+# contract, templated on {text} AND {source}. Separate from RUBRIC_PROMPTS so
+# the job builder knows to attach a source tail — and to skip the row entirely
+# when the source is missing, rather than judging against an empty string.
+SOURCE_RUBRIC_PROMPTS: dict[str, str] = {
+    "hallucination": """An explanation was produced to describe a language model's internal state while it was reading the SOURCE text below. The state was captured near the END of the source.
+
+Rate HOW MUCH THE EXPLANATION HALLUCINATES — asserts specific content the source does not support — on an integer scale 1-10:
+
+1-2 = fully grounded. Every specific claim traces to something in the source.
+3-4 = mostly grounded. Minor embellishment, or a slightly overreaching inference.
+5-6 = mixed. At least one confident specific (entity, number, relation, event) the source does not contain.
+7-8 = substantially fabricated. Several invented specifics, or a confident claim about subject matter the source never raises.
+9-10 = unrelated. Describes text that is essentially not this source.
+
+Judge GROUNDING ONLY. An explanation may be vague, dull, or badly written and still score 1-2 if it invents nothing. Do NOT penalise abstraction — describing a general pattern the source genuinely exhibits is grounded. Do NOT penalise discussion of the model's expectations or predictions, provided the source supports them.
+
+HIGHER MEANS WORSE.
+
+Respond with ONLY the integer.
+
+SOURCE (tail):
+{source}
+
+EXPLANATION:
+{text}""",
+}
+
 
 MATCH_PROMPT = """A language model produced the EXPLANATION below while reading exactly ONE of the {k} source texts. The explanation describes the model's internal state near the END of its source. Decide which source it was reading.
 
@@ -157,14 +203,15 @@ def judge_explanations(explanations: list[str | None], sources: list[str],
                        *, seed: int = 0, concurrency: int = 64,
                        model: str = JUDGE_MODEL,
                        total_timeout_s: float = 600.0) -> tuple[dict, list[dict]]:
-    """Judge each explanation on the 5 rubric dims + source_match.
+    """Judge each explanation on the 7 rubric dims + source_match.
 
     explanations[i] = the extracted <explanation> text for eval row i, or None
     for failed extractions (skipped). sources[i] = that row's source text
     (detokenized_text_truncated); empty strings disable source_match per-row.
 
     Returns (metrics, per_sample):
-      metrics: {<dim>_mean (repetitiveness LOWER=better), source_match_acc,
+      metrics: {<dim>_mean (repetitiveness and hallucination LOWER=better),
+                source_match_acc,
                 judge_fail_rate, n_judged}
       per_sample: one dict per input row with the raw scores (None = unscored).
 
@@ -186,6 +233,16 @@ def judge_explanations(explanations: list[str | None], sources: list[str],
             continue
         for dim, tmpl in RUBRIC_PROMPTS.items():
             jobs.append(("rubric", i, dim, tmpl.format(text=t)))
+        # Source-conditioned rubrics. Same "rubric" kind (identical parse and
+        # storage); skipped when the row has no source so a sourceless eval set
+        # yields nan instead of judging against "".
+        _src = sources[i] if i < len(sources) else ""
+        if _src:
+            _tail = ("... " + _src[-GROUNDING_SOURCE_CHARS:]
+                     if len(_src) > GROUNDING_SOURCE_CHARS else _src)
+            for dim, tmpl in SOURCE_RUBRIC_PROMPTS.items():
+                jobs.append(("rubric", i, dim,
+                             tmpl.format(text=t, source=_tail)))
         tails, true_pos = build_match_options(sources, i, seed)
         if tails is not None:
             options = "\n\n".join(
@@ -245,7 +302,7 @@ def judge_explanations(explanations: list[str | None], sources: list[str],
                 match_total += 1
 
     metrics: dict[str, float] = {}
-    for dim in RUBRIC_PROMPTS:
+    for dim in (*RUBRIC_PROMPTS, *SOURCE_RUBRIC_PROMPTS):
         vals = [d[dim] for d in per_sample if isinstance(d.get(dim), int)]
         metrics[f"{dim}_mean"] = float(statistics.mean(vals)) if vals else float("nan")
     metrics["source_match_acc"] = (

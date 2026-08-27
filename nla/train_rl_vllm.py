@@ -1088,6 +1088,9 @@ def main():
                         "--eval-temperature (default --temperature=1.0) — set "
                         "--eval-temperature 0 for deterministic greedy judging "
                         "(lowest metric noise).")
+    p.add_argument("--judge-model", type=str, default=None,
+                   help="Model for the text_judges rubric calls. Default: "
+                        "text_judges.JUDGE_MODEL.")
     p.add_argument("--judge-concurrency", type=int, default=64,
                    help="Concurrent judge API calls for text_judges.")
     p.add_argument("--sampler-mismatch-thresh", type=float, default=0.1,
@@ -2431,20 +2434,23 @@ def main():
             # ---- Opus text-attribute judges (opt-in; reuses THIS round's
             # generations — see nla/utils/text_judges.py) ----
             if "text_judges" in args.evals and step % args.text_judges_every == 0:
-                from nla.utils.text_judges import RUBRIC_PROMPTS, judge_explanations
+                from nla.utils.text_judges import (
+                    RUBRIC_PROMPTS, SOURCE_RUBRIC_PROMPTS, judge_explanations)
                 _t_tj = time.time()
                 _tj_expl = [r["explanation"] if r["extracted"] else None
                             for r in eval_records]
                 _tj_src = [row.get("source", "") for row in eval_rows]
+                _judge_kw = ({"model": args.judge_model}
+                             if args.judge_model else {})
                 tj_metrics, _ = judge_explanations(
                     _tj_expl, _tj_src, seed=args.seed,
-                    concurrency=args.judge_concurrency)
+                    concurrency=args.judge_concurrency, **_judge_kw)
                 log.update({f"eval_judge/{k}": v for k, v in tj_metrics.items()})
                 log["time/eval_text_judges_s"] = time.time() - _t_tj
                 print(
                     f"  [text_judges@{step}] "
                     + " ".join(f"{d} {tj_metrics[d + '_mean']:.2f}"
-                               for d in RUBRIC_PROMPTS)
+                               for d in (*RUBRIC_PROMPTS, *SOURCE_RUBRIC_PROMPTS))
                     + f" | match {tj_metrics['source_match_acc']:.0%}"
                     f" | judge_fail {tj_metrics['judge_fail_rate']:.0%}"
                     f" | {log['time/eval_text_judges_s']:.0f}s",
