@@ -621,7 +621,8 @@ def resolve_kl_beta(kl_beta, kl_estimator):
     return DEFAULT_KL_BETA[kl_estimator]
 
 
-def grpo_token_loss(new_lp, ref_lp, advantage, *, kl_beta=0.01, kl_tok=None):
+def grpo_token_loss(new_lp, ref_lp, advantage, *, kl_beta=0.01, kl_tok=None,
+                    length_normalizer=None):
     """Per-token policy-gradient loss + KL for ONE sample's response tokens.
 
     PURELY ON-POLICY: NO importance ratio. The rollouts are on-policy (vLLM holds the
@@ -650,7 +651,14 @@ def grpo_token_loss(new_lp, ref_lp, advantage, *, kl_beta=0.01, kl_tok=None):
         delta = (ref_lp - new_lp).clamp(max=12.0)
         kl = torch.exp(delta) - delta - 1.0
     per_tok = -(surrogate - kl_beta * kl)
-    return per_tok.mean(), kl.detach().mean()
+    if length_normalizer is None:
+        loss = per_tok.mean()               # vanilla GRPO: mean over THIS response
+    else:
+        # Dr. GRPO: divide by a CONSTANT, so total gradient scales with response
+        # length instead of being renormalized away. Uses the generation cap, not
+        # the realized length, so the denominator is identical across rollouts.
+        loss = per_tok.sum() / length_normalizer
+    return loss, kl.detach().mean()
 
 
 def _allreduce_grads_(params, world_size, measure=False):
@@ -729,6 +737,7 @@ def grpo_update_microbatched(
     micro_batch=2, kl_beta=0.04, max_grad_norm=1.0,
     zero_grad_first=True, do_step=True, loss_scale=1.0,
     dp_world_size=1, kl_estimator="k3", kl_topk=64, n_total=None,
+    length_normalizer=None,
     old_logps_list=None, sampler_mismatch_thresh=0.0,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
@@ -841,6 +850,7 @@ def grpo_update_microbatched(
                     continue
             sample_loss, kl_m = grpo_token_loss(
                 new_lp, ref_lp, advantages[i], kl_beta=kl_beta, kl_tok=kl_tok,
+                length_normalizer=length_normalizer,
             )
             chunk_losses.append(sample_loss)
             sample_kls_log.append(kl_m.item())
@@ -997,6 +1007,15 @@ def main():
                         "the critic and supervised MSE loss on (explanation, "
                         "gold_activation) pairs each step.")
     p.add_argument("--critic-lr", type=float, default=8e-5)
+    p.add_argument("--dr-grpo", action="store_true", default=False,
+                   help="Dr. GRPO: drop the two normalizations that bias vanilla "
+                        "GRPO. (1) advantage = r - group_mean, WITHOUT dividing by "
+                        "the group std -- the std divide up-weights low-variance "
+                        "groups, which for a -MSE reward means already-solved "
+                        "prompts dominate the update. (2) per-response loss = "
+                        "sum_t / max_new_tokens instead of mean_t, so a long "
+                        "response is not down-weighted per token (the length bias "
+                        "that rewards verbosity).")
     p.add_argument("--critic-ema-decay", type=float, default=0.0,
                    help="EMA decay over the critic's TRAINABLE params (LoRA A/B + "
                         "value_head; frozen backbone and the actor are excluded). "
@@ -1982,8 +2001,14 @@ def main():
                 continue
             group_r = rewards_t[mask]
             mu = group_r.mean()
-            sd = group_r.std() if group_r.numel() > 1 else torch.tensor(1.0, device=device)
-            adv[mask] = (group_r - mu) / (sd + 1e-6)
+            if args.dr_grpo:
+                # Dr. GRPO: centre only. No std divide -> a group where every
+                # rollout already scores well keeps its small spread instead of
+                # being rescaled up to unit variance.
+                adv[mask] = group_r - mu
+            else:
+                sd = group_r.std() if group_r.numel() > 1 else torch.tensor(1.0, device=device)
+                adv[mask] = (group_r - mu) / (sd + 1e-6)
         t_score_end = time.time()  # [timing] end of scoring+shaping+advantage
 
         # ---- GRPO update: fused forward+loss+backward per micro-batch ----
@@ -2029,6 +2054,7 @@ def main():
             loss_scale=1.0 / accum, dp_world_size=world_size,
             kl_estimator=args.kl_estimator, kl_topk=args.kl_topk,
             n_total=len(inject_ok),   # fixed budget: dropped rollouts act as zeros
+            length_normalizer=(args.max_new_tokens if args.dr_grpo else None),
             old_logps_list=upd_old_logps,
             sampler_mismatch_thresh=args.sampler_mismatch_thresh,
         )
