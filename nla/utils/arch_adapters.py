@@ -27,6 +27,13 @@ _WRAPPER_MODEL_ATTRS = ("language_model",)
 # Gemma3Config.text_config → Gemma3TextConfig (has hidden_size, num_hidden_layers)
 _WRAPPER_CONFIG_ATTRS = ("text_config",)
 
+# Qwen3.6 (`Qwen3_5ForConditionalGeneration`): multimodal wrapper whose text
+# stack is a HYBRID of linear-attention and full-attention layers
+# (full_attention_interval=4), plus a vision tower and an `mtp` speculative
+# head. Deliberately NOT in _LLAMA_FAMILY_MODEL_TYPES: the family entry would
+# hand back q_proj/k_proj/v_proj/o_proj, which exist on only 16 of 64 layers.
+_QWEN36_MODEL_TYPES = {"qwen3_5", "qwen3_5_text"}
+
 
 def resolve_text_config(config: Any) -> Any:
     """Return the text-side config for multimodal wrappers; pass-through otherwise.
@@ -90,7 +97,21 @@ def resolve_decoder_layers(model: Any) -> torch.nn.ModuleList:
     """
     model = resolve_text_model(model)
     if hasattr(model, "model"):
-        layers = model.model.layers
+        inner = model.model
+        # Qwen3.6 nests one level deeper than Llama/Qwen2: the wrapper's .model
+        # holds .language_model (the decoder) NEXT TO .visual, so .model.layers
+        # does not exist. resolve_text_model can't unwrap it either, because
+        # .language_model hangs off .model rather than off the top-level module.
+        layers = getattr(inner, "layers", None)
+        if layers is None:
+            nested = getattr(inner, "language_model", None)
+            layers = getattr(nested, "layers", None) if nested is not None else None
+        if layers is None:
+            raise AssertionError(
+                f"{type(model).__name__}.model has neither .layers nor "
+                f".language_model.layers — extend "
+                f"arch_adapters.resolve_decoder_layers for this architecture"
+            )
     elif hasattr(model, "transformer"):
         layers = model.transformer.h
     else:
@@ -203,6 +224,14 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
         return ["q_proj", "k_proj", "v_proj", "dense"]
     if model_type == "internlm2":
         return ["wqkv", "wo"]   # fused qkv + output proj
+    if model_type in _QWEN36_MODEL_TYPES:
+        # Hybrid attention: full-attention layers use q/k/v/o_proj, linear-
+        # attention layers use in_proj_*/out_proj. Attention-ONLY LoRA on this
+        # arch is a bad idea (it skips the dense MLPs that carry most of the
+        # params) -- prefer resolve_lora_target_modules. Listed for callers
+        # that specifically want attention.
+        return ["q_proj", "k_proj", "v_proj", "o_proj",
+                "in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z", "out_proj"]
     raise AssertionError(
         f"model_type={model_type!r}: unknown attention module naming — extend "
         f"arch_adapters.resolve_attn_target_modules for this architecture."
@@ -232,6 +261,18 @@ def resolve_lora_target_modules(config: Any) -> list[str] | str:
         return ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
     if model_type == "phi3":
         return ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+    if model_type in _QWEN36_MODEL_TYPES:
+        # Qwen3.6 is HYBRID: only every 4th layer is full attention with
+        # q/k/v/o_proj; the other 48/64 are `linear_attn` with a different set
+        # of projections entirely. A suffix list keyed on q_proj would silently
+        # adapt 16 of 64 layers. Anchored to `language_model.` so the vision
+        # tower (model.visual.*) and the multi-token-prediction head (mtp.*)
+        # are both left alone — adapting either trains params the NLA never
+        # uses. `conv1d` is a Conv1d, not a Linear, so it is not listed.
+        return (r".*language_model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
+                r"|.*language_model\.layers\.\d+\.linear_attn\."
+                r"(in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)"
+                r"|.*language_model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)")
     raise AssertionError(
         f"model_type={model_type!r}: unknown module naming — extend "
         f"arch_adapters.resolve_lora_target_modules for this architecture."
