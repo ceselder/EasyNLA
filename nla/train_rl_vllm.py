@@ -109,6 +109,7 @@ from nla.utils.run_config import add_config_arg, apply_config_defaults, save_res
 # Evals selectable via the config `evals:` list. base_fve is the core held-out FVE.
 KNOWN_EVALS = ("base_fve", "text_judges")
 from nla.config import load_nla_config
+from nla.critic_ema import CriticEMA, NoEMA
 from nla.injection import karvonen_inject_in_residual, marker_well_formed
 from nla.models import NLACriticModel
 from nla.schema import (
@@ -996,6 +997,12 @@ def main():
                         "the critic and supervised MSE loss on (explanation, "
                         "gold_activation) pairs each step.")
     p.add_argument("--critic-lr", type=float, default=8e-5)
+    p.add_argument("--critic-ema-decay", type=float, default=0.0,
+                   help="EMA decay over the critic's TRAINABLE params (LoRA A/B + "
+                        "value_head; frozen backbone and the actor are excluded). "
+                        "The EMA critic scores rollouts via shadow-swap while the "
+                        "co-train loss/optimizer stay on live weights. 0.0 (default) "
+                        "= control, no EMA. Sweep values: 0.98, 0.995.")
     p.add_argument("--ar-lora", action="store_true", default=False,
                    help="Co-train the AR critic as a LoRA (frozen backbone + LoRA "
                         "+ value head) instead of full fine-tune. Frees ~20GB "
@@ -1421,7 +1428,17 @@ def main():
         n_trainable = sum(p.numel() for p in critic_trainable)
         print(f"[critic] CO-TRAINED ({_critic_mode}), lr={args.critic_lr}, "
               f"trainable={n_trainable/1e6:.0f}M params")
+        # EMA over the critic's trainable params. Shadow init == live at step 0,
+        # so d=0 and "no EMA" are the same run by construction.
+        critic_ema = CriticEMA(critic, args.critic_ema_decay)
+        print(f"[critic] EMA decay={args.critic_ema_decay} "
+              f"({'ON' if critic_ema.enabled else 'OFF (control arm)'}), "
+              f"tracking {critic_ema.n_params()/1e6:.0f}M params")
     else:
+        if args.critic_ema_decay > 0.0:
+            raise SystemExit("--critic-ema-decay requires --train-critic: with a "
+                             "frozen critic there is nothing to average.")
+        critic_ema = NoEMA()
         print(f"[critic] FROZEN (eval-only scorer)")
     critic.eval()  # Qwen3 has no dropout — eval mode is fine for both grad/no-grad
     print(f"[critic] value_head shape={tuple(critic.value_head.weight.shape)}")
@@ -1600,6 +1617,16 @@ def main():
                 _actor_restored = False
                 print(f"[resume] WARN: actor optimizer state incompatible "
                       f"({_e}) — Adam moments restart.", flush=True)
+            if critic_ema.enabled and "critic_ema" in _opt_st:
+                if args.ar_lora:
+                    # Same reason the critic optimizer restore is skipped below:
+                    # the saved shadow belongs to the merged-away LoRA params.
+                    print("[resume] --ar-lora: skipping critic EMA restore "
+                          "(saved shadow belongs to the merged-away LoRA).",
+                          flush=True)
+                else:
+                    critic_ema.load_state_dict(_opt_st["critic_ema"])
+                    print("[resume] critic EMA shadow restored.", flush=True)
             if critic_optim is not None and "critic_optim" in _opt_st:
                 if args.ar_lora:
                     # critic_latest is saved MERGED and resume injects a FRESH
@@ -1901,10 +1928,14 @@ def main():
 
         # ---- scoring ----
         # reward = -MSE(critic reconstruction, gold activation).
-        rewards = score_with_critic(
-            critic, tokenizer, all_explanations, all_activations,
-            template, mse_scale_f, device,
-        )
+        # Rewards come from the EMA critic when --critic-ema-decay > 0; the
+        # co-train loss below always runs on live weights. swapped() restores in
+        # a finally, so a crash here cannot leave EMA weights in the live slots.
+        with critic_ema.swapped():
+            rewards = score_with_critic(
+                critic, tokenizer, all_explanations, all_activations,
+                template, mse_scale_f, device,
+            )
         # TRUNCATED -> FAILED: a rollout that hit the max_new_tokens cap must not
         # be scored as if its explanation were complete (a cut-off <explanation>
         # that still parses scores artificially — the "FVE peaks then drops"
@@ -2108,7 +2139,9 @@ def main():
                         critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                             critic_trainable, args.max_grad_norm,
                         )
+                        critic_ema.assert_live("(non-dist critic step)")
                         critic_optim.step()
+                        critic_ema.update()   # ema = d*ema + (1-d)*live, after the step
                         critic_optim.zero_grad(set_to_none=True)  # never leave applied grads (see actor step)
                         critic_grad_norm_val = (
                             critic_grad_norm.item()
@@ -2132,7 +2165,9 @@ def main():
             _cgn = (critic_grad_norm.item() if hasattr(critic_grad_norm, "item")
                     else float(critic_grad_norm))
             if math.isfinite(_cgn):
+                critic_ema.assert_live("(dist critic step)")
                 critic_optim.step()
+                critic_ema.update()   # ema = d*ema + (1-d)*live, after the step
                 critic_optim.zero_grad(set_to_none=True)  # never leave applied grads (see actor step)
             else:
                 critic_optim.zero_grad(set_to_none=True)
@@ -2282,26 +2317,42 @@ def main():
             # rollout_batch_vllm may return responses in any order; key each by
             # the prompt index it stamps (group_size=1 -> exactly one per prompt).
             _resp_by_idx = {r["prompt_idx"]: r["text"] for r in _eval_responses}
-            # --- Phase 2: scoring (per-row, reads the pre-generated responses) ---
-            for ei, row in enumerate(eval_rows):
-                activation = _eval_prompts_with_acts[ei][1]
-                resp = _resp_by_idx.get(ei, "")
-                expl = extract_explanation(resp)
-                e_reward = -2.0
-                if expl is not None:
-                    ctext = template.format(explanation=expl)
-                    cids = tokenizer.encode(ctext, add_special_tokens=False)
-                    if 0 < len(cids) <= 1024:
-                        x = torch.tensor([cids], dtype=torch.long, device=device)
-                        with torch.no_grad():
-                            pred = critic_predict(critic, x, None, mse_scale_f)[0]
-                        gold = activation.to(device).float()
-                        pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
-                        gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
-                        mse = F.mse_loss(pn, gn).item()
-                        if math.isfinite(mse):
-                            e_reward = -mse
-                eval_rewards_s.append(e_reward)
+            # --- Phase 2: scoring (per-row, reads the pre-generated responses).
+            # Run TWICE when EMA is on -- same generations, live vs EMA critic --
+            # so the arms are compared on scorer quality, not on sampling noise.
+            _eval_expls = [extract_explanation(_resp_by_idx.get(ei, ""))
+                           for ei in range(len(eval_rows))]
+
+            def _score_eval_rows():
+                """Reward per eval row under whatever critic weights are live now."""
+                out = []
+                for ei in range(len(eval_rows)):
+                    activation = _eval_prompts_with_acts[ei][1]
+                    expl = _eval_expls[ei]
+                    e_reward = -2.0
+                    if expl is not None:
+                        ctext = template.format(explanation=expl)
+                        cids = tokenizer.encode(ctext, add_special_tokens=False)
+                        if 0 < len(cids) <= 1024:
+                            x = torch.tensor([cids], dtype=torch.long, device=device)
+                            with torch.no_grad():
+                                pred = critic_predict(critic, x, None, mse_scale_f)[0]
+                            gold = activation.to(device).float()
+                            pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
+                            gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
+                            mse = F.mse_loss(pn, gn).item()
+                            if math.isfinite(mse):
+                                e_reward = -mse
+                    out.append(e_reward)
+                return out
+
+            eval_rewards_s = _score_eval_rows()          # live critic (canonical)
+            eval_rewards_ema = None
+            if critic_ema.enabled:
+                with critic_ema.swapped():
+                    eval_rewards_ema = _score_eval_rows()
+            for ei in range(len(eval_rows)):
+                expl, e_reward = _eval_expls[ei], eval_rewards_s[ei]
                 eval_records.append({
                     "step": step, "idx": ei, "reward": e_reward,
                     "fve": (1.0 - (-e_reward) / eval_fve_baseline) if e_reward > -2.0 else float("nan"),
@@ -2320,6 +2371,13 @@ def main():
                 (1.0 - (-float(np.mean(valid_e))) / eval_fve_baseline) * 100.0
                 if valid_e else float("nan")
             )
+            if eval_rewards_ema is not None:
+                _valid_ema = [r for r in eval_rewards_ema if r > -2.0]
+                log["eval/fve_pct_ema"] = (
+                    (1.0 - (-float(np.mean(_valid_ema))) / eval_fve_baseline) * 100.0
+                    if _valid_ema else float("nan")
+                )
+                log["eval/reward_mean_ema"] = float(np.mean(eval_rewards_ema))
             log["eval/extraction_rate"] = (
                 sum(1 for r in eval_records if r["extracted"]) / len(eval_records)
                 if eval_records else 0.0
@@ -2339,7 +2397,9 @@ def main():
             print(
                 f"  [eval@{step}] reward {log['eval/reward_mean']:.3f} "
                 f"| FVE {log['eval/fve_pct']:.1f}% "
-                f"| ext {log['eval/extraction_rate']:.0%}",
+                f"| ext {log['eval/extraction_rate']:.0%}"
+                + (f" | FVE(ema) {log['eval/fve_pct_ema']:.1f}%"
+                   if eval_rewards_ema is not None else ""),
                 flush=True,
             )
             # ---- Opus text-attribute judges (opt-in; reuses THIS round's
@@ -2442,6 +2502,8 @@ def main():
             _opt_state = {"step": step + 1, "actor_optim": optim.state_dict()}
             if args.train_critic and critic_optim is not None:
                 _opt_state["critic_optim"] = critic_optim.state_dict()
+                # without this, resume restarts the EMA from the live weights
+                _opt_state["critic_ema"] = critic_ema.state_dict()
             torch.save(_opt_state, str(_opt_tmp))
             os.replace(str(_opt_tmp), str(_opt_dst))   # atomic on same fs
             print(f"[save] LoRA → {out_dir} (+ optim_latest @ step {step + 1})"
