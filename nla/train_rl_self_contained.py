@@ -57,6 +57,7 @@ from nla.utils.run_config import add_config_arg, apply_config_defaults, save_res
 # Evals selectable via the config `evals:` list. base_fve is the core FVE.
 KNOWN_EVALS = ("base_fve", "text_judges")
 from nla.config import load_nla_config
+from nla.critic_ema import CriticEMA, NoEMA
 from nla.injection import karvonen_inject_in_residual, marker_well_formed
 from nla.models import NLACriticModel
 from nla.schema import (
@@ -219,7 +220,8 @@ def score_with_critic(
     return rewards
 
 
-def grpo_token_loss(new_lp, ref_lp, advantage, kl_beta=0.04, kl_tok=None):
+def grpo_token_loss(new_lp, ref_lp, advantage, kl_beta=0.04, kl_tok=None,
+                    length_normalizer=None):
     """Pure ON-POLICY GRPO per-sample token loss + KL to reference.
 
     This trainer rolls out with the current policy and does exactly ONE
@@ -251,14 +253,18 @@ def grpo_token_loss(new_lp, ref_lp, advantage, kl_beta=0.04, kl_tok=None):
         delta = (ref_lp - new_lp).clamp(max=12.0)
         kl = torch.exp(delta) - delta - 1.0
     per_tok = -(surrogate - kl_beta * kl)
-    return per_tok.mean(), kl.detach().mean()
+    if length_normalizer is None:
+        loss = per_tok.mean()               # vanilla GRPO: mean over THIS response
+    else:
+        loss = per_tok.sum() / length_normalizer   # Dr. GRPO: constant denominator
+    return loss, kl.detach().mean()
 
 
 def grpo_update_microbatched(
     actor, optim, tokenizer, full_ids_list, prompt_lens, activations,
     advantages, vectors_ref, device,
     micro_batch=2, kl_beta=0.04, max_grad_norm=1.0,
-    kl_estimator="k3", n_total=None,
+    kl_estimator="k3", n_total=None, length_normalizer=None,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
 
@@ -347,6 +353,7 @@ def grpo_update_microbatched(
             # Pure on-policy surrogate (advantage * new_lp) + KL to ref.
             sample_loss, sample_kl = grpo_token_loss(
                 new_lp, ref_lp, advantages[i], kl_beta=kl_beta, kl_tok=kl_tok,
+                length_normalizer=length_normalizer,
             )
             chunk_losses.append(sample_loss)
             sample_kls_log.append(sample_kl.item())
@@ -434,6 +441,15 @@ def main():
                         "(explanation, gold_activation) pairs each step. "
                         "(--train-critic kept as a deprecated alias.)")
     p.add_argument("--ar-lr", "--critic-lr", dest="critic_lr", type=float, default=8e-5)  # matches train_rl_vllm
+    p.add_argument("--critic-ema-decay", type=float, default=0.0,
+                   help="EMA decay over the critic's TRAINABLE params (LoRA A/B + "
+                        "value_head). The EMA critic scores rollouts via shadow-swap "
+                        "while the co-train loss/optimizer stay on live weights. "
+                        "0.0 (default) = control. Sweep: 0.98, 0.995.")
+    p.add_argument("--dr-grpo", action="store_true", default=False,
+                   help="Dr. GRPO: advantage = r - group_mean (no std divide), and "
+                        "per-response loss = sum_t / max_new_tokens (no length "
+                        "normalization). See the vLLM twin for the rationale.")
     p.add_argument("--length-penalty", type=float, default=0.01,
                    help="HINGED length penalty: subtract length_penalty * "
                         "max(0, n_response_tokens - length_threshold) from the GRPO "
@@ -771,7 +787,14 @@ def main():
         n_trainable = sum(p.numel() for p in critic_trainable)
         print(f"[ar] CO-TRAINED, lr={args.critic_lr}, "
               f"trainable={n_trainable/1e9:.2f}B (backbone + value_head)")
+        critic_ema = CriticEMA(critic, args.critic_ema_decay)
+        print(f"[ar] EMA decay={args.critic_ema_decay} "
+              f"({'ON' if critic_ema.enabled else 'OFF (control arm)'}), "
+              f"tracking {critic_ema.n_params()/1e6:.0f}M params")
     else:
+        if args.critic_ema_decay > 0.0:
+            raise SystemExit("--critic-ema-decay requires a co-trained critic.")
+        critic_ema = NoEMA()
         print(f"[ar] FROZEN (eval-only scorer)")
     critic.eval()  # Qwen3 has no dropout — eval mode is fine for both grad/no-grad
     print(f"[ar] value_head shape={tuple(critic.value_head.weight.shape)}")
@@ -1075,10 +1098,11 @@ def main():
         # `rewards` holds the reconstruction reward (-MSE) and feeds FVE logging.
         # Length shaping is applied only to `rewards_t` (the GRPO signal), so FVE
         # stays a pure reconstruction metric comparable across runs.
-        rewards = score_with_critic(
-            critic, tokenizer, all_explanations, all_activations,
-            template, mse_scale_f, device,
-        )
+        with critic_ema.swapped():
+            rewards = score_with_critic(
+                critic, tokenizer, all_explanations, all_activations,
+                template, mse_scale_f, device,
+            )
         # TRUNCATED -> FAILED: a cap-truncated rollout must not be scored as if
         # its explanation were complete — it gets the -2 failure reward, which IS
         # trained on (the anti-runaway gradient). Keeps FVE/extraction honest.
@@ -1124,8 +1148,11 @@ def main():
                 continue
             group_r = rewards_t[mask]
             mu = group_r.mean()
-            sd = group_r.std() if group_r.numel() > 1 else torch.tensor(1.0, device=device)
-            adv[mask] = (group_r - mu) / (sd + 1e-6)
+            if args.dr_grpo:
+                adv[mask] = group_r - mu          # Dr. GRPO: centre only
+            else:
+                sd = group_r.std() if group_r.numel() > 1 else torch.tensor(1.0, device=device)
+                adv[mask] = (group_r - mu) / (sd + 1e-6)
 
         # ---- GRPO update: fused forward+loss+backward per micro-batch ----
         # Previous code did all forwards then all backwards, which retained
@@ -1151,6 +1178,7 @@ def main():
             max_grad_norm=args.max_grad_norm,
             kl_estimator=args.kl_estimator,
             n_total=len(inject_ok),   # fixed budget: dropped rollouts act as zeros
+            length_normalizer=(args.max_new_tokens if args.dr_grpo else None),
         )
         # Build a scalar-tensor stand-in for the existing logging path that
         # expects a `loss` tensor with .item().
@@ -1227,7 +1255,9 @@ def main():
                     critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                         critic_trainable, args.max_grad_norm,
                     )
+                    critic_ema.assert_live("(critic step)")
                     critic_optim.step()
+                    critic_ema.update()   # ema = d*ema + (1-d)*live
                     critic_loss_val = accumulated  # already the full-batch mean
                     critic_grad_norm_val = (
                         critic_grad_norm.item()
@@ -1342,26 +1372,42 @@ def main():
                         _all_resp.append(tokenizer.decode(_new[_i], skip_special_tokens=True))
             finally:
                 tokenizer.padding_side = _orig_pad
-            # --- Phase 2: scoring (per-row, reads the pre-generated responses) ---
-            for ei, row in enumerate(eval_rows):
-                activation = _eval_acts[ei]
-                resp = _all_resp[ei]
-                expl = extract_explanation(resp)
-                e_reward = -2.0
-                if expl is not None:
-                    ctext = template.format(explanation=expl)
-                    cids = tokenizer.encode(ctext, add_special_tokens=False)
-                    if 0 < len(cids) <= 1024:
-                        x = torch.tensor([cids], dtype=torch.long, device=device)
-                        with torch.no_grad():
-                            pred = critic_predict(critic, x, None, mse_scale_f)[0]
-                        gold = activation.to(device).float()
-                        pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
-                        gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
-                        mse = F.mse_loss(pn, gn).item()
-                        if math.isfinite(mse):
-                            e_reward = -mse
-                eval_rewards_s.append(e_reward)
+            # --- Phase 2: scoring. Run TWICE when EMA is on -- same generations,
+            # live vs EMA critic -- so the arms differ by scorer, not by sampling
+            # noise. The brief requires reporting held-out FVE under both.
+            _eval_expls = [extract_explanation(_all_resp[ei])
+                           for ei in range(len(eval_rows))]
+
+            def _score_eval_rows():
+                """Reward per eval row under whatever critic weights are live now."""
+                out = []
+                for ei in range(len(eval_rows)):
+                    activation = _eval_acts[ei]
+                    expl = _eval_expls[ei]
+                    e_reward = -2.0
+                    if expl is not None:
+                        ctext = template.format(explanation=expl)
+                        cids = tokenizer.encode(ctext, add_special_tokens=False)
+                        if 0 < len(cids) <= 1024:
+                            x = torch.tensor([cids], dtype=torch.long, device=device)
+                            with torch.no_grad():
+                                pred = critic_predict(critic, x, None, mse_scale_f)[0]
+                            gold = activation.to(device).float()
+                            pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
+                            gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
+                            mse = F.mse_loss(pn, gn).item()
+                            if math.isfinite(mse):
+                                e_reward = -mse
+                    out.append(e_reward)
+                return out
+
+            eval_rewards_s = _score_eval_rows()          # live critic (canonical)
+            eval_rewards_ema = None
+            if critic_ema.enabled:
+                with critic_ema.swapped():
+                    eval_rewards_ema = _score_eval_rows()
+            for ei in range(len(eval_rows)):
+                expl, e_reward = _eval_expls[ei], eval_rewards_s[ei]
                 eval_records.append({
                     "step": step, "idx": ei, "reward": e_reward,
                     "fve": (1.0 - (-e_reward) / eval_fve_baseline) if e_reward > -2.0 else float("nan"),
@@ -1376,6 +1422,13 @@ def main():
             log["eval/reward_mean_valid"] = (
                 float(np.mean(valid_e)) if valid_e else float("nan")
             )
+            if eval_rewards_ema is not None:
+                _valid_ema = [r for r in eval_rewards_ema if r > -2.0]
+                log["eval/fve_pct_ema"] = (
+                    (1.0 - (-float(np.mean(_valid_ema))) / eval_fve_baseline) * 100.0
+                    if _valid_ema else float("nan")
+                )
+                log["eval/reward_mean_ema"] = float(np.mean(eval_rewards_ema))
             log["eval/fve_pct"] = (
                 (1.0 - (-float(np.mean(valid_e))) / eval_fve_baseline) * 100.0
                 if valid_e else float("nan")
@@ -1399,7 +1452,9 @@ def main():
                 )
             print(
                 f"  [eval@{step}] reward {log['eval/reward_mean']:.3f} "
-                f"| FVE {log['eval/fve_pct']:.1f}% "
+                f"| FVE {log['eval/fve_pct']:.1f}%"
+                + (f" | FVE(ema) {log['eval/fve_pct_ema']:.1f}%"
+                   if eval_rewards_ema is not None else "") + " "
                 f"| ext {log['eval/extraction_rate']:.0%}",
                 flush=True,
             )
