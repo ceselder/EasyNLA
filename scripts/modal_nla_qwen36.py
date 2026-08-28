@@ -264,3 +264,273 @@ def throughput_sweep():
               f"({mins*200/60:.1f} h for a 200-step arm; "
               f"{mins*200/60/8:.1f} h if sharded over 8 GPUs)", flush=True)
     return {"sweep": results, "best": best}
+
+
+DATA = "/vol/data"
+OPUS5 = "ceselder/easynla-dsv4-warmstart-opus5"
+
+
+@app.function(volumes={"/vol": vol}, timeout=90 * 60, cpu=8.0, memory=65536,
+              secrets=[_secret()])
+def prepare_rows():
+    """CPU stage: build ONE shared row pool of (text, explanation) for Qwen3.6.
+
+    Source is the Opus-5 warm start, not asher577's: its sidecar records
+    api_summaries.model = claude-sonnet-4-6, and the DSv4 result was that Opus-5
+    explanations lift held-out AR FVE 36.1 -> 45.3 at matched steps. Same corpus,
+    same doc_ids, same detokenized_text_truncated, so the text positions line up.
+
+    Its activation_vector columns are DISCARDED — they are DSv4 layer-28, 4096-d.
+    We keep only text + explanation and re-extract on Qwen3.6 (5120-d, layer 42).
+
+    Celeste's design rule (2026-08-27): AV and AR SFT train on the SAME rows.
+    The published av/ar splits are disjoint halves, so they are unioned here into
+    a shared pool keyed on doc_id.
+    """
+    import os
+    import re
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+
+    os.makedirs(DATA, exist_ok=True)
+    KEEP = ["prompt", "response", "doc_id", "detokenized_text_truncated", "n_raw_tokens"]
+
+    def _explanation_from_av(resp):
+        if resp is None:
+            return None
+        m = re.search(r"<explanation>(.*?)</explanation>", resp, re.S)
+        return (m.group(1) if m else resp).strip() or None
+
+    def _explanation_from_ar(prompt):
+        if prompt is None:
+            return None
+        m = re.search(r"<text>(.*?)</text>", prompt, re.S)
+        return (m.group(1).strip() or None) if m else None
+
+    pool = {}          # doc_id -> {"text":..., "explanation":...}
+    stats = {}
+    for split, kind in (("av_sft_shuf", "av"), ("ar_sft_shuf", "ar"),
+                        ("av_sft_val", "av"), ("ar_sft_val", "ar")):
+        path = hf_hub_download(OPUS5, f"{split}.parquet", repo_type="dataset",
+                              cache_dir="/vol/hf_cache")
+        pf = pq.ParquetFile(path)
+        cols = [c for c in KEEP if c in pf.schema_arrow.names]
+        n_new = n_seen = n_noexpl = 0
+        for batch in pf.iter_batches(batch_size=20000, columns=cols):
+            d = batch.to_pydict()
+            for i in range(batch.num_rows):
+                n_seen += 1
+                did = d["doc_id"][i]
+                text = d["detokenized_text_truncated"][i]
+                if not text:
+                    continue
+                expl = (_explanation_from_av(d.get("response", [None])[i])
+                        if kind == "av" else
+                        _explanation_from_ar(d.get("prompt", [None])[i]))
+                if not expl:
+                    n_noexpl += 1
+                    continue
+                # Key on the TEXT, not doc_id: positions_per_doc=10, so ~10
+                # rows share a doc_id and keying on it discards 90% of the data
+                # (measured: 363,961 av rows collapsed to 36,734 docs).
+                # detokenized_text_truncated is the prefix up to the capture
+                # position, so it is unique per (doc, position).
+                key = text
+                if key not in pool:
+                    pool[key] = {"doc_id": did, "text": text, "explanation": expl,
+                                 "n_raw_tokens": d.get("n_raw_tokens", [0])[i] or 0,
+                                 "is_val": split.endswith("_val")}
+                    n_new += 1
+        stats[split] = (n_seen, n_new, n_noexpl)
+        print(f"  {split:14} rows={n_seen:7d} new={n_new:7d} "
+              f"no_explanation={n_noexpl:6d} pool={len(pool):7d}", flush=True)
+
+    rows = list(pool.values())
+    # doc-level val split is inherited from which file a doc_id first appeared in
+    n_val = sum(1 for r in rows if r["is_val"])
+    n_docs = len({r["doc_id"] for r in rows})
+    tbl = pa.table({
+        "doc_id": pa.array([r["doc_id"] for r in rows]),
+        "text": pa.array([r["text"] for r in rows]),
+        "explanation": pa.array([r["explanation"] for r in rows]),
+        "n_raw_tokens": pa.array([r["n_raw_tokens"] for r in rows]),
+        "is_val": pa.array([r["is_val"] for r in rows]),
+    })
+    out = f"{DATA}/shared_pool.parquet"
+    pq.write_table(tbl, out, compression="zstd")
+    vol.commit()
+    print(f"\nwrote {out}: {len(rows)} unique (doc, position) rows across "
+          f"{n_docs} docs ({len(rows)-n_val} train / {n_val} val)", flush=True)
+    print(f"  size on volume: {os.path.getsize(out)/1e6:.0f} MB", flush=True)
+    ex = rows[0]
+    print(f"\n  sample doc_id     {ex['doc_id']}")
+    print(f"  sample text       {ex['text'][:90]!r}")
+    print(f"  sample explanation{ex['explanation'][:90]!r}")
+    return {"pool": len(rows), "val": n_val, "per_split": stats}
+
+
+@app.function(gpu="B200", volumes={"/vol": vol}, timeout=14 * 60 * 60,
+              secrets=[_secret()])
+def extract_activations(batch_size: int = 256, max_length: int = 1024,
+                        limit: int = 0):
+    """Stage 0: re-extract Qwen3.6 layer-42 residuals for the shared pool.
+
+    Captures the OUTPUT of block LAYER_INDEX at the LAST REAL token —
+    detokenized_text_truncated is the prefix ending at the capture position, so
+    the final token IS that position. --ar-num-layers must then be
+    LAYER_INDEX+1 = 43 (the critic needs block 42 to exist).
+
+    Also computes alpha = p75 of the activation L2 norms over the corpus, which
+    the brief asks for. Recorded as a diagnostic; injection_scale is left absent
+    (= raw injection) to match the reference configuration.
+    """
+    import json
+    import os
+    import sys
+    import time
+
+    sys.path.insert(0, REPO_REMOTE)
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from nla.utils.arch_adapters import resolve_decoder_layers
+
+    outdir = f"{DATA}/acts_qwen36_L{LAYER_INDEX}"
+    os.makedirs(outdir, exist_ok=True)
+
+    tbl = pq.read_table(f"{DATA}/shared_pool.parquet")
+    rows = tbl.to_pydict()
+    n_all = len(rows["text"])
+    idx_all = list(range(n_all))
+    if limit:
+        idx_all = idx_all[:limit]
+    print(f"pool: {n_all} rows | extracting {len(idx_all)}", flush=True)
+
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "right"          # gather at (len-1) per row
+
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL, dtype=torch.bfloat16, device_map="cuda:0", low_cpu_mem_usage=True)
+    model.eval()
+    layers = resolve_decoder_layers(model)
+    assert len(layers) == 64, f"expected 64 layers, got {len(layers)}"
+    print(f"hooking layers[{LAYER_INDEX}] = {type(layers[LAYER_INDEX]).__name__}", flush=True)
+
+    # sort by token length so batches pad minimally (big throughput win)
+    print("tokenizing + length-sorting...", flush=True)
+    enc_all = tok([rows["text"][i] for i in idx_all], add_special_tokens=False,
+                  truncation=True, max_length=max_length)["input_ids"]
+    order = sorted(range(len(idx_all)), key=lambda k: len(enc_all[k]))
+    print(f"  token lengths: min={len(enc_all[order[0]])} "
+          f"med={len(enc_all[order[len(order)//2]])} "
+          f"max={len(enc_all[order[-1]])}", flush=True)
+
+    grab = {}
+
+    class _StopForward(Exception):
+        """Abort the forward once the capture layer has produced its output."""
+
+    def _hook(_m, _i, out):
+        grab["h"] = out[0] if isinstance(out, tuple) else out
+        raise _StopForward          # layers 43..63 are never computed
+
+    handle = layers[LAYER_INDEX].register_forward_hook(_hook)
+
+    SHARD = 25000
+    buf_vec, buf_meta, norms = [], [], []
+    shard_id, n_done, t0 = 0, 0, time.time()
+
+    def _flush():
+        nonlocal shard_id, buf_vec, buf_meta
+        if not buf_vec:
+            return
+        arr = np.stack(buf_vec).astype(np.float32)
+        t = pa.table({
+            "doc_id": pa.array([m[0] for m in buf_meta]),
+            "text": pa.array([m[1] for m in buf_meta]),
+            "explanation": pa.array([m[2] for m in buf_meta]),
+            "is_val": pa.array([m[3] for m in buf_meta]),
+            "n_raw_tokens": pa.array([m[4] for m in buf_meta]),
+            "activation_layer": pa.array([LAYER_INDEX] * len(buf_meta)),
+            "activation_vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(arr.reshape(-1)), arr.shape[1]),
+        })
+        p = f"{outdir}/shard_{shard_id:04d}.parquet"
+        pq.write_table(t, p, compression="zstd")
+        print(f"    wrote {p} ({len(buf_meta)} rows, "
+              f"{os.path.getsize(p)/1e6:.0f} MB)", flush=True)
+        shard_id += 1
+        buf_vec, buf_meta = [], []
+        vol.commit()
+
+    for bs_start in range(0, len(order), batch_size):
+        chunk = order[bs_start:bs_start + batch_size]
+        ids_list = [enc_all[k] for k in chunk]
+        maxlen = max(len(x) for x in ids_list)
+        bx = torch.full((len(chunk), maxlen), tok.pad_token_id, dtype=torch.long)
+        am = torch.zeros((len(chunk), maxlen), dtype=torch.long)
+        for r, ids in enumerate(ids_list):
+            bx[r, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+            am[r, :len(ids)] = 1
+        bx, am = bx.to("cuda:0"), am.to("cuda:0")
+        # model.model(...), NOT model(...): the CausalLM wrapper runs lm_head
+        # over the whole sequence, which at vocab 248077 x batch 256 tried to
+        # allocate 54.7GB and OOM'd. We only ever need a hidden state.
+        # use_cache=False so aborting mid-forward leaves no partial cache state
+        # in the hybrid linear-attention layers.
+        try:
+            with torch.no_grad():
+                model.model(input_ids=bx, attention_mask=am, use_cache=False)
+        except _StopForward:
+            pass
+        h = grab["h"]                                   # [B, T, d]
+        last = am.sum(dim=1) - 1                        # last REAL token index
+        vecs = h[torch.arange(h.shape[0], device=h.device), last].float()
+        nrm = vecs.norm(dim=-1)
+        norms.append(nrm.cpu().numpy())
+        vecs_np = vecs.cpu().numpy()
+        for r, k in enumerate(chunk):
+            i = idx_all[k]
+            buf_vec.append(vecs_np[r])
+            buf_meta.append((rows["doc_id"][i], rows["text"][i],
+                             rows["explanation"][i], rows["is_val"][i],
+                             int(rows["n_raw_tokens"][i]), ))
+        n_done += len(chunk)
+        if len(buf_vec) >= SHARD:
+            _flush()
+        if (bs_start // batch_size) % 50 == 0:
+            el = time.time() - t0
+            rate = n_done / max(el, 1e-9)
+            print(f"  {n_done}/{len(order)} ({100*n_done/len(order):.1f}%) "
+                  f"{rate:.0f} rows/s  eta {(len(order)-n_done)/max(rate,1e-9)/60:.0f} min",
+                  flush=True)
+    _flush()
+    handle.remove()
+
+    alln = np.concatenate(norms)
+    alpha = float(np.percentile(alln, 75))
+    stats = {
+        "rows": int(n_done), "d_model": int(len(buf_vec[0]) if buf_vec else 5120),
+        "layer_index": LAYER_INDEX,
+        "norm_p25": float(np.percentile(alln, 25)),
+        "norm_p50": float(np.percentile(alln, 50)),
+        "alpha_norm_p75": alpha,
+        "norm_p95": float(np.percentile(alln, 95)),
+        "norm_mean": float(alln.mean()), "norm_std": float(alln.std()),
+        "shards": shard_id, "elapsed_min": round((time.time() - t0) / 60, 1),
+    }
+    with open(f"{outdir}/extraction_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+    vol.commit()
+    print("\n=== extraction stats ===", flush=True)
+    for k, v in stats.items():
+        print(f"  {k:18} {v}", flush=True)
+    print(f"\nALPHA (p75 of layer-{LAYER_INDEX} activation norms) = {alpha:.2f}", flush=True)
+    return stats
