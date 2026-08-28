@@ -38,45 +38,55 @@ def check(cond, label):
         FAILS.append(label)
 
 
-# --- real module names (layer 0 = linear_attention, layer 3 = full_attention) ---
-SHOULD_MATCH = [
-    "model.language_model.layers.0.linear_attn.in_proj_qkv",
-    "model.language_model.layers.0.linear_attn.in_proj_a",
-    "model.language_model.layers.0.linear_attn.in_proj_b",
-    "model.language_model.layers.0.linear_attn.in_proj_z",
-    "model.language_model.layers.0.linear_attn.out_proj",
-    "model.language_model.layers.3.self_attn.q_proj",
-    "model.language_model.layers.3.self_attn.k_proj",
-    "model.language_model.layers.3.self_attn.v_proj",
-    "model.language_model.layers.3.self_attn.o_proj",
-    "model.language_model.layers.0.mlp.gate_proj",
-    "model.language_model.layers.42.mlp.up_proj",
-    "model.language_model.layers.63.mlp.down_proj",
-    # the AR critic wraps the backbone, so names gain a prefix
-    "backbone.model.language_model.layers.7.self_attn.q_proj",
-    "backbone.model.language_model.layers.7.linear_attn.out_proj",
+# --- REAL module names, from AutoModelForCausalLM.from_config on a meta device.
+# NOT from model.safetensors.index.json: the checkpoint keys carry a
+# `model.language_model.` prefix that the loaded module tree does NOT have
+# (AutoModelForCausalLM yields Qwen3_5ForCausalLM, 497 Linears, no vision
+# tower). A regex anchored on that prefix matched 0 of 497 modules on a real
+# B200 load while this test passed — hence real names only, decoys separate.
+def _real_trainable_linears():
+    out = []
+    for n in range(64):
+        out += [f"model.layers.{n}.mlp.{p}" for p in ("gate_proj", "up_proj", "down_proj")]
+        if (n + 1) % 4 == 0:          # full_attention_interval = 4
+            out += [f"model.layers.{n}.self_attn.{p}"
+                    for p in ("q_proj", "k_proj", "v_proj", "o_proj")]
+        else:
+            out += [f"model.layers.{n}.linear_attn.{p}"
+                    for p in ("in_proj_qkv", "in_proj_a", "in_proj_b",
+                              "in_proj_z", "out_proj")]
+    return out
+
+
+SHOULD_MATCH = _real_trainable_linears()
+
+# Shapes other load paths produce: the multimodal wrapper class, and the AR
+# critic wrapping the backbone. Must also match.
+ALT_SHOULD_MATCH = [
+    "model.language_model.layers.42.mlp.gate_proj",
+    "backbone.model.layers.7.self_attn.q_proj",
+    "backbone.model.language_model.layers.0.linear_attn.out_proj",
 ]
 
 SHOULD_NOT_MATCH = [
     "lm_head",
-    "model.language_model.embed_tokens",
-    "model.language_model.norm",
-    "model.language_model.layers.0.input_layernorm",
-    "model.language_model.layers.0.post_attention_layernorm",
-    "model.language_model.layers.0.linear_attn.norm",
-    "model.language_model.layers.0.linear_attn.conv1d",   # Conv1d, not Linear
-    "model.language_model.layers.3.self_attn.q_norm",
-    "model.language_model.layers.3.self_attn.k_norm",
-    # vision tower — adapting it trains params the NLA never reads
-    "model.visual.blocks.0.attn.qkv",
-    "model.visual.blocks.0.attn.proj",
-    "model.visual.blocks.0.mlp.linear_fc1",
-    "model.visual.merger.linear_fc1",
-    "model.visual.patch_embed.proj",
-    # multi-token-prediction head — same story
+    "model.embed_tokens",
+    "model.norm",
+    "model.layers.0.input_layernorm",
+    "model.layers.0.post_attention_layernorm",
+    "model.layers.0.linear_attn.norm",
+    "model.layers.0.linear_attn.conv1d",   # Conv1d, not Linear
+    "model.layers.3.self_attn.q_norm",
+    "model.layers.3.self_attn.k_norm",
+    # multi-token-prediction head — names its Linears q_proj/gate_proj too
     "mtp.layers.0.self_attn.q_proj",
     "mtp.layers.0.mlp.gate_proj",
     "mtp.fc",
+    # vision tower — adapting it trains params the NLA never reads
+    "model.visual.blocks.0.attn.qkv",
+    "model.visual.blocks.0.mlp.linear_fc1",
+    "model.visual.merger.linear_fc1",
+    "model.visual.patch_embed.proj",
 ]
 
 
@@ -88,14 +98,18 @@ def main():
 
     # peft uses re.fullmatch when target_modules is a str
     missed = [n for n in SHOULD_MATCH if not re.fullmatch(pattern, n)]
-    check(not missed, f"2  every language-model Linear is targeted "
-                      f"({len(SHOULD_MATCH)} names)")
-    for n in missed:
+    check(not missed, f"2  all {len(SHOULD_MATCH)} real trainable Linears targeted "
+                      f"(48 linear_attn + 16 self_attn + 64 mlp layers)")
+    for n in missed[:5]:
+        print(f"        MISSED: {n}")
+    alt_missed = [n for n in ALT_SHOULD_MATCH if not re.fullmatch(pattern, n)]
+    check(not alt_missed, "2b multimodal-wrapper and critic-wrapped paths also match")
+    for n in alt_missed:
         print(f"        MISSED: {n}")
 
     wrong = [n for n in SHOULD_NOT_MATCH if re.fullmatch(pattern, n)]
-    check(not wrong, f"3  nothing outside the language model is targeted "
-                     f"({len(SHOULD_NOT_MATCH)} names)")
+    check(not wrong, f"3  norms/embeddings/lm_head/mtp/vision all excluded "
+                     f"({len(SHOULD_NOT_MATCH)} decoys)")
     for n in wrong:
         print(f"        WRONGLY MATCHED: {n}")
 

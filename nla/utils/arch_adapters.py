@@ -263,16 +263,25 @@ def resolve_lora_target_modules(config: Any) -> list[str] | str:
         return ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
     if model_type in _QWEN36_MODEL_TYPES:
         # Qwen3.6 is HYBRID: only every 4th layer is full attention with
-        # q/k/v/o_proj; the other 48/64 are `linear_attn` with a different set
-        # of projections entirely. A suffix list keyed on q_proj would silently
-        # adapt 16 of 64 layers. Anchored to `language_model.` so the vision
-        # tower (model.visual.*) and the multi-token-prediction head (mtp.*)
-        # are both left alone — adapting either trains params the NLA never
-        # uses. `conv1d` is a Conv1d, not a Linear, so it is not listed.
-        return (r".*language_model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
-                r"|.*language_model\.layers\.\d+\.linear_attn\."
-                r"(in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)"
-                r"|.*language_model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)")
+        # q/k/v/o_proj; the other 48 of 64 are `linear_attn` with a different
+        # projection set entirely. A suffix list keyed on q_proj would silently
+        # adapt 16 of 64 layers, so this returns a regex covering both layer
+        # kinds plus the dense MLPs.
+        #
+        # Keyed on STRUCTURE (`layers.<N>.<family>.<proj>`), not on a
+        # `language_model.` prefix: AutoModelForCausalLM yields
+        # Qwen3_5ForCausalLM with paths `model.layers.N.*` (no vision tower,
+        # 497 Linears), while the checkpoint index and the
+        # ForConditionalGeneration class carry `model.language_model.layers.N.*`.
+        # Anchoring on the prefix matched 0 of 497 modules on a real load.
+        # The leading lookahead drops the vision tower and the multi-token-
+        # prediction head, which names its Linears q_proj/gate_proj too.
+        # `conv1d` is a Conv1d, not a Linear, so it is deliberately absent.
+        return (r"(?!.*(?:^|\.)(?:mtp|visual)\.)"
+                r".*layers\.\d+\.(?:"
+                r"self_attn\.(?:q_proj|k_proj|v_proj|o_proj)"
+                r"|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)"
+                r"|mlp\.(?:gate_proj|up_proj|down_proj))")
     raise AssertionError(
         f"model_type={model_type!r}: unknown module naming — extend "
         f"arch_adapters.resolve_lora_target_modules for this architecture."
