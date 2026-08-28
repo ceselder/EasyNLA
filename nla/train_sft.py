@@ -742,12 +742,28 @@ def main():
             n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"[ar] LoRA-injected; trainable={n_tr/1e6:.1f}M (lora + value_head)")
         vectors_ref = None
-        if args.gradient_checkpointing and not args.use_lora:
-            # NLACriticModel wraps backbone; enable on inner module
-            # (use_lora+4bit path already enabled it via prepare_model_for_kbit_training)
+        if args.gradient_checkpointing and quant_config is None:
+            # NLACriticModel wraps backbone; enable on the inner module.
+            # Gate on quant_config, NOT on `not use_lora`: the 4-bit path already
+            # enabled checkpointing inside prepare_model_for_kbit_training, but
+            # that call only happens when quant_config is not None. The old
+            # `not args.use_lora` condition meant --use-lora --quant none fell
+            # through BOTH branches and silently got no checkpointing at all —
+            # it OOM'd a 180GB B200 on a 43-layer 27B critic while reporting
+            # gradient_checkpointing=True.
             if hasattr(model.backbone, "gradient_checkpointing_enable"):
                 model.backbone.gradient_checkpointing_enable()
-                print("[ar] gradient_checkpointing ENABLED (backbone)")
+                if args.use_lora:
+                    # With a frozen base, checkpointed segments have no
+                    # grad-requiring input, so autograd stores nothing to
+                    # recompute from and the LoRA grads come back None.
+                    if hasattr(model.backbone, "enable_input_require_grads"):
+                        model.backbone.enable_input_require_grads()
+                    else:
+                        model.backbone.get_input_embeddings().register_forward_hook(
+                            lambda _m, _i, out: out.requires_grad_(True))
+                print(f"[ar] gradient_checkpointing ENABLED (backbone"
+                      f"{', input grads forced for LoRA' if args.use_lora else ''})")
         if args.freeze_backbone:
             # Linear-probe baseline: freeze the backbone, train ONLY the
             # value_head. (The old semantics froze everything incl. the head,

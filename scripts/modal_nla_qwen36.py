@@ -35,7 +35,13 @@ image = (
         "accelerate", "peft", "bitsandbytes",
         "pyarrow", "pandas", "numpy",
         "wandb", "anthropic", "huggingface_hub[hf_transfer]",
-        "safetensors", "sentencepiece", "protobuf",
+        "safetensors", "sentencepiece", "protobuf", "pyyaml",
+        # transformers decorates the qwen3_5 linear-attention ops with
+        # use_kernel_func_from_hub_with_fallback("chunk_gated_delta_rule",
+        # "fla"). Without `kernels` it silently falls back to
+        # torch_chunk_gated_delta_rule, which materializes chunk x chunk
+        # intermediates per layer and OOM'd a 180GB B200.
+        "kernels",
     )
     .env({
         "HF_HOME": "/vol/hf_cache",           # keep the 15-shard pull on the volume
@@ -373,8 +379,8 @@ def prepare_rows():
 
 @app.function(gpu="B200", volumes={"/vol": vol}, timeout=14 * 60 * 60,
               secrets=[_secret()])
-def extract_activations(batch_size: int = 256, max_length: int = 1024,
-                        limit: int = 0):
+def extract_activations(batch_size: int = 512, max_length: int = 1024,
+                        limit: int = 0, longest: int = 0):
     """Stage 0: re-extract Qwen3.6 layer-42 residuals for the shared pool.
 
     Captures the OUTPUT of block LAYER_INDEX at the LAST REAL token —
@@ -401,6 +407,17 @@ def extract_activations(batch_size: int = 256, max_length: int = 1024,
     from nla.utils.arch_adapters import resolve_decoder_layers
 
     outdir = f"{DATA}/acts_qwen36_L{LAYER_INDEX}"
+    # Clear stale output first. shard_id restarts at 0 every run, so a previous
+    # (or crashed) run's shards would otherwise survive alongside this run's and
+    # silently become training data. Observed: a crashed bs=256 run left
+    # shards 0001-0008 (~225k rows) next to a 5120-row slice's shard_0000.
+    if os.path.isdir(outdir):
+        stale = [f for f in os.listdir(outdir)
+                 if f.endswith((".parquet", ".json")) or f == "_COMPLETE"]
+        for f in stale:
+            os.remove(os.path.join(outdir, f))
+        if stale:
+            print(f"cleared {len(stale)} stale file(s) from {outdir}", flush=True)
     os.makedirs(outdir, exist_ok=True)
 
     tbl = pq.read_table(f"{DATA}/shared_pool.parquet")
@@ -409,6 +426,10 @@ def extract_activations(batch_size: int = 256, max_length: int = 1024,
     idx_all = list(range(n_all))
     if limit:
         idx_all = idx_all[:limit]
+    if longest:
+        # Exercise the conv1d 32-bit-index path directly: the overflow lives in
+        # the long-sequence tail, which a head-of-pool slice never reaches.
+        idx_all = sorted(idx_all, key=lambda i: -len(rows["text"][i]))[:longest]
     print(f"pool: {n_all} rows | extracting {len(idx_all)}", flush=True)
 
     tok = AutoTokenizer.from_pretrained(BASE_MODEL)
@@ -470,8 +491,27 @@ def extract_activations(batch_size: int = 256, max_length: int = 1024,
         buf_vec, buf_meta = [], []
         vol.commit()
 
-    for bs_start in range(0, len(order), batch_size):
-        chunk = order[bs_start:bs_start + batch_size]
+    # TOKEN-BUDGET batching, not fixed batch size. The hybrid linear-attention
+    # layers run causal_conv1d with C=10240 channels, and F.conv1d uses 32-bit
+    # index math: batch*seq*C must stay under 2^31 = 2.15e9, i.e.
+    # batch*seq <= 209,715 tokens. Fixed batch 256 x seq 1024 = 262,144 tokens
+    # -> 2.68e9 -> "canUse32BitIndexMath ... got false". Budget 131,072 is the
+    # combination already proven on the validation slice (1.34e9).
+    # Rows are length-sorted, so the last row of a candidate batch is the
+    # longest and sets the padded width.
+    token_budget = 131072
+    max_batch = max(1, batch_size)
+    i_ord, n_batches = 0, 0
+    while i_ord < len(order):
+        n = 0
+        while i_ord + n < len(order) and n < max_batch:
+            cand = len(enc_all[order[i_ord + n]])
+            if n > 0 and (n + 1) * cand > token_budget:
+                break
+            n += 1
+        chunk = order[i_ord:i_ord + n]
+        i_ord += n
+        n_batches += 1
         ids_list = [enc_all[k] for k in chunk]
         maxlen = max(len(x) for x in ids_list)
         bx = torch.full((len(chunk), maxlen), tok.pad_token_id, dtype=torch.long)
@@ -505,7 +545,7 @@ def extract_activations(batch_size: int = 256, max_length: int = 1024,
         n_done += len(chunk)
         if len(buf_vec) >= SHARD:
             _flush()
-        if (bs_start // batch_size) % 50 == 0:
+        if n_batches % 20 == 1:
             el = time.time() - t0
             rate = n_done / max(el, 1e-9)
             print(f"  {n_done}/{len(order)} ({100*n_done/len(order):.1f}%) "
@@ -528,9 +568,364 @@ def extract_activations(batch_size: int = 256, max_length: int = 1024,
     }
     with open(f"{outdir}/extraction_stats.json", "w") as f:
         json.dump(stats, f, indent=2)
+    # Written LAST and only on success: downstream stages must refuse to read
+    # this directory without it, so a crashed run cannot be consumed as data.
+    with open(f"{outdir}/_COMPLETE", "w") as f:
+        f.write(f"rows={n_done} shards={shard_id} alpha={alpha:.4f}\n")
     vol.commit()
     print("\n=== extraction stats ===", flush=True)
     for k, v in stats.items():
         print(f"  {k:18} {v}", flush=True)
     print(f"\nALPHA (p75 of layer-{LAYER_INDEX} activation norms) = {alpha:.2f}", flush=True)
     return stats
+
+
+# Recomputed for the Qwen3.6 tokenizer. ㈎ (U+320E) encodes to TWO tokens here,
+# and nla/config.py asserts single-token, so the marker had to change. Derived
+# via nla.config.compute_canonical_neighbors, not by hand.
+QWEN36_TOKENS = {
+    "injection_char": "㈜",                     # ㈜  (was ㈎)
+    "injection_token_id": 158983,                   # was 149705
+    "injection_left_neighbor_id": 29,               # was 29
+    "injection_right_neighbor_id": 510,             # was 522
+    "critic_suffix_ids": [1272, 29, 361, 1648, 29],  # was [1318,29,366,1708,29]
+}
+ALPHA_P75 = 95.708          # measured over all 742,652 rows at layer 42
+
+
+@app.function(volumes={"/vol": vol}, timeout=4 * 60 * 60, cpu=8.0,
+              memory=131072, secrets=[_secret()])
+def build_sft_datasets(n_train: int = 500_000, seed: int = 42):
+    """Materialize AV and AR SFT parquets from the extracted activations.
+
+    Both stages train on the SAME rows (Celeste, 2026-08-27), and per Celeste
+    2026-08-28: 500k rows each, same data.
+
+    Prompt templates are read VERBATIM from the source dataset's sidecar rather
+    than retyped — the marker's canonical left/right neighbour token ids depend
+    on the exact surrounding characters, so whitespace drift in the template
+    would break config.py's neighbour assertions in a way that looks like
+    tokenizer drift.
+    """
+    import glob
+    import json
+    import os
+    import random
+    import sys
+
+    sys.path.insert(0, REPO_REMOTE)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import yaml
+    from huggingface_hub import hf_hub_download
+
+    actdir = f"{DATA}/acts_qwen36_L{LAYER_INDEX}"
+    if not os.path.exists(f"{actdir}/_COMPLETE"):
+        raise SystemExit(f"{actdir} has no _COMPLETE marker — extraction did not "
+                         f"finish, refusing to build datasets from a partial run.")
+    print(open(f"{actdir}/_COMPLETE").read().strip(), flush=True)
+
+    # verbatim templates from the source sidecar
+    side = hf_hub_download(OPUS5, "ar_sft_shuf.parquet.nla_meta.yaml",
+                          repo_type="dataset", cache_dir="/vol/hf_cache")
+    src = yaml.safe_load(open(side))
+    ACTOR = src["prompt_templates"]["actor"]
+    CRITIC = src["prompt_templates"]["critic"]
+    assert "{injection_char}" in ACTOR and "{explanation}" in CRITIC
+    print(f"templates loaded: actor {len(ACTOR)} chars, critic {CRITIC!r}", flush=True)
+    # The parquet stores the PLACEHOLDER; train_sft swaps in cfg.injection_char.
+    ACTOR_PLACEHOLDER = ACTOR.replace("{injection_char}", "<INJECT>")
+
+    shards = sorted(glob.glob(f"{actdir}/shard_*.parquet"))
+    print(f"reading {len(shards)} shards...", flush=True)
+    train_idx, val_idx, tables = [], [], []
+    off = 0
+    for sp in shards:
+        t = pq.read_table(sp)
+        tables.append(t)
+        iv = t.column("is_val").to_pylist()
+        for i, v in enumerate(iv):
+            (val_idx if v else train_idx).append((len(tables) - 1, i))
+        off += t.num_rows
+    print(f"  rows={off} train={len(train_idx)} val={len(val_idx)}", flush=True)
+
+    # DOC-LEVEL split, per nla/val_split.py. The inherited per-file is_val flag
+    # is a FILE split, so a document's ~10 positions can straddle train and val
+    # — exactly the leak val_split.py warns about ("a row-index split leaves
+    # ~zero docs fully unseen"). permille=20 matches the published convention
+    # (is_val_doc(doc_id, 20)).
+    from nla.val_split import is_val_doc
+    VAL_PERMILLE = 20
+    leaked = 0
+    old_val_docs = {tables[ti].column("doc_id")[ri].as_py() for (ti, ri) in val_idx}
+    old_train_docs = {tables[ti].column("doc_id")[ri].as_py() for (ti, ri) in train_idx}
+    leaked = len(old_val_docs & old_train_docs)
+    print(f"  inherited split: {len(old_val_docs)} val docs, "
+          f"{leaked} of them ALSO in train ({100*leaked/max(1,len(old_val_docs)):.1f}% leaked) "
+          f"-> discarding it", flush=True)
+
+    all_idx = train_idx + val_idx
+    train_idx, val_idx = [], []
+    for (ti, ri) in all_idx:
+        d = tables[ti].column("doc_id")[ri].as_py()
+        (val_idx if is_val_doc(d, VAL_PERMILLE) else train_idx).append((ti, ri))
+    v_docs = {tables[ti].column("doc_id")[ri].as_py() for (ti, ri) in val_idx}
+    t_docs = {tables[ti].column("doc_id")[ri].as_py() for (ti, ri) in train_idx}
+    assert not (v_docs & t_docs), "doc-level split still overlaps"
+    print(f"  doc-level split (permille={VAL_PERMILLE}): "
+          f"train={len(train_idx)} rows/{len(t_docs)} docs  "
+          f"val={len(val_idx)} rows/{len(v_docs)} docs  overlap=0", flush=True)
+
+    rng = random.Random(seed)
+    rng.shuffle(train_idx)
+    if n_train and n_train < len(train_idx):
+        train_idx = train_idx[:n_train]
+    print(f"  sampled train={len(train_idx)} (seed={seed})", flush=True)
+
+    def _emit(pairs, stage, split):
+        prompts, responses, vecs, docs, texts, nraw = [], [], [], [], [], []
+        for (ti, ri) in pairs:
+            t = tables[ti]
+            expl = t.column("explanation")[ri].as_py()
+            if stage == "av":
+                prompts.append([{"role": "user", "content": ACTOR_PLACEHOLDER}])
+                responses.append(f"<explanation>\n{expl}\n</explanation>")
+            else:
+                prompts.append(CRITIC.replace("{explanation}", expl))
+            vecs.append(t.column("activation_vector")[ri].as_py())
+            docs.append(t.column("doc_id")[ri].as_py())
+            texts.append(t.column("text")[ri].as_py())
+            nraw.append(t.column("n_raw_tokens")[ri].as_py())
+        n = len(vecs)
+        cols = {
+            "prompt": pa.array(prompts),
+            "activation_vector": pa.array(vecs, type=pa.list_(pa.float32(), 5120)),
+            "n_raw_tokens": pa.array(nraw, type=pa.int64()),
+            "activation_layer": pa.array([LAYER_INDEX] * n, type=pa.int64()),
+            "doc_id": pa.array(docs),
+            "detokenized_text_truncated": pa.array(texts),
+        }
+        if stage == "av":
+            cols["response"] = pa.array(responses)
+        out = f"{DATA}/sft/{stage}_sft_{split}.parquet"
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        pq.write_table(pa.table(cols), out, compression="zstd", row_group_size=5000)
+
+        toks = dict(QWEN36_TOKENS)
+        if stage == "av":
+            toks["critic_suffix_ids"] = None
+        meta = {
+            "dataset_id": f"{stage}_sft_Qwen3.6-27B_L{LAYER_INDEX}_opus5expl_{split}",
+            "stage": f"{stage}_sft",
+            "row_count": n,
+            "extraction": {
+                "base_model": BASE_MODEL,
+                "d_model": 5120,
+                "layer_index": LAYER_INDEX,
+                "norm": "none",
+                "corpus": src["extraction"]["corpus"],
+                "positions_per_doc": 10,   # source sidecar says 1, but ~10 rows
+                                           # share a doc_id (val_split.py agrees)
+                "val_doc_permille": VAL_PERMILLE,
+                # measured diagnostic; injection_scale intentionally ABSENT
+                # (absent => raw injection, matching the reference config)
+                "activation_norm_p75": ALPHA_P75,
+            },
+            "kind": "nla_dataset",
+            "schema_version": 1,
+            "keep_debug_metadata": True,
+            "tokens": toks,
+            "prompt_templates": {"actor": ACTOR, "critic": CRITIC},
+            "api_summaries": {"model": "claude-opus-5",
+                              "note": "explanations inherited from "
+                                      f"{OPUS5}; activations re-extracted on "
+                                      f"{BASE_MODEL} layer {LAYER_INDEX}"},
+        }
+        with open(f"{out}.nla_meta.yaml", "w") as f:
+            yaml.safe_dump(meta, f, sort_keys=False, allow_unicode=True)
+        print(f"  wrote {out} ({n} rows, {os.path.getsize(out)/1e9:.2f} GB) + sidecar",
+              flush=True)
+        return n
+
+    counts = {}
+    for stage in ("av", "ar"):
+        counts[f"{stage}_train"] = _emit(train_idx, stage, "train")
+        counts[f"{stage}_val"] = _emit(val_idx, stage, "val")
+    vol.commit()
+    print("\n=== built ===", flush=True)
+    for k, v in counts.items():
+        print(f"  {k:10} {v}", flush=True)
+    return counts
+
+
+@app.function(volumes={"/vol": vol}, timeout=60 * 60, cpu=4.0, memory=32768,
+              secrets=[_secret()])
+def validate_datasets():
+    """Run the built datasets through the repo's OWN loader and assertions.
+
+    load_nla_config re-derives the injection token id and the marker's canonical
+    left/right neighbours from the LIVE tokenizer and asserts they match the
+    sidecar. verify_critic_suffix checks the tokenized AR prompt ends with the
+    recorded suffix. Both are exactly the checks that would otherwise fire at
+    trainer startup, several GPU-minutes in.
+    """
+    import sys
+
+    sys.path.insert(0, REPO_REMOTE)
+    import pyarrow.parquet as pq
+    from transformers import AutoTokenizer
+
+    from nla.config import load_nla_config, verify_critic_suffix
+    from nla.schema import INJECT_PLACEHOLDER
+
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+    ok = True
+    for stage in ("av", "ar"):
+        for split in ("train", "val"):
+            p = f"{DATA}/sft/{stage}_sft_{split}.parquet"
+            try:
+                cfg = load_nla_config(p, tok)
+            except AssertionError as e:
+                print(f"  FAIL {stage}_{split}: {str(e)[:200]}", flush=True)
+                ok = False
+                continue
+            print(f"  OK   {stage}_{split}: d_model={cfg.d_model} "
+                  f"inj_id={cfg.injection_token_id} "
+                  f"L/R={cfg.injection_left_neighbor_id}/{cfg.injection_right_neighbor_id} "
+                  f"mse_scale={cfg.mse_scale:.2f} "
+                  f"inj_scale={cfg.injection_scale} "
+                  f"layer={cfg.extraction_layer_index}", flush=True)
+
+            t = pq.ParquetFile(p).read_row_group(0).slice(0, 3)
+            if stage == "ar":
+                for i in range(3):
+                    ids = tok.encode(t.column("prompt")[i].as_py(),
+                                     add_special_tokens=False)
+                    try:
+                        verify_critic_suffix(ids, cfg.critic_suffix_ids,
+                                             context=f"{stage}_{split} row {i}")
+                    except AssertionError as e:
+                        print(f"  FAIL suffix {stage}_{split}[{i}]: {str(e)[:180]}",
+                              flush=True)
+                        ok = False
+                print(f"       critic suffix verified on 3 rows", flush=True)
+            else:
+                c = t.column("prompt")[0].as_py()[0]["content"]
+                has_ph = INJECT_PLACEHOLDER in c
+                # the marker must resolve to EXACTLY one token in the live prompt
+                live = c.replace(INJECT_PLACEHOLDER, cfg.injection_char)
+                n_marker = tok.encode(live, add_special_tokens=False).count(
+                    cfg.injection_token_id)
+                print(f"       placeholder present={has_ph} "
+                      f"marker_tokens_in_prompt={n_marker} (want 1)", flush=True)
+                if not has_ph or n_marker != 1:
+                    ok = False
+                r = t.column("response")[0].as_py()
+                print(f"       response starts/ends: {r[:24]!r} ... {r[-18:]!r}",
+                      flush=True)
+    print(f"\n{'ALL CHECKS PASSED' if ok else 'VALIDATION FAILED'}", flush=True)
+    if not ok:
+        raise SystemExit("dataset validation failed")
+    return {"validated": True}
+
+
+CKPT = "/vol/ckpts"
+
+
+def _run_sft(mode: str, lr: float, extra: list[str], steps: int = 0,
+             bs: int = 32, accum: int = 2, ckpt: bool = True):
+    """Shared driver for AV/AR SFT. Runs the repo trainer as a subprocess so its
+    argparse, sidecar assertions and wandb logging behave exactly as documented.
+    """
+    import os
+    import subprocess
+    import sys
+
+    save_dir = f"{CKPT}/qwen36_{mode}"
+    os.makedirs(save_dir, exist_ok=True)
+    data = f"{DATA}/sft/{mode}_sft_train.parquet"
+    # Held-out parquet is ALWAYS the AV-format one, for both modes: AV uses it
+    # for val token-CE/ppl, and AR's load_heldout_explanation_pairs reads the
+    # `response` column to recover the explanation text (the AR parquet has no
+    # `response` — its explanation is baked into `prompt`). Same rows either way,
+    # since av_sft_val and ar_sft_val are built from the identical val_idx.
+    val = f"{DATA}/sft/av_sft_val.parquet"
+    for p in (data, val):
+        if not os.path.exists(p):
+            raise SystemExit(f"missing {p} — run build_sft_datasets first")
+
+    cmd = [
+        sys.executable, "-m", "nla.train_sft",
+        "--mode", mode,
+        "--base-ckpt", BASE_MODEL,
+        "--parquet", data,
+        "--sidecar", data,
+        "--heldout-parquet", val,      # honest held-out FVE during training
+        "--save-dir", save_dir,
+        # Effective batch stays 64 (the brief's value) via 32 x 2 accumulation.
+        # Gradient checkpointing is forced ON: train_sft defaults it OFF for AR
+        # ("smaller model + shorter seq fits comfortably"), which was tuned for
+        # an 8B base. At 27B the 43-layer critic is ~34GB and batch 64 x 1024
+        # activations OOM'd a 180GB B200 at 176GB allocated.
+        "--batch-size", str(bs),
+        "--gradient-accumulation-steps", str(accum),
+        ("--gradient-checkpointing" if ckpt else "--no-gradient-checkpointing"),
+        "--max-len", "1024",
+        "--lr", str(lr),
+        "--min-lr", "2e-6",
+        "--lr-warmup-steps", "50",
+        "--max-grad-norm", "1.0",
+        # LoRA r64/alpha16 (+ rsLoRA, hardcoded in train_sft) per Celeste's default.
+        # bf16 base rather than 4bit: 27B is 53.8GB on a 180GB B200, so there is
+        # no need to quantize, and the RL stage loads the same dtype.
+        "--use-lora", "--lora-r", "64", "--lora-alpha", "16",
+        "--quant", "none",
+        "--save-every", "1000",
+        "--heldout-every", "250",
+        "--seed", "0",
+        "--wandb-project", "easynla-qwen36-ema",
+        "--wandb-name", f"{mode}_sft_qwen36_L{LAYER_INDEX}",
+        # comma-separated, not nargs
+        "--wandb-tags", f"qwen3.6-27b,L{LAYER_INDEX},opus5-expl,{mode}_sft",
+    ] + extra
+    if steps:
+        cmd += ["--num-steps", str(steps)]     # else default = exactly one epoch
+
+    print("CMD: " + " ".join(cmd), flush=True)
+    # expandable_segments fixes the fragmentation that OOM'd batch 64 with
+    # 26.6GB reserved-but-unallocated. Safe here: CLAUDE.md's warning against it
+    # applies to vLLM's IPC weight sync, and this path never loads vLLM.
+    env = dict(os.environ, PYTHONUNBUFFERED="1", TOKENIZERS_PARALLELISM="false",
+               PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+    p = subprocess.run(cmd, cwd=REPO_REMOTE, env=env)
+    vol.commit()
+    if p.returncode != 0:
+        raise SystemExit(f"{mode} SFT exited {p.returncode}")
+    return {"mode": mode, "save_dir": save_dir, "returncode": p.returncode}
+
+
+@app.function(gpu="B200", volumes={"/vol": vol}, timeout=22 * 60 * 60,
+              secrets=[_secret()])
+def train_av_sft(steps: int = 0, bs: int = 32, accum: int = 2,
+                 ckpt: bool = True):
+    """AV verbalizer: activation -> explanation text. lr 1e-4 per the brief.
+
+    Checkpointing OFF by default here: AV sequences are only ~270 tokens
+    (prompt ~130 + response ~141), so at batch 64 that is ~17k tokens against a
+    54GB bf16 model on a 180GB card — recompute cost dominated the memory it
+    saved (14.2s/step with it on).
+    """
+    return _run_sft("av", 1e-4, [], steps, bs=bs, accum=accum, ckpt=ckpt)
+
+
+@app.function(gpu="B200", volumes={"/vol": vol}, timeout=22 * 60 * 60,
+              secrets=[_secret()])
+def train_ar_sft(steps: int = 0, bs: int = 32, accum: int = 2,
+                 ckpt: bool = True):
+    """AR critic: explanation text -> activation. lr 2e-5 per the brief.
+
+    --ar-num-layers = LAYER_INDEX + 1: the critic reads the OUTPUT of block 42,
+    so block 42 must exist. A mismatch here silently trains a wrong-depth critic.
+    """
+    return _run_sft("ar", 2e-5, ["--ar-num-layers", str(LAYER_INDEX + 1)], steps,
+                    bs=bs, accum=accum, ckpt=ckpt)
