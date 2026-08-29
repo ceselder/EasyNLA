@@ -85,9 +85,15 @@ def main():
           and {"lora_A.weight", "lora_B.weight", "value_head.weight"} == set(ema._shadow),
           "3  only trainable params tracked (backbone excluded)")
 
-    # 4 — shadow is not a buffer / not in the module's state_dict
-    check(not any("shadow" in k or "ema" in k for k in c.state_dict()),
-          "4  shadow absent from module.state_dict() (not a buffer)")
+    # 4 — construction must leave the module's state_dict IDENTICAL. (Grepping
+    # for a "shadow"/"ema" substring only fails if someone registers a buffer
+    # with that literal name; this asserts the actual property.)
+    c4 = FakeCritic()
+    before = set(c4.state_dict().keys())
+    _ = CriticEMA(c4, 0.98)
+    after = set(c4.state_dict().keys())
+    check(before == after,
+          "4  CriticEMA construction leaves module.state_dict() unchanged")
 
     # 5 — swap installs EMA weights, restore is bit-exact
     c = FakeCritic()
@@ -168,6 +174,90 @@ def main():
     n.update(); n.assert_live()
     check(n.enabled is False and active is False and n.n_params() == 0,
           "11  NoEMA matches the CriticEMA surface")
+
+
+    # ---- properties that were actually broken in review ----
+
+    # 12 — bf16 params: accumulate in fp32, restore bit-exact
+    cb = FakeCritic().to(torch.bfloat16)
+    emab = CriticEMA(cb, 0.9)
+    for _ in range(4):
+        jitter(cb, 0.05)
+        emab.update()
+    live_before = {n: p.detach().clone() for n, p in cb.named_parameters()}
+    with emab.swapped() as active:
+        differs = not torch.equal(cb.lora_A.weight.detach(),
+                                  live_before["lora_A.weight"])
+    exact = all(torch.equal(p.detach(), live_before[n])
+                for n, p in cb.named_parameters())
+    fp32_shadow = all(t.dtype is torch.float32 for t in emab._shadow.values())
+    check(active and differs and exact and fp32_shadow,
+          "12  bf16 critic: fp32 shadow, swap differs, restore BIT-EXACT")
+
+    # 13 — an exception during the copy-IN loop must not leave a half-swapped
+    # model that assert_live() waves through (the pre-fix hole)
+    c13 = FakeCritic()
+    e13 = CriticEMA(c13, 0.9)
+    jitter(c13); e13.update()
+    live13 = {n: p.detach().clone() for n, p in c13.named_parameters()}
+    # NOT a 1-element tensor: copy_ BROADCASTS that and silently succeeds.
+    # lora_B.weight is (8, 4); (3, 7) is non-broadcastable, so copy_ raises.
+    e13._shadow["lora_B.weight"] = torch.zeros(3, 7)
+    try:
+        with e13.swapped():
+            pass
+        raised = False
+    except Exception:
+        raised = True
+    restored = all(torch.equal(p.detach(), live13[n])
+                   for n, p in c13.named_parameters())
+    step_blocked = True
+    try:
+        e13.assert_live("(post-failure)")
+        step_blocked = not e13._swapped      # ok only if genuinely not swapped
+    except RuntimeError:
+        step_blocked = True
+    check(raised and restored and step_blocked and not e13._swapped,
+          "13  exception during copy-IN restores live weights, no half-swap")
+
+    # 14 — non-re-entrancy is claimed in the code; exercise it
+    c14 = FakeCritic(); e14 = CriticEMA(c14, 0.9)
+    try:
+        with e14.swapped():
+            with e14.swapped():
+                pass
+        nested_blocked = False
+    except RuntimeError:
+        nested_blocked = True
+    check(nested_blocked and not e14._swapped,
+          "14  swapped() is not re-entrant, and unwinds cleanly")
+
+    # 15 — a checkpoint must NOT be able to change the sweep arm
+    c15 = FakeCritic(); e15 = CriticEMA(c15, 0.98)
+    sd15 = CriticEMA(FakeCritic(), 0.0).state_dict()      # a d=0 control ckpt
+    e15.load_state_dict(sd15)
+    check(e15.decay == 0.98 and e15.enabled,
+          "15  load_state_dict keeps the REQUESTED decay (CLI wins)")
+
+    # 16 — a mismatched shadow must fail loudly, not restore "successfully"
+    c16 = FakeCritic(); e16 = CriticEMA(c16, 0.98)
+    bad = e16.state_dict()
+    bad["shadow"] = {"nonexistent.weight": torch.zeros(4, 4)}
+    try:
+        e16.load_state_dict(bad)
+        loud = False
+    except RuntimeError:
+        loud = True
+    check(loud, "16  load_state_dict raises on a shadow/critic key mismatch")
+
+    # 17 — out-of-range decay is a typo, not an intention
+    bad_decay = 0
+    for d in (-0.98, 1.0, 1.5):
+        try:
+            CriticEMA(FakeCritic(), d)
+        except ValueError:
+            bad_decay += 1
+    check(bad_decay == 3, "17  decay outside [0,1) is rejected")
 
     print()
     if FAILS:

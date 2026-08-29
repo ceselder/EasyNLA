@@ -2407,6 +2407,33 @@ def main():
                     if _valid_ema else float("nan")
                 )
                 log["eval/reward_mean_ema"] = float(np.mean(eval_rewards_ema))
+                # MATCHED-SUBSET pair. The two passes each drop their own rows at
+                # the -2.0 failure floor (mse >= 2.0, the orthogonal-vector
+                # region), so eval/fve_pct and eval/fve_pct_ema above are means
+                # over DIFFERENT row sets with different N — the EMA can read
+                # better purely by dropping its own worst rows. These two are
+                # restricted to rows valid under BOTH critics and are the only
+                # honest live-vs-EMA comparison; fve_matched_n exposes how many
+                # rows the restriction cost.
+                _both = [i for i in range(len(eval_rewards_s))
+                         if eval_rewards_s[i] > -2.0 and eval_rewards_ema[i] > -2.0]
+                log["eval/fve_matched_n"] = len(_both)
+                log["eval/fve_matched_dropped"] = len(eval_rewards_s) - len(_both)
+                if _both:
+                    _m_live = float(np.mean([eval_rewards_s[i] for i in _both]))
+                    _m_ema = float(np.mean([eval_rewards_ema[i] for i in _both]))
+                    log["eval/fve_pct_live_matched"] = (
+                        (1.0 - (-_m_live) / eval_fve_baseline) * 100.0)
+                    log["eval/fve_pct_ema_matched"] = (
+                        (1.0 - (-_m_ema) / eval_fve_baseline) * 100.0)
+                    log["eval/fve_ema_minus_live"] = (
+                        log["eval/fve_pct_ema_matched"]
+                        - log["eval/fve_pct_live_matched"])
+                else:
+                    for _k in ("eval/fve_pct_live_matched",
+                               "eval/fve_pct_ema_matched",
+                               "eval/fve_ema_minus_live"):
+                        log[_k] = float("nan")
             log["eval/extraction_rate"] = (
                 sum(1 for r in eval_records if r["extracted"]) / len(eval_records)
                 if eval_records else 0.0
