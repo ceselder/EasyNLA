@@ -33,6 +33,7 @@ from typing import cast
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -587,9 +588,28 @@ def main():
     apply_config_defaults(p)   # YAML (--config) -> argparse defaults; CLI still overrides
     args = p.parse_args()
 
+    # ---- data-parallel setup (torchrun) ----
+    # Manual gradient all-reduce rather than DistributedDataParallel: the AR
+    # path wraps the backbone in NLACriticModel and trains only LoRA +
+    # value_head, so DDP would flag every frozen parameter as unused, and
+    # gradient checkpointing needs static_graph/find_unused_parameters juggling
+    # to work with it at all. The RL trainers in this repo take the same
+    # approach (_allreduce_grads_), so the two stay consistent.
+    dp_rank = int(os.environ.get("RANK", 0))
+    dp_world = int(os.environ.get("WORLD_SIZE", 1))
+    dp_local = int(os.environ.get("LOCAL_RANK", 0))
+    is_dist = dp_world > 1
+    is_main = dp_rank == 0
+    if is_dist:
+        torch.cuda.set_device(dp_local)
+        dist.init_process_group(backend="nccl")
+        print(f"[dp] rank {dp_rank}/{dp_world} on cuda:{dp_local}", flush=True)
+
+    # Every rank draws a DIFFERENT slice of the same permutation, so seeds must
+    # match across ranks (the shuffle is replicated, the slice is not).
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = "cuda"
+    device = f"cuda:{dp_local}" if is_dist else "cuda"
     dtype = torch.bfloat16
     if args.lr is None:
         # Mode-aware default: non-comp AV warmstart is 1e-4 (2x-data 1-epoch best, held-out
@@ -782,11 +802,17 @@ def main():
     rows = load_sft_dataset(args.parquet, n_max=args.max_rows, mode=args.mode)
     print(f"[data] {len(rows)} rows", flush=True)
     if args.num_steps is None:
-        eff_batch = args.batch_size * args.gradient_accumulation_steps
+        # MUST include world size: each optimizer step consumes
+        # batch_size * grad_accum * world_size rows. Omitting dp_world made
+        # "one epoch" on 4 GPUs compute 4x too many steps — i.e. four epochs,
+        # the exact overfit the recipe warns about ("a second epoch overfits;
+        # held-out FVE regresses while train loss keeps dropping").
+        eff_batch = args.batch_size * args.gradient_accumulation_steps * dp_world
         args.num_steps = math.ceil(len(rows) / eff_batch)
         print(f"[steps] --num-steps not given → one epoch: "
-              f"ceil({len(rows)} rows / {eff_batch} eff. batch) = {args.num_steps} steps",
-              flush=True)
+              f"ceil({len(rows)} rows / {eff_batch} eff. batch "
+              f"[{args.batch_size} x {args.gradient_accumulation_steps} x {dp_world} ranks]) "
+              f"= {args.num_steps} steps", flush=True)
     if args.mode == "ar" and cfg.critic_suffix_ids:
         # One-time suffix-anchor sanity check (the sidecar field's stated
         # purpose): the tokenized critic prompt must end with the expected
@@ -858,8 +884,8 @@ def main():
         print(f"[ar] {len(heldout_pairs)} held-out pairs from "
               f"{args.heldout_parquet}; baseline (paper def) = {heldout_baseline:.4f}")
 
-    # ---- wandb ----
-    if not args.no_wandb:
+    # ---- wandb ---- (rank 0 only; other ranks would open duplicate runs)
+    if not args.no_wandb and is_main:
         wandb.init(project=args.wandb_project, name=args.wandb_name,
                    group=args.wandb_group,
                    tags=(args.wandb_tags.split(",") if args.wandb_tags else None),
@@ -880,7 +906,7 @@ def main():
     cursor = 0
 
     grad_accum = args.gradient_accumulation_steps
-    eff_batch = args.batch_size * grad_accum
+    eff_batch = args.batch_size * grad_accum * dp_world
     print(f"[loop] {args.num_steps} steps, batch={args.batch_size} × "
           f"grad_accum={grad_accum} = eff_batch={eff_batch}")
 
@@ -895,11 +921,16 @@ def main():
 
         for accum_idx in range(grad_accum):
             # ---- pick batch ----
-            if cursor + args.batch_size > len(perm):
+            # Under data parallelism every rank consumes a disjoint slice of
+            # the SAME window, so one optimizer step still sees
+            # batch_size * grad_accum * world_size distinct rows.
+            window = args.batch_size * dp_world
+            if cursor + window > len(perm):
                 rng.shuffle(perm)
                 cursor = 0
-            chunk_rows = [rows[i] for i in perm[cursor:cursor + args.batch_size]]
-            cursor += args.batch_size
+            lo = cursor + dp_rank * args.batch_size
+            chunk_rows = [rows[i] for i in perm[lo:lo + args.batch_size]]
+            cursor += window
 
             # ---- forward + loss ----
             if args.mode == "av":
@@ -959,6 +990,15 @@ def main():
             accum_n += 1
 
         # ---- step ----
+        if is_dist:
+            # Sum-then-divide so every rank clips an identical gradient and
+            # takes an identical step; zero-fill any missing grad so all ranks
+            # participate in every collective (a skipped all_reduce deadlocks).
+            for p_ in trainable:
+                if p_.grad is None:
+                    p_.grad = torch.zeros_like(p_)
+                dist.all_reduce(p_.grad, op=dist.ReduceOp.SUM)
+                p_.grad.div_(dp_world)
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         optim.step()
         sched.step()
@@ -992,7 +1032,8 @@ def main():
             log.update(ar_dbg)
             line += (f" | cos {ar_dbg['cos_pred_gold']:.3f} "
                      f"| |p|/|g| {ar_dbg['pred_norm']:.1f}/{ar_dbg['gold_norm']:.1f}")
-        print(line, flush=True)
+        if is_main:
+            print(line, flush=True)
 
         # ---- periodic example-generation table (debug) ----
         if args.sample_every > 0 and (
@@ -1038,7 +1079,7 @@ def main():
                     )
 
         # ---- held-out val token-CE/ppl (AV mode, doc-disjoint) ----
-        if heldout_av_rows is not None and (
+        if is_main and heldout_av_rows is not None and (
             (step + 1) % args.heldout_every == 0 or (step + 1) == args.num_steps
         ):
             model.eval()
@@ -1052,7 +1093,7 @@ def main():
             print(f"  [heldout@{step}] val_loss {h_ce:.4f} | val_ppl "
                   f"{log['heldout_ppl']:.3f} (n={h_n})", flush=True)
         # ---- held-out FVE (AR mode, doc-disjoint) ----
-        if heldout_pairs is not None and (
+        if is_main and heldout_pairs is not None and (
             (step + 1) % args.heldout_every == 0 or (step + 1) == args.num_steps
         ):
             model.eval()
@@ -1068,11 +1109,13 @@ def main():
             print(f"  [heldout@{step}] mse {h_mse:.4f} | FVE {h_fve:.1f}% "
                   f"(n={h_n})", flush=True)
 
-        if not args.no_wandb:
+        if not args.no_wandb and is_main:
             wandb.log(log, step=step)
 
         # ---- save ----
-        if (step + 1) % args.save_every == 0 or (step + 1) == args.num_steps:
+        if is_main and (
+            (step + 1) % args.save_every == 0 or (step + 1) == args.num_steps
+        ):
             out_dir = save_dir / f"iter_{step + 1:07d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             print(f"[save] → {out_dir}", flush=True)

@@ -41,7 +41,15 @@ image = (
         # "fla"). Without `kernels` it silently falls back to
         # torch_chunk_gated_delta_rule, which materializes chunk x chunk
         # intermediates per layer and OOM'd a 180GB B200.
-        "kernels",
+        # The REAL fix for the qwen3_5 linear-attention cost. transformers'
+        # use_kernel_func_from_hub_with_fallback resolves in order:
+        #   1. HF hub kernels (only if explicitly requested)
+        #   2. importlib.import_module("fla")   <-- flash-linear-attention
+        #   3. torch reference fallback
+        # Without `fla` installed, 48 of 64 layers ran torch_chunk_gated_delta_rule
+        # at ~12% MFU on a B200. `kernels` alone does NOT trigger path 1.
+        "kernels", "flash-linear-attention",   # causal-conv1d needs
+        # nvcc + --no-build-isolation; fla is the one that matters here
     )
     .env({
         "HF_HOME": "/vol/hf_cache",           # keep the 15-shard pull on the volume
@@ -833,7 +841,7 @@ CKPT = "/vol/ckpts"
 
 
 def _run_sft(mode: str, lr: float, extra: list[str], steps: int = 0,
-             bs: int = 32, accum: int = 2, ckpt: bool = True):
+             bs: int = 32, accum: int = 2, ckpt: bool = True, nproc: int = 1):
     """Shared driver for AV/AR SFT. Runs the repo trainer as a subprocess so its
     argparse, sidecar assertions and wandb logging behave exactly as documented.
     """
@@ -854,8 +862,13 @@ def _run_sft(mode: str, lr: float, extra: list[str], steps: int = 0,
         if not os.path.exists(p):
             raise SystemExit(f"missing {p} — run build_sft_datasets first")
 
-    cmd = [
-        sys.executable, "-m", "nla.train_sft",
+    # torchrun for nproc>1: train_sft now does manual gradient all-reduce
+    # (no DDP wrapper — LoRA freezes most params, which DDP treats as unused).
+    launcher = ([sys.executable, "-m", "torch.distributed.run",
+                 "--standalone", f"--nproc_per_node={nproc}"]
+                if nproc > 1 else [sys.executable])
+    cmd = launcher + [
+        "-m", "nla.train_sft",
         "--mode", mode,
         "--base-ckpt", BASE_MODEL,
         "--parquet", data,
@@ -896,7 +909,8 @@ def _run_sft(mode: str, lr: float, extra: list[str], steps: int = 0,
     # 26.6GB reserved-but-unallocated. Safe here: CLAUDE.md's warning against it
     # applies to vLLM's IPC weight sync, and this path never loads vLLM.
     env = dict(os.environ, PYTHONUNBUFFERED="1", TOKENIZERS_PARALLELISM="false",
-               PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+               PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
+               PYTORCH_ALLOC_CONF="expandable_segments:True")
     p = subprocess.run(cmd, cwd=REPO_REMOTE, env=env)
     vol.commit()
     if p.returncode != 0:
@@ -904,10 +918,10 @@ def _run_sft(mode: str, lr: float, extra: list[str], steps: int = 0,
     return {"mode": mode, "save_dir": save_dir, "returncode": p.returncode}
 
 
-@app.function(gpu="B200", volumes={"/vol": vol}, timeout=22 * 60 * 60,
+@app.function(gpu="B200:8", volumes={"/vol": vol}, timeout=22 * 60 * 60,
               secrets=[_secret()])
-def train_av_sft(steps: int = 0, bs: int = 32, accum: int = 2,
-                 ckpt: bool = True):
+def train_av_sft(steps: int = 0, bs: int = 8, accum: int = 1,
+                 ckpt: bool = True, nproc: int = 8):
     """AV verbalizer: activation -> explanation text. lr 1e-4 per the brief.
 
     Checkpointing OFF by default here: AV sequences are only ~270 tokens
@@ -915,17 +929,18 @@ def train_av_sft(steps: int = 0, bs: int = 32, accum: int = 2,
     54GB bf16 model on a 180GB card — recompute cost dominated the memory it
     saved (14.2s/step with it on).
     """
-    return _run_sft("av", 1e-4, [], steps, bs=bs, accum=accum, ckpt=ckpt)
+    return _run_sft("av", 1e-4, [], steps, bs=bs, accum=accum, ckpt=ckpt,
+                    nproc=nproc)
 
 
-@app.function(gpu="B200", volumes={"/vol": vol}, timeout=22 * 60 * 60,
+@app.function(gpu="B200:4", volumes={"/vol": vol}, timeout=22 * 60 * 60,
               secrets=[_secret()])
-def train_ar_sft(steps: int = 0, bs: int = 32, accum: int = 2,
-                 ckpt: bool = True):
+def train_ar_sft(steps: int = 0, bs: int = 16, accum: int = 1,
+                 ckpt: bool = True, nproc: int = 4):
     """AR critic: explanation text -> activation. lr 2e-5 per the brief.
 
     --ar-num-layers = LAYER_INDEX + 1: the critic reads the OUTPUT of block 42,
     so block 42 must exist. A mismatch here silently trains a wrong-depth critic.
     """
     return _run_sft("ar", 2e-5, ["--ar-num-layers", str(LAYER_INDEX + 1)], steps,
-                    bs=bs, accum=accum, ckpt=ckpt)
+                    bs=bs, accum=accum, ckpt=ckpt, nproc=nproc)

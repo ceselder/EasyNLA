@@ -886,6 +886,15 @@ def main():
                 optim.load_state_dict(_opt_st["actor_optim"])
                 if critic_optim is not None and "critic_optim" in _opt_st:
                     critic_optim.load_state_dict(_opt_st["critic_optim"])
+                if critic_ema.enabled and "critic_ema" in _opt_st:
+                    critic_ema.load_state_dict(_opt_st["critic_ema"])
+                    print("[resume] critic EMA shadow restored.", flush=True)
+                elif critic_ema.enabled:
+                    # Loud, because a silently-reset shadow is invisible in the
+                    # metrics and only affects the treatment arms.
+                    print("[resume] WARN: no critic_ema in checkpoint — the EMA "
+                          "shadow restarts from the live critic. This arm's "
+                          "effective decay horizon is reset.", flush=True)
                 print(f"[resume] optimizer state restored (saved at step "
                       f"{_opt_st.get('step', '?')})", flush=True)
             except (ValueError, KeyError, RuntimeError) as _e:
@@ -1520,6 +1529,12 @@ def main():
             _opt_state = {"step": step + 1, "actor_optim": optim.state_dict()}
             if args.train_critic and critic_optim is not None:
                 _opt_state["critic_optim"] = critic_optim.state_dict()
+                # Without this the EMA shadow re-initialises to the LIVE critic
+                # on resume, silently resetting the target network's lag. It
+                # would corrupt ONLY the d>0 arms — an asymmetric confound that
+                # produces perfectly plausible FVE curves. The vLLM twin already
+                # saves this; the port here was incomplete.
+                _opt_state["critic_ema"] = critic_ema.state_dict()
             torch.save(_opt_state, str(_opt_tmp))
             os.replace(str(_opt_tmp), str(_opt_dst))
             print(f"[save] LoRA → {out_dir} (+ optim_latest)"
