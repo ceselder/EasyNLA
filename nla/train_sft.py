@@ -40,6 +40,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 from nla.utils import critic_predict, register_karvonen_hook
+from nla.utils.kl import topk_tail_kl
 from nla.utils.run_config import add_config_arg, apply_config_defaults, save_resolved_config
 from nla.config import load_nla_config
 from nla.injection import karvonen_inject_in_residual
@@ -595,10 +596,7 @@ def ar_kl_loss_batched(critic, base, kl_layer, W, chunk_rows, tokenizer, mse_sca
             for r in range(nb):
                 hcol = hs[r, pf[r] + ar_pos].float()
                 logits = hcol @ W.float().t()
-                lse = torch.logsumexp(logits, -1, keepdim=True)
-                plp = logits.gather(-1, tk_ids[r]) - lse
-                cp = torch.softmax(tk_lp[r], -1); clp = torch.log_softmax(tk_lp[r], -1)
-                chunk_kl = chunk_kl + ((cp * (clp - plp)).sum(-1) * wj).sum()
+                chunk_kl = chunk_kl + (topk_tail_kl(tk_lp[r], tk_ids[r], logits) * wj).sum()
             if torch.isfinite(chunk_kl):
                 (chunk_kl / total_rows * scale).backward()     # frees this chunk's graph
                 loss_val += float(chunk_kl.item()); n_used += nb

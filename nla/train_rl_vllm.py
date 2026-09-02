@@ -110,6 +110,7 @@ from nla.utils.run_config import add_config_arg, apply_config_defaults, save_res
 KNOWN_EVALS = ("base_fve", "text_judges", "halluc")
 from nla.config import load_nla_config
 from nla.critic_ema import CriticEMA, NoEMA
+from nla.utils.kl import topk_tail_kl
 from nla.injection import karvonen_inject_in_residual, marker_well_formed
 from nla.models import NLACriticModel
 from nla.schema import (
@@ -983,11 +984,7 @@ def downstream_kl_reward(actor, tokenizer, vectors_ref, sources, preds, golds,
                     _, _, tki, tlp = ents[r]
                     hcol = hs[r, pfirst[r] + ar].float()                       # [N,d]
                     logits = hcol @ W.float().t()                             # [N,V]
-                    lse = torch.logsumexp(logits, dim=-1, keepdim=True)
-                    patched_lp = logits.gather(-1, tki) - lse                  # [N,k]
-                    clean_p = torch.softmax(tlp, dim=-1)
-                    clean_lp = torch.log_softmax(tlp, dim=-1)
-                    kl = (clean_p * (clean_lp - patched_lp)).sum(-1)           # [N]
+                    kl = topk_tail_kl(tlp, tki, logits)                       # [N] coarsened KL
                     m = (kl * wj).sum().item()
                     rewards[i] = (-m) if math.isfinite(m) else None
     finally:
@@ -1061,11 +1058,7 @@ def downstream_kl_critic_loss(critic, actor, tokenizer, vectors_ref, chunk_expl_
                 patch["vec"] = None
                 hcol = hs[pos + ar].float()                                # [N,d]
                 logits = hcol @ W.float().t()                              # [N,V]
-                lse = torch.logsumexp(logits, dim=-1, keepdim=True)
-                patched_lp = logits.gather(-1, tk_ids) - lse               # [N,k]
-                clean_p = torch.softmax(tk_lp, dim=-1)
-                clean_lp = torch.log_softmax(tk_lp, dim=-1)
-                klr = ((clean_p * (clean_lp - patched_lp)).sum(-1) * wj).sum()  # scalar
+                klr = (topk_tail_kl(tk_lp, tk_ids, logits) * wj).sum()     # scalar (coarsened KL)
                 if torch.isfinite(klr):
                     (klr * scale).backward()                               # frees this rollout's graph
                     loss_val += klr.item(); n_used += 1

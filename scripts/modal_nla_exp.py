@@ -487,5 +487,11 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "shell":
         f = shell.with_options(gpu=f"B200:{gpus or 1}")
         print(f.remote(cmd=cmd))
+    elif task == "shells":
+        # N parallel one-GPU shells; `{shard}` / `{nshards}` are substituted in cmd.
+        f = shell.with_options(gpu=f"B200:{gpus or 1}")
+        calls = [f.spawn(cmd=cmd.format(shard=s, nshards=nshards)) for s in range(nshards)]
+        for c in calls:
+            print(c.get())
     else:
         raise SystemExit(f"unknown task {task}")
