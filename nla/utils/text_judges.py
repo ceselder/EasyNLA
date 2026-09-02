@@ -38,7 +38,7 @@ import statistics
 
 import numpy as np
 
-JUDGE_MODEL = "claude-opus-4-8"
+JUDGE_MODEL = "claude-sonnet-5"   # per the judge-model rule: Sonnet 5
 MAX_EXPL_CHARS = 6000      # judge-input cap per explanation
 MATCH_SNIPPET_CHARS = 700  # per-candidate source tail for source_match
 GROUNDING_SOURCE_CHARS = 1500  # source tail for hallucination — needs more
@@ -215,13 +215,12 @@ def judge_explanations(explanations: list[str | None], sources: list[str],
                 judge_fail_rate, n_judged}
       per_sample: one dict per input row with the raw scores (None = unscored).
 
-    Auth: ANTHROPIC_API_KEY (SDK default). The SDK's built-in retries handle
-    transient 429/5xx; per-call failures degrade to None rather than killing
-    the eval round.
+    Auth: OPENROUTER_API_KEY or ANTHROPIC_API_KEY (nla.utils.judge_client). Per-call
+    failures degrade to None rather than killing the eval round.
     """
-    import anthropic
+    from nla.utils.judge_client import JudgeClient
 
-    client = anthropic.AsyncAnthropic(max_retries=6)
+    client = JudgeClient(model=model)
     sem = asyncio.Semaphore(concurrency)
 
     texts = [(e or "").strip()[:MAX_EXPL_CHARS] or None for e in explanations]
@@ -252,21 +251,13 @@ def judge_explanations(explanations: list[str | None], sources: list[str],
                          MATCH_PROMPT.format(k=len(tails), text=t,
                                              options=options, letters=letters)))
 
-    async def one(prompt: str) -> str | None:
+    async def one(job) -> object:
+        """rubric jobs -> int | None (forced tool call); match jobs -> letter index | None."""
+        kind, _i, aux, prompt = job
         async with sem:
-            try:
-                r = await client.messages.create(
-                    model=model, max_tokens=8,
-                    # NB: no temperature — newer models reject the kwarg.
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            except Exception as e:
-                print(f"  [text_judges] judge call failed: "
-                      f"{type(e).__name__}: {str(e)[:80]}", flush=True)
-                return None
-        if r.content and r.content[0].type == "text":
-            return r.content[0].text
-        return None
+            if kind == "rubric":
+                return await client.rate_1_10(prompt)
+            return await client.pick_letter(prompt, N_MATCH_OPTIONS)
 
     async def run():
         # Hard wall-clock bound: under DP only rank0 judges while the other
@@ -274,7 +265,7 @@ def judge_explanations(explanations: list[str | None], sources: list[str],
         # degrade (all-None -> nan metrics), not stall past the NCCL watchdog.
         try:
             return await asyncio.wait_for(
-                asyncio.gather(*(one(j[3]) for j in jobs)), total_timeout_s)
+                asyncio.gather(*(one(j) for j in jobs)), total_timeout_s)
         except asyncio.TimeoutError:
             print(f"  [text_judges] TIMED OUT after {total_timeout_s:.0f}s — "
                   f"skipping this round (metrics nan).", flush=True)
@@ -287,11 +278,11 @@ def judge_explanations(explanations: list[str | None], sources: list[str],
     match_hits = match_total = 0
     for (kind, i, aux, _), out in zip(jobs, outs):
         if kind == "rubric":
-            score = _parse_1_10(out) if out else None
+            score = out if isinstance(out, int) else None
             per_sample[i][aux] = score
             n_failed += score is None
         else:
-            pick = _parse_letter(out, N_MATCH_OPTIONS) if out else None
+            pick = out if isinstance(out, int) else None
             if pick is None:
                 n_failed += 1
                 per_sample[i]["source_match"] = None
@@ -318,7 +309,5 @@ def judge_explanations(explanations: list[str | None], sources: list[str],
 
 def require_judge_key():
     """Fail-fast startup check for trainers with text_judges enabled."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise SystemExit(
-            "--evals text_judges needs ANTHROPIC_API_KEY set (Opus judge calls)."
-        )
+    from nla.utils.judge_client import require_judge_key as _req
+    _req("--evals text_judges")

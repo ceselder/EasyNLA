@@ -91,9 +91,9 @@ def judge_hallucination(explanations: list[str | None], sources: list[str],
     Auth: ANTHROPIC_API_KEY (SDK default). SDK retries handle transient 429/5xx;
     per-call failures degrade to None rather than killing the eval round.
     """
-    import anthropic
+    from nla.utils.judge_client import JudgeClient
 
-    client = anthropic.AsyncAnthropic(max_retries=6)
+    client = JudgeClient(model=model)
     sem = asyncio.Semaphore(concurrency)
 
     texts = [(e or "").strip()[:MAX_EXPL_CHARS] or None for e in explanations]
@@ -108,37 +108,9 @@ def judge_hallucination(explanations: list[str | None], sources: list[str],
         jobs.append(("halluc", i, HALLUC_PROMPT.format(source=src_tail, text=t)))
         jobs.append(("inform", i, INFORM_PROMPT.format(source=src_tail, text=t)))
 
-    # Forced tool call -> the model MUST return a structured integer 1-10, so there
-    # is no free-text to truncate or misparse (a bare max_tokens=8 completion was
-    # ~40% judge_fail, and Sonnet 5 rejects assistant prefill).
-    rate_tool = {
-        "name": "rate",
-        "description": "Record the 1-10 rating.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"score": {"type": "integer", "minimum": 1, "maximum": 10}},
-            "required": ["score"],
-        },
-    }
-
     async def one(prompt: str):
         async with sem:
-            try:
-                r = await client.messages.create(
-                    model=model, max_tokens=64,
-                    tools=[rate_tool], tool_choice={"type": "tool", "name": "rate"},
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            except Exception as e:
-                print(f"  [halluc] judge call failed: "
-                      f"{type(e).__name__}: {str(e)[:80]}", flush=True)
-                return None
-        for block in (r.content or []):
-            if getattr(block, "type", None) == "tool_use":
-                s = block.input.get("score")
-                if isinstance(s, int) and 1 <= s <= 10:
-                    return s
-        return None
+            return await client.rate_1_10(prompt)   # forced tool call -> int | None
 
     async def run():
         # Hard wall-clock bound: under DP only rank0 judges while others wait at
@@ -173,7 +145,5 @@ def judge_hallucination(explanations: list[str | None], sources: list[str],
 
 def require_judge_key():
     """Fail-fast startup check for trainers with halluc enabled."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise SystemExit(
-            "--evals halluc needs ANTHROPIC_API_KEY set (Sonnet-5 judge calls)."
-        )
+    from nla.utils.judge_client import require_judge_key as _req
+    _req("--evals halluc")

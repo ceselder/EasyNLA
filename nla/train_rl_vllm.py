@@ -829,31 +829,36 @@ def downstream_ladder_reward(actor, tokenizer, vectors_ref, sources, preds, gold
     return rewards
 
 
-def downstream_kl_reward(actor, tokenizer, vectors_ref, sources, preds, golds,
-                         prompt_group, extraction_layer, device,
-                         n_future=16, top_k=128, ctx_tokens=512, batch_size=8, decay=0.9):
-    """Dan Mossing's next-N-token-KL reward (actor-only).
+def build_kl_gold_cache(actor, tokenizer, vectors_ref, sources, golds, prompt_group,
+                        extraction_layer, device, n_future=16, top_k=128,
+                        ctx_tokens=512, batch_size=8):
+    """Gold-side cache shared by the downstream-KL reward and the AR-KL critic loss.
 
-    reward[i] = -mean_{j<n_future} KL_topk(clean_j || patched_j), where the model's
-    next-token distributions are read at the extraction position and the following
-    n_future-1 positions, with a vector patched into block `extraction_layer`'s
-    OUTPUT (causal chain preserved — 43+ recompute):
-      clean_j   : GOLD activation patched (the reference behaviour)
-      patched_j : reconstruction (norm-matched to ||gold||) patched
-    The teacher-forced continuation is the clean (gold-patched) model's own GREEDY
-    generation, so both models are scored on the SAME token path. KL is restricted
-    to the clean dist's top_k support (renormalized) — this kills the 1e-6-tail
-    blow-up that makes full-vocab KL a bad reward for a fuzzy reconstruction.
-    Continuation is generated ONCE per prompt group (members share source+gold).
-    All forwards through the base with adapters disabled. Actor-only; critic still
-    trains on vector-MSE."""
+    Per PROMPT GROUP (members share source + gold): the tail-truncated context ids,
+    the clean (gold-patched) GREEDY continuation of n_future tokens, and the clean
+    top-k next-token log-probs at each of the n_future positions. All forwards go
+    through the base with adapters disabled. Returns
+    {prompt_group: (ctx_ids, cont_tokens, tk_ids [N,k], tk_lp [N,k])}."""
     import torch.nn.functional as _F
-    n = len(preds)
-    rewards = [None] * n
+    n = len(sources)
     base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
     layer = resolve_decoder_layers(base)[extraction_layer]
-    W = base.get_output_embeddings().weight          # lm_head [V, d]
+    W = base.get_output_embeddings().weight
     pad_id = tokenizer.eos_token_id
+    reps = {}
+    for i in range(n):
+        if not sources[i] or golds[i] is None:
+            continue
+        reps.setdefault(int(prompt_group[i]), i)
+    ctx = {}
+    for pg, i in reps.items():
+        ids = tokenizer.encode(sources[i], add_special_tokens=True)
+        if ids:
+            ctx[pg] = ids[-ctx_tokens:]
+    pgs = list(ctx)
+    cache = {}
+    if not pgs:
+        return cache
 
     patch = {"pos": None, "vec": None}
 
@@ -865,107 +870,131 @@ def downstream_kl_reward(actor, tokenizer, vectors_ref, sources, preds, golds,
         h[b, patch["pos"].to(h.device)] = patch["vec"].to(device=h.device, dtype=h.dtype)
         return output
 
-    # per-rollout context (tail-truncated) + norm-matched patch vectors
-    ids_list = [None] * n
-    gvec, pvec = {}, {}
-    for i in range(n):
-        if preds[i] is None or not sources[i]:
-            continue
-        ids = tokenizer.encode(sources[i], add_special_tokens=True)
-        if not ids:
-            continue
-        ids_list[i] = ids[-ctx_tokens:]
-        g = golds[i].to(device).float(); p = preds[i].to(device).float()
-        gvec[i] = g
-        pvec[i] = p * (g.norm().clamp_min(1e-12) / p.norm().clamp_min(1e-12))
-    valid = [i for i in range(n) if ids_list[i] is not None]
-    if not valid:
-        return rewards
-
-    # one representative rollout per prompt group (shared source+gold => same clean cont.)
-    reps = {}
-    for i in valid:
-        reps.setdefault(int(prompt_group[i]), i)
-    rep_idx = list(reps.values())
-
-    cont_tokens = {}   # rep -> [n_future] greedy continuation token ids
-    clean_topk = {}    # rep -> ([n_future, k] ids, [n_future, k] logp)
-
     handle = layer.register_forward_hook(patch_hook)
     _saved = vectors_ref[0]; vectors_ref[0] = None
     try:
-        with actor.disable_adapter():
-            # ---- clean (gold-patched) greedy continuation + clean top-k dists ----
-            for cs in range(0, len(rep_idx), batch_size):
-                chunk = rep_idx[cs:cs + batch_size]
-                pos0 = [len(ids_list[i]) - 1 for i in chunk]
-                seqs = [list(ids_list[i]) for i in chunk]
+        with torch.no_grad(), actor.disable_adapter():
+            for cs in range(0, len(pgs), batch_size):
+                chunk = pgs[cs:cs + batch_size]
+                pos0 = [len(ctx[pg]) - 1 for pg in chunk]
+                seqs = [list(ctx[pg]) for pg in chunk]
+                gv = torch.stack([golds[reps[pg]].to(device).float() for pg in chunk])
                 tk_i = [[] for _ in chunk]; tk_lp = [[] for _ in chunk]; toks = [[] for _ in chunk]
                 for _ in range(n_future):
-                    maxlen = max(len(s) for s in seqs)
+                    maxlen = max(len(s_) for s_ in seqs)
                     bx = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long, device=device)
                     attn = torch.zeros((len(chunk), maxlen), dtype=torch.long, device=device)
                     last = torch.zeros(len(chunk), dtype=torch.long, device=device)
-                    for r, s in enumerate(seqs):
-                        bx[r, :len(s)] = torch.tensor(s, device=device); attn[r, :len(s)] = 1
-                        last[r] = len(s) - 1
+                    for r, s_ in enumerate(seqs):
+                        bx[r, :len(s_)] = torch.tensor(s_, device=device); attn[r, :len(s_)] = 1
+                        last[r] = len(s_) - 1
                     patch["pos"] = torch.tensor(pos0, device=device)
-                    patch["vec"] = torch.stack([gvec[i] for i in chunk])
-                    with torch.no_grad():
-                        hs = base.model(input_ids=bx, attention_mask=attn,
-                                        use_cache=False).last_hidden_state
+                    patch["vec"] = gv
+                    hs = base.model(input_ids=bx, attention_mask=attn,
+                                    use_cache=False).last_hidden_state
                     patch["vec"] = None
-                    hl = hs[torch.arange(len(chunk), device=device), last]     # [B,d]
-                    logits = hl.float() @ W.float().t()                        # [B,V]
+                    hl = hs[torch.arange(len(chunk), device=device), last]
+                    logits = hl.float() @ W.float().t()
                     lp = _F.log_softmax(logits, dim=-1)
                     tv, ti = lp.topk(top_k, dim=-1)
                     nxt = logits.argmax(dim=-1)
                     for r in range(len(chunk)):
                         tk_i[r].append(ti[r]); tk_lp[r].append(tv[r])
                         t = int(nxt[r].item()); toks[r].append(t); seqs[r].append(t)
-                for r, i in enumerate(chunk):
-                    cont_tokens[i] = toks[r]
-                    clean_topk[i] = (torch.stack(tk_i[r]), torch.stack(tk_lp[r]))  # [N,k]
+                for r, pg in enumerate(chunk):
+                    cache[pg] = (ctx[pg], toks[r], torch.stack(tk_i[r]), torch.stack(tk_lp[r]))
+    finally:
+        handle.remove()
+        patch["vec"] = None
+        vectors_ref[0] = _saved
+        torch.cuda.empty_cache()
+    return cache
 
-            # ---- patched eval: teacher-force [ctx + group continuation], KL per rollout ----
-            ar = torch.arange(n_future, device=device)
-            wj = (decay ** ar.float()); wj = wj / wj.sum()   # geometric position discount (normalized)
+
+def downstream_kl_reward(actor, tokenizer, vectors_ref, sources, preds, golds,
+                         prompt_group, extraction_layer, device,
+                         n_future=16, top_k=128, ctx_tokens=512, batch_size=8, decay=0.9,
+                         gold_cache=None):
+    """Next-N-token-KL reward (actor-only).
+
+    reward[i] = -sum_j w_j KL_topk(clean_j || patched_j): the model's next-token
+    distributions at the extraction position and the following n_future-1
+    positions, with a vector patched into block `extraction_layer`'s OUTPUT:
+      clean_j   : GOLD activation patched (the reference behaviour)
+      patched_j : reconstruction (norm-matched to ||gold||) patched
+    The teacher-forced continuation is the clean model's own greedy generation
+    (build_kl_gold_cache), so both are scored on the SAME token path; KL is over
+    the clean dist's top_k support (renormalized); w_j = decay^j (normalized).
+    Returns (rewards, gold_cache) — the cache is reused by the AR-KL critic loss."""
+    n = len(preds)
+    rewards = [None] * n
+    base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
+    layer = resolve_decoder_layers(base)[extraction_layer]
+    W = base.get_output_embeddings().weight
+    pad_id = tokenizer.eos_token_id
+    if gold_cache is None:
+        gold_cache = build_kl_gold_cache(
+            actor, tokenizer, vectors_ref, sources, golds, prompt_group,
+            extraction_layer, device, n_future=n_future, top_k=top_k,
+            ctx_tokens=ctx_tokens, batch_size=batch_size)
+    valid = [i for i in range(n)
+             if preds[i] is not None and sources[i] and int(prompt_group[i]) in gold_cache]
+    if not valid:
+        return rewards, gold_cache
+    pvec = {}
+    for i in valid:
+        g = golds[i].to(device).float(); p = preds[i].to(device).float()
+        pvec[i] = p * (g.norm().clamp_min(1e-12) / p.norm().clamp_min(1e-12))
+
+    patch = {"pos": None, "vec": None}
+
+    def patch_hook(_m, _i, output):
+        if patch["vec"] is None:
+            return output
+        h = output[0] if isinstance(output, tuple) else output
+        b = torch.arange(h.shape[0], device=h.device)
+        h[b, patch["pos"].to(h.device)] = patch["vec"].to(device=h.device, dtype=h.dtype)
+        return output
+
+    ar = torch.arange(n_future, device=device)
+    wj = (decay ** ar.float()); wj = wj / wj.sum()
+    handle = layer.register_forward_hook(patch_hook)
+    _saved = vectors_ref[0]; vectors_ref[0] = None
+    try:
+        with torch.no_grad(), actor.disable_adapter():
             for cs in range(0, len(valid), batch_size):
                 chunk = valid[cs:cs + batch_size]
-                rows = [ids_list[i] + cont_tokens[reps[int(prompt_group[i])]] for i in chunk]
-                maxlen = max(len(r) for r in rows)
+                ents = [gold_cache[int(prompt_group[i])] for i in chunk]
+                rows = [e[0] + e[1] for e in ents]
+                maxlen = max(len(r_) for r_ in rows)
                 bx = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long, device=device)
                 attn = torch.zeros((len(chunk), maxlen), dtype=torch.long, device=device)
                 pfirst = torch.zeros(len(chunk), dtype=torch.long, device=device)
-                for r, i in enumerate(chunk):
-                    s = rows[r]; bx[r, :len(s)] = torch.tensor(s, device=device); attn[r, :len(s)] = 1
-                    pfirst[r] = len(ids_list[i]) - 1
+                for r, e in enumerate(ents):
+                    s_ = rows[r]
+                    bx[r, :len(s_)] = torch.tensor(s_, device=device); attn[r, :len(s_)] = 1
+                    pfirst[r] = len(e[0]) - 1
                 patch["pos"] = pfirst
                 patch["vec"] = torch.stack([pvec[i] for i in chunk])
-                with torch.no_grad():
-                    hs = base.model(input_ids=bx, attention_mask=attn,
-                                    use_cache=False).last_hidden_state
+                hs = base.model(input_ids=bx, attention_mask=attn,
+                                use_cache=False).last_hidden_state
                 patch["vec"] = None
                 for r, i in enumerate(chunk):
-                    tki, tlp = clean_topk[reps[int(prompt_group[i])]]          # [N,k]
+                    _, _, tki, tlp = ents[r]
                     hcol = hs[r, pfirst[r] + ar].float()                       # [N,d]
-                    logits = hcol @ W.float().t()                             # [N,V] (small: N rows)
-                    lse = torch.logsumexp(logits, dim=-1, keepdim=True)        # [N,1]
-                    patched_lp = logits.gather(-1, tki) - lse                  # [N,k] patched logp at clean ids
-                    clean_p = torch.softmax(tlp, dim=-1)                       # renormalize clean over topk
+                    logits = hcol @ W.float().t()                             # [N,V]
+                    lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+                    patched_lp = logits.gather(-1, tki) - lse                  # [N,k]
+                    clean_p = torch.softmax(tlp, dim=-1)
                     clean_lp = torch.log_softmax(tlp, dim=-1)
-                    kl = (clean_p * (clean_lp - patched_lp)).sum(-1)           # [N] forward KL
-                    m = (kl * wj).sum().item()                                 # gamma-discounted over positions
+                    kl = (clean_p * (clean_lp - patched_lp)).sum(-1)           # [N]
+                    m = (kl * wj).sum().item()
                     rewards[i] = (-m) if math.isfinite(m) else None
     finally:
         handle.remove()
         patch["vec"] = None
         vectors_ref[0] = _saved
-        torch.cuda.empty_cache()   # defragment before the GRPO update (see downstream_reward)
-    # gold-side cache for the coherent AR-KL critic loss (reuse, don't regenerate):
-    # prompt_group -> (ctx_ids, continuation tokens, clean top-k ids [N,k], clean top-k logp [N,k]).
-    gold_cache = {pg: (ids_list[i], cont_tokens[i], clean_topk[i][0], clean_topk[i][1])
-                  for pg, i in reps.items() if i in cont_tokens}
+        torch.cuda.empty_cache()
     return rewards, gold_cache
 
 
@@ -1694,7 +1723,7 @@ def main():
     # ---- reward mode (actor reward; the AR/critic always trains on vector-MSE) ----
     p.add_argument("--reward-mode",
                    choices=["vector_mse", "downstream_mse", "downstream_plus_fve",
-                            "downstream_kl", "downstream_ladder"],
+                            "downstream_kl", "downstream_ladder", "vector_plus_kl"],
                    default="vector_mse",
                    help="ACTOR reward. vector_mse (DEFAULT) = -MSE(reconstruction, gold) "
                         "in L42 activation space (the classic NLA reward). downstream_mse "
@@ -1734,7 +1763,27 @@ def main():
                    help="Cap on rollouts used for the --ar-loss downstream_kl update per "
                         "step (each needs a base fwd+bwd, so this bounds critic cost). "
                         "Subsampled with a stride so it spreads across prompts.")
-    p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl"], default="vector_mse",
+    p.add_argument("--downstream-kl-weight", type=float, default=1.0,
+                   help="Weight w on the KL term in --reward-mode vector_plus_kl "
+                        "(reward = -mse_vec - w * KL).")
+    p.add_argument("--ar-kl-weight", type=float, default=1.0,
+                   help="Weight w on the downstream-KL term in --ar-loss mse_plus_kl "
+                        "(critic loss = MSE + w * KL on a subsample of rollouts).")
+    p.add_argument("--critic-lag-steps", type=int, default=0,
+                   help="HARD-LAG scoring critic (target network): rollouts are scored "
+                        "by a snapshot of the AR refreshed every N critic updates; the "
+                        "co-train loss still updates the live AR every step. 0 = off. "
+                        "Mutually exclusive with --critic-ema-decay.")
+    p.add_argument("--critic-update-every", type=int, default=1,
+                   help="Co-train the AR only every N steps (the AV takes N GRPO steps "
+                        "per AR step — the AV 'chases' a slower-moving AR). 1 = every step.")
+    p.add_argument("--eval-parquet", type=str, default=None,
+                   help="Separate parquet for the fixed held-out eval prompts (e.g. the "
+                        "1%% test split). When set, the trainer trains on ALL rows of "
+                        "--rl-parquet (no doc-hash carve-out) and evaluates on the first "
+                        "--eval-n-prompts rows of this file.")
+    p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl"],
+                   default="vector_mse",
                    help="Critic (AR) TRAINING loss. vector_mse (DEFAULT) = classic "
                         "reconstruction MSE. downstream_kl = train the AR with the SAME "
                         "differentiable downstream-KL objective as the --reward-mode "
@@ -1897,7 +1946,16 @@ def main():
     # filters silently returned 0 rows (nan evals). Explicit positive values keep the
     # legacy row-boundary behavior exactly. ----
     val_permille = 0   # >0 => doc-hash split active (train excludes val docs)
-    if (args.max_rows is None or args.max_rows <= 0) or args.eval_skip_rows <= 0:
+    if args.eval_parquet:
+        import pyarrow.parquet as _pq
+        _total = _pq.ParquetFile(args.rl_parquet).metadata.num_rows
+        if args.max_rows is None or args.max_rows <= 0:
+            args.max_rows = _total
+        args.eval_skip_rows = _total   # eval rows live in a different file
+        print(f"[data] --eval-parquet {args.eval_parquet}: training on all "
+              f"{args.max_rows} rows of {args.rl_parquet}; eval prompts from the "
+              f"separate file", flush=True)
+    elif (args.max_rows is None or args.max_rows <= 0) or args.eval_skip_rows <= 0:
         import pyarrow.parquet as _pq
         from nla.val_split import val_doc_permille
         _total = _pq.ParquetFile(args.rl_parquet).metadata.num_rows
@@ -2095,13 +2153,13 @@ def main():
               f"trainable={n_trainable/1e6:.0f}M params")
         # EMA over the critic's trainable params. Shadow init == live at step 0,
         # so d=0 and "no EMA" are the same run by construction.
-        critic_ema = CriticEMA(critic, args.critic_ema_decay)
-        print(f"[critic] EMA decay={args.critic_ema_decay} "
+        critic_ema = CriticEMA(critic, args.critic_ema_decay, lag_steps=args.critic_lag_steps)
+        print(f"[critic] EMA decay={args.critic_ema_decay} lag_steps={args.critic_lag_steps} "
               f"({'ON' if critic_ema.enabled else 'OFF (control arm)'}), "
               f"tracking {critic_ema.n_params()/1e6:.0f}M params")
     else:
-        if args.critic_ema_decay > 0.0:
-            raise SystemExit("--critic-ema-decay requires --train-critic: with a "
+        if args.critic_ema_decay > 0.0 or args.critic_lag_steps > 0:
+            raise SystemExit("--critic-ema-decay/--critic-lag-steps require --train-critic: with a "
                              "frozen critic there is nothing to average.")
         critic_ema = NoEMA()
         print(f"[critic] FROZEN (eval-only scorer)")
@@ -2223,7 +2281,9 @@ def main():
           f"val_doc_permille={val_permille})", flush=True)
     from nla.val_split import is_val_doc
     _val_pred = (lambda d: is_val_doc(d, val_permille)) if val_permille else None
-    _need_src = args.reward_mode in ("downstream_mse", "downstream_plus_fve", "downstream_kl", "downstream_ladder")
+    _need_src = (args.reward_mode in ("downstream_mse", "downstream_plus_fve", "downstream_kl",
+                                      "downstream_ladder", "vector_plus_kl")
+                 or args.ar_loss in ("downstream_kl", "mse_plus_kl"))
     rows = load_rl_dataset(args.rl_parquet, n_max=args.max_rows,
                            exclude_doc_pred=_val_pred, include_source=_need_src)
     if _need_src:
@@ -2361,7 +2421,27 @@ def main():
     # (measured — see train_rl_self_contained.py). Pass 1 collects training-
     # window doc_ids; pass 2 takes only eval rows whose doc_id is unseen.
     eval_rows = []
-    if args.eval_every > 0 and args.eval_n_prompts > 0 and val_permille > 0:
+    if args.eval_every > 0 and args.eval_n_prompts > 0 and args.eval_parquet:
+        import pyarrow.parquet as _pq
+        _pf = _pq.ParquetFile(args.eval_parquet)
+        _tj_cols = (["detokenized_text_truncated"]
+                    if "detokenized_text_truncated" in _pf.schema_arrow.names else [])
+        for _rg_idx in range(_pf.num_row_groups):
+            if len(eval_rows) >= args.eval_n_prompts:
+                break
+            _rg = _pf.read_row_group(_rg_idx, columns=["prompt", "activation_vector"] + _tj_cols)
+            _prompts = _rg.column("prompt").to_pylist()
+            _acts = np.asarray(_rg.column("activation_vector").combine_chunks().flatten(),
+                               dtype=np.float32).reshape(len(_prompts), -1)
+            _srcs = (_rg.column("detokenized_text_truncated").to_pylist()
+                     if _tj_cols else [""] * len(_prompts))
+            for _i in range(len(_prompts)):
+                eval_rows.append({"prompt": _prompts[_i], "activation": _acts[_i],
+                                  "source": _srcs[_i] or ""})
+                if len(eval_rows) >= args.eval_n_prompts:
+                    break
+        print(f"[eval] {len(eval_rows)} prompts loaded from --eval-parquet", flush=True)
+    elif args.eval_every > 0 and args.eval_n_prompts > 0 and val_permille > 0:
         # Doc-hash split: eval rows = first eval_n_prompts rows of HELD-OUT docs
         # (~val_permille/1000 of rows, scattered) — doc-disjoint from training by
         # construction, no doc-set pass needed.
@@ -2652,7 +2732,7 @@ def main():
                 ctx_tokens=args.downstream_ctx_tokens,
             )
             ds_rewards = [None if t else r for r, t in zip(ds_rewards, all_truncated)]
-        elif args.reward_mode == "downstream_kl":
+        elif args.reward_mode in ("downstream_kl", "vector_plus_kl"):
             _ds_sources = [batch_sources[g] for g in all_prompt_group]
             ds_rewards, kl_gold_cache = downstream_kl_reward(
                 actor, tokenizer, vectors_ref, _ds_sources, recon_preds,
@@ -2671,12 +2751,28 @@ def main():
             )
             ds_rewards = [None if t else r for r, t in zip(ds_rewards, all_truncated)]
 
+        # AR-KL losses need the gold-side cache even when the actor reward is
+        # plain vector-MSE (supplemental-loss arms): build it here once per step.
+        if kl_gold_cache is None and args.ar_loss in ("downstream_kl", "mse_plus_kl"):
+            _ds_sources = [batch_sources[g] for g in all_prompt_group]
+            kl_gold_cache = build_kl_gold_cache(
+                actor, tokenizer, vectors_ref, _ds_sources, all_activations,
+                all_prompt_group, args.extraction_layer, device,
+                n_future=args.downstream_kl_future, top_k=args.downstream_kl_topk,
+                ctx_tokens=args.downstream_ctx_tokens)
+
         # Select the ACTOR's reward per --reward-mode (FVE logging always uses the
         # vector `rewards`).
         if args.reward_mode == "vector_mse":
             actor_rewards = rewards
         elif args.reward_mode in ("downstream_mse", "downstream_kl", "downstream_ladder"):
             actor_rewards = ds_rewards
+        elif args.reward_mode == "vector_plus_kl":   # -mse_vec - w * KL, per sample
+            _w = args.downstream_kl_weight
+            actor_rewards = [
+                None if (rv is None or rd is None) else (rv + _w * rd)
+                for rv, rd in zip(rewards, ds_rewards)
+            ]
         else:  # downstream_plus_fve: -mse_vec + w * -mse_downstream, per sample
             _w = args.downstream_fve_weight
             actor_rewards = [
@@ -2830,7 +2926,9 @@ def main():
         critic_loss_val = float("nan")
         critic_grad_norm_val = float("nan")
         critic_bwd_ok = False  # DP: did THIS rank run a finite critic backward this step?
-        if args.train_critic and critic_optim is not None:
+        critic_kl_val = float("nan")
+        _critic_now = (args.critic_update_every <= 1) or (step % args.critic_update_every == 0)
+        if args.train_critic and critic_optim is not None and _critic_now:
             crit_inputs = []
             crit_golds = []
             crit_pg = []   # prompt_group per crit input (for the AR downstream-KL loss)
@@ -2890,7 +2988,7 @@ def main():
                             kl_gold_cache, args.extraction_layer, mse_scale_f, device,
                             n_future=args.downstream_kl_future, top_k=args.downstream_kl_topk,
                             decay=args.downstream_kl_decay,
-                            ctx_tokens=min(args.downstream_ctx_tokens, 256),
+                            ctx_tokens=args.downstream_ctx_tokens,
                             scale=1.0 / (bs_total * accum))
                         accumulated += lv / bs_total       # mean KL for logging
                         continue
@@ -2917,6 +3015,21 @@ def main():
                     (raw_mse / accum).backward()
                     accumulated += raw_mse.item()
                 critic_bwd_ok = finite
+                # Supplemental downstream-KL on a strided subsample (MSE grads above
+                # stay on ALL rollouts): grad += w * mean_KL / accum.
+                if finite and args.ar_loss == "mse_plus_kl" and kl_gold_cache:
+                    _st = max(1, len(crit_inputs) // args.ar_kl_max_rollouts)
+                    _sel = list(range(0, len(crit_inputs), _st))[:args.ar_kl_max_rollouts]
+                    _lv, _nk = downstream_kl_critic_loss(
+                        critic, actor, tokenizer, vectors_ref,
+                        [crit_inputs[j] for j in _sel], [crit_pg[j] for j in _sel],
+                        kl_gold_cache, args.extraction_layer, mse_scale_f, device,
+                        n_future=args.downstream_kl_future, top_k=args.downstream_kl_topk,
+                        decay=args.downstream_kl_decay, ctx_tokens=args.downstream_ctx_tokens,
+                        scale=args.ar_kl_weight / (max(len(_sel), 1) * accum))
+                    critic_kl_val = _lv / max(_nk, 1)
+                    shape_terms["ar/recon_kl"] = critic_kl_val
+                    shape_terms["ar/recon_kl_n"] = float(_nk)
                 if finite:
                     critic_loss_val = accumulated  # full-batch mean MSE (logged every step)
                     if is_accum_end and not is_dist:  # DP: step in unified block below
@@ -2937,7 +3050,7 @@ def main():
         # step at accum-end, even if THIS rank built no/non-finite critic batch
         # (grads zero-filled), so the collective stays matched. Non-dist runs took
         # the per-branch step above and skip this. ----
-        if is_dist and args.train_critic and critic_optim is not None and is_accum_end:
+        if is_dist and args.train_critic and critic_optim is not None and is_accum_end and _critic_now:
             if not critic_bwd_ok:
                 for p in critic_trainable:
                     if p.grad is not None:

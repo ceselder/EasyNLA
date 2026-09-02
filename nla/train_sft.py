@@ -648,7 +648,11 @@ def main():
                         "back to 25 = Qwen3-8B layer-24 if the sidecar lacks it); "
                         "an explicit value is asserted against the sidecar.")
     # ---- AR downstream-KL warmstart (train the from-scratch AR on the coherent loss) ----
-    p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl"], default="vector_mse",
+    p.add_argument("--ar-kl-weight", type=float, default=1.0,
+                   help="Weight w on the downstream-KL term for --ar-loss mse_plus_kl "
+                        "(loss = MSE + w * KL). Needs --ar-kl-base.")
+    p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl"],
+                   default="vector_mse",
                    help="AR training loss. vector_mse (DEFAULT) = classic reconstruction. "
                         "downstream_kl = differentiable downstream-KL (patch v_hat into the "
                         "frozen full base, top-k KL vs the clean continuation) — the coherent "
@@ -967,7 +971,7 @@ def main():
     # ---- data ----
     print(f"[data] loading {args.parquet} (max_rows={args.max_rows})", flush=True)
     rows = load_sft_dataset(args.parquet, n_max=args.max_rows, mode=args.mode,
-                            want_source=(args.mode == "ar" and args.ar_loss == "downstream_kl"))
+                            want_source=(args.mode == "ar" and args.ar_loss in ("downstream_kl", "mse_plus_kl")))
     print(f"[data] {len(rows)} rows", flush=True)
     if args.num_steps is None:
         # MUST include world size: each optimizer step consumes
@@ -1024,9 +1028,9 @@ def main():
     # which runs before 2026-06-09 used and which inflates FVE.
     # ---- AR downstream-KL: load the frozen FULL base for the patch-forward ----
     kl_base = kl_layer = kl_W = None
-    if args.mode == "ar" and args.ar_loss == "downstream_kl":
+    if args.mode == "ar" and args.ar_loss in ("downstream_kl", "mse_plus_kl"):
         from nla.utils.arch_adapters import resolve_decoder_layers
-        assert args.ar_kl_base, "--ar-loss downstream_kl requires --ar-kl-base (full base)"
+        assert args.ar_kl_base, f"--ar-loss {args.ar_loss} requires --ar-kl-base (full base)"
         print(f"[ar-kl] loading frozen full base for patch-forward: {args.ar_kl_base}", flush=True)
         kl_base = AutoModelForCausalLM.from_pretrained(
             args.ar_kl_base, torch_dtype=torch.bfloat16, attn_implementation="sdpa").to(device).eval()
@@ -1104,6 +1108,7 @@ def main():
         optim.zero_grad()
         accum_loss = 0.0
         accum_ar_mse = 0.0  # AR downstream-KL only: genuine vector-MSE for train FVE
+        accum_kl = 0.0      # AR mse_plus_kl: the supplemental KL term (logging)
         accum_kl_diag = None  # AR downstream-KL only: collapse diagnostics (cos/norm/selfcos)
         accum_resp_tokens = 0  # AV only: total response tokens for normalization
         accum_av_entropy = 0.0  # AV only: mean policy entropy over response tokens (nats)
@@ -1177,7 +1182,17 @@ def main():
                 for _k, _v in _kdiag.items():
                     accum_kl_diag[_k] += _v
                 continue
-            else:  # ar, single-vector (classic vector-MSE)
+            else:  # ar: classic vector-MSE (optionally + w * downstream-KL)
+                if args.ar_loss == "mse_plus_kl":
+                    # KL term first: backward happens inside (per gen_bs chunk, scaled by
+                    # w/grad_accum); the MSE backward below then ADDS to the same grads.
+                    _klv, _nk, _kdiag = ar_kl_loss_batched(
+                        model, kl_base, kl_layer, kl_W, chunk_rows, tokenizer,
+                        mse_scale_f, device, args.extraction_layer,
+                        n_future=args.downstream_kl_future, top_k=args.downstream_kl_topk,
+                        decay=args.downstream_kl_decay, ctx_tokens=args.downstream_ctx_tokens,
+                        gen_bs=args.ar_kl_gen_bs, scale=args.ar_kl_weight / grad_accum)
+                    accum_kl += _klv
                 ids, attn, gold, _kr = _ar_prepare_chunk(
                     chunk_rows, tokenizer, device, max_len=args.max_len,
                 )
@@ -1231,6 +1246,9 @@ def main():
                 log["kl"] = mean_loss
             else:
                 fve_mse = mean_loss
+                if args.ar_loss == "mse_plus_kl":
+                    log["kl"] = accum_kl / max(accum_n, 1)
+                    line += f" | kl {log['kl']:.4f}"
             fve = (1.0 - fve_mse / fve_baseline) * 100.0
             log["fve_pct"] = fve
             log["ar_mse"] = fve_mse

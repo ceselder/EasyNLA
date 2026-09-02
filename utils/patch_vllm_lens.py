@@ -396,27 +396,40 @@ def main() -> int:
     # Per-hunk idempotency: a hunk whose NEW text is already present is skipped
     # (lets us add new hunks to an already-partially-patched file). A hunk whose
     # OLD text is missing AND whose NEW text is absent = version drift -> refuse.
-    to_apply = []
-    for i, hunk in enumerate(HUNKS):
-        old, new = hunk[0], hunk[1]
-        satisfied = hunk[2] if len(hunk) > 2 else []
-        if new in src or any(alt in src for alt in satisfied):
-            continue
-        if old not in src:
-            print(f"[patch_vllm_lens] hunk {i} not found (neither OLD, NEW, nor a "
-                  f"satisfied baseline) — vllm_lens version drift? Refusing to patch {path}")
-            return 1
-        to_apply.append((old, new))
+    # Hunks are checked and applied SEQUENTIALLY against the progressively
+    # patched text: later hunks (the steer-log set) anchor on text that an
+    # earlier hunk introduces (e.g. hunk 9 anchors on get_and_reset_steer_count,
+    # which hunk 7 adds), so a pre-check of every hunk against the PRISTINE file
+    # wrongly reports "not found" on a fresh install.
+    # A hunk whose `satisfied` baseline is present is skipped, but a later hunk
+    # can rewrite that baseline so the skipped hunk becomes applicable — hence
+    # up to 3 passes until a pass applies nothing (single invocation = complete).
+    n_applied = 0
+    for _pass in range(3):
+        n_this = 0
+        for i, hunk in enumerate(HUNKS):
+            old, new = hunk[0], hunk[1]
+            satisfied = hunk[2] if len(hunk) > 2 else []
+            if new in src or any(alt in src for alt in satisfied):
+                continue
+            if old not in src:
+                print(f"[patch_vllm_lens] hunk {i} not found (neither OLD, NEW, nor a "
+                      f"satisfied baseline) — vllm_lens version drift? Refusing to patch {path}")
+                return 1
+            src = src.replace(old, new, 1)
+            n_this += 1
+        n_applied += n_this
+        if n_this == 0:
+            break
 
-    if not to_apply:
+    if not n_applied:
         print(f"[patch_vllm_lens] already patched (all {len(HUNKS)} hunks): {path}")
         return 0
 
     _orig = path.with_suffix(".py.orig")
     if not _orig.exists():   # keep the PRISTINE original across incremental patches
         shutil.copy2(path, _orig)
-    for old, new in to_apply:
-        src = src.replace(old, new, 1)
+    to_apply = [None] * n_applied   # for the summary line below
     path.write_text(src)
     pycache = path.parent / "__pycache__"
     if pycache.exists():

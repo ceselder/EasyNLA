@@ -32,12 +32,21 @@ import torch
 
 
 class CriticEMA:
-    def __init__(self, critic: torch.nn.Module, decay: float):
+    def __init__(self, critic: torch.nn.Module, decay: float, lag_steps: int = 0):
+        """decay>0: exponential moving average. lag_steps>0: HARD lag (target
+        network): the scoring shadow is a snapshot of the live weights refreshed
+        every `lag_steps` critic updates (decay is ignored). Both 0: control."""
         self.decay = float(decay)
+        self.lag_steps = int(lag_steps)
+        self._n_updates = 0
         # A negative decay would silently read as "disabled" (control arm) while
         # still paying the shadow cost; decay >= 1 freezes the shadow at step 0
         # so every rollout is scored by the SFT-init critic. Both are typos, not
         # intentions.
+        if self.lag_steps < 0:
+            raise ValueError(f"critic lag steps must be >= 0, got {self.lag_steps}")
+        if self.lag_steps > 0 and self.decay > 0.0:
+            raise ValueError("pass EITHER --critic-ema-decay or --critic-lag-steps, not both")
         if not (0.0 <= self.decay < 1.0):
             raise ValueError(
                 f"critic EMA decay must be in [0.0, 1.0), got {self.decay!r}. "
@@ -55,7 +64,7 @@ class CriticEMA:
 
     @property
     def enabled(self) -> bool:
-        return self.decay > 0.0
+        return self.decay > 0.0 or self.lag_steps > 0
 
     def n_params(self) -> int:
         return sum(p.numel() for p in self._params.values())
@@ -65,6 +74,14 @@ class CriticEMA:
         """Call immediately AFTER critic_optim.step()."""
         if self._swapped:
             raise RuntimeError("CriticEMA.update() while EMA weights are swapped in")
+        self._n_updates += 1
+        if self.lag_steps > 0:
+            # hard lag: refresh the snapshot only every lag_steps updates
+            if self._n_updates % self.lag_steps != 0:
+                return
+            for n, p in self._params.items():
+                self._shadow[n].copy_(p.detach().float())
+            return
         d = self.decay
         for n, p in self._params.items():
             s, live = self._shadow[n], p.detach().float()
@@ -113,7 +130,8 @@ class CriticEMA:
             raise RuntimeError(f"optimizer step under swapped EMA weights {where}".strip())
 
     def state_dict(self) -> dict:
-        return {"decay": self.decay,
+        return {"decay": self.decay, "lag_steps": self.lag_steps,
+                "n_updates": self._n_updates,
                 "shadow": {n: t.clone() for n, t in self._shadow.items()}}
 
     def load_state_dict(self, sd: dict, strict: bool = True) -> None:
@@ -130,6 +148,7 @@ class CriticEMA:
             print(f"[critic-ema] checkpoint decay {ckpt_decay} != requested "
                   f"{self.decay}; KEEPING the requested value (the CLI wins).",
                   flush=True)
+        self._n_updates = int(sd.get("n_updates", 0))
         shadow = sd["shadow"]
         missing = [n for n in self._shadow if n not in shadow]
         unexpected = [n for n in shadow if n not in self._shadow]
