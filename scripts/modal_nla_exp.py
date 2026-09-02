@@ -284,13 +284,20 @@ def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024):
     if model_tag == "qwen3_8b":
         base, layer, d = BASE_8B, LAYER_8B, D_8B
         actdir = f"{DATA}/acts_qwen3_8b_L{LAYER_8B}"
+        complete = glob.glob(f"{actdir}/_COMPLETE_shard*")
+        shards = sorted(glob.glob(f"{actdir}/shard*_part*.parquet"))
+        assert complete and shards, f"no completed extraction under {actdir}"
+        n_sh = json.loads(open(complete[0]).read())["nshards"]
+        assert len(complete) == n_sh, f"{len(complete)}/{n_sh} shards complete"
+    elif model_tag == "qwen36_27b":
+        # August extraction (nla-qwen36-ema volume): 30 shards, all 742k rows, cols
+        # doc_id/text/explanation/is_val/n_raw_tokens/activation_layer/activation_vector
+        base, layer, d = "Qwen/Qwen3.6-27B", 42, 5120
+        actdir = "/vol_q36/data/acts_qwen36_L42"
+        assert os.path.exists(f"{actdir}/_COMPLETE"), f"{actdir} incomplete"
+        shards = sorted(glob.glob(f"{actdir}/shard_*.parquet"))
     else:
         raise SystemExit(model_tag)
-    complete = glob.glob(f"{actdir}/_COMPLETE_shard*")
-    shards = sorted(glob.glob(f"{actdir}/shard*_part*.parquet"))
-    assert complete and shards, f"no completed extraction under {actdir}"
-    n_sh = json.loads(open(complete[0]).read())["nshards"]
-    assert len(complete) == n_sh, f"{len(complete)}/{n_sh} shards complete"
 
     side = yaml.safe_load(open(hf_hub_download(
         OPUS5, "ar_sft_shuf.parquet.nla_meta.yaml", repo_type="dataset")))
@@ -304,7 +311,15 @@ def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024):
     print(f"tokens: {tmeta}", flush=True)
     ACTOR_PH = ACTOR.replace("{injection_char}", INJECT_PLACEHOLDER)
 
-    tables = [pq.read_table(s) for s in shards]
+    tables = []
+    for sp in shards:
+        t = pq.read_table(sp)
+        if "text" in t.column_names and "detokenized_text_truncated" not in t.column_names:
+            t = t.rename_columns([("detokenized_text_truncated" if c == "text" else c)
+                                  for c in t.column_names])
+        keep = ["doc_id", "detokenized_text_truncated", "explanation", "n_raw_tokens",
+                "activation_layer", "activation_vector"]
+        tables.append(t.select(keep))
     tbl = pa.concat_tables(tables)
     del tables
     dids = tbl.column("doc_id").to_pylist()
