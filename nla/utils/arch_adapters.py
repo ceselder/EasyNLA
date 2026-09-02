@@ -191,7 +191,8 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
         # Hybrid: full attention every 4th layer (q/k/v/o_proj), gated-deltanet
         # linear attention elsewhere. Adapt the token-mixing projections of BOTH
         # block types; skip in_proj_a/in_proj_b (delta-rule decay dynamics,
-        # tiny out-dims where r=128 LoRA is degenerate).
+        # tiny out-dims where r=128 LoRA is degenerate). Use scope="all" (via
+        # resolve_lora_target_modules) to additionally adapt those + the MLP.
         return ["q_proj", "k_proj", "v_proj", "o_proj",
                 "in_proj_qkv", "in_proj_z", "out_proj"]
     if model_type == "gpt2":
@@ -210,3 +211,58 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
         f"model_type={model_type!r}: unknown attention module naming — extend "
         f"arch_adapters.resolve_attn_target_modules for this architecture."
     )
+
+
+# MLP (channel-mixing) projection names by family, for LoRA scope="all". These
+# are where most of a transformer's parameters live, so adapting them materially
+# widens the AV verbalizer's capacity beyond token-mixing alone.
+_MLP_MODULES = {
+    "llama_family": ["gate_proj", "up_proj", "down_proj"],
+    "qwen3_5": ["gate_proj", "up_proj", "down_proj"],
+    "phi3": ["gate_up_proj", "down_proj"],
+    "phi": ["fc1", "fc2"],
+}
+
+
+def resolve_lora_target_modules(config: Any, scope: str = "attn") -> list[str]:
+    """LoRA target modules by scope.
+
+      scope="attn" (default, upstream behaviour): token-mixing projections only
+        (resolve_attn_target_modules) — attention q/k/v/o (+ deltanet in/out for
+        qwen3_5). Keeps the adapter small and makes the only-adapted vLLM weight
+        sync sound (av_merged differs from base ONLY in these).
+      scope="all": additionally adapt the MLP (channel-mixing) block and, for
+        qwen3_5, the deltanet decay/beta projections in_proj_a/in_proj_b — i.e.
+        adapt every learnable Linear in the decoder layer. More expressive
+        verbalizer; ~3x the trainable params.
+
+    NB: use the SAME scope for warm-start SFT and RL — the only-adapted sync
+    assumes the RL adapter set is a SUPERSET of wherever av_merged differs from
+    base. Mixing scopes across stages can leave stale base weights in vLLM.
+    """
+    attn = resolve_attn_target_modules(config)
+    if scope == "attn":
+        return attn
+    if scope != "all":
+        raise AssertionError(f"lora scope must be 'attn' or 'all', got {scope!r}")
+    model_type = getattr(resolve_text_config(config), "model_type", "")
+    extra: list[str] = []
+    if model_type in ("qwen3_5", "qwen3_5_text"):
+        extra = _MLP_MODULES["qwen3_5"] + ["in_proj_a", "in_proj_b"]
+    elif model_type in _LLAMA_FAMILY_MODEL_TYPES:
+        extra = _MLP_MODULES["llama_family"]
+    elif model_type in _MLP_MODULES:
+        extra = _MLP_MODULES[model_type]
+    else:
+        # Unknown MLP naming for this arch — fail loud rather than silently
+        # adapt attn-only under a scope="all" the caller asked for.
+        raise AssertionError(
+            f"lora scope='all' but MLP module names unknown for model_type="
+            f"{model_type!r}; add them to arch_adapters._MLP_MODULES."
+        )
+    # de-dup, preserve order (attn first)
+    seen, out = set(), []
+    for m in attn + extra:
+        if m not in seen:
+            seen.add(m); out.append(m)
+    return out

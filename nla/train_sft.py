@@ -60,15 +60,17 @@ from nla.schema import (
 
 
 
-def load_sft_dataset(parquet_path, n_max=None, *, mode):
+def load_sft_dataset(parquet_path, n_max=None, *, mode, want_source=False):
     """Stream-load AV (prompt: list[dict], response: str, activation_vector)
     or AR (prompt: str, activation_vector). Slice rowgroups so n_max=N takes
-    only N rows, not the full first rowgroup."""
+    only N rows, not the full first rowgroup. want_source: also load
+    detokenized_text_truncated -> row["detokenized_text_truncated"] (AR KL loss)."""
+    pf = pq.ParquetFile(parquet_path)
+    _has_src = want_source and "detokenized_text_truncated" in pf.schema_arrow.names
     cols = (
         ["prompt", "response", "activation_vector"] if mode == "av"
-        else ["prompt", "activation_vector"]
+        else ["prompt", "activation_vector"] + (["detokenized_text_truncated"] if _has_src else [])
     )
-    pf = pq.ParquetFile(parquet_path)
     rows = []
     for rg_idx in range(pf.num_row_groups):
         if n_max is not None and len(rows) >= n_max:
@@ -85,10 +87,13 @@ def load_sft_dataset(parquet_path, n_max=None, *, mode):
                    .astype(np.float32).reshape(len(acts_col), -1))
         prompts = rg.column("prompt").to_pylist()
         responses = rg.column("response").to_pylist() if mode == "av" else None
+        srcs = rg.column("detokenized_text_truncated").to_pylist() if _has_src else None
         for i in range(take):
             row = {"prompt": prompts[i], "activation_vector": acts_np[i]}
             if mode == "av":
                 row["response"] = responses[i]
+            if srcs is not None:
+                row["detokenized_text_truncated"] = srcs[i] or ""
             rows.append(row)
     return rows
 
@@ -474,7 +479,142 @@ def _ar_prepare_chunk(rows, tokenizer, device, max_len=1024):
         np.stack([r["activation_vector"] for r in kept_rows]),
         dtype=torch.float32, device=device,
     )
-    return batch_ids, attn, gold
+    return batch_ids, attn, gold, kept_rows
+
+
+def ar_kl_loss_batched(critic, base, kl_layer, W, chunk_rows, tokenizer, mse_scale_f,
+                       device, extraction_layer, n_future=16, top_k=128, decay=0.9,
+                       ctx_tokens=128, gen_bs=4, scale=1.0):
+    """BATCHED differentiable downstream-KL loss for AR warmstart (from-scratch base AR).
+
+    Per gen_bs chunk: reconstruct v_hat (critic, grad), norm-match, patch into the FROZEN
+    full `base` at each row's source extraction position, teacher-force the clean
+    (gold-patched) greedy continuation, and BACKWARD the chunk's gamma-discounted top-k
+    forward-KL immediately (× scale/total_rows) so only ONE chunk's base-forward graph is
+    alive at a time (holding all chunks OOMs — grad-through-64-layers isn't checkpointable
+    with the stateful patch hook). Returns (mean_kl, n_used, diag); backward already done.
+    diag = {mse, cos_pred_gold, pred_norm, gold_norm, pred_selfcos, gold_selfcos}: mse is
+    the RAW-pred normalized MSE (matches heldout_fve_mse) for a genuine train FVE (the KL
+    loss itself is NOT an FVE); *selfcos is cross-example pairwise cosine — pred_selfcos
+    -> 1 flags collapse to a near-constant low-info vector that games KL."""
+    import torch.nn.functional as _F
+    rows = [r for r in chunk_rows if r.get("detokenized_text_truncated")]
+    if not rows:
+        return 0.0, 0
+    pad_id = tokenizer.eos_token_id
+    ar_pos = torch.arange(n_future, device=device)
+    wj = (decay ** ar_pos.float()); wj = wj / wj.sum()
+    total_rows = len(rows)
+
+    patch = {"pos": None, "vec": None}
+    def hook(_m, _i, out):
+        if patch["vec"] is None:
+            return out
+        h = out[0] if isinstance(out, tuple) else out
+        h = h.clone()
+        b = torch.arange(h.shape[0], device=h.device)
+        h[b, patch["pos"].to(h.device)] = patch["vec"].to(device=h.device, dtype=h.dtype)
+        return (h, *out[1:]) if isinstance(out, tuple) else h
+    handle = kl_layer.register_forward_hook(hook)
+    _gc = bool(getattr(base, "is_gradient_checkpointing", False))
+    if _gc:
+        base.gradient_checkpointing_disable()
+
+    loss_val = 0.0; n_used = 0; mse_sum = 0.0
+    # collapse diagnostics (accumulated across chunks, weighted by chunk size)
+    cos_sum = 0.0; pnorm_sum = 0.0; gnorm_sum = 0.0
+    pself_sum = 0.0; gself_sum = 0.0; pself_n = 0    # cross-example pairwise cosine
+    try:
+        for s in range(0, total_rows, gen_bs):
+            batch = rows[s:s + gen_bs]
+            nb = len(batch)
+            ctx = [tokenizer.encode(r["detokenized_text_truncated"], add_special_tokens=True)[-ctx_tokens:]
+                   for r in batch]
+            gold = torch.tensor(np.stack([r["activation_vector"] for r in batch]),
+                                dtype=torch.float32, device=device)          # [nb,d]
+            # --- clean gold-patched greedy continuation + top-k dists (no grad) ---
+            with torch.no_grad():
+                seqs = [list(c) for c in ctx]; pos0 = [len(c) - 1 for c in ctx]
+                tk_i = [[] for _ in batch]; tk_v = [[] for _ in batch]; toks = [[] for _ in batch]
+                for _ in range(n_future):
+                    ml = max(len(x) for x in seqs)
+                    bx = torch.full((nb, ml), pad_id, dtype=torch.long, device=device)
+                    at = torch.zeros((nb, ml), dtype=torch.long, device=device)
+                    last = torch.tensor([len(x) - 1 for x in seqs], device=device)
+                    for r, x in enumerate(seqs):
+                        bx[r, :len(x)] = torch.tensor(x, device=device); at[r, :len(x)] = 1
+                    patch["pos"] = torch.tensor(pos0, device=device); patch["vec"] = gold
+                    hl = base.model(input_ids=bx, attention_mask=at, use_cache=False).last_hidden_state[
+                        torch.arange(nb, device=device), last]
+                    patch["vec"] = None
+                    lg = hl.float() @ W.float().t(); lp = _F.log_softmax(lg, -1)
+                    tv, ti = lp.topk(top_k, -1); nx = lg.argmax(-1)
+                    for r in range(nb):
+                        tk_i[r].append(ti[r]); tk_v[r].append(tv[r]); t = int(nx[r]); toks[r].append(t); seqs[r].append(t)
+                tk_ids = [torch.stack(x) for x in tk_i]; tk_lp = [torch.stack(x) for x in tk_v]
+            # --- v_hat (grad) + patched forward + KL (grad) ---
+            cin = [torch.tensor(tokenizer.encode(r["prompt"], add_special_tokens=False)[:1024],
+                                dtype=torch.long) for r in batch]
+            Tc = max(t.numel() for t in cin)
+            cb = torch.full((nb, Tc), pad_id, dtype=torch.long, device=device)
+            ca = torch.zeros((nb, Tc), dtype=torch.long, device=device)
+            for r, t in enumerate(cin):
+                cb[r, :t.numel()] = t.to(device); ca[r, :t.numel()] = 1
+            vhat = critic_predict(critic, cb, ca, mse_scale_f)               # [nb,d] grad
+            with torch.no_grad():   # genuine vector-MSE FVE on the RAW pred (matches heldout_fve_mse)
+                mse_sum += float(F.mse_loss(normalize_activation(vhat, mse_scale_f),
+                                            normalize_activation(gold, mse_scale_f)).item()) * nb
+                # collapse diagnostics: directional match + norms + how similar the
+                # predictions are ACROSS examples (pairwise cos -> 1 == collapsed to a
+                # near-constant "I do nothing" vector that games KL without info).
+                cos_sum += float(F.cosine_similarity(vhat, gold, dim=-1).mean().item()) * nb
+                pnorm_sum += float(vhat.norm(dim=-1).mean().item()) * nb
+                gnorm_sum += float(gold.norm(dim=-1).mean().item()) * nb
+                if nb > 1:
+                    def _selfcos(x):
+                        xn = x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                        m = xn @ xn.t()
+                        off = m[~torch.eye(nb, dtype=torch.bool, device=m.device)]
+                        return float(off.mean().item())
+                    pself_sum += _selfcos(vhat) * nb; gself_sum += _selfcos(gold) * nb
+                    pself_n += nb
+            vhat = vhat * (gold.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                           / vhat.norm(dim=-1, keepdim=True).clamp_min(1e-12))
+            rowseqs = [ctx[r] + toks[r] for r in range(nb)]
+            ml = max(len(x) for x in rowseqs)
+            bx = torch.full((nb, ml), pad_id, dtype=torch.long, device=device)
+            at = torch.zeros((nb, ml), dtype=torch.long, device=device)
+            pf = torch.tensor([len(ctx[r]) - 1 for r in range(nb)], device=device)
+            for r, x in enumerate(rowseqs):
+                bx[r, :len(x)] = torch.tensor(x, device=device); at[r, :len(x)] = 1
+            patch["pos"] = pf; patch["vec"] = vhat
+            hs = base.model(input_ids=bx, attention_mask=at, use_cache=False).last_hidden_state
+            patch["vec"] = None
+            chunk_kl = 0.0
+            for r in range(nb):
+                hcol = hs[r, pf[r] + ar_pos].float()
+                logits = hcol @ W.float().t()
+                lse = torch.logsumexp(logits, -1, keepdim=True)
+                plp = logits.gather(-1, tk_ids[r]) - lse
+                cp = torch.softmax(tk_lp[r], -1); clp = torch.log_softmax(tk_lp[r], -1)
+                chunk_kl = chunk_kl + ((cp * (clp - plp)).sum(-1) * wj).sum()
+            if torch.isfinite(chunk_kl):
+                (chunk_kl / total_rows * scale).backward()     # frees this chunk's graph
+                loss_val += float(chunk_kl.item()); n_used += nb
+    finally:
+        handle.remove(); patch["vec"] = None
+        if _gc:
+            base.gradient_checkpointing_enable()
+    nu = max(n_used, 1)
+    diag = {
+        "mse": mse_sum / nu,
+        "cos_pred_gold": cos_sum / nu,
+        "pred_norm": pnorm_sum / nu,
+        "gold_norm": gnorm_sum / nu,
+        "pred_selfcos": (pself_sum / pself_n) if pself_n else 0.0,
+        "gold_selfcos": (gself_sum / pself_n) if pself_n else 0.0,
+    }
+    return (loss_val / nu), n_used, diag
 
 
 # ----------------------------------------------------------------------------
@@ -502,6 +642,25 @@ def main():
                         "blocks. Default: sidecar extraction.layer_index + 1 (falls "
                         "back to 25 = Qwen3-8B layer-24 if the sidecar lacks it); "
                         "an explicit value is asserted against the sidecar.")
+    # ---- AR downstream-KL warmstart (train the from-scratch AR on the coherent loss) ----
+    p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl"], default="vector_mse",
+                   help="AR training loss. vector_mse (DEFAULT) = classic reconstruction. "
+                        "downstream_kl = differentiable downstream-KL (patch v_hat into the "
+                        "frozen full base, top-k KL vs the clean continuation) — the coherent "
+                        "loss that matches the RL KL reward. Needs --ar-kl-base.")
+    p.add_argument("--ar-kl-base", default=None,
+                   help="Full base model (e.g. av_merged_all) loaded frozen for the KL "
+                        "patch-forward when --ar-loss downstream_kl.")
+    p.add_argument("--extraction-layer", type=int, default=42,
+                   help="Decoder block whose output the activations came from (patch site).")
+    p.add_argument("--downstream-kl-future", type=int, default=16)
+    p.add_argument("--downstream-kl-topk", type=int, default=128)
+    p.add_argument("--downstream-kl-decay", type=float, default=0.9,
+                   help="Geometric discount gamma^j over the N future token positions.")
+    p.add_argument("--downstream-ctx-tokens", type=int, default=256,
+                   help="Tail length of the source context for the KL patch-forward.")
+    p.add_argument("--ar-kl-gen-bs", type=int, default=16,
+                   help="Batch for the KL base fwd/bwd (bigger = faster, more memory).")
     p.add_argument("--freeze-backbone", action="store_true", default=False,
                    help="AR mode: freeze the backbone and train ONLY the "
                         "value_head — a linear-probe baseline for how much of "
@@ -562,6 +721,11 @@ def main():
                         "Mandatory for 4bit. (AR value_head stays fully trainable.)")
     p.add_argument("--lora-r", type=int, default=128)
     p.add_argument("--lora-alpha", type=int, default=16)
+    p.add_argument("--lora-scope", choices=["attn", "all"], default="attn",
+                   help="AV LoRA target modules. 'attn' (default) = token-mixing only; "
+                        "'all' additionally adapts the MLP (+ deltanet decay projs for "
+                        "qwen3_5) — a more expressive verbalizer. AR keeps attn-only "
+                        "(the deliberate reconstruction bottleneck).")
     p.add_argument("--device-map", choices=["single", "auto"], default="single",
                    help="single = whole 4-bit model on GPU0 (fits up to ~70B on "
                         "a B200). auto = accelerate splits weights across all "
@@ -586,7 +750,29 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = "cuda"
+    # ---- optional data-parallel via manual grad all-reduce (torchrun) ----
+    # train_sft uses device_map=auto (naive MP, no throughput gain); for a real
+    # N-GPU speedup we run one model per rank on its own data shard and all-reduce
+    # grads before optim.step(). The custom KL forward (model.model(...) /
+    # critic_predict, not model(...)) would break DDP's forward-coupled reducer,
+    # so we all-reduce grads by hand instead. Launch with `torchrun --standalone
+    # --nproc-per-node=N`; single-process (no torchrun) still works unchanged.
+    _ddp = "LOCAL_RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if _ddp:
+        import torch.distributed as dist
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        rank = int(os.environ["RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group("nccl")
+        device = f"cuda:{local_rank}"
+    else:
+        dist = None
+        local_rank, world_size, rank = 0, 1, 0
+        device = "cuda"
+    is_main = (rank == 0)
+    if not is_main:
+        args.no_wandb = True   # only rank 0 logs to wandb (else N duplicate runs)
     dtype = torch.bfloat16
     if args.lr is None:
         # Mode-aware default: non-comp AV warmstart is 1e-4 (2x-data 1-epoch best, held-out
@@ -659,11 +845,13 @@ def main():
                 model = prepare_model_for_kbit_training(
                     model, use_gradient_checkpointing=args.gradient_checkpointing,
                 )
-            from nla.utils.arch_adapters import resolve_attn_target_modules
+            from nla.utils.arch_adapters import resolve_lora_target_modules
+            _tm = resolve_lora_target_modules(model.config, args.lora_scope)
+            print(f"[av] LoRA scope={args.lora_scope} → {len(_tm)} module types: {_tm}")
             model = get_peft_model(model, LoraConfig(
                 r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                 bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=resolve_attn_target_modules(model.config),
+                target_modules=_tm,
             ))
             model.print_trainable_parameters()
         vectors_ref = [None]
@@ -727,11 +915,11 @@ def main():
                 model.backbone = prepare_model_for_kbit_training(
                     model.backbone, use_gradient_checkpointing=args.gradient_checkpointing,
                 )
-            from nla.utils.arch_adapters import resolve_attn_target_modules
+            from nla.utils.arch_adapters import resolve_lora_target_modules
             inject_adapter_in_model(LoraConfig(
                 r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                 bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=resolve_attn_target_modules(model.backbone.config),
+                target_modules=resolve_lora_target_modules(model.backbone.config, args.lora_scope),
             ), model.backbone)
             # Train ONLY the LoRA adapters + the value_head; freeze the rest.
             for n_, p_ in model.named_parameters():
@@ -760,7 +948,8 @@ def main():
 
     # ---- data ----
     print(f"[data] loading {args.parquet} (max_rows={args.max_rows})", flush=True)
-    rows = load_sft_dataset(args.parquet, n_max=args.max_rows, mode=args.mode)
+    rows = load_sft_dataset(args.parquet, n_max=args.max_rows, mode=args.mode,
+                            want_source=(args.mode == "ar" and args.ar_loss == "downstream_kl"))
     print(f"[data] {len(rows)} rows", flush=True)
     if args.mode == "ar" and cfg.critic_suffix_ids:
         # One-time suffix-anchor sanity check (the sidecar field's stated
@@ -785,6 +974,11 @@ def main():
         "no trainable parameters — --freeze-backbone freezes the whole AR, so "
         "there is nothing to optimize in AR-SFT. Drop --freeze-backbone."
     )
+    if _ddp:
+        # torch.manual_seed is identical across ranks so LoRA init already matches,
+        # but broadcast trainable params from rank 0 to be bulletproof about it.
+        for p in trainable:
+            dist.broadcast(p.data, src=0)
     optim = optim_cls(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(
         optim,
@@ -798,6 +992,22 @@ def main():
     # Paper definition: baseline = E[||v_norm - μ||²] (raw variance of the
     # normalized distribution, ≈0.72), NOT MSE against normalize(μ) (≈0.94)
     # which runs before 2026-06-09 used and which inflates FVE.
+    # ---- AR downstream-KL: load the frozen FULL base for the patch-forward ----
+    kl_base = kl_layer = kl_W = None
+    if args.mode == "ar" and args.ar_loss == "downstream_kl":
+        from nla.utils.arch_adapters import resolve_decoder_layers
+        assert args.ar_kl_base, "--ar-loss downstream_kl requires --ar-kl-base (full base)"
+        print(f"[ar-kl] loading frozen full base for patch-forward: {args.ar_kl_base}", flush=True)
+        kl_base = AutoModelForCausalLM.from_pretrained(
+            args.ar_kl_base, torch_dtype=torch.bfloat16, attn_implementation="sdpa").to(device).eval()
+        for _p in kl_base.parameters():
+            _p.requires_grad_(False)
+        kl_layer = resolve_decoder_layers(kl_base)[args.extraction_layer]
+        kl_W = kl_base.get_output_embeddings().weight
+        print(f"[ar-kl] N={args.downstream_kl_future} topk={args.downstream_kl_topk} "
+              f"gamma={args.downstream_kl_decay} patch@L{args.extraction_layer} "
+              f"gen_bs={args.ar_kl_gen_bs}", flush=True)
+
     fve_baseline = None
     if args.mode == "ar":
         from nla.schema import compute_predict_mean_baselines
@@ -852,17 +1062,25 @@ def main():
     rng = np.random.default_rng(args.seed)
     perm = list(range(len(rows)))
     rng.shuffle(perm)
+    if world_size > 1:
+        # disjoint rank-strided shard: rank r trains on perm[r::world]. Grads are
+        # all-reduced before optim.step() so eff_batch = batch_size × world_size.
+        perm = perm[rank::world_size]
+        print(f"[ddp] rank {rank}/{world_size}: {len(perm)} rows this shard", flush=True)
     cursor = 0
 
     grad_accum = args.gradient_accumulation_steps
-    eff_batch = args.batch_size * grad_accum
-    print(f"[loop] {args.num_steps} steps, batch={args.batch_size} × "
-          f"grad_accum={grad_accum} = eff_batch={eff_batch}")
+    eff_batch = args.batch_size * grad_accum * world_size
+    if is_main:
+        print(f"[loop] {args.num_steps} steps, batch={args.batch_size} × "
+              f"grad_accum={grad_accum} × world={world_size} = eff_batch={eff_batch}")
 
     for step in range(args.num_steps):
         t0 = time.time()
         optim.zero_grad()
         accum_loss = 0.0
+        accum_ar_mse = 0.0  # AR downstream-KL only: genuine vector-MSE for train FVE
+        accum_kl_diag = None  # AR downstream-KL only: collapse diagnostics (cos/norm/selfcos)
         accum_resp_tokens = 0  # AV only: total response tokens for normalization
         accum_av_entropy = 0.0  # AV only: mean policy entropy over response tokens (nats)
         accum_n = 0
@@ -913,8 +1131,25 @@ def main():
                     resp_logits = shift_logits[shift_mask.bool()]   # [n_resp, V]
                     lsm = F.log_softmax(resp_logits, dim=-1)
                     accum_av_entropy += float((-(lsm.exp() * lsm).sum(-1)).mean())
-            else:  # ar, single-vector
-                ids, attn, gold = _ar_prepare_chunk(
+            elif args.ar_loss == "downstream_kl":  # ar, coherent downstream-KL loss
+                # backward happens PER CHUNK inside the fn (frees each base-forward graph);
+                # returns a float loss value, so skip the shared backward below.
+                _klv, _nk, _kdiag = ar_kl_loss_batched(
+                    model, kl_base, kl_layer, kl_W, chunk_rows, tokenizer,
+                    mse_scale_f, device, args.extraction_layer,
+                    n_future=args.downstream_kl_future, top_k=args.downstream_kl_topk,
+                    decay=args.downstream_kl_decay, ctx_tokens=args.downstream_ctx_tokens,
+                    gen_bs=args.ar_kl_gen_bs, scale=1.0 / grad_accum)
+                if _nk == 0:
+                    continue
+                accum_loss += _klv; accum_ar_mse += _kdiag["mse"]; accum_n += 1
+                if accum_kl_diag is None:
+                    accum_kl_diag = {k: 0.0 for k in _kdiag}
+                for _k, _v in _kdiag.items():
+                    accum_kl_diag[_k] += _v
+                continue
+            else:  # ar, single-vector (classic vector-MSE)
+                ids, attn, gold, _kr = _ar_prepare_chunk(
                     chunk_rows, tokenizer, device, max_len=args.max_len,
                 )
                 with amp():
@@ -934,6 +1169,14 @@ def main():
             accum_n += 1
 
         # ---- step ----
+        if world_size > 1:
+            # average grads across ranks (data-parallel). Grads accumulated over
+            # all micro-batches / KL chunks are summed then divided by world_size,
+            # equivalent to one optimizer step on the full eff_batch.
+            for p in trainable:
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    p.grad /= world_size
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         optim.step()
         sched.step()
@@ -951,9 +1194,25 @@ def main():
         line = (f"step {step:04d} | loss {mean_loss:.4f} | lr {cur_lr:.2e} "
                 f"| grad {log['grad_norm']:.3f} | t {log['wall_s']:.1f}s")
         if args.mode == "ar" and fve_baseline is not None:
-            fve = (1.0 - mean_loss / fve_baseline) * 100.0
+            # KL warmstart optimizes KL (mean_loss), so the FVE must come from the
+            # separately-tracked genuine vector-MSE, not from KL/mse_baseline.
+            if args.ar_loss == "downstream_kl":
+                fve_mse = accum_ar_mse / max(accum_n, 1)
+                log["kl"] = mean_loss
+            else:
+                fve_mse = mean_loss
+            fve = (1.0 - fve_mse / fve_baseline) * 100.0
             log["fve_pct"] = fve
-            line += f" | FVE {fve:.1f}%"
+            log["ar_mse"] = fve_mse
+            line += (f" | kl {mean_loss:.4f} | FVE {fve:.1f}%"
+                     if args.ar_loss == "downstream_kl" else f" | FVE {fve:.1f}%")
+            if args.ar_loss == "downstream_kl" and accum_kl_diag is not None:
+                d = {k: v / max(accum_n, 1) for k, v in accum_kl_diag.items()}
+                log.update({f"vec_{k}": v for k, v in d.items()})
+                # pred_selfcos ~ gold_selfcos => diverse; pred_selfcos -> 1 => collapse
+                line += (f" | cos {d['cos_pred_gold']:.3f} | |p|/|g| "
+                         f"{d['pred_norm']:.1f}/{d['gold_norm']:.1f} | selfcos "
+                         f"p{d['pred_selfcos']:.2f}/g{d['gold_selfcos']:.2f}")
         if args.mode == "av":
             n_seen = max(1, args.batch_size * accum_n)
             log["resp_tokens"] = accum_resp_tokens
@@ -967,10 +1226,11 @@ def main():
             log.update(ar_dbg)
             line += (f" | cos {ar_dbg['cos_pred_gold']:.3f} "
                      f"| |p|/|g| {ar_dbg['pred_norm']:.1f}/{ar_dbg['gold_norm']:.1f}")
-        print(line, flush=True)
+        if is_main:
+            print(line, flush=True)
 
         # ---- periodic example-generation table (debug) ----
-        if args.sample_every > 0 and (
+        if is_main and args.sample_every > 0 and (
             (step + 1) % args.sample_every == 0 or (step + 1) == args.num_steps
         ):
             if args.mode == "av":
@@ -992,7 +1252,7 @@ def main():
             else:  # ar: reconstruction examples
                 model.eval()
                 for i, row in enumerate(sample_rows):
-                    ids, attn, gold = _ar_prepare_chunk(
+                    ids, attn, gold, _kr = _ar_prepare_chunk(
                         [row], tokenizer, device, max_len=args.max_len,
                     )
                     with torch.no_grad(), amp():
@@ -1013,7 +1273,7 @@ def main():
                     )
 
         # ---- held-out val token-CE/ppl (AV mode, doc-disjoint) ----
-        if heldout_av_rows is not None and (
+        if is_main and heldout_av_rows is not None and (
             (step + 1) % args.heldout_every == 0 or (step + 1) == args.num_steps
         ):
             model.eval()
@@ -1027,9 +1287,15 @@ def main():
             print(f"  [heldout@{step}] val_loss {h_ce:.4f} | val_ppl "
                   f"{log['heldout_ppl']:.3f} (n={h_n})", flush=True)
         # ---- held-out FVE (AR mode, doc-disjoint) ----
-        if heldout_pairs is not None and (
+        if is_main and heldout_pairs is not None and (
             (step + 1) % args.heldout_every == 0 or (step + 1) == args.num_steps
         ):
+            # Full-FT AR sits at ~177GB steady-state (fp32 params + fp32 grads +
+            # 8bit-Adam); the eval forward OOMs on the ~few-GB margin. Grads are
+            # only nulled at the next step's optim.zero_grad(), so free them (and
+            # the allocator cache) here to give the eval decisive headroom.
+            optim.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
             model.eval()
             with amp():
                 h_mse, h_n = heldout_fve_mse(
@@ -1046,8 +1312,8 @@ def main():
         if not args.no_wandb:
             wandb.log(log, step=step)
 
-        # ---- save ----
-        if (step + 1) % args.save_every == 0 or (step + 1) == args.num_steps:
+        # ---- save (rank 0 only; LoRA + value_head are identical across ranks) ----
+        if is_main and ((step + 1) % args.save_every == 0 or (step + 1) == args.num_steps):
             out_dir = save_dir / f"iter_{step + 1:07d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             print(f"[save] → {out_dir}", flush=True)
@@ -1062,16 +1328,17 @@ def main():
                       for n, p in model.named_parameters()
                       if ("lora_" in n) or n.startswith("value_head")}
                 save_file(sd, str(out_dir / "ar_lora_value_head.safetensors"))
-                from nla.utils.arch_adapters import resolve_attn_target_modules
+                from nla.utils.arch_adapters import resolve_lora_target_modules
                 (out_dir / "ar_meta.json").write_text(json.dumps({
                     "ar_num_layers": args.ar_num_layers,
                     "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
+                    "lora_scope": args.lora_scope,
                     "quant": args.quant,
-                    # Resolve from the arch, not a hardcoded llama-family list:
-                    # qwen3_5 adapts deltanet in_proj_qkv/in_proj_z/out_proj too,
-                    # and merge_ar rebuilds the LoRA from THIS list — a wrong list
-                    # makes load_state_dict see the deltanet adapters as unexpected.
-                    "target_modules": resolve_attn_target_modules(model.backbone.config),
+                    # Resolve from the arch + scope, not a hardcoded list: qwen3_5
+                    # adapts deltanet in_proj_qkv/in_proj_z/out_proj too, and scope=all
+                    # adds MLP; merge_ar rebuilds the LoRA from THIS list — a wrong list
+                    # makes load_state_dict see the adapters as unexpected.
+                    "target_modules": resolve_lora_target_modules(model.backbone.config, args.lora_scope),
                     # Whether the backbone's final RMSNorm was stripped at init.
                     # RL must rebuild the critic the same way or predictions
                     # silently shift (pre-2026-06 ckpts: norm kept = False).
@@ -1092,6 +1359,9 @@ def main():
     print("done.", flush=True)
     if not args.no_wandb:
         wandb.finish()
+    if _ddp:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
