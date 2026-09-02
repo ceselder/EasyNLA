@@ -1,6 +1,9 @@
 Qwen/Qwen3-8B:
   char: ㈎
   token_id: 149705
+Qwen/Qwen3.6-27B:
+  char: ㈜
+  token_id: 158983
 meta-llama/Llama-3.3-70B-Instruct:
   char: ㎡
   token_id: 105565
