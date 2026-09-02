@@ -21,3 +21,10 @@ All commands run from the repo root; every stage is `modal run --detach`.
       --eval-parquet /vol/data/qwen3_8b/av_sft_eval.parquet --eval-n-prompts 128 --eval-every 10 \
       --evals base_fve halluc text_judges --halluc-every 50 --text-judges-every 50 \
       --num-steps 150 --save-every 50 --extraction-layer 24 --ipc-weight-sync --seed 0"
+
+## Launched 2026-09-02 (actual commands)
+    modal run --detach scripts/modal_nla_exp.py --task sft --mode av --tag av_sft --nproc 4 --bs 16 \
+        --extra "--use-lora --lora-r 128 --lora-alpha 16 --quant none --lr 1e-4 --min-lr 1e-5 --sample-every 2000 --n-samples 4"
+    modal run --detach scripts/modal_nla_exp.py --task sft --mode ar --tag ar_sft --nproc 4 --bs 16 \
+        --extra "--lr 2e-5 --min-lr 2e-6 --full-ft-dtype fp32"
+    # data: /vol/data/qwen3_8b/{av,ar}_sft_{train,test}.parquet (735,359 / 7,293 rows), av_sft_eval.parquet (1,024)
