@@ -212,6 +212,14 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
     model_type = getattr(resolve_text_config(config), "model_type", "")
     if model_type in _LLAMA_FAMILY_MODEL_TYPES:
         return ["q_proj", "k_proj", "v_proj", "o_proj"]
+    if model_type in ("qwen3_5", "qwen3_5_text"):
+        # Hybrid: full attention every 4th layer (q/k/v/o_proj), gated-deltanet
+        # linear attention elsewhere. Adapt the token-mixing projections of BOTH
+        # block types; skip in_proj_a/in_proj_b (delta-rule decay dynamics,
+        # tiny out-dims where r=128 LoRA is degenerate). Use scope="all" (via
+        # resolve_lora_target_modules) to additionally adapt those + the MLP.
+        return ["q_proj", "k_proj", "v_proj", "o_proj",
+                "in_proj_qkv", "in_proj_z", "out_proj"]
     if model_type == "gpt2":
         return ["c_attn", "c_proj"]
     if model_type in ("falcon", "gpt_neox"):
@@ -239,8 +247,12 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
 
 
 
-def resolve_lora_target_modules(config: Any) -> list[str] | str:
+def resolve_lora_target_modules(config: Any, scope: str = "all") -> list[str] | str:
     """ALL-linear LoRA targets (attention + dense MLP), resolved by model_type.
+
+    scope="all" (default) = every linear in the decoder layer (this function's
+    regex/list). scope="attn" = token-mixing projections only
+    (resolve_attn_target_modules) — kept for older attn-only checkpoints.
 
     Returns either a suffix list or a fullmatch-regex string — peft.LoraConfig
     accepts both. The llama family gets a REGEX, not suffixes, deliberately:
@@ -251,6 +263,9 @@ def resolve_lora_target_modules(config: Any) -> list[str] | str:
     alone. Archs where some layers lack a listed module are fine — a pattern
     that matches nothing on a layer simply skips it.
     """
+    if scope == "attn":
+        return resolve_attn_target_modules(config)
+    assert scope == "all", f"lora scope must be 'attn' or 'all', got {scope!r}"
     model_type = getattr(resolve_text_config(config), "model_type", "")
     if model_type in _LLAMA_FAMILY_MODEL_TYPES:
         return (r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"

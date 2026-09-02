@@ -1,0 +1,57 @@
+# NLA RL for Qwen3.6-27B on 6xB200 — nanoNLA/EasyNLA tuned defaults
+# (configs/rl_vllm.yaml) with the minimum arch/memory-forced deviations:
+#   batch_prompts 256 -> 252  (must divide by 6 DP ranks)
+#   ar_lora on             (full-FT critic grads+Adam ~ +66GB: doesn't fit
+#                            next to the 54GB actor + vLLM engine on 183GB)
+#   vllm_model/base wrapper + qwen3_5_wrapper name map (vLLM registry has no
+#                            text-only Qwen3_5ForCausalLM)
+evals: [base_fve]
+train_critic: true
+ar_lora: true
+ar_lora_r: 64
+ar_lora_alpha: 16
+
+lr: 1.0e-4
+critic_lr: 8.0e-5
+num_steps: 400
+batch_prompts: 288        # 6×48; bumped from 252 for the 2k-step extension (peak mem set by micro-batch=4, not this)
+group_size: 8
+max_new_tokens: 256
+length_penalty: 0.01
+temperature: 1.0
+
+lora_r: 64             # RL-actor refinement LoRA; 64 (not 128) for memory — the all-module
+                       # verbalizer was already learned at r128 in warm-start and MERGED into
+                       # av_merged_all, so this fresh on-top adapter needs little rank. Halving
+                       # it frees ~3.5GB vs the all-module r128 that OOM'd next to critic+vLLM.
+lora_alpha: 16
+use_rslora: true
+lora_scope: all        # AV/actor adapts attn + MLP + deltanet decay (more expressive verbalizer);
+                       # AR critic stays attn-only (deliberate reconstruction bottleneck).
+                       # MUST match the AV warm-start scope (av_merged_all).
+
+vllm_tp: 1
+vllm_max_len: 1024
+vllm_gpu_mem: 0.40   # 0.35->0.40: NOW worth it — after the chunked-CE freed training memory, rollout is
+                     # ~35% of the step (not 11%), so a bigger KV cache (~7->~14GB) actually speeds it.
+                     # Uses part of the ~16GB freed headroom; ~7GB left for the critic-mb bump below.
+ipc_weight_sync: true
+vllm_name_map: qwen3_5_wrapper
+vllm_attn_backend: FLASH_ATTN   # auto-picked FLASHINFER JIT-compiles (ninja/nvcc) and dies
+# vllm_model set on CLI (absolute snapshot path of the base wrapper ckpt)
+
+# 27B memory fit. micro-batch 2 (down from 4): the [mb, seqlen, 248k-vocab] bf16
+# logits (new+ref) are the dominant training transient — halving them frees ~5GB/GPU
+# (GPU2 was at 1.1GB free with mb4). Forward is compute-bound so wall-clock barely
+# changes (~same FLOPs, more launches). Keeps vllm KV big for fast rollout.
+logp_micro_batch: 8   # 2->8: the chunked-CE logp path (train_rl_vllm.chunked_response_logp) no longer
+                      # materializes the [mb,seq,248k] logits, which is what pinned mb low. grad-ckpt
+                      # kept ON so activations stay cheap -> mb8 fits (~20GB margin) -> big util win.
+critic_micro_batch: 4 # 2->4: critic is ~26% of the step; freed headroom lets it batch bigger too.
+gradient_checkpointing: true
+
+eval_every: 10
+eval_n_prompts: 128
+save_every: 100
+wandb_project: nla-qwen36-27b
+wandb_name: rl_vllm

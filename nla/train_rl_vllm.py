@@ -107,7 +107,7 @@ from nla.utils.vllm_steer import read_reset_steer_count
 from nla.utils.run_config import add_config_arg, apply_config_defaults, save_resolved_config
 
 # Evals selectable via the config `evals:` list. base_fve is the core held-out FVE.
-KNOWN_EVALS = ("base_fve", "text_judges")
+KNOWN_EVALS = ("base_fve", "text_judges", "halluc")
 from nla.config import load_nla_config
 from nla.critic_ema import CriticEMA, NoEMA
 from nla.injection import karvonen_inject_in_residual, marker_well_formed
@@ -117,11 +117,13 @@ from nla.schema import (
     normalize_activation,
     resolve_target_scale,
 )
+from nla.utils.arch_adapters import resolve_decoder_layers
 
 
 
 
-def load_rl_dataset(parquet_path, n_max=None, exclude_doc_pred=None):
+def load_rl_dataset(parquet_path, n_max=None, exclude_doc_pred=None,
+                    include_source=False):
     """Streaming + vectorized load — reads only the columns/rows we need, and keeps
     activations as numpy float32 (zero-copy from arrow), NEVER python floats.
 
@@ -133,11 +135,19 @@ def load_rl_dataset(parquet_path, n_max=None, exclude_doc_pred=None):
     exclude_doc_pred: optional doc_id -> bool; rows whose doc matches are DROPPED
     (the auto-split's held-out val docs — see nla/val_split.py). n_max counts
     kept rows.
+
+    include_source: also load `detokenized_text_truncated` -> row["source"] (the
+    verbatim context the activation was extracted from; its LAST token is the
+    extraction position). Needed by the downstream-MSE reward, which patches the
+    reconstruction into the base at that position and reads the final hidden.
     """
     import numpy as np
     import pyarrow.parquet as pq_inner
     pf = pq_inner.ParquetFile(parquet_path)
-    cols = ["prompt", "activation_vector"] + (["doc_id"] if exclude_doc_pred else [])
+    _src_ok = include_source and "detokenized_text_truncated" in pf.schema_arrow.names
+    cols = (["prompt", "activation_vector"]
+            + (["doc_id"] if exclude_doc_pred else [])
+            + (["detokenized_text_truncated"] if _src_ok else []))
     rows = []
     for rg_idx in range(pf.num_row_groups):
         if n_max is not None and len(rows) >= n_max:
@@ -152,16 +162,24 @@ def load_rl_dataset(parquet_path, n_max=None, exclude_doc_pred=None):
         # .flatten() respects the slice offsets; np.asarray is zero-copy.
         col = rg.column("activation_vector").combine_chunks()
         acts = np.asarray(col.flatten(), dtype=np.float32).reshape(len(prompts), -1)
+        srcs = (rg.column("detokenized_text_truncated").to_pylist()
+                if _src_ok else None)
         if exclude_doc_pred is not None:
             dids = rg.column("doc_id").to_pylist()
             for i, p in enumerate(prompts):
                 if n_max is not None and len(rows) >= n_max:
                     break
                 if not exclude_doc_pred(dids[i]):
-                    rows.append({"prompt": p, "activation": acts[i]})
+                    r = {"prompt": p, "activation": acts[i]}
+                    if srcs is not None:
+                        r["source"] = srcs[i] or ""
+                    rows.append(r)
         else:
             for i, p in enumerate(prompts):
-                rows.append({"prompt": p, "activation": acts[i]})
+                r = {"prompt": p, "activation": acts[i]}
+                if srcs is not None:
+                    r["source"] = srcs[i] or ""
+                rows.append(r)
     return rows
 
 
@@ -377,7 +395,24 @@ def _vllm_load_weights_ipc(model, handle_chunk):
     _torch.cuda.synchronize()
 
 
-def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
+def _wrapper_key_qwen3_5(k: str) -> str:
+    """Text-only actor state_dict name -> multimodal-wrapper checkpoint name.
+
+    vLLM's registry only knows Qwen3_5ForConditionalGeneration, so the engine
+    serves the ORIGINAL wrapper checkpoint whose text weights live under
+    `model.language_model.*` (lm_head stays top-level). The HF actor is the
+    text-only Qwen3_5ForCausalLM (`model.*`). The weight sync must speak the
+    wrapper's names or load_weights silently matches nothing.
+    """
+    if k.startswith("model."):
+        return "model.language_model." + k[len("model."):]
+    return k  # lm_head.weight and friends
+
+
+_VLLM_NAME_MAPS = {"none": None, "qwen3_5_wrapper": _wrapper_key_qwen3_5}
+
+
+def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True, name_map=None):
     """Colocate weight sync: push the LoRA-merged state to vLLM, OUT-OF-PLACE.
 
     Unlike TRL's merge_adapter() -> push -> unmerge_adapter() pattern, this never
@@ -450,6 +485,12 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
         if only_adapted and any("modules_to_save" in k for k in sd):
             print("[sync] modules_to_save present — falling back to full push", flush=True)
             only_adapted = False
+        # Bucket only REFERENCES here (push_k, new_k, base-weight view) — do NOT
+        # materialize the merged tensors yet. The merged copy for an adapted
+        # module is base-weight-sized; building all of them up front (as this did
+        # before) piles ~45GB (scope=all) of transient copies on GPU before the
+        # first push and OOMs the initial sync. We materialize per-layer in the
+        # push loop below and free immediately after apply_model.
         buckets = defaultdict(list)
         for k, v in sd.items():
             if "lora_" in k or "modules_to_save" in k:
@@ -457,6 +498,22 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
             new_k = _clean(k)
             if only_adapted and new_k not in lora_mods:
                 continue   # frozen + already in vLLM from --av-ckpt: skip
+            # Layer params look like "model.layers.<N>.<...>" (Llama family) or
+            # "transformer.h.<N>.<...>" (GPT-2/Falcon). Non-layer params (embed,
+            # norm, lm_head) go to "_other". Arch-aware: with a hardcoded prefix
+            # a GPT-arch model dumps ~16GB into one "_other" chunk and blows
+            # msgspec's 4GB single-encode cap on the CPU-pickle path.
+            # Bucket by layer on the ACTOR name (model.layers.N); push under the
+            # name_map-translated name (e.g. qwen3_5 wrapper: model.* ->
+            # model.language_model.*) so vLLM's loader matches.
+            push_k = name_map(new_k) if name_map is not None else new_k
+            _m_layer = re.match(r"(?:model\.layers|transformer\.h)\.(\d+)\.", new_k)
+            if _m_layer:
+                buckets[f"layer_{int(_m_layer.group(1)):03d}"].append((push_k, new_k, v))
+            else:
+                buckets["_other"].append((push_k, new_k, v))
+
+        def _materialize(new_k, v):
             # ipc: keep on GPU (we ship a CUDA-IPC handle, not the data).
             # else: CPU detach (the apply_model pickle path serialises the data).
             if new_k in lora_mods:
@@ -470,24 +527,21 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
                     t = t.cpu()
             else:
                 t = v.detach() if ipc else v.detach().cpu()
-            # Layer params look like "model.layers.<N>.<...>" (Llama family) or
-            # "transformer.h.<N>.<...>" (GPT-2/Falcon). Non-layer params (embed,
-            # norm, lm_head) go to "_other". Arch-aware: with a hardcoded prefix
-            # a GPT-arch model dumps ~16GB into one "_other" chunk and blows
-            # msgspec's 4GB single-encode cap on the CPU-pickle path.
-            _m_layer = re.match(r"(?:model\.layers|transformer\.h)\.(\d+)\.", new_k)
-            if _m_layer:
-                buckets[f"layer_{int(_m_layer.group(1)):03d}"].append((new_k, t))
-            else:
-                buckets["_other"].append((new_k, t))
-        # Push _other first (small), then each layer in order.
+            return t
+
+        # Push _other first (small), then each layer in order. Materialize each
+        # chunk's merged tensors immediately before its push, then drop them right
+        # after: apply_model is synchronous, so the CUDA-IPC handles are fully
+        # consumed by the workers before it returns and the source tensors are
+        # safe to free. Peak transient = one layer (~0.75GB), not ~45GB.
         import functools as _ft
         if ipc:
             from torch.multiprocessing.reductions import reduce_tensor
         for group_name in ["_other"] + sorted(k for k in buckets if k != "_other"):
-            chunk = buckets[group_name]
-            if not chunk:
+            specs = buckets[group_name]
+            if not specs:
                 continue
+            chunk = [(push_k, _materialize(new_k, v)) for push_k, new_k, v in specs]
             if ipc:
                 # reduce_tensor -> (rebuild_fn, args): a small picklable CUDA-IPC
                 # handle, NOT the data. Source tensors (the merged params) stay alive
@@ -496,6 +550,7 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
                 llm.apply_model(_ft.partial(_vllm_load_weights_ipc, handle_chunk=handles))
             else:
                 llm.apply_model(_ft.partial(_vllm_load_weights_chunk, chunk=chunk))
+            del chunk   # free this layer's merged copies before the next layer
         # Prefix cache keys on token IDs; weights changed, cache is stale.
         try:
             llm.llm_engine.reset_prefix_cache()
@@ -519,6 +574,8 @@ def score_with_critic(
     `score_s` bottleneck — 1 fwd/rollout of the 5.4B critic)."""
     n = len(explanations)
     rewards = [None] * n
+    preds_out = [None] * n   # raw (un-normalized) critic reconstruction per row, for
+                             # the downstream-MSE reward's patch (None where no reward)
     pad_id = tokenizer.eos_token_id
     ids_list = [None] * n
     for i, expl in enumerate(explanations):
@@ -546,7 +603,450 @@ def score_with_critic(
         for r, i in enumerate(chunk):
             m = mse[r].item()
             rewards[i] = (-m) if math.isfinite(m) else None
+            if rewards[i] is not None:
+                preds_out[i] = preds[r].detach().float().cpu()
+    return rewards, preds_out
+
+
+def downstream_reward(actor, tokenizer, vectors_ref, sources, preds, golds,
+                      extraction_layer, mse_scale_f, device,
+                      ctx_tokens=512, batch_size=8):
+    """Reward = -MSE(norm(h_pred), norm(h_ref)) in the model's FINAL pre-lm_head
+    hidden space, where h_* is that hidden at the extraction position when a vector
+    is norm-matched and patched into the output of block `extraction_layer`, run
+    through the base with ALL adapters disabled ("no lora applied").
+
+      h_ref  : patch the GOLD activation (the true residual) — computed ONCE per
+               unique source (shared across a prompt's group members).
+      h_pred : patch the reconstruction, scaled to ||gold|| (norm-matched).
+
+    Because ref and members share the SAME (adapter-disabled) context and differ
+    ONLY in the patched vector at one position, the context cancels and the reward
+    isolates the reconstruction's downstream causal footprint. The source context
+    is tail-truncated to the last `ctx_tokens` tokens (the extraction position is
+    the last token; the truncation is identical for ref and members, so it cancels)
+    to bound cost.
+
+    preds[i]/golds[i] = raw reconstruction / gold vector (or None); sources[i] =
+    verbatim context for rollout i. Returns rewards list (None where preds[i] is
+    None or source empty). Actor-only: never touches the critic.
+    """
+    n = len(preds)
+    rewards = [None] * n
+    base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
+    layer = resolve_decoder_layers(base)[extraction_layer]
+    pad_id = tokenizer.eos_token_id
+
+    patch = {"pos": None, "vec": None}   # per-forward: [B] index, [B, d] vector
+
+    def patch_hook(_m, _i, output):
+        if patch["vec"] is None:
+            return output
+        h = output[0] if isinstance(output, tuple) else output
+        b = torch.arange(h.shape[0], device=h.device)
+        h[b, patch["pos"].to(h.device)] = patch["vec"].to(device=h.device, dtype=h.dtype)
+        return output
+
+    # Tokenize + cache each valid row's context (tail-truncated to ctx_tokens).
+    ids_list = [None] * n
+    for i in range(n):
+        if preds[i] is None or not sources[i]:
+            continue
+        ids = tokenizer.encode(sources[i], add_special_tokens=True)
+        if len(ids) == 0:
+            continue
+        ids_list[i] = ids[-ctx_tokens:]
+    valid = [i for i in range(n) if ids_list[i] is not None]
+
+    def _run(chunk, vecs):
+        """Forward the chunk's contexts with `vecs[r]` patched at each row's last
+        real token; return the final pre-lm_head hidden there, [len(chunk), d]."""
+        maxlen = max(len(ids_list[i]) for i in chunk)
+        bx = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((len(chunk), maxlen), dtype=torch.long, device=device)
+        pos = torch.zeros(len(chunk), dtype=torch.long, device=device)
+        for r, i in enumerate(chunk):
+            L = len(ids_list[i])
+            bx[r, :L] = torch.tensor(ids_list[i], dtype=torch.long, device=device)
+            attn[r, :L] = 1
+            pos[r] = L - 1
+        patch["pos"] = pos
+        patch["vec"] = torch.stack([vecs[i].to(device).float() for i in chunk], dim=0)
+        with torch.no_grad():
+            hs = base.model(input_ids=bx, attention_mask=attn,
+                            use_cache=False).last_hidden_state    # [B, L, d]
+        patch["vec"] = None
+        return hs[torch.arange(len(chunk), device=device), pos]   # [B, d]
+
+    # norm-matched patch vectors: gold stays as-is (it IS the true residual);
+    # pred is scaled to ||gold|| per row.
+    gold_vec = {}
+    pred_vec = {}
+    for i in valid:
+        g = golds[i].to(device).float()
+        p = preds[i].to(device).float()
+        gn = g.norm().clamp_min(1e-12)
+        pn = p.norm().clamp_min(1e-12)
+        gold_vec[i] = g
+        pred_vec[i] = p * (gn / pn)
+
+    _saved_vref = vectors_ref[0]
+    vectors_ref[0] = None   # disable the Karvonen L1 injection hook for these forwards
+    handle = layer.register_forward_hook(patch_hook)
+    try:
+        with actor.disable_adapter():
+            # One-time self-check (first call per process): patching the SAME vector
+            # twice must give MSE~0 (deterministic + hook/readout wired right), and a
+            # random vector must give a much larger MSE (the patch actually moves the
+            # downstream state). Cheap sanity that the reward mechanism is correct.
+            if valid and not getattr(downstream_reward, "_diag_done", False):
+                downstream_reward._diag_done = True
+                _c = valid[:min(4, len(valid))]
+                _h1 = normalize_activation(_run(_c, gold_vec), mse_scale_f)
+                _h2 = normalize_activation(_run(_c, gold_vec), mse_scale_f)
+                _rand = {i: torch.randn_like(gold_vec[i]) * gold_vec[i].norm() for i in _c}
+                _hr = normalize_activation(_run(_c, _rand), mse_scale_f)
+                _same = ((_h1 - _h2) ** 2).mean().item()
+                _diff = ((_h1 - _hr) ** 2).mean().item()
+                print(f"  [downstream_reward selftest] same-vector MSE={_same:.2e} "
+                      f"(want ~0) | random-vector MSE={_diff:.3f} (want >>0)", flush=True)
+            for cs in range(0, len(valid), batch_size):
+                chunk = valid[cs:cs + batch_size]
+                h_ref = _run(chunk, gold_vec)
+                h_prd = _run(chunk, pred_vec)
+                rn = normalize_activation(h_ref, mse_scale_f)
+                pn_ = normalize_activation(h_prd, mse_scale_f)
+                mse = ((pn_ - rn) ** 2).mean(dim=1)                # [B] per-row
+                for r, i in enumerate(chunk):
+                    m = mse[r].item()
+                    rewards[i] = (-m) if math.isfinite(m) else None
+    finally:
+        handle.remove()
+        patch["vec"] = None
+        vectors_ref[0] = _saved_vref
+        # release the reward forward's reserved-but-unallocated cache so the GRPO
+        # update below finds a contiguous block (else fragmentation OOMs it).
+        torch.cuda.empty_cache()
     return rewards
+
+
+def downstream_ladder_reward(actor, tokenizer, vectors_ref, sources, preds, golds,
+                             extraction_layer, mse_scale_f, device,
+                             ratio=0.5, ctx_tokens=512, batch_size=8):
+    """Reward = -sum_k w_k * MSE(norm(h_{L+k}^pred), norm(h_{L+k}^gold)), the
+    GEOMETRICALLY-DISCOUNTED sum of per-layer reconstruction MSE at the extraction
+    position, over blocks L=extraction_layer .. final. h_{L+k} = that position's
+    residual after block L+k when the (norm-matched) vector is patched into block L's
+    output (adapters disabled; causal chain preserved — later blocks recompute).
+
+    Weights w_k = (1-ratio) * ratio^k (renormalized over the available layers): with
+    ratio=0.5 the current layer (k=0) gets 1/2 and ALL future layers combined get the
+    other 1/2 (1/2, 1/4, 1/8, ...). NOTE the k=0 term is exactly the classic vector
+    reconstruction MSE (block-L output at the patch position == the patched vector),
+    so this reward SUBSUMES vector-MSE at weight (1-ratio) and adds discounted
+    downstream. Each layer's hidden is unit-normalized before MSE (residual norm grows
+    with depth). Actor-only; critic still trains on vector-MSE."""
+    n = len(preds)
+    rewards = [None] * n
+    base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
+    layers = resolve_decoder_layers(base)
+    read_layers = list(range(extraction_layer, len(layers)))     # blocks L .. final
+    K = len(read_layers)
+    w = torch.tensor([(1.0 - ratio) * ratio ** k for k in range(K)],
+                     dtype=torch.float32, device=device)
+    w = w / w.sum()                                              # renormalize over available layers
+    pad_id = tokenizer.eos_token_id
+
+    patch = {"pos": None, "vec": None}
+    cap = {}   # block_idx -> [B, d] readout at the patch position (post-block, post-patch)
+
+    def make_hook(li):
+        def hook(_m, _i, output):
+            h = output[0] if isinstance(output, tuple) else output
+            b = torch.arange(h.shape[0], device=h.device)
+            pos = patch["pos"].to(h.device)
+            if li == extraction_layer and patch["vec"] is not None:
+                h[b, pos] = patch["vec"].to(device=h.device, dtype=h.dtype)
+            cap[li] = h[b, pos].detach().float()                 # readout AFTER any patch
+            return output
+        return hook
+
+    ids_list = [None] * n
+    for i in range(n):
+        if preds[i] is None or not sources[i]:
+            continue
+        ids = tokenizer.encode(sources[i], add_special_tokens=True)
+        if ids:
+            ids_list[i] = ids[-ctx_tokens:]
+    valid = [i for i in range(n) if ids_list[i] is not None]
+    if not valid:
+        return rewards
+
+    gold_vec, pred_vec = {}, {}
+    for i in valid:
+        g = golds[i].to(device).float(); p = preds[i].to(device).float()
+        gold_vec[i] = g
+        pred_vec[i] = p * (g.norm().clamp_min(1e-12) / p.norm().clamp_min(1e-12))
+
+    def _run(chunk, vecs):
+        maxlen = max(len(ids_list[i]) for i in chunk)
+        bx = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((len(chunk), maxlen), dtype=torch.long, device=device)
+        pos = torch.zeros(len(chunk), dtype=torch.long, device=device)
+        for r, i in enumerate(chunk):
+            L = len(ids_list[i]); bx[r, :L] = torch.tensor(ids_list[i], device=device)
+            attn[r, :L] = 1; pos[r] = L - 1
+        patch["pos"] = pos
+        patch["vec"] = torch.stack([vecs[i].to(device).float() for i in chunk])
+        cap.clear()
+        with torch.no_grad():
+            base.model(input_ids=bx, attention_mask=attn, use_cache=False)
+        patch["vec"] = None
+        return {li: cap[li].clone() for li in read_layers}       # each [B, d]
+
+    handles = [layers[li].register_forward_hook(make_hook(li)) for li in read_layers]
+    _saved = vectors_ref[0]; vectors_ref[0] = None
+    try:
+        with actor.disable_adapter():
+            for cs in range(0, len(valid), batch_size):
+                chunk = valid[cs:cs + batch_size]
+                ref = _run(chunk, gold_vec)
+                prd = _run(chunk, pred_vec)
+                acc = torch.zeros(len(chunk), device=device)
+                for k, li in enumerate(read_layers):
+                    rn = normalize_activation(ref[li], mse_scale_f)
+                    pn = normalize_activation(prd[li], mse_scale_f)
+                    acc = acc + w[k] * ((pn - rn) ** 2).mean(dim=1)   # [B]
+                for r, i in enumerate(chunk):
+                    m = acc[r].item()
+                    rewards[i] = (-m) if math.isfinite(m) else None
+    finally:
+        for h in handles:
+            h.remove()
+        patch["vec"] = None
+        vectors_ref[0] = _saved
+        torch.cuda.empty_cache()
+    return rewards
+
+
+def downstream_kl_reward(actor, tokenizer, vectors_ref, sources, preds, golds,
+                         prompt_group, extraction_layer, device,
+                         n_future=16, top_k=128, ctx_tokens=512, batch_size=8, decay=0.9):
+    """Dan Mossing's next-N-token-KL reward (actor-only).
+
+    reward[i] = -mean_{j<n_future} KL_topk(clean_j || patched_j), where the model's
+    next-token distributions are read at the extraction position and the following
+    n_future-1 positions, with a vector patched into block `extraction_layer`'s
+    OUTPUT (causal chain preserved — 43+ recompute):
+      clean_j   : GOLD activation patched (the reference behaviour)
+      patched_j : reconstruction (norm-matched to ||gold||) patched
+    The teacher-forced continuation is the clean (gold-patched) model's own GREEDY
+    generation, so both models are scored on the SAME token path. KL is restricted
+    to the clean dist's top_k support (renormalized) — this kills the 1e-6-tail
+    blow-up that makes full-vocab KL a bad reward for a fuzzy reconstruction.
+    Continuation is generated ONCE per prompt group (members share source+gold).
+    All forwards through the base with adapters disabled. Actor-only; critic still
+    trains on vector-MSE."""
+    import torch.nn.functional as _F
+    n = len(preds)
+    rewards = [None] * n
+    base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
+    layer = resolve_decoder_layers(base)[extraction_layer]
+    W = base.get_output_embeddings().weight          # lm_head [V, d]
+    pad_id = tokenizer.eos_token_id
+
+    patch = {"pos": None, "vec": None}
+
+    def patch_hook(_m, _i, output):
+        if patch["vec"] is None:
+            return output
+        h = output[0] if isinstance(output, tuple) else output
+        b = torch.arange(h.shape[0], device=h.device)
+        h[b, patch["pos"].to(h.device)] = patch["vec"].to(device=h.device, dtype=h.dtype)
+        return output
+
+    # per-rollout context (tail-truncated) + norm-matched patch vectors
+    ids_list = [None] * n
+    gvec, pvec = {}, {}
+    for i in range(n):
+        if preds[i] is None or not sources[i]:
+            continue
+        ids = tokenizer.encode(sources[i], add_special_tokens=True)
+        if not ids:
+            continue
+        ids_list[i] = ids[-ctx_tokens:]
+        g = golds[i].to(device).float(); p = preds[i].to(device).float()
+        gvec[i] = g
+        pvec[i] = p * (g.norm().clamp_min(1e-12) / p.norm().clamp_min(1e-12))
+    valid = [i for i in range(n) if ids_list[i] is not None]
+    if not valid:
+        return rewards
+
+    # one representative rollout per prompt group (shared source+gold => same clean cont.)
+    reps = {}
+    for i in valid:
+        reps.setdefault(int(prompt_group[i]), i)
+    rep_idx = list(reps.values())
+
+    cont_tokens = {}   # rep -> [n_future] greedy continuation token ids
+    clean_topk = {}    # rep -> ([n_future, k] ids, [n_future, k] logp)
+
+    handle = layer.register_forward_hook(patch_hook)
+    _saved = vectors_ref[0]; vectors_ref[0] = None
+    try:
+        with actor.disable_adapter():
+            # ---- clean (gold-patched) greedy continuation + clean top-k dists ----
+            for cs in range(0, len(rep_idx), batch_size):
+                chunk = rep_idx[cs:cs + batch_size]
+                pos0 = [len(ids_list[i]) - 1 for i in chunk]
+                seqs = [list(ids_list[i]) for i in chunk]
+                tk_i = [[] for _ in chunk]; tk_lp = [[] for _ in chunk]; toks = [[] for _ in chunk]
+                for _ in range(n_future):
+                    maxlen = max(len(s) for s in seqs)
+                    bx = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long, device=device)
+                    attn = torch.zeros((len(chunk), maxlen), dtype=torch.long, device=device)
+                    last = torch.zeros(len(chunk), dtype=torch.long, device=device)
+                    for r, s in enumerate(seqs):
+                        bx[r, :len(s)] = torch.tensor(s, device=device); attn[r, :len(s)] = 1
+                        last[r] = len(s) - 1
+                    patch["pos"] = torch.tensor(pos0, device=device)
+                    patch["vec"] = torch.stack([gvec[i] for i in chunk])
+                    with torch.no_grad():
+                        hs = base.model(input_ids=bx, attention_mask=attn,
+                                        use_cache=False).last_hidden_state
+                    patch["vec"] = None
+                    hl = hs[torch.arange(len(chunk), device=device), last]     # [B,d]
+                    logits = hl.float() @ W.float().t()                        # [B,V]
+                    lp = _F.log_softmax(logits, dim=-1)
+                    tv, ti = lp.topk(top_k, dim=-1)
+                    nxt = logits.argmax(dim=-1)
+                    for r in range(len(chunk)):
+                        tk_i[r].append(ti[r]); tk_lp[r].append(tv[r])
+                        t = int(nxt[r].item()); toks[r].append(t); seqs[r].append(t)
+                for r, i in enumerate(chunk):
+                    cont_tokens[i] = toks[r]
+                    clean_topk[i] = (torch.stack(tk_i[r]), torch.stack(tk_lp[r]))  # [N,k]
+
+            # ---- patched eval: teacher-force [ctx + group continuation], KL per rollout ----
+            ar = torch.arange(n_future, device=device)
+            wj = (decay ** ar.float()); wj = wj / wj.sum()   # geometric position discount (normalized)
+            for cs in range(0, len(valid), batch_size):
+                chunk = valid[cs:cs + batch_size]
+                rows = [ids_list[i] + cont_tokens[reps[int(prompt_group[i])]] for i in chunk]
+                maxlen = max(len(r) for r in rows)
+                bx = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long, device=device)
+                attn = torch.zeros((len(chunk), maxlen), dtype=torch.long, device=device)
+                pfirst = torch.zeros(len(chunk), dtype=torch.long, device=device)
+                for r, i in enumerate(chunk):
+                    s = rows[r]; bx[r, :len(s)] = torch.tensor(s, device=device); attn[r, :len(s)] = 1
+                    pfirst[r] = len(ids_list[i]) - 1
+                patch["pos"] = pfirst
+                patch["vec"] = torch.stack([pvec[i] for i in chunk])
+                with torch.no_grad():
+                    hs = base.model(input_ids=bx, attention_mask=attn,
+                                    use_cache=False).last_hidden_state
+                patch["vec"] = None
+                for r, i in enumerate(chunk):
+                    tki, tlp = clean_topk[reps[int(prompt_group[i])]]          # [N,k]
+                    hcol = hs[r, pfirst[r] + ar].float()                       # [N,d]
+                    logits = hcol @ W.float().t()                             # [N,V] (small: N rows)
+                    lse = torch.logsumexp(logits, dim=-1, keepdim=True)        # [N,1]
+                    patched_lp = logits.gather(-1, tki) - lse                  # [N,k] patched logp at clean ids
+                    clean_p = torch.softmax(tlp, dim=-1)                       # renormalize clean over topk
+                    clean_lp = torch.log_softmax(tlp, dim=-1)
+                    kl = (clean_p * (clean_lp - patched_lp)).sum(-1)           # [N] forward KL
+                    m = (kl * wj).sum().item()                                 # gamma-discounted over positions
+                    rewards[i] = (-m) if math.isfinite(m) else None
+    finally:
+        handle.remove()
+        patch["vec"] = None
+        vectors_ref[0] = _saved
+        torch.cuda.empty_cache()   # defragment before the GRPO update (see downstream_reward)
+    # gold-side cache for the coherent AR-KL critic loss (reuse, don't regenerate):
+    # prompt_group -> (ctx_ids, continuation tokens, clean top-k ids [N,k], clean top-k logp [N,k]).
+    gold_cache = {pg: (ids_list[i], cont_tokens[i], clean_topk[i][0], clean_topk[i][1])
+                  for pg, i in reps.items() if i in cont_tokens}
+    return rewards, gold_cache
+
+
+def downstream_kl_critic_loss(critic, actor, tokenizer, vectors_ref, chunk_expl_ids,
+                              chunk_pg, gold_cache, extraction_layer, mse_scale_f,
+                              device, n_future=16, top_k=128, decay=0.9, ctx_tokens=256,
+                              scale=1.0):
+    """DIFFERENTIABLE downstream-KL loss for the AR critic (coherent with the KL reward).
+
+    Per rollout: reconstruct v_hat from its explanation (critic, WITH grad), patch v_hat
+    into the frozen base at the extraction position of that rollout's source context,
+    teacher-force the cached clean continuation, compute the gamma-discounted top-k
+    forward-KL(clean || patched) over the N future positions, and BACKWARD it immediately
+    (× scale) so each rollout's graph is freed before the next — bounds memory to one
+    rollout at a time (no grad-checkpointing, which would break the stateful patch hook).
+    Grad flows v_hat -> patch -> base(L->final) -> logits -> KL -> critic. Returns
+    (summed_loss_value, n_used) for logging; the backward is already done."""
+    base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
+    layer = resolve_decoder_layers(base)[extraction_layer]
+    W = base.get_output_embeddings().weight
+    ar = torch.arange(n_future, device=device)
+    wj = (decay ** ar.float()); wj = wj / wj.sum()
+
+    use = [r for r in range(len(chunk_expl_ids)) if int(chunk_pg[r]) in gold_cache]
+    if not use:
+        return 0.0, 0
+
+    patch = {"pos": None, "vec": None}
+    def patch_hook(_m, _i, output):
+        if patch["vec"] is None:
+            return output
+        h = output[0] if isinstance(output, tuple) else output
+        h = h.clone()
+        b = torch.arange(h.shape[0], device=h.device)
+        h[b, patch["pos"].to(h.device)] = patch["vec"].to(device=h.device, dtype=h.dtype)
+        return (h, *output[1:]) if isinstance(output, tuple) else h
+
+    handle = layer.register_forward_hook(patch_hook)
+    _saved = vectors_ref[0]; vectors_ref[0] = None
+    # grad-checkpointing (on globally via config) recomputes the layer forward in
+    # backward, where the stateful patch hook has already cleared its vec -> the
+    # recompute diverges (CheckpointError). Per-rollout backward bounds memory anyway,
+    # so disable checkpointing for these forwards and restore after (the actor GRPO
+    # update already ran earlier this step, so nothing else needs it right now).
+    _gc_was = bool(getattr(base, "is_gradient_checkpointing", False))
+    if _gc_was:
+        base.gradient_checkpointing_disable()
+    loss_val = 0.0; n_used = 0
+    try:
+        with actor.disable_adapter():
+            for r in use:
+                ctx, cont, tk_ids, tk_lp = gold_cache[int(chunk_pg[r])]
+                ctx = ctx[-ctx_tokens:]
+                ids = chunk_expl_ids[r]
+                cb = ids.unsqueeze(0).to(device)
+                vhat = critic_predict(critic, cb, torch.ones_like(cb), mse_scale_f)  # [1,d] grad
+                seq = ctx + cont
+                bx = torch.tensor([seq], dtype=torch.long, device=device)
+                pos = len(ctx) - 1
+                patch["pos"] = torch.tensor([pos], device=device)
+                patch["vec"] = vhat                                        # [1,d] (grad)
+                hs = base.model(input_ids=bx, attention_mask=torch.ones_like(bx),
+                                use_cache=False).last_hidden_state[0]      # [seq,d] grad
+                patch["vec"] = None
+                hcol = hs[pos + ar].float()                                # [N,d]
+                logits = hcol @ W.float().t()                              # [N,V]
+                lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+                patched_lp = logits.gather(-1, tk_ids) - lse               # [N,k]
+                clean_p = torch.softmax(tk_lp, dim=-1)
+                clean_lp = torch.log_softmax(tk_lp, dim=-1)
+                klr = ((clean_p * (clean_lp - patched_lp)).sum(-1) * wj).sum()  # scalar
+                if torch.isfinite(klr):
+                    (klr * scale).backward()                               # frees this rollout's graph
+                    loss_val += klr.item(); n_used += 1
+    finally:
+        handle.remove()
+        patch["vec"] = None
+        vectors_ref[0] = _saved
+        if _gc_was:
+            base.gradient_checkpointing_enable()
+    return loss_val, n_used
 
 
 def _reference_logits(actor, batch_ids, attn):
@@ -566,6 +1066,59 @@ def _reference_logits(actor, batch_ids, attn):
             actor.set_adapter("default")
     with actor.disable_adapter():
         return actor(input_ids=batch_ids, attention_mask=attn).logits
+
+
+def _reference_hidden(actor, batch_ids, attn):
+    """Last hidden state (post-final-norm) under the frozen KL-reference policy —
+    the chunked-CE mirror of _reference_logits. Runs the transformer only (NO
+    lm_head), so the caller applies lm_head chunked over response positions and
+    never materializes [B, L, vocab]. Caller wraps in torch.no_grad()."""
+    base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
+    if "reference" in getattr(actor, "peft_config", {}):
+        actor.set_adapter("reference")
+        try:
+            return base.model(input_ids=batch_ids, attention_mask=attn).last_hidden_state
+        finally:
+            actor.set_adapter("default")
+    with actor.disable_adapter():
+        return base.model(input_ids=batch_ids, attention_mask=attn).last_hidden_state
+
+
+def chunked_response_logp(hidden, lm_head_weight, target_ids, chunk_size=256):
+    """Memory-efficient per-token logp of target_ids, computed in chunks over the
+    response-position dim so the full [n_resp, vocab] logits tensor is NEVER
+    materialized (only [chunk_size, vocab] at a time, recomputed in backward via
+    checkpoint). Bit-identical to F.log_softmax(hidden@Wᵀ).gather() — values AND
+    gradient (validated on synthetic tensors, 0.0 max diff bf16+fp32).
+
+    hidden [n_resp, d] (bf16, grad); lm_head_weight [V, d] (frozen); target_ids [n_resp].
+    Returns (logp [n_resp], lse [n_resp], entropy_mean scalar-detached)."""
+    import torch.utils.checkpoint as _ckpt
+
+    def _chunk_fn(h_chunk, w, tgt_chunk):
+        logits = h_chunk.float() @ w.float().t()                              # [c, V] fp32
+        lse_c = torch.logsumexp(logits, dim=-1)                               # [c]
+        lp_c = logits.gather(-1, tgt_chunk.unsqueeze(-1)).squeeze(-1) - lse_c # [c]
+        with torch.no_grad():
+            ent_c = lse_c - (torch.softmax(logits, dim=-1) * logits).sum(-1)  # [c]
+        return lp_c, lse_c, ent_c
+
+    n_resp = hidden.shape[0]
+    logp_parts, lse_parts, ent_parts = [], [], []
+    for s in range(0, n_resp, chunk_size):
+        e = min(s + chunk_size, n_resp)
+        if hidden.requires_grad or lm_head_weight.requires_grad:
+            lp_c, lse_c, ent_c = _ckpt.checkpoint(
+                _chunk_fn, hidden[s:e], lm_head_weight, target_ids[s:e],
+                use_reentrant=False)
+        else:
+            with torch.no_grad():
+                lp_c, lse_c, ent_c = _chunk_fn(hidden[s:e], lm_head_weight, target_ids[s:e])
+        logp_parts.append(lp_c); lse_parts.append(lse_c); ent_parts.append(ent_c)
+    logp = torch.cat(logp_parts, dim=0)
+    lse = torch.cat(lse_parts, dim=0)
+    entropy_mean = torch.cat(ent_parts, dim=0).mean().detach()
+    return logp, lse, entropy_mean
 
 
 def truncated_dist_kl(resp_logits, lse, ref_resp_logits, ref_lse, k=64):
@@ -788,14 +1341,21 @@ def grpo_update_microbatched(
         # Jacobian (I + v_hat h_hat^T from the norm-match) — a silent gradient
         # error on exactly the marker pathway (verified vs no-checkpoint grads).
         vectors_ref[0] = v_batch
-        new_logits = actor(input_ids=batch_ids, attention_mask=attn).logits   # [B,L,V] bf16
+        # CHUNKED-CE path: run the transformer ONLY (last_hidden_state, [B,L,d]),
+        # NOT .logits — so the [B,L,248k] vocab tensor is never materialized. The
+        # lm_head is applied chunked over just the response positions inside
+        # chunked_response_logp (peak ~[chunk,V], recomputed in backward). Bit-
+        # identical to the old .logits->log_softmax->gather path (values + grad).
+        # k3-only: 'dist' needs the full logits for its top-k, so it's rejected below.
+        _base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
+        lm_w = _base.lm_head.weight                                            # [V, d], frozen
+        new_hidden = _base.model(input_ids=batch_ids, attention_mask=attn).last_hidden_state  # [B,L,d]
         with torch.no_grad():
-            ref_logits = _reference_logits(actor, batch_ids, attn)            # [B,L,V] bf16
-        # SELECTIVE log-prob: materialize fp32 log-probs ONLY at the response positions
-        # (per row), never a full [B,L,V] fp32 log_softmax over all positions. Identities:
-        #   logp(tok) = logit[tok] - logsumexp(logits);  entropy H = logsumexp - E_p[logit].
-        # Bit-for-bit the same as the old F.log_softmax(...).gather(...), but the fp32 tensor
-        # is [n_resp, V] (response tokens only) instead of [B, L, V] -> big memory/bandwidth cut.
+            ref_hidden = _reference_hidden(actor, batch_ids, attn)             # [B,L,d]
+        if kl_estimator == "dist":
+            raise NotImplementedError(
+                "kl_estimator='dist' needs full-vocab logits (truncated_dist_kl); the "
+                "chunked-CE path only supports 'k3'. Rerun with --kl-estimator k3.")
         # --- per-sample GRPO loss for this chunk ---
         chunk_losses = []
         for row, i in enumerate(idxs):
@@ -805,25 +1365,15 @@ def grpo_update_microbatched(
                 continue
             target_ids = batch_ids[row, p_len:L]
             pred_idx = torch.arange(p_len - 1, L - 1, device=device)
-            # policy: logp at response tokens (with grad), + entropy (no grad, logging)
-            resp_logits = new_logits[row].index_select(0, pred_idx).float()   # [n_resp, V] fp32, response only
-            lse = torch.logsumexp(resp_logits, dim=-1)                        # [n_resp]
-            new_lp = resp_logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1) - lse
+            # policy: chunked logp at response tokens (grad -> hidden -> LoRA) + entropy (no grad)
+            resp_hidden = new_hidden[row].index_select(0, pred_idx)            # [n_resp, d]
+            new_lp, lse, ent_mean = chunked_response_logp(resp_hidden, lm_w, target_ids)
+            sample_entropy_log.append(float(ent_mean))
+            # reference: chunked logp at response tokens (frozen SFT, detached, no grad)
             with torch.no_grad():
-                p_resp = (resp_logits - lse.unsqueeze(-1)).exp()             # softmax over response tokens
-                sample_entropy_log.append(float((lse - (p_resp * resp_logits).sum(-1)).mean()))
-                del p_resp
-            # reference: logp at response tokens (frozen SFT, detached)
-            ref_resp_logits = ref_logits[row].index_select(0, pred_idx).float()
-            ref_lse = torch.logsumexp(ref_resp_logits, dim=-1)
-            ref_lp = (ref_resp_logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1) - ref_lse).detach()
-            kl_tok = None
-            if kl_estimator == "dist":
-                # Bounded distributional KL instead of the heavy-tailed single-
-                # sample k3 (the occasional grad/KL spike — see truncated_dist_kl).
-                kl_tok = truncated_dist_kl(
-                    resp_logits, lse, ref_resp_logits, ref_lse, k=kl_topk,
-                )
+                ref_resp_hidden = ref_hidden[row].index_select(0, pred_idx)
+                ref_lp, _, _ = chunked_response_logp(ref_resp_hidden, lm_w, target_ids)
+                ref_lp = ref_lp.detach()
             # on-policy: no ratio, single GPU0 pass = new_lp
             if new_lp.numel() == 0:
                 continue
@@ -854,11 +1404,11 @@ def grpo_update_microbatched(
             )
             chunk_losses.append(sample_loss)
             sample_kls_log.append(kl_m.item())
-        # ref_logits (no grad) freeable now; new_logits retained until backward (grad path).
-        del ref_logits
+        # ref_hidden (no grad) freeable now; new_hidden retained until backward (grad path).
+        del ref_hidden
         if not chunk_losses:
             vectors_ref[0] = None
-            del new_logits
+            del new_hidden
             continue
         # Scale so summed chunk losses give batch-mean; loss_scale=1/accum for
         # gradient accumulation. Logged loss divides loss_scale back out.
@@ -871,7 +1421,7 @@ def grpo_update_microbatched(
         chunk_loss.backward()
         vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
         sample_losses_log.append(chunk_loss.item() * denom / len(chunk_losses) / loss_scale)
-        del new_logits
+        del new_hidden
     if do_step:
         _trainable = [p for p in actor.parameters() if p.requires_grad]
         # DP: average grads across ranks BEFORE clip+step so every rank clips the
@@ -968,6 +1518,18 @@ def main():
     p.add_argument("--av-ckpt", required=True,
                    help="Merged bf16 /hf AV warm-start model. Loaded into the vLLM "
                         "engine (rollout serving) and used for the tokenizer.")
+    p.add_argument("--vllm-model", default=None,
+                   help="Model the vLLM engine serves (default: --av-ckpt). Use when the AV "
+                        "ckpt's arch string is not in vLLM's registry (e.g. text-only "
+                        "Qwen3_5ForCausalLM): serve the ORIGINAL wrapper checkpoint here and "
+                        "the merged AV weights are pushed in via a forced initial sync.")
+    p.add_argument("--vllm-name-map", choices=sorted(_VLLM_NAME_MAPS), default="none",
+                   help="Actor->vLLM weight-name translation for the sync. 'qwen3_5_wrapper': "
+                        "text-only actor names (model.*) -> wrapper names (model.language_model.*).")
+    p.add_argument("--vllm-attn-backend", default=None,
+                   help="Force a vLLM attention backend (e.g. FLASH_ATTN). None = auto. Use "
+                        "FLASH_ATTN where the auto-picked FLASHINFER backend would JIT-compile "
+                        "(needs ninja + nvcc matching torch's CUDA).")
     p.add_argument("--ar-ckpt", required=True,
                    help="AR critic warm-start (bf16 /hf dir from train_sft --mode ar).")
     p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B",
@@ -997,6 +1559,12 @@ def main():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--lora-r", type=int, default=128)
     p.add_argument("--lora-alpha", type=int, default=16)
+    p.add_argument("--lora-scope", choices=["attn", "all"], default="attn",
+                   help="AV/actor LoRA target modules. 'all' adds MLP (+ deltanet decay "
+                        "projs for qwen3_5) for a more expressive verbalizer. MUST match "
+                        "the warm-start SFT scope (the only-adapted vLLM sync assumes the "
+                        "RL adapter set covers wherever av_merged differs from base). The "
+                        "co-trained AR critic LoRA stays attn-only regardless.")
     p.add_argument("--use-rslora", action=argparse.BooleanOptionalAction, default=True,
                    help="Use rsLoRA scaling (alpha/sqrt(r) instead of alpha/r). "
                         "Default ON because we use r=128 where vanilla LoRA's "
@@ -1114,7 +1682,71 @@ def main():
                         "(doc-disjoint). Used when --max-rows/--eval-skip-rows are auto (0).")
     p.add_argument("--evals", nargs="*", default=["base_fve"],
                    help="Which evals to run each eval step (set this in the run YAML). "
-                        f"Choices: {', '.join(KNOWN_EVALS)}. base_fve = held-out FVE.")
+                        f"Choices: {', '.join(KNOWN_EVALS)}. base_fve = held-out FVE. "
+                        "halluc = source-grounded hallucination + informativeness "
+                        "(Sonnet-5 judge sees verbatim context + explanation).")
+    p.add_argument("--halluc-every", type=int, default=50,
+                   help="Run the source-grounded hallucination/informativeness judge "
+                        "(nla/utils/halluc_eval.py, Sonnet 5) every N steps, reusing "
+                        "that step's held-out eval generations. Must be a multiple of "
+                        "--eval-every. Active only with `--evals ... halluc`; needs "
+                        "ANTHROPIC_API_KEY. ~eval_n_prompts x 2 calls/round.")
+    # ---- reward mode (actor reward; the AR/critic always trains on vector-MSE) ----
+    p.add_argument("--reward-mode",
+                   choices=["vector_mse", "downstream_mse", "downstream_plus_fve",
+                            "downstream_kl", "downstream_ladder"],
+                   default="vector_mse",
+                   help="ACTOR reward. vector_mse (DEFAULT) = -MSE(reconstruction, gold) "
+                        "in L42 activation space (the classic NLA reward). downstream_mse "
+                        "= -MSE on the FINAL pre-lm_head hidden when the reconstruction is "
+                        "norm-matched + patched at the extraction position in the "
+                        "adapter-disabled base (scores the reconstruction's downstream "
+                        "causal footprint). downstream_plus_fve = vector + "
+                        "--downstream-fve-weight * downstream. The critic (AR) ALWAYS "
+                        "trains on the vector-MSE targets regardless.")
+    p.add_argument("--extraction-layer", type=int, default=42,
+                   help="Decoder block whose OUTPUT residual the activations were "
+                        "extracted from (= where the downstream reward patches). Must "
+                        "match the data's extraction layer (Qwen3.6-27B L42).")
+    p.add_argument("--downstream-ctx-tokens", type=int, default=512,
+                   help="Tail length (tokens) of the source context used for the "
+                        "downstream-reward forward. The extraction position is the last "
+                        "token; truncation is identical for the gold-patch reference and "
+                        "the reconstruction-patch member, so it cancels. Bounds cost.")
+    p.add_argument("--downstream-fve-weight", type=float, default=1.0,
+                   help="Weight on the downstream term in --reward-mode "
+                        "downstream_plus_fve (reward = vector + w * downstream).")
+    p.add_argument("--downstream-kl-future", type=int, default=16,
+                   help="N for --reward-mode downstream_kl: number of future token "
+                        "positions (extraction pos + N-1 teacher-forced) over which to "
+                        "sum discounted KL(clean||patched). Bigger N = longer behavioural "
+                        "horizon but slower (extra generation + eval forwards).")
+    p.add_argument("--downstream-kl-topk", type=int, default=128,
+                   help="Top-k support (of the clean dist) for the downstream_kl KL — "
+                        "renormalized over top-k. Forward KL weights by clean prob so the "
+                        "1e-8 tail is damped regardless; k mostly controls compute.")
+    p.add_argument("--downstream-kl-decay", type=float, default=0.9,
+                   help="Geometric discount over token POSITION for downstream_kl: the "
+                        "j-th future token's KL is weighted gamma^j (normalized). 0.9 "
+                        "(default) tapers gently so all N contribute, nearer tokens more. "
+                        "1.0 = uniform average.")
+    p.add_argument("--ar-kl-max-rollouts", type=int, default=48,
+                   help="Cap on rollouts used for the --ar-loss downstream_kl update per "
+                        "step (each needs a base fwd+bwd, so this bounds critic cost). "
+                        "Subsampled with a stride so it spreads across prompts.")
+    p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl"], default="vector_mse",
+                   help="Critic (AR) TRAINING loss. vector_mse (DEFAULT) = classic "
+                        "reconstruction MSE. downstream_kl = train the AR with the SAME "
+                        "differentiable downstream-KL objective as the --reward-mode "
+                        "downstream_kl actor reward (grad flows v_hat -> patch -> frozen "
+                        "base -> logits -> KL), so actor+critic optimize one objective. "
+                        "Expensive (fwd+bwd through the base per critic update). FVE is "
+                        "still measured, just no longer the AR's objective.")
+    p.add_argument("--downstream-ladder-ratio", type=float, default=0.5,
+                   help="Geometric decay for --reward-mode downstream_ladder: layer "
+                        "L+k gets weight (1-ratio)*ratio^k (renormalized). 0.5 (default) "
+                        "= current layer weighted as much as ALL future layers combined "
+                        "(1/2, 1/4, 1/8, ...). The k=0 term equals the classic vector MSE.")
     p.add_argument("--initial-sync-warmup", action="store_true",
                    help="Run the initial actor->vLLM weight sync at startup. It's "
                         "a no-op at step 0 (LoRA is zero), so OFF by default saves "
@@ -1200,6 +1832,15 @@ def main():
         assert args.eval_every > 0 and args.text_judges_every % args.eval_every == 0, (
             f"--text-judges-every {args.text_judges_every} must be a multiple of "
             f"--eval-every {args.eval_every} (the judges reuse that step's eval "
+            f"generations)."
+        )
+    if "halluc" in args.evals:
+        from nla.utils.halluc_eval import require_judge_key as _require_halluc_key
+        _require_halluc_key()
+        assert args.halluc_every > 0, "--halluc-every must be > 0"
+        assert args.eval_every > 0 and args.halluc_every % args.eval_every == 0, (
+            f"--halluc-every {args.halluc_every} must be a multiple of "
+            f"--eval-every {args.eval_every} (the judge reuses that step's eval "
             f"generations)."
         )
 
@@ -1337,9 +1978,11 @@ def main():
             args.av_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         ).to(device)
         from nla.utils.arch_adapters import resolve_lora_target_modules
+        _tm = resolve_lora_target_modules(actor.config, args.lora_scope)
+        print(f"[actor] LoRA scope={args.lora_scope} → {len(_tm)} module types: {_tm}", flush=True)
         lora_cfg = LoraConfig(
             r=args.lora_r, lora_alpha=args.lora_alpha,
-            target_modules=resolve_lora_target_modules(actor.config),
+            target_modules=_tm,
             lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
             use_rslora=args.use_rslora,
         )
@@ -1528,8 +2171,13 @@ def main():
             )
         del _wx_check, _wx_src
     from vllm import LLM as VLLM
+    _vllm_extra = {}
+    if args.vllm_attn_backend:
+        from vllm.config.attention import AttentionConfig
+        _vllm_extra["attention_config"] = AttentionConfig(backend=args.vllm_attn_backend)
     llm = VLLM(
-        model=args.av_ckpt,
+        **_vllm_extra,
+        model=args.vllm_model or args.av_ckpt,
         tokenizer=args.av_ckpt,
         dtype="bfloat16",
         gpu_memory_utilization=args.vllm_gpu_mem,
@@ -1549,13 +2197,22 @@ def main():
     # At step 0 the LoRA is zero AND vLLM already loaded the same merged ckpt, so
     # this is a true no-op (~180s wasted). OFF by default; --initial-sync-warmup
     # re-enables it purely to smoke-test the sync path early.
+    _name_map = _VLLM_NAME_MAPS[args.vllm_name_map]
+    if args.vllm_model and args.vllm_model != args.av_ckpt and not args.resume_from_lora:
+        # vLLM loaded the RAW --vllm-model (e.g. the base wrapper), NOT the AV
+        # warm-start — the initial sync is a CORRECTNESS requirement here, not a
+        # warm-up: without it step-0 rollouts come from the base policy. (Safe
+        # under only_adapted: AV-SFT touched only the adapted modules, so the
+        # frozen weights vLLM has from the base wrapper already match av_merged.)
+        print("[vllm] --vllm-model != --av-ckpt: forcing initial weight sync", flush=True)
+        args.initial_sync_warmup = True
     if args.initial_sync_warmup or args.resume_from_lora is not None:
         # MANDATORY on resume: the HF actor holds the resumed RL LoRA but vLLM
         # just loaded the SFT --av-ckpt — without this sync, step 0's rollouts
         # would come from the SFT policy (off-policy under our no-ratio surrogate).
         why = "resume" if args.resume_from_lora is not None else "warm-up"
         print(f"[vllm] initial weight sync ({why})", flush=True)
-        sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync)
+        sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync, name_map=_name_map)
         print(f"[vllm] initial sync done in {sync_secs:.1f}s", flush=True)
     else:
         print(f"[vllm] skipping initial sync warm-up (fresh run: vLLM already "
@@ -1566,9 +2223,18 @@ def main():
           f"val_doc_permille={val_permille})", flush=True)
     from nla.val_split import is_val_doc
     _val_pred = (lambda d: is_val_doc(d, val_permille)) if val_permille else None
+    _need_src = args.reward_mode in ("downstream_mse", "downstream_plus_fve", "downstream_kl", "downstream_ladder")
     rows = load_rl_dataset(args.rl_parquet, n_max=args.max_rows,
-                           exclude_doc_pred=_val_pred)
-    print(f"[data] {len(rows)} rows", flush=True)
+                           exclude_doc_pred=_val_pred, include_source=_need_src)
+    if _need_src:
+        _n_src = sum(1 for r in rows if r.get("source"))
+        print(f"[data] {len(rows)} rows ({_n_src} with source text for "
+              f"--reward-mode {args.reward_mode})", flush=True)
+        assert _n_src > 0, (
+            "--reward-mode downstream_* needs detokenized_text_truncated in the "
+            "parquet, but no rows have it. Regenerate data with that column.")
+    else:
+        print(f"[data] {len(rows)} rows", flush=True)
 
     # ---- FVE baseline: predict-the-mean MSE on this dataset ----
     # FVE = 1 - mse_actual / baseline_mse, with the PAPER's baseline:
@@ -1819,11 +2485,13 @@ def main():
         actor.eval()
         # Build prompt texts + per-prompt activations for this step.
         prompts_with_acts = []
+        batch_sources = []   # per-prompt verbatim context (for the downstream reward)
         for row_idx in batch_idxs:
             row = rows[row_idx]
             prompt_text = build_prompt_text(row["prompt"], inject_char, tokenizer)
             activation = torch.tensor(row["activation"], dtype=torch.float32)
             prompts_with_acts.append((prompt_text, activation))
+            batch_sources.append(row.get("source", ""))
         # Reset the patched per-worker steering-apply counters so steer_apply_count
         # below reflects ONLY this rollout's generate (not, e.g., a CF-eval generate).
         try:
@@ -1949,12 +2617,16 @@ def main():
         t_roll_end = time.time()   # [timing] end of vLLM rollout (no old_logp recompute)
 
         # ---- scoring ----
-        # reward = -MSE(critic reconstruction, gold activation).
-        # Rewards come from the EMA critic when --critic-ema-decay > 0; the
-        # co-train loss below always runs on live weights. swapped() restores in
-        # a finally, so a crash here cannot leave EMA weights in the live slots.
+        # vector-MSE reconstruction reward = -MSE(critic reconstruction, gold
+        # activation). ALWAYS computed: it drives the held-out FVE curve (kept
+        # comparable across reward modes) AND is the baseline actor reward.
+        # score_with_critic also returns the raw reconstructions for the
+        # downstream rewards' patch. Rewards come from the EMA critic when
+        # --critic-ema-decay > 0; the co-train loss below always runs on live
+        # weights. swapped() restores in a finally, so a crash here cannot
+        # leave EMA weights in the live slots.
         with critic_ema.swapped():
-            rewards = score_with_critic(
+            rewards, recon_preds = score_with_critic(
                 critic, tokenizer, all_explanations, all_activations,
                 template, mse_scale_f, device,
             )
@@ -1964,24 +2636,81 @@ def main():
         # pathology). The -2 failure reward it gets instead IS trained on — the
         # anti-runaway gradient — and keeps FVE/extraction_rate honest.
         rewards = [None if t else r for r, t in zip(rewards, all_truncated)]
+
+        # ---- downstream-MSE reward (actor-only; the critic still trains on the
+        # vector-MSE targets, untouched). reward = -MSE on the FINAL pre-lm_head
+        # hidden when the reconstruction is norm-matched + patched at the extraction
+        # position in the adapter-disabled base (see downstream_reward). `rewards`
+        # (vector) stays the FVE metric regardless.
+        ds_rewards = None
+        kl_gold_cache = None   # gold-side cache from downstream_kl_reward, reused by the AR-KL loss
+        if args.reward_mode in ("downstream_mse", "downstream_plus_fve"):
+            _ds_sources = [batch_sources[g] for g in all_prompt_group]
+            ds_rewards = downstream_reward(
+                actor, tokenizer, vectors_ref, _ds_sources, recon_preds,
+                all_activations, args.extraction_layer, mse_scale_f, device,
+                ctx_tokens=args.downstream_ctx_tokens,
+            )
+            ds_rewards = [None if t else r for r, t in zip(ds_rewards, all_truncated)]
+        elif args.reward_mode == "downstream_kl":
+            _ds_sources = [batch_sources[g] for g in all_prompt_group]
+            ds_rewards, kl_gold_cache = downstream_kl_reward(
+                actor, tokenizer, vectors_ref, _ds_sources, recon_preds,
+                all_activations, all_prompt_group, args.extraction_layer, device,
+                n_future=args.downstream_kl_future, top_k=args.downstream_kl_topk,
+                ctx_tokens=args.downstream_ctx_tokens, decay=args.downstream_kl_decay,
+            )
+            ds_rewards = [None if t else r for r, t in zip(ds_rewards, all_truncated)]
+        elif args.reward_mode == "downstream_ladder":
+            _ds_sources = [batch_sources[g] for g in all_prompt_group]
+            ds_rewards = downstream_ladder_reward(
+                actor, tokenizer, vectors_ref, _ds_sources, recon_preds,
+                all_activations, args.extraction_layer, mse_scale_f, device,
+                ratio=args.downstream_ladder_ratio,
+                ctx_tokens=args.downstream_ctx_tokens,
+            )
+            ds_rewards = [None if t else r for r, t in zip(ds_rewards, all_truncated)]
+
+        # Select the ACTOR's reward per --reward-mode (FVE logging always uses the
+        # vector `rewards`).
+        if args.reward_mode == "vector_mse":
+            actor_rewards = rewards
+        elif args.reward_mode in ("downstream_mse", "downstream_kl", "downstream_ladder"):
+            actor_rewards = ds_rewards
+        else:  # downstream_plus_fve: -mse_vec + w * -mse_downstream, per sample
+            _w = args.downstream_fve_weight
+            actor_rewards = [
+                None if (rv is None or rd is None) else (rv + _w * rd)
+                for rv, rd in zip(rewards, ds_rewards)
+            ]
+
         # GRPO reward fill + optional -log transform (mirrors train_rl_self_contained).
-        # `rewards` holds raw -mse (or None); FVE below uses these raw values, so the
-        # FVE curve is identical regardless of --log-reward. Failed-extraction floor =
-        # orthogonal-vector outcome (mse=2.0): -mse -> -2.0 ; -log(mse) -> -log(2.0).
+        # Failed-extraction floor = orthogonal-vector outcome (mse=2.0):
+        # -mse -> -2.0 ; -log(mse) -> -log(2.0).
         if args.log_reward:
             _floor = -math.log(2.0)
             rewards_filled = [
                 _floor if r is None else -math.log(min(max(-r, 1e-3), 2.0))
-                for r in rewards
+                for r in actor_rewards
             ]
         else:
-            rewards_filled = [-2.0 if r is None else r for r in rewards]
+            rewards_filled = [-2.0 if r is None else r for r in actor_rewards]
         rewards_t = torch.tensor(rewards_filled, dtype=torch.float32, device=device)
 
         # ---- reward shaping (length penalty) ----
         # Subtracted from the GRPO signal (rewards_t) only, so FVE stays a pure
         # reconstruction metric. Default (0) is a no-op.
         shape_terms = {}
+        if ds_rewards is not None:
+            _dsv = [r for r in ds_rewards if r is not None]
+            if _dsv:
+                shape_terms["av/downstream_reward_mean"] = float(np.mean(_dsv))
+                if args.reward_mode in ("downstream_mse", "downstream_plus_fve", "downstream_ladder"):
+                    # "downstream FVE": 1 - mean(mse_downstream)/baseline(≈1.0, since
+                    # both hiddens are unit-normalized -> mean-pred MSE ~ 1). Rough gauge.
+                    shape_terms["av/downstream_fve_pct"] = (1.0 - (-float(np.mean(_dsv)))) * 100.0
+                else:  # downstream_kl: reward = -mean topk-KL; log mean KL directly
+                    shape_terms["av/downstream_kl_mean"] = -float(np.mean(_dsv))
         if args.length_penalty > 0:
             n_tok = torch.tensor(
                 [lp.numel() for lp in all_old_logps], dtype=torch.float32, device=device,
@@ -2090,7 +2819,7 @@ def main():
         # nothing (at grad_accum=4 that's 3 wasted syncs per real update). ----
         vllm_sync_secs = 0.0
         if is_accum_end:
-            vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync)
+            vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync, name_map=_name_map)
             print(f"  [vllm sync@{step+1}] {vllm_sync_secs:.1f}s", flush=True)
 
         # ---- AR critic co-training (paper-faithful, optional) ----
@@ -2104,6 +2833,7 @@ def main():
         if args.train_critic and critic_optim is not None:
             crit_inputs = []
             crit_golds = []
+            crit_pg = []   # prompt_group per crit input (for the AR downstream-KL loss)
             # `keep` excludes injection-failed rollouts (cjk/marker) — don't train the
             # AR reconstructor on garbage explanations (corrupt regression targets).
             # Also exclude sampler-mismatch-masked rollouts (see grpo): their
@@ -2124,6 +2854,16 @@ def main():
                     continue
                 crit_inputs.append(torch.tensor(ids, dtype=torch.long))
                 crit_golds.append(act)
+                crit_pg.append(all_prompt_group[i])
+            # AR downstream-KL is fwd+bwd-through-base per rollout — cap the count
+            # (strided subsample so it spans prompts, not just the first few groups).
+            if (args.ar_loss == "downstream_kl" and kl_gold_cache
+                    and len(crit_inputs) > args.ar_kl_max_rollouts):
+                _st = max(1, len(crit_inputs) // args.ar_kl_max_rollouts)
+                _sel = list(range(0, len(crit_inputs), _st))[:args.ar_kl_max_rollouts]
+                crit_inputs = [crit_inputs[j] for j in _sel]
+                crit_golds = [crit_golds[j] for j in _sel]
+                crit_pg = [crit_pg[j] for j in _sel]
             if crit_inputs:
                 # Micro-batch the critic update — single forward on 256 sequences
                 # × 200 tokens × 5.5B-param critic with grad blows past 130GB.
@@ -2136,10 +2876,25 @@ def main():
                 accumulated = 0.0
                 finite = True
                 cmb = max(1, args.critic_micro_batch)
+                _use_kl_ar = (args.ar_loss == "downstream_kl" and kl_gold_cache)
                 for cs in range(0, bs_total, cmb):
                     chunk = list(range(cs, min(cs + cmb, bs_total)))
-                    max_len = max(crit_inputs[i].numel() for i in chunk)
                     bs = len(chunk)
+                    if _use_kl_ar:
+                        # coherent AR loss: differentiable downstream-KL (grad through the
+                        # frozen base to v_hat); the fn backwards per-rollout internally
+                        # with `scale` so grad = full-batch-mean KL / accum.
+                        lv, _n = downstream_kl_critic_loss(
+                            critic, actor, tokenizer, vectors_ref,
+                            [crit_inputs[i] for i in chunk], [crit_pg[i] for i in chunk],
+                            kl_gold_cache, args.extraction_layer, mse_scale_f, device,
+                            n_future=args.downstream_kl_future, top_k=args.downstream_kl_topk,
+                            decay=args.downstream_kl_decay,
+                            ctx_tokens=min(args.downstream_ctx_tokens, 256),
+                            scale=1.0 / (bs_total * accum))
+                        accumulated += lv / bs_total       # mean KL for logging
+                        continue
+                    max_len = max(crit_inputs[i].numel() for i in chunk)
                     batch_ids = torch.full(
                         (bs, max_len), pad_id, dtype=torch.long, device=device,
                     )
@@ -2481,6 +3236,28 @@ def main():
                     + f" | match {tj_metrics['source_match_acc']:.0%}"
                     f" | judge_fail {tj_metrics['judge_fail_rate']:.0%}"
                     f" | {log['time/eval_text_judges_s']:.0f}s",
+                    flush=True,
+                )
+            # ---- source-grounded hallucination + informativeness (Sonnet 5;
+            # reuses THIS round's generations — see nla/utils/halluc_eval.py) ----
+            if "halluc" in args.evals and step % args.halluc_every == 0:
+                from nla.utils.halluc_eval import judge_hallucination
+                _t_h = time.time()
+                _h_expl = [r["explanation"] if r["extracted"] else None
+                           for r in eval_records]
+                _h_src = [row.get("source", "") for row in eval_rows]
+                h_metrics, _ = judge_hallucination(
+                    _h_expl, _h_src, seed=args.seed,
+                    concurrency=args.judge_concurrency)
+                log.update({f"eval_halluc/{k}": v for k, v in h_metrics.items()})
+                log["time/eval_halluc_s"] = time.time() - _t_h
+                print(
+                    f"  [halluc@{step}] hallucination "
+                    f"{h_metrics['hallucination_mean']:.2f} (lower=better) | "
+                    f"informativeness {h_metrics['informativeness_mean']:.2f} | "
+                    f"n {h_metrics['n_judged']:.0f} | "
+                    f"judge_fail {h_metrics['judge_fail_rate']:.0%} | "
+                    f"{log['time/eval_halluc_s']:.0f}s",
                     flush=True,
                 )
             # Print 3 sample explanations so the log itself shows how outputs
