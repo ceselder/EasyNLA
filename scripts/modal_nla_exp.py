@@ -20,7 +20,8 @@ import shlex
 
 import modal
 
-APP_NAME = "nla-exp"
+# NLA_APP_NAME=nla-<run-tag> modal run ... -> one dashboard row per run instead of "nla-exp" x N
+APP_NAME = os.environ.get("NLA_APP_NAME", "nla-exp")
 VOL = "nla-exp"
 VOL_Q36 = "nla-qwen36-ema"
 REPO_LOCAL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
