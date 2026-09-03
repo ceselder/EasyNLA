@@ -144,3 +144,12 @@ halluc 9.41, inform 2.25 (n=256). RL arms rlB_ar_onpol (scratch AR) and rlB_ar_o
 Both run clean end-to-end (gold cache built, FVE tracked). Arms `rlB_klsup` / `rlB_klrew` use w=1.0 (queue 3, 4 GPUs, starts when
 the best-of-N chain releases its GPUs ≈16:40), followed by `rlB_av_bon6` (distilled AV, baseline AR; HF actor = 500k-merged AV +
 bon6 LoRA, reference = frozen copy of that adapter, vLLM = av_bon6_merged) and the combination `rlB_av_bon6_ar_onpol_cont`.
+
+### Arm result: rlB_ema0995 (EMA critic, decay 0.995) — finished 14:50, 150 steps
+| @150 | rlB_base | rlB_ema098 | rlB_ema0995 |
+|---|---|---|---|
+| held-out FVE | 75.2% | 75.0% | 73.9% (EMA weights 74.5%) |
+| hallucination ↓ | 9.12 | 9.23 | 9.03 |
+| informativeness ↑ | 2.62 | 2.58 | 2.63 |
+Slower critic → ~1.3 pt lower FVE, hallucination within noise (it was 8.74 at step 50 but converged back to the baseline's
+level by 100). Verdict: EMA on the critic does not help hallucination at this horizon and costs a little FVE at 0.995.
