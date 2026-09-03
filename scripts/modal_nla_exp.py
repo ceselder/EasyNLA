@@ -605,7 +605,8 @@ def pyrun(cmd: str):
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
          limit: int = 0, extra: str = "", model_tag: str = "qwen3_8b", gpus: int = 0,
          bs: int = 16, accum: int = 1, config: str = "configs/rl_vllm.yaml",
-         av_dir: str = "", out: str = "", cmd: str = "", data_dir: str = ""):
+         av_dir: str = "", out: str = "", cmd: str = "", data_dir: str = "",
+         glob: str = "", ncomplete: int = 0):
     if task == "harness":
         print(harness_check.remote())
     elif task == "extract":
@@ -628,14 +629,19 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         f = shell.with_options(gpu=f"B200:{gpus or 1}")
         print(f.remote(cmd=cmd))
     elif task == "judge_sync":
-        # one scorer per mining shard (disjoint part globs), all polling the same dir
+        # --glob: ONE scorer on that part glob (--ncomplete = #_COMPLETE files that end
+        # follow mode); else one scorer per mining shard, all polling the same dir
         rd, sp, od = cmd.split("|")
-        calls = [judge_sync.spawn(rollouts_dir=rd, source_parquet=sp, out_dir=od,
-                                  part_glob=f"rollouts_shard{s:02d}_*part*.parquet",
-                                  concurrency=limit or 128, n_complete=nshards)
-                 for s in range(nshards)]
-        for c in calls:
-            print(c.get())
+        if glob:
+            print(judge_sync.remote(rollouts_dir=rd, source_parquet=sp, out_dir=od, part_glob=glob,
+                                    concurrency=limit or 128, n_complete=ncomplete or nshards))
+        else:
+            calls = [judge_sync.spawn(rollouts_dir=rd, source_parquet=sp, out_dir=od,
+                                      part_glob=f"rollouts_shard{s:02d}_*part*.parquet",
+                                      concurrency=limit or 128, n_complete=ncomplete or nshards)
+                     for s in range(nshards)]
+            for c in calls:
+                print(c.get())
     elif task == "judge_batch":
         print(judge_batch.remote(rollouts_dir=cmd.split("|")[0], source_parquet=cmd.split("|")[1],
                                  out_dir=cmd.split("|")[2], phase=mode, limit=limit, max_parts=nshards))
