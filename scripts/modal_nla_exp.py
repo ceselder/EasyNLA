@@ -109,7 +109,7 @@ def _prep(patch_lens: bool = True):
             # has its own hook (verified separately) -> skip the guard, keep the
             # sampler-mismatch check as the runtime safety net
             os.environ["NLA_ALLOW_STALE_LENS"] = "1"
-            if os.environ.get("NLA_VLLM_GRAPHS", "1") == "1":
+            if os.environ.get("NLA_VLLM_GRAPHS", "1") == "1" and os.environ.get("NLA_VLLM_GRAPHS_OVERRIDE", "") != "0":
                 os.environ["VLLM_LENS_CUDA_GRAPHS"] = "1"   # decode CUDA graphs, prompt-position steering
                 os.environ["NLA_VLLM_EAGER"] = "0"          # scripts drop enforce_eager=True
             print(f"[prep] lens=metamodel graphs={os.environ.get('VLLM_LENS_CUDA_GRAPHS','0')}", flush=True)
@@ -479,10 +479,11 @@ def merge_av(av_dir: str, out: str, model_tag: str = "qwen3_8b"):
 # ------------------------------------------------------------------------------ RL
 @app.function(gpu="B200:4", volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS)
 def train_rl(tag: str, nproc: int = 4, model_tag: str = "qwen3_8b", extra: str = "",
-             config: str = "configs/rl_vllm.yaml"):
+             config: str = "configs/rl_vllm.yaml", graphs: int = 1):
     """torchrun -m nla.train_rl_vllm --config <config> <extra>. All run-specific
     arguments (checkpoints, data, reward mode, EMA, ...) come through `extra`."""
     import sys
+    os.environ["NLA_VLLM_GRAPHS"] = str(graphs)   # 0 -> eager even on the metamodel image
     _prep(patch_lens=True)
     save_dir = f"{CKPT}/{model_tag}/{tag}"
     cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone",
@@ -643,7 +644,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         print(merge_av.remote(av_dir=av_dir, out=out, model_tag=model_tag))
     elif task == "rl":
         f = train_rl.with_options(gpu=f"B200:{gpus or nproc}")
-        print(f.remote(tag=tag, nproc=nproc, model_tag=model_tag, extra=extra, config=config))
+        print(f.remote(tag=tag, nproc=nproc, model_tag=model_tag, extra=extra, config=config,
+                       graphs=int(os.environ.get("NLA_VLLM_GRAPHS", "1"))))
     elif task == "shell":
         f = shell.with_options(gpu=f"B200:{gpus or 1}")
         print(f.remote(cmd=cmd))
