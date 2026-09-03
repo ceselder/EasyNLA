@@ -36,6 +36,10 @@ def main():
     p.add_argument("--sidecar", default=None)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--n-samples", type=int, default=2)
+    p.add_argument("--sample-offset", type=int, default=0,
+                   help="first sample_idx to assign (a second mining pass over the same rows "
+                        "uses --sample-offset <n_samples of pass 1> so ids do not collide)")
+    p.add_argument("--seed", type=int, default=0, help="vLLM sampling seed base (pass 2: use a new seed)")
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--shard", type=int, default=0)
@@ -72,7 +76,8 @@ def main():
     llm = LLM(**vllm_attn_kwargs(), model=args.av_ckpt, tokenizer=args.av_ckpt, dtype="bfloat16",
               gpu_memory_utilization=args.vllm_gpu_mem, max_model_len=args.vllm_max_len,
               tensor_parallel_size=1, enforce_eager=True, disable_log_stats=True,
-              enable_prefix_caching=False)   # per-request steering => no prefix cache
+              enable_prefix_caching=False,   # per-request steering => no prefix cache
+              seed=args.seed + 1000 * args.shard + 7919 * args.sample_offset)
 
     # Stream rows in row-group order; pick out this shard's indices.
     row_groups = []
@@ -102,7 +107,7 @@ def main():
             "truncated": pa.array(out_cols["truncated"], pa.bool_()),
             "steer_verified": pa.array(out_cols["steer_verified"], pa.bool_()),
         })
-        path = f"{args.out_dir}/rollouts_shard{args.shard:02d}_part{part:04d}.parquet"
+        path = f"{args.out_dir}/rollouts_shard{args.shard:02d}_off{args.sample_offset:02d}_part{part:04d}.parquet"
         pq.write_table(t, path, compression="zstd")
         print(f"  wrote {path} ({t.num_rows} rows)", flush=True)
         part += 1
@@ -128,7 +133,7 @@ def main():
                     expl = None
                 out_cols["row_idx"].append(ri)
                 out_cols["doc_id"].append(did)
-                out_cols["sample_idx"].append(si)
+                out_cols["sample_idx"].append(si + args.sample_offset)
                 out_cols["explanation"].append(expl)
                 out_cols["n_tokens"].append(int(r["n_resp"]))
                 out_cols["truncated"].append(bool(r.get("truncated", False)))
@@ -164,7 +169,7 @@ def main():
     stats = {"shard": args.shard, "nshards": args.nshards, "rows": len(my_rows),
              "samples": n_done, "extract_ok": n_ok, "truncated": n_trunc,
              "steer_unverified": n_unver, "elapsed_min": (time.time() - t0) / 60}
-    json.dump(stats, open(f"{args.out_dir}/_COMPLETE_shard{args.shard:02d}.json", "w"), indent=2)
+    json.dump(stats, open(f"{args.out_dir}/_COMPLETE_shard{args.shard:02d}_off{args.sample_offset:02d}.json", "w"), indent=2)
     print(json.dumps(stats, indent=2), flush=True)
 
 
