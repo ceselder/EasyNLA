@@ -40,6 +40,8 @@ def main():
                    help="first sample_idx to assign (a second mining pass over the same rows "
                         "uses --sample-offset <n_samples of pass 1> so ids do not collide)")
     p.add_argument("--seed", type=int, default=0, help="vLLM sampling seed base (pass 2: use a new seed)")
+    p.add_argument("--part-start", type=int, default=0, help="first output part number (resuming a shard)")
+    p.add_argument("--complete-suffix", default="", help="suffix for the _COMPLETE marker (split jobs)")
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--shard", type=int, default=0)
@@ -90,7 +92,7 @@ def main():
 
     out_cols = {k: [] for k in ("row_idx", "doc_id", "sample_idx", "explanation",
                                 "n_tokens", "truncated", "steer_verified")}
-    part = 0
+    part = args.part_start
     n_done = n_ok = n_trunc = n_unver = 0
     t0 = time.time()
 
@@ -169,7 +171,7 @@ def main():
     stats = {"shard": args.shard, "nshards": args.nshards, "rows": len(my_rows),
              "samples": n_done, "extract_ok": n_ok, "truncated": n_trunc,
              "steer_unverified": n_unver, "elapsed_min": (time.time() - t0) / 60}
-    json.dump(stats, open(f"{args.out_dir}/_COMPLETE_shard{args.shard:02d}_off{args.sample_offset:02d}.json", "w"), indent=2)
+    json.dump(stats, open(f"{args.out_dir}/_COMPLETE_shard{args.shard:02d}_off{args.sample_offset:02d}{args.complete_suffix}.json", "w"), indent=2)
     print(json.dumps(stats, indent=2), flush=True)
 
 
