@@ -592,6 +592,14 @@ def split_sft_rl(model_tag: str = "qwen3_8b", n_sft: int = 500_000):
     vol.commit()
     return out
 
+
+@app.function(volumes=VOLS, timeout=6 * 60 * 60, cpu=8.0, memory=65536, secrets=SECRETS)
+def pyrun(cmd: str):
+    """Run a CPU-only command in the repo with the volumes mounted (stats, data builds)."""
+    _prep(patch_lens=False)
+    _run(["bash", "-lc", cmd])
+    return "ok"
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -633,6 +641,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
                                  out_dir=cmd.split("|")[2], phase=mode, limit=limit, max_parts=nshards))
     elif task == "split":
         print(split_sft_rl.remote(model_tag=model_tag, n_sft=limit or 500_000))
+    elif task == "pyrun":
+        print(pyrun.remote(cmd=cmd))
     elif task == "probe_tok":
         print(probe_tokenizer.remote())
     elif task == "shells":
