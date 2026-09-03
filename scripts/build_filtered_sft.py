@@ -53,12 +53,18 @@ def main():
 
     ro = pa.concat_tables([pq.read_table(f) for f in
                            sorted(glob.glob(f"{args.rollouts_dir}/rollouts_shard*_part*.parquet"))])
-    sc = pa.concat_tables([pq.read_table(f) for f in
-                           sorted(glob.glob(f"{args.scores_dir}/scores_shard*_part*.parquet"))])
-    print(f"rollouts={ro.num_rows} scored={sc.num_rows}", flush=True)
+    # any judge output (sync / batch / local), several dirs allowed (comma-separated);
+    # the first VALID score per (row, sample) wins
+    sfiles = []
+    for d in args.scores_dir.split(","):
+        sfiles += sorted(glob.glob(f"{d}/scores_*.parquet"))
+    sc = pa.concat_tables([pq.read_table(f) for f in sfiles])
+    print(f"rollouts={ro.num_rows} scored rows={sc.num_rows} from {len(sfiles)} files", flush=True)
     score = {}
     for r, s, h, i in zip(sc.column("row_idx").to_pylist(), sc.column("sample_idx").to_pylist(),
                           sc.column("halluc").to_pylist(), sc.column("inform").to_pylist()):
+        if (r, s) in score and score[(r, s)][0] >= 1:
+            continue
         score[(r, s)] = (h, i)
 
     hist_h, hist_i = Counter(), Counter()

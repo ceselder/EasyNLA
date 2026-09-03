@@ -122,6 +122,14 @@ class JudgeClient:
                     fb_hdr["anthropic-workspace-id"] = fb_ws
                 self._fb = anthropic.AsyncAnthropic(api_key=fb_key, max_retries=max_retries,
                                                     default_headers=fb_hdr)
+                # NLA_JUDGE_PREFER_FALLBACK=1: the low-priority tier is *slow* (not just
+                # 429-ing) under load -- ~15 s/call -- which starves bulk scoring. Swap
+                # roles so the high-priority key is tried first and the infinite key
+                # becomes the spill-over. Reserved for the bulk filtering pass.
+                if os.environ.get("NLA_JUDGE_PREFER_FALLBACK") == "1":
+                    self._c, self._fb = self._fb, anthropic.AsyncAnthropic(
+                        max_retries=min(2, max_retries), default_headers=hdr)
+                    print("  [judge] NLA_JUDGE_PREFER_FALLBACK=1: high-priority key first", flush=True)
             self._n_fallback = 0
 
     async def _anthropic_create(self, **kw):
