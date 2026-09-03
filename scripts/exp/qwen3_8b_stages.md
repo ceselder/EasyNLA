@@ -151,5 +151,6 @@ bon6 LoRA, reference = frozen copy of that adapter, vLLM = av_bon6_merged) and t
 | held-out FVE | 75.2% | 75.0% | 73.9% (EMA weights 74.5%) |
 | hallucination ↓ | 9.12 | 9.23 | 9.03 |
 | informativeness ↑ | 2.62 | 2.58 | 2.63 |
-Slower critic → ~1.3 pt lower FVE, hallucination within noise (it was 8.74 at step 50 but converged back to the baseline's
-level by 100). Verdict: EMA on the critic does not help hallucination at this horizon and costs a little FVE at 0.995.
+| writing quality ↑ | 4.16 | 4.12 | 4.61 |
+Slower critic → ~1.3 pt lower FVE, hallucination within noise (8.74 at step 50, back at the baseline's level by step 100);
+writing quality a little higher (4.61 vs 4.16, repetitiveness 3.84 vs 4.20). Verdict: EMA on the critic does not help hallucination at this horizon and costs a little FVE at 0.995.
