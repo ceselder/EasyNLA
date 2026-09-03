@@ -45,6 +45,9 @@ def main():
                    help="after filtering, keep a uniformly random subset of N (row, sample) pairs — "
                         "size-matched controls (e.g. --max-halluc 10 --random-n <n_kept_of_the_filtered_set>)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max-row-idx", type=int, default=0,
+                   help="only use rollouts with row_idx < N (protocol: warm-start rows = first 500k "
+                        "of the shuffled train split; rows >= N are the RL pool and must stay unseen)")
     p.add_argument("--tag", default="filtered")
     args = p.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -77,7 +80,7 @@ def main():
     for r, s, e, ok in zip(ro.column("row_idx").to_pylist(), ro.column("sample_idx").to_pylist(),
                            ro.column("explanation").to_pylist(), ro.column("steer_verified").to_pylist()):
         n_seen += 1
-        if not e or not ok:
+        if not e or not ok or (args.max_row_idx and r >= args.max_row_idx):
             continue
         h, i = score.get((r, s), (None, None))
         if h is None or h < 0:
@@ -197,6 +200,7 @@ def main():
              "rows_with_kept": len(kept), "n_ar_rows": n_ar, "n_av_rows": n_av,
              "max_halluc": args.max_halluc, "min_inform": args.min_inform,
              "max_per_row": args.max_per_row, "random_n": args.random_n, "tag": args.tag,
+             "max_row_idx": args.max_row_idx,
              "halluc_hist": dict(sorted(hist_h.items())), "inform_hist": dict(sorted(hist_i.items()))}
     json.dump(stats, open(f"{args.out_dir}/stats.json", "w"), indent=2)
     print(json.dumps(stats, indent=2), flush=True)
