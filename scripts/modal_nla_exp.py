@@ -79,6 +79,12 @@ def _prep(patch_lens: bool = True):
     import subprocess
     import sys
     os.chdir(REPO_REMOTE)
+    # A consumer launched seconds after a producer's print (but before its commit
+    # propagated) saw a missing/partial checkpoint dir once; reload is cheap.
+    try:
+        vol.reload()
+    except Exception as e:
+        print(f"[prep] vol.reload skipped: {e}", flush=True)
     if patch_lens:
         r = subprocess.run([sys.executable, "utils/patch_vllm_lens.py"],
                            capture_output=True, text=True)
@@ -475,6 +481,34 @@ def shell(cmd: str, patch_lens: bool = True):
     return "ok"
 
 
+
+@app.function(volumes=VOLS, timeout=20 * 60, cpu=4.0, memory=16384, secrets=SECRETS)
+def probe_tokenizer(merged: str = f"{CKPT}/qwen3_8b/av_sft_merged", base: str = BASE_8B,
+                    char: str = "㈎"):
+    """CPU check: does the saved tokenizer round-trip the injection char?"""
+    import json
+    import transformers
+    from transformers import AutoTokenizer
+    _prep(patch_lens=False)
+    vol.reload()
+    print("transformers", transformers.__version__)
+    print("merged dir:", sorted(os.listdir(merged)) if os.path.isdir(merged) else "MISSING")
+    for name in (base, merged):
+        try:
+            t = AutoTokenizer.from_pretrained(name)
+            ids = t.encode(char, add_special_tokens=False)
+            print(f"{name}: {type(t).__name__} vocab={len(t)} encode({char!r})={ids} "
+                  f"decode={t.decode(ids)!r} | 'hello'->{t.encode('hello', add_special_tokens=False)}")
+        except Exception as e:
+            print(f"{name}: FAILED {type(e).__name__}: {str(e)[:200]}")
+    cfg = os.path.join(merged, "tokenizer_config.json")
+    if os.path.exists(cfg):
+        d = json.load(open(cfg))
+        print("tokenizer_config keys:", sorted(d)[:40])
+        print("class:", d.get("tokenizer_class"), "| add_prefix_space:", d.get("add_prefix_space"),
+              "| split_special_tokens:", d.get("split_special_tokens"))
+    return "ok"
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -502,6 +536,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "shell":
         f = shell.with_options(gpu=f"B200:{gpus or 1}")
         print(f.remote(cmd=cmd))
+    elif task == "probe_tok":
+        print(probe_tokenizer.remote())
     elif task == "shells":
         # N parallel one-GPU shells; `{shard}` / `{nshards}` are substituted in cmd.
         f = shell.with_options(gpu=f"B200:{gpus or 1}")
