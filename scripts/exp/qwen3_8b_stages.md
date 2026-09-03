@@ -116,3 +116,8 @@ AV rollouts at eval: hallucination 9.42, informativeness 2.11 (Sonnet 5, n=256).
 Hallucination-filtering the AR data does NOT help at matched size (le6 54.5 vs rand 55.6, within noise): the AR must
 read the distribution the AV actually produces, and the ≤6 slice is 4% of it. Continuation variants (`ar_*_cont`) and
 best-of-6 pending. Arm queue reprioritised (queue 2): rlB_ar_onpol → lag10 → lowlr → rlB_ar_onpol_cont → arevery2 → arlr4e5 → ema098_arlr16e5.
+
+Pass 2 done 13:07 (2,099,756 scored rollouts on 499,992 activations, ≈4.2 samples each, mean 9.30). Best-of-N sets built 13:19:
+`bon6` = 499,992 rows (best sample per activation), `bon6le6` = 68,185 rows (best sample ≤6; 13.6% of activations).
+34% of activations have every sample at 10. Distillation SFTs launched 13:19: ar_bon6 (scratch), ar_bon6_cont, ar_bon6le6_cont (1 GPU,
+sequential), av_bon6_cont (fresh LoRA on the merged 500k AV, lr 5e-5, 2 GPUs, ~2.6 h).
