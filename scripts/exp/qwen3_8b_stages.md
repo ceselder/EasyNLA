@@ -165,3 +165,13 @@ merge av_bon6 ∥ ar_bon6_cont ∥ ar_bon6le6_cont → evals) and launch_arms_q3
 Partial rlB_ar_onpol trajectory (on-policy from-scratch AR as RL critic), eval FVE: 63.4 @0 (baseline 58.8), 69.4 @10, 70.7 @20,
 69.7 @30, 73.1 @40, 72.6 @50, 73.6 @60, 73.6 @70, 73.1 @80, 75.5 @90 (baseline 74.4 @90); halluc 8.92 @0 / 9.25 @50 (baseline
 9.20 / 9.07 — note the step-0 policies are identical, so 8.92 vs 9.20 is the judge+sampling noise floor ≈ 0.3 on 128 prompts).
+
+### AV hill-climb (expert iteration on the verbalizer) — user-confirmed 23:50, chain `~/nla-exp-logs/launch_av_hillclimb.sh`
+Round 1 = `av_bon6_cont` (fresh LoRA r128 on the merged 500k AV, trained on the best of ≈4 samples for all 500k train
+activations, lr 5e-5) → `av_bon6_merged`; eval = `eval_bon6_avbon6.json` (bon6 chain). Rounds 2–4: mine 8 samples × 125k
+train activations (rows (R−2)·125k …) from the previous merged AV (2 GPUs, ~1 h), Sonnet judge (2 followers + sweep),
+best sample per activation (`--max-per-row 1 --max-halluc 10`), AV SFT one epoch on the previous merged AV (2 GPUs, ~40 min),
+merge, 1,024-prompt eval with the baseline AR and `ar_onpol_cont` (`eval_hc_rR.json`). Gate: continue only if held-out
+hallucination drops ≥ 0.2 vs the previous round (n=256 judged, s.e. ≈ 0.09). Outputs `/vol/ckpts/qwen3_8b/av_hc_rR{,_merged}`,
+`/vol/data/qwen3_8b/hc/rR/{mine,scores,set}`. Queue 3b (KL arms, av_bon6 RL arm, combo) now waits for "[hc] hill-climb done".
+Slot A meanwhile: rlB_ar_onpol_cont (running since 23:46) → rlB_ar_onpol (rerun; crashed dir deleted) → lag10 → lowlr → arevery2 → arlr4e5.
