@@ -536,6 +536,22 @@ def judge_batch(rollouts_dir: str, source_parquet: str, out_dir: str, phase: str
     _run(cmd)
     return out_dir
 
+
+@app.function(volumes=VOLS, timeout=24 * 60 * 60, cpu=4.0, memory=32768, secrets=SECRETS)
+def judge_sync(rollouts_dir: str, source_parquet: str, out_dir: str,
+               part_glob: str = "rollouts_shard*_part*.parquet", concurrency: int = 128,
+               follow: bool = True, n_complete: int = 4):
+    """Sonnet-5 bulk scoring over the synchronous API, high-priority key first."""
+    import sys
+    _prep(patch_lens=False)
+    cmd = [sys.executable, "scripts/judge_hallucination_sync.py", "--rollouts-dir", rollouts_dir,
+           "--source-parquet", source_parquet, "--out-dir", out_dir, "--part-glob", part_glob,
+           "--concurrency", str(concurrency), "--n-complete", str(n_complete)]
+    if follow:
+        cmd.append("--follow")
+    _run(cmd, env_extra={"NLA_JUDGE_PREFER_FALLBACK": "1"})
+    return out_dir
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -563,6 +579,15 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "shell":
         f = shell.with_options(gpu=f"B200:{gpus or 1}")
         print(f.remote(cmd=cmd))
+    elif task == "judge_sync":
+        # one scorer per mining shard (disjoint part globs), all polling the same dir
+        rd, sp, od = cmd.split("|")
+        calls = [judge_sync.spawn(rollouts_dir=rd, source_parquet=sp, out_dir=od,
+                                  part_glob=f"rollouts_shard{s:02d}_*part*.parquet",
+                                  concurrency=limit or 128, n_complete=nshards)
+                 for s in range(nshards)]
+        for c in calls:
+            print(c.get())
     elif task == "judge_batch":
         print(judge_batch.remote(rollouts_dir=cmd.split("|")[0], source_parquet=cmd.split("|")[1],
                                  out_dir=cmd.split("|")[2], phase=mode, limit=limit, max_parts=nshards))

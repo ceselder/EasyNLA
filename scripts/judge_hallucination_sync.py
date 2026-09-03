@@ -85,7 +85,7 @@ async def main_async(args):
     total = fails = 0
     t_start = time.time()
     while True:
-        parts = sorted(glob.glob(f"{args.rollouts_dir}/rollouts_shard*_part*.parquet"))
+        parts = sorted(glob.glob(f"{args.rollouts_dir}/{args.part_glob}"))
         todo = [p for p in parts if not os.path.exists(
             os.path.join(args.out_dir, f"scores_{os.path.splitext(os.path.basename(p))[0]}.parquet"))]
         if args.max_parts:
@@ -114,6 +114,8 @@ def main():
     p.add_argument("--concurrency", type=int, default=96)
     p.add_argument("--limit", type=int, default=0, help="items per part (debug)")
     p.add_argument("--max-parts", type=int, default=0)
+    p.add_argument("--part-glob", default="rollouts_shard*_part*.parquet",
+                   help="restrict to matching part files (run several scorers on disjoint globs)")
     p.add_argument("--follow", action="store_true", help="keep polling for new parts")
     p.add_argument("--n-complete", type=int, default=4, help="stop following once this many _COMPLETE files exist")
     args = p.parse_args()
