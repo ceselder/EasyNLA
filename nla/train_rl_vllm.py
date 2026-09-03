@@ -2196,13 +2196,15 @@ def main():
         )
     print(f"[vllm] loading {args.av_ckpt} (gpu_memory_utilization={args.vllm_gpu_mem})",
           flush=True)
-    if is_dist:
+    if is_dist or os.environ.get("TORCHELASTIC_RUN_ID") or os.environ.get("MASTER_ADDR"):
         # vLLM spawns its own TP worker group. If those workers inherit torchrun's
         # distributed env (RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT/...), vLLM's
         # internal init connects to torchrun's store (our DP group) instead of its
         # own per-engine store -> TP rendezvous times out (c10d socket timeout).
         # Our DP process group is already initialized and no longer reads these, so
         # clear them before building the engine (vars captured above still hold).
+        # ALSO under torchrun with ONE rank (is_dist False): the vars are set but no
+        # store is served -> the engine hangs 10 min then dies (observed).
         for _k in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
                    "GROUP_RANK", "ROLE_RANK", "ROLE_NAME", "LOCAL_WORLD_SIZE",
                    "GROUP_WORLD_SIZE", "TORCHELASTIC_RUN_ID",
