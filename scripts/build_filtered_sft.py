@@ -41,6 +41,10 @@ def main():
     p.add_argument("--max-halluc", type=int, default=3)
     p.add_argument("--min-inform", type=int, default=0)
     p.add_argument("--max-per-row", type=int, default=0, help="cap kept samples per activation (0=all)")
+    p.add_argument("--random-n", type=int, default=0,
+                   help="after filtering, keep a uniformly random subset of N (row, sample) pairs — "
+                        "size-matched controls (e.g. --max-halluc 10 --random-n <n_kept_of_the_filtered_set>)")
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tag", default="filtered")
     args = p.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -89,6 +93,15 @@ def main():
         kept[r].sort()
         if args.max_per_row:
             kept[r] = kept[r][:args.max_per_row]
+    if args.random_n:
+        import random as _random
+        pairs = [(r, k) for r, v in kept.items() for k in range(len(v))]
+        _random.Random(args.seed).shuffle(pairs)
+        keep_pairs = set(pairs[:args.random_n])
+        kept = {r: [v[k] for k in range(len(v)) if (r, k) in keep_pairs] for r, v in kept.items()}
+        kept = {r: v for r, v in kept.items() if v}
+        for r in kept:
+            kept[r].sort()
     n_keep = sum(len(v) for v in kept.values())
     print(f"seen={n_seen} scored={n_scored} kept={n_keep} ({n_keep/max(n_scored,1):.1%}) "
           f"rows_with_kept={len(kept)}", flush=True)
@@ -183,6 +196,7 @@ def main():
     stats = {"n_rollouts": n_seen, "n_scored": n_scored, "n_kept": n_keep,
              "rows_with_kept": len(kept), "n_ar_rows": n_ar, "n_av_rows": n_av,
              "max_halluc": args.max_halluc, "min_inform": args.min_inform,
+             "max_per_row": args.max_per_row, "random_n": args.random_n, "tag": args.tag,
              "halluc_hist": dict(sorted(hist_h.items())), "inform_hist": dict(sorted(hist_i.items()))}
     json.dump(stats, open(f"{args.out_dir}/stats.json", "w"), indent=2)
     print(json.dumps(stats, indent=2), flush=True)
