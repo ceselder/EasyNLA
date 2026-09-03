@@ -108,7 +108,10 @@ class JudgeClient:
             # high-priority key (ANTHROPIC_API_KEY_FALLBACK) when one is configured
             # -- judge scores feed real results, so a nan eval round is worse than
             # spending the backup quota. Swaps are counted and logged.
-            self._c = anthropic.AsyncAnthropic(max_retries=max_retries, default_headers=hdr)
+            # few retries on the primary so an overloaded low-priority tier falls
+            # through to the backup within seconds, not minutes (eval rounds have a
+            # hard wall-clock budget)
+            self._c = anthropic.AsyncAnthropic(max_retries=min(2, max_retries), default_headers=hdr)
             self._model_id = model
             self._fb = None
             fb_key = os.environ.get("ANTHROPIC_API_KEY_FALLBACK")

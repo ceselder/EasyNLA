@@ -76,6 +76,10 @@ def main():
     p.add_argument("--vllm-gpu-mem", type=float, default=0.9)
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--no-inform", action="store_true", help="skip the informativeness question")
+    p.add_argument("--moe-backend", default="triton",
+                   help="vLLM MoE kernel backend. 'auto' picks FLASHINFER_TRTLLM for FP8 on "
+                        "Blackwell, which JIT-compiles with nvcc (absent in the slim image); "
+                        "'triton' needs no compiler.")
     args = p.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -112,7 +116,11 @@ def main():
     from vllm import LLM, SamplingParams
     from nla.utils.vllm_steer import vllm_attn_kwargs
     tok = AutoTokenizer.from_pretrained(args.judge_model)
-    llm = LLM(**vllm_attn_kwargs(), model=args.judge_model, tensor_parallel_size=args.tp,
+    extra = dict(vllm_attn_kwargs())
+    if args.moe_backend and args.moe_backend != "auto":
+        from vllm.config.kernel import KernelConfig
+        extra["kernel_config"] = KernelConfig(moe_backend=args.moe_backend)
+    llm = LLM(**extra, model=args.judge_model, tensor_parallel_size=args.tp,
               gpu_memory_utilization=args.vllm_gpu_mem, max_model_len=args.max_model_len,
               enable_prefix_caching=True, disable_log_stats=True)
     sp = SamplingParams(temperature=0.0, max_tokens=6)
