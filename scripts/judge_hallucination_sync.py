@@ -79,12 +79,23 @@ async def score_part(part, args, jc, sem):
     return len(items), n_fail
 
 
+def _reload_volume():
+    """Inside a Modal container the mounted volume does NOT show files written by other
+    containers until it is reloaded — without this, follow mode never sees new parts."""
+    try:
+        import modal
+        modal.Volume.from_name(os.environ.get("NLA_VOL", "nla-exp")).reload()
+    except Exception as e:
+        print(f"  [follow] volume reload skipped: {type(e).__name__}: {str(e)[:80]}", flush=True)
+
+
 async def main_async(args):
     jc = JudgeClient("claude-sonnet-5", max_retries=6)
     sem = asyncio.Semaphore(args.concurrency)
     total = fails = 0
     t_start = time.time()
     while True:
+        _reload_volume()
         parts = sorted(glob.glob(f"{args.rollouts_dir}/{args.part_glob}"))
         todo = [p for p in parts if not os.path.exists(
             os.path.join(args.out_dir, f"scores_{os.path.splitext(os.path.basename(p))[0]}.parquet"))]
