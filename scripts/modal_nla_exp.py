@@ -30,6 +30,12 @@ DATA = "/vol/data"
 CKPT = "/vol/ckpts"
 HF_CACHE = "/vol/hf_cache"
 
+# NLA_LENS=metamodel -> ceselder/vllm-metamodel (vllm-lens fork: indexed hook, CUDA graphs
+# after prefill, 3-40x faster rollouts); default = upstream vllm-lens 1.1.0 + repo patch.
+LENS = os.environ.get("NLA_LENS", "lens110")
+LENS_PKG = ("'vllm-lens @ git+https://github.com/ceselder/vllm-metamodel'" if LENS == "metamodel"
+            else "'vllm-lens==1.1.0'")
+
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "build-essential")
@@ -40,7 +46,7 @@ image = (
     # B200 for Qwen3.6-27B in July; Qwen3-8B uses the same stack.
     .run_commands(
         "uv pip install --system --python $(which python) "
-        "'vllm==0.21.0' 'vllm-lens==1.1.0' 'transformers==5.5.4' "
+        "'vllm==0.21.0' " + LENS_PKG + " 'transformers==5.5.4' "
         "peft bitsandbytes wandb accelerate datasets pyarrow pandas numpy "
         "anthropic openai 'huggingface_hub[hf_xet]' safetensors sentencepiece "
         "protobuf pyyaml orjson httpx tqdm flash-linear-attention scipy"
@@ -90,11 +96,23 @@ def _prep(patch_lens: bool = True):
     except Exception as e:
         print(f"[prep] vol.reload skipped: {e}", flush=True)
     if patch_lens:
-        r = subprocess.run([sys.executable, "utils/patch_vllm_lens.py"],
-                           capture_output=True, text=True)
-        print("[prep] patch_vllm_lens:", (r.stdout + r.stderr).strip()[-400:], flush=True)
+        import importlib.util
+        spec = importlib.util.find_spec("vllm_lens._worker_ext")
+        is_fork = spec and spec.origin and "_apply_layer_vectorized" in open(spec.origin).read()
+        patcher = "utils/patch_vllm_metamodel.py" if is_fork else "utils/patch_vllm_lens.py"
+        r = subprocess.run([sys.executable, patcher], capture_output=True, text=True)
+        print(f"[prep] {patcher}:", (r.stdout + r.stderr).strip()[-400:], flush=True)
         if r.returncode != 0:
             raise SystemExit("vllm-lens patch failed")
+        if is_fork:
+            # the trainer's vintage guard looks for the upstream-patch markers; the fork
+            # has its own hook (verified separately) -> skip the guard, keep the
+            # sampler-mismatch check as the runtime safety net
+            os.environ["NLA_ALLOW_STALE_LENS"] = "1"
+            if os.environ.get("NLA_VLLM_GRAPHS", "1") == "1":
+                os.environ["VLLM_LENS_CUDA_GRAPHS"] = "1"   # decode CUDA graphs, prompt-position steering
+                os.environ["NLA_VLLM_EAGER"] = "0"          # scripts drop enforce_eager=True
+            print(f"[prep] lens=metamodel graphs={os.environ.get('VLLM_LENS_CUDA_GRAPHS','0')}", flush=True)
     os.environ.setdefault("WANDB_DIR", "/root/wandb")
     # FlashInfer's top-k/top-p sampler JIT-compiles with nvcc at engine init (the
     # slim image has no CUDA toolkit) -> use vLLM's PyTorch sampler instead.

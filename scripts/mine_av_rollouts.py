@@ -77,7 +77,8 @@ def main():
     from nla.utils.vllm_steer import vllm_attn_kwargs
     llm = LLM(**vllm_attn_kwargs(), model=args.av_ckpt, tokenizer=args.av_ckpt, dtype="bfloat16",
               gpu_memory_utilization=args.vllm_gpu_mem, max_model_len=args.vllm_max_len,
-              tensor_parallel_size=1, enforce_eager=True, disable_log_stats=True,
+              tensor_parallel_size=1, enforce_eager=(os.environ.get("NLA_VLLM_EAGER", "1") == "1"),
+              disable_log_stats=True,
               enable_prefix_caching=False,   # per-request steering => no prefix cache
               seed=args.seed + 1000 * args.shard + 7919 * args.sample_offset)
 

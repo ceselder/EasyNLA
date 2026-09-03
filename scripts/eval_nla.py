@@ -135,7 +135,8 @@ def main():
     from nla.utils.vllm_steer import vllm_attn_kwargs
     llm = LLM(**vllm_attn_kwargs(), model=args.av_ckpt, tokenizer=args.av_ckpt, dtype="bfloat16",
               gpu_memory_utilization=args.vllm_gpu_mem, max_model_len=1024,
-              enforce_eager=True, disable_log_stats=True, enable_prefix_caching=False)
+              enforce_eager=(os.environ.get("NLA_VLLM_EAGER", "1") == "1"),
+              disable_log_stats=True, enable_prefix_caching=False)
     pwa = [(build_prompt_text(r["prompt"], cfg.injection_char, tok),
             torch.tensor(r["activation"], dtype=torch.float32)) for r in rows]
     t0 = time.time()

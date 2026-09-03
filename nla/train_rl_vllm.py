@@ -2250,7 +2250,8 @@ def main():
         gpu_memory_utilization=args.vllm_gpu_mem,
         max_model_len=args.vllm_max_len,
         tensor_parallel_size=args.vllm_tp,
-        enforce_eager=True,  # avoids CUDA graph capture conflicts with HF training
+        # eager unless NLA_VLLM_EAGER=0 (vllm-metamodel: decode CUDA graphs, prompt-only steering)
+        enforce_eager=(os.environ.get("NLA_VLLM_EAGER", "1") == "1"),
         disable_log_stats=False,  # enable get_metrics() (preemptions/KV usage) + periodic stat line
         # CRITICAL: AV prompts within a batch are often byte-identical and differ
         # ONLY in the injected activation (a per-request steering vector applied
