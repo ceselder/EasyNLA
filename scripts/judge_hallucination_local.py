@@ -109,9 +109,10 @@ def main():
     print(f"[judge] sources loaded for {len(src)} rows", flush=True)
 
     from transformers import AutoTokenizer
-    from vllm import LLM, SamplingParams
+    from vllm import LLM
+    from nla.utils.vllm_steer import vllm_attn_kwargs, SamplingParams
     tok = AutoTokenizer.from_pretrained(args.judge_model)
-    llm = LLM(model=args.judge_model, tensor_parallel_size=args.tp,
+    llm = LLM(**vllm_attn_kwargs(), model=args.judge_model, tensor_parallel_size=args.tp,
               gpu_memory_utilization=args.vllm_gpu_mem, max_model_len=args.max_model_len,
               enable_prefix_caching=True, disable_log_stats=True)
     sp = SamplingParams(temperature=0.0, max_tokens=6)

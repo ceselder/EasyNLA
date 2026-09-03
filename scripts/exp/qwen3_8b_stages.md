@@ -20,7 +20,7 @@ All commands run from the repo root; every stage is `modal run --detach`.
       --rl-parquet /vol/data/qwen3_8b/av_sft_train.parquet --sidecar /vol/data/qwen3_8b/av_sft_train.parquet \
       --eval-parquet /vol/data/qwen3_8b/av_sft_eval.parquet --eval-n-prompts 128 --eval-every 10 \
       --evals base_fve halluc text_judges --halluc-every 50 --text-judges-every 50 \
-      --num-steps 150 --save-every 50 --extraction-layer 24 --ipc-weight-sync --seed 0"
+      --num-steps 150 --save-every 50 --extraction-layer 24 --vllm-attn-backend FLASH_ATTN --ipc-weight-sync --seed 0"
 
 ## Launched 2026-09-02 (actual commands)
     modal run --detach scripts/modal_nla_exp.py --task sft --mode av --tag av_sft --nproc 4 --bs 16 \
@@ -39,7 +39,7 @@ All commands run from the repo root; every stage is `modal run --detach`.
       --rl-parquet /vol/data/qwen3_8b/av_sft_train.parquet --sidecar /vol/data/qwen3_8b/av_sft_train.parquet \
       --eval-parquet /vol/data/qwen3_8b/av_sft_eval.parquet --eval-n-prompts 128 --eval-every 10 \
       --evals base_fve halluc text_judges --halluc-every 50 --text-judges-every 50 \
-      --num-steps 151 --save-every 50 --extraction-layer 24 --ipc-weight-sync --seed 0"
+      --num-steps 151 --save-every 50 --extraction-layer 24 --vllm-attn-backend FLASH_ATTN --ipc-weight-sync --seed 0"
     modal run --detach scripts/modal_nla_exp.py --task rl --tag rl_base --nproc 4 --extra "$RLCOMMON"
     modal run --detach scripts/modal_nla_exp.py --task shells --nshards 4 --cmd "python scripts/mine_av_rollouts.py \
       --av-ckpt /vol/ckpts/qwen3_8b/av_sft_merged --parquet /vol/data/qwen3_8b/av_sft_train.parquet \

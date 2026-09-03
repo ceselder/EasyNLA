@@ -54,6 +54,8 @@ image = (
         # auto-picked FLASHINFER JIT-compiles (needs nvcc) and dies in a slim image
         "VLLM_ATTENTION_BACKEND": "FLASH_ATTN",
         "VLLM_USE_FLASHINFER_SAMPLER": "0",   # sampler JIT needs nvcc (absent here)
+        "VLLM_USE_DEEP_GEMM": "0",
+        "VLLM_DEEP_GEMM_WARMUP": "skip",
         "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
         "PYTHONPATH": REPO_REMOTE,
     })
@@ -96,6 +98,10 @@ def _prep(patch_lens: bool = True):
     # FlashInfer's top-k/top-p sampler JIT-compiles with nvcc at engine init (the
     # slim image has no CUDA toolkit) -> use vLLM's PyTorch sampler instead.
     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+    # DeepGEMM (FP8) warmup imports a vendored deep_gemm that needs nvcc too; the
+    # models here are bf16, so disable it outright.
+    os.environ["VLLM_USE_DEEP_GEMM"] = "0"
+    os.environ["VLLM_DEEP_GEMM_WARMUP"] = "skip"
 
 
 def _run(cmd, env_extra=None, cwd=REPO_REMOTE):

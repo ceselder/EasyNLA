@@ -68,7 +68,8 @@ def main():
           f"x {args.n_samples} samples", flush=True)
 
     from vllm import LLM
-    llm = LLM(model=args.av_ckpt, tokenizer=args.av_ckpt, dtype="bfloat16",
+    from nla.utils.vllm_steer import vllm_attn_kwargs
+    llm = LLM(**vllm_attn_kwargs(), model=args.av_ckpt, tokenizer=args.av_ckpt, dtype="bfloat16",
               gpu_memory_utilization=args.vllm_gpu_mem, max_model_len=args.vllm_max_len,
               tensor_parallel_size=1, enforce_eager=True, disable_log_stats=True,
               enable_prefix_caching=False)   # per-request steering => no prefix cache

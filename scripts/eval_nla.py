@@ -129,7 +129,8 @@ def main():
 
     # ---- 1. generate
     from vllm import LLM
-    llm = LLM(model=args.av_ckpt, tokenizer=args.av_ckpt, dtype="bfloat16",
+    from nla.utils.vllm_steer import vllm_attn_kwargs
+    llm = LLM(**vllm_attn_kwargs(), model=args.av_ckpt, tokenizer=args.av_ckpt, dtype="bfloat16",
               gpu_memory_utilization=args.vllm_gpu_mem, max_model_len=1024,
               enforce_eager=True, disable_log_stats=True, enable_prefix_caching=False)
     pwa = [(build_prompt_text(r["prompt"], cfg.injection_char, tok),

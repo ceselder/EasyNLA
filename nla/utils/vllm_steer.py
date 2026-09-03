@@ -90,3 +90,21 @@ def build_steering_vector(activation, marker_pos, injection_layer=1):
         norm_match=True,
         position_indices=[marker_pos],
     )
+
+
+def vllm_attn_kwargs(backend: str | None = None) -> dict:
+    """Extra kwargs for vllm.LLM(...) that pin the attention backend.
+
+    vLLM >= 0.20 ignores the VLLM_ATTENTION_BACKEND env var; the auto-picked
+    FLASHINFER backend JIT-compiles (needs nvcc) on Blackwell, so the offline
+    scripts default to FLASH_ATTN (override: NLA_VLLM_ATTN_BACKEND=auto|<name>).
+    """
+    import os
+    name = backend or os.environ.get("NLA_VLLM_ATTN_BACKEND", "FLASH_ATTN")
+    if not name or name.lower() == "auto":
+        return {}
+    try:
+        from vllm.config.attention import AttentionConfig
+    except Exception:
+        return {}
+    return {"attention_config": AttentionConfig(backend=name)}
