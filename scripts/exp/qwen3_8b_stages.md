@@ -121,3 +121,17 @@ Pass 2 done 13:07 (2,099,756 scored rollouts on 499,992 activations, ≈4.2 samp
 `bon6` = 499,992 rows (best sample per activation), `bon6le6` = 68,185 rows (best sample ≤6; 13.6% of activations).
 34% of activations have every sample at 10. Distillation SFTs launched 13:19: ar_bon6 (scratch), ar_bon6_cont, ar_bon6le6_cont (1 GPU,
 sequential), av_bon6_cont (fresh LoRA on the merged 500k AV, lr 5e-5, 2 GPUs, ~2.6 h).
+
+### Milestone 1, continuation variants (Opus-trained AR `ar_sft500k/iter_0007813` continued at lr 1e-5; eval 13:51–14:10, same 1,024 rollouts — identical seed, baseline reproduces 55.19%)
+| AR | FVE on the AV's own rollouts | FVE on Opus gold text |
+|---|---|---|
+| ar_sft500k (baseline) | 55.2% | 78.3% |
+| ar_le6_cont (49.5k ≤6 samples) | 58.6% | 76.2% |
+| ar_rand_cont (49.5k random) | 59.3% | 75.2% |
+| ar_onpol_cont (500k on-policy) | **60.7%** | 74.6% |
+| (ar_onpol from scratch, for reference) | 60.1% | 72.7% |
+Continuation is strictly better than from-scratch: the 500k continuation is the best on-policy reader (60.7%) and keeps 74.6% on
+gold (vs 72.7% scratch). Even 49.5k on-policy rows (one 775-step epoch, ~10 min) recover +3.4–4.1 pts on rollouts for a 2–3 pt
+loss on gold. Hallucination filtering again does not help the AR (le6_cont 58.6 vs rand_cont 59.3 on rollouts; 76.2 vs 75.2 on
+gold — the filtered set is slightly closer to Opus text, which is the point: it is *less* on-policy). AV rollouts at eval:
+halluc 9.41, inform 2.25 (n=256). RL arms rlB_ar_onpol (scratch AR) and rlB_ar_onpol_cont queued (queue 2).
