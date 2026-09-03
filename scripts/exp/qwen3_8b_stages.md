@@ -93,3 +93,13 @@ merged 500k AV, lr 5e-5, 2 GPUs; merge → `av_bon6_merged`; evals `eval_bon6_av
 
 Mining pass 2 (samples 2..5) was restarted on the fork at 11:00 resuming from row 51200 (`--start 51200 --part-start 5
 --complete-suffix R`, app `nla-mineB-pass2R`, ~100 samples/s per B200 vs ~44 on the old stack).
+
+### Arm result: rlB_ema098 (EMA critic, decay 0.98) — finished 12:27, 150 steps, 4×B200 DP
+| @150 | rlB_base | rlB_ema098 |
+|---|---|---|
+| held-out FVE (128 prompts) | 75.2% | 75.0% (EMA weights: 75.7%) |
+| hallucination ↓ | 9.12 | 9.23 |
+| informativeness ↑ | 2.62 | 2.58 |
+| writing quality ↑ | 4.16 | 4.12 |
+Trajectory matched the baseline within eval noise at every 10-step mark (≤1.7 pt apart). Verdict: EMA 0.98 on the critic
+does NOT help at this scale/horizon; the AR is not moving fast enough for a slower target to matter. Next: ema0995, lag10.
