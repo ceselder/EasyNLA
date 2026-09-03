@@ -77,3 +77,19 @@ All commands run from the repo root; every stage is `modal run --detach`.
     # (image variant). It inherits upstream's norm-match-against-the-partial-residual bug -> utils/patch_vllm_metamodel.py
     # (norm_ref = output[0]+output[1] in both apply paths + module-level steer counter). Validation = RL smoke's
     # sampler_logp_absdiff_mean (~0.02 healthy) + steer_apply_rate, then a mining throughput smoke.
+
+## Milestone 1 chains (2026-09-03 11:00–, protocol B, fork backend `NLA_LENS=metamodel` default)
+
+Chain scripts live in `~/nla-exp-logs/` (copied here for reference): `launch_milestone1.sh` (wait for pass-1 mining →
+sweep-score → `score_stats` → `build_filtered_sft` for `onpol` (500k random on-policy samples), `le6` (all ≤6, 49,547),
+`rand` (49,547 random, size-matched) → AR SFTs from scratch `ar_onpol|ar_le6|ar_rand`, lr 2e-5, bs 64, 1 GPU),
+`launch_milestone1_eval.sh` (`eval_nla.py --ar-ckpts onpol= le6= rand=` vs `ar_sft500k/iter_0007813`, 1,024 eval rows,
+judge-n 256, gold FVE → `results/eval_milestone1_avsft500k.json`), `launch_milestone1_cont.sh` (same three sets but
+CONTINUING the Opus-trained AR: `--base-ckpt ar_sft500k/iter_0007813 --lr 1e-5` → `ar_*_cont`, eval →
+`eval_milestone1_cont.json`), `launch_bon6.sh` (after mining pass 2R + scoring: `bon6` = best of 6 per activation,
+`bon6le6` = best of 6 only if ≤6; `ar_bon6` scratch, `ar_bon6_cont`, `ar_bon6le6_cont`; `av_bon6_cont` = fresh LoRA r128 on the
+merged 500k AV, lr 5e-5, 2 GPUs; merge → `av_bon6_merged`; evals `eval_bon6_avbase.json` (baseline AV × all ARs) and
+`eval_bon6_avbon6.json` (bon6 AV × baseline AR / bon6_cont AR)).
+
+Mining pass 2 (samples 2..5) was restarted on the fork at 11:00 resuming from row 51200 (`--start 51200 --part-start 5
+--complete-suffix R`, app `nla-mineB-pass2R`, ~100 samples/s per B200 vs ~44 on the old stack).
