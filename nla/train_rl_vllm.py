@@ -1378,6 +1378,7 @@ def grpo_update_microbatched(
             raise NotImplementedError(
                 "kl_estimator='dist' needs full-vocab logits (truncated_dist_kl); the "
                 "chunked-CE path only supports 'k3'. Rerun with --kl-estimator k3.")
+        kl_tok = None   # chunked-CE path: per-token k3 estimator only (no dist KL tensor)
         # --- per-sample GRPO loss for this chunk ---
         chunk_losses = []
         for row, i in enumerate(idxs):
