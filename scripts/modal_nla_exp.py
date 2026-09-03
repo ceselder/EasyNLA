@@ -655,7 +655,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "shells":
         # N parallel one-GPU shells; `{shard}` / `{nshards}` are substituted in cmd.
         f = shell.with_options(gpu=f"B200:{gpus or 1}")
-        calls = [f.spawn(cmd=cmd.format(shard=s, nshards=nshards)) for s in range(nshards)]
+        shard_ids = [int(x) for x in out.split(",")] if out else list(range(nshards))
+        calls = [f.spawn(cmd=cmd.format(shard=s, nshards=nshards)) for s in shard_ids]
         for c in calls:
             print(c.get())
     else:

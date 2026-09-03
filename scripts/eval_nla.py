@@ -99,6 +99,9 @@ def main():
     p.add_argument("--av-ckpt", required=True, help="merged bf16 HF dir for vLLM")
     p.add_argument("--ar-ckpt", required=True, help="HF critic dir (train_sft AR / critic_latest)")
     p.add_argument("--ar-ckpt-b", default=None, help="second critic scored on the same text")
+    p.add_argument("--ar-ckpts", nargs="*", default=[],
+                   help="more critics as name=path; each is scored on the same generations "
+                        "(metrics fve_<name>, gold_fve_<name>)")
     p.add_argument("--parquet", required=True, help="test AV-format parquet")
     p.add_argument("--sidecar", default=None)
     p.add_argument("--n", type=int, default=1024)
@@ -162,6 +165,9 @@ def main():
                "av_ckpt": args.av_ckpt, "ar_ckpt": args.ar_ckpt, "parquet": args.parquet}
     per = {"doc_id": [r["doc_id"] for r in rows], "explanation": expls, "n_tokens": lens}
     crit_specs = [("a", args.ar_ckpt)] + ([("b", args.ar_ckpt_b)] if args.ar_ckpt_b else [])
+    for spec in args.ar_ckpts:
+        name, path = spec.split("=", 1)
+        crit_specs.append((name, path))
     golds = [extract_explanation(r["gold"]) if r.get("gold") else None for r in rows]
     for key, path in crit_specs:
         critic = NLACriticModel.from_pretrained(path, torch_dtype=torch.bfloat16).to(device).eval()
