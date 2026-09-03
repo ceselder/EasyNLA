@@ -154,3 +154,14 @@ bon6 LoRA, reference = frozen copy of that adapter, vLLM = av_bon6_merged) and t
 | writing quality ↑ | 4.16 | 4.12 | 4.61 |
 Slower critic → ~1.3 pt lower FVE, hallucination within noise (8.74 at step 50, back at the baseline's level by step 100);
 writing quality a little higher (4.61 vs 4.16, repetitiveness 3.84 vs 4.20). Verdict: EMA on the critic does not help hallucination at this horizon and costs a little FVE at 0.995.
+
+### 16:13 crash + 8 h stall (2026-09-03)
+At 16:13 two Modal apps died together (`RemoteError`; rank-0 TCPStore shutdown in the DP run) — rlB_ar_onpol at step 99
+(ckpts iter_000050/000100 saved) and sft ar_bon6_cont at step 4749. The chains' completion grep did not match RemoteError, so
+queue 2, bon6 part 2 and queue 3 sat waiting until 23:45; the Claude-side monitors had died at 15:13. av_bon6_cont finished
+normally at 15:52 (iter_0007813). Fix: `rl_common.sh` DONE_PAT now includes RemoteError / App completed; relaunched as
+launch_arms_q2b.sh (slot A: ar_onpol → ar_onpol_cont → lag10 → lowlr → arevery2 → arlr4e5), launch_bon6_part3.sh (slot B:
+merge av_bon6 ∥ ar_bon6_cont ∥ ar_bon6le6_cont → evals) and launch_arms_q3b.sh (KL arms, av_bon6 arm, combo after slot B).
+Partial rlB_ar_onpol trajectory (on-policy from-scratch AR as RL critic), eval FVE: 63.4 @0 (baseline 58.8), 69.4 @10, 70.7 @20,
+69.7 @30, 73.1 @40, 72.6 @50, 73.6 @60, 73.6 @70, 73.1 @80, 75.5 @90 (baseline 74.4 @90); halluc 8.92 @0 / 9.25 @50 (baseline
+9.20 / 9.07 — note the step-0 policies are identical, so 8.92 vs 9.20 is the judge+sampling noise floor ≈ 0.3 on 128 prompts).
