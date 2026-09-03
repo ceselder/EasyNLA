@@ -28,3 +28,25 @@ All commands run from the repo root; every stage is `modal run --detach`.
     modal run --detach scripts/modal_nla_exp.py --task sft --mode ar --tag ar_sft --nproc 4 --bs 16 \
         --extra "--lr 2e-5 --min-lr 2e-6 --full-ft-dtype fp32"
     # data: /vol/data/qwen3_8b/{av,ar}_sft_{train,test}.parquet (735,359 / 7,293 rows), av_sft_eval.parquet (1,024)
+
+## Warm-start results (2026-09-03)
+    AV: /vol/ckpts/qwen3_8b/av_sft/iter_0011490  held-out ppl 5.21   -> merged: /vol/ckpts/qwen3_8b/av_sft_merged
+    AR: /vol/ckpts/qwen3_8b/ar_sft/iter_0011490  held-out FVE 78.9% (Opus text, n=1000)
+
+## Planned real runs (DP=4 baseline + 4-GPU mining concurrently, then DP=8 arms)
+    RLCOMMON="--base-ckpt Qwen/Qwen3-8B --av-adapter /vol/ckpts/qwen3_8b/av_sft/iter_0011490 \
+      --av-ckpt /vol/ckpts/qwen3_8b/av_sft_merged --ar-ckpt /vol/ckpts/qwen3_8b/ar_sft/iter_0011490 \
+      --rl-parquet /vol/data/qwen3_8b/av_sft_train.parquet --sidecar /vol/data/qwen3_8b/av_sft_train.parquet \
+      --eval-parquet /vol/data/qwen3_8b/av_sft_eval.parquet --eval-n-prompts 128 --eval-every 10 \
+      --evals base_fve halluc text_judges --halluc-every 50 --text-judges-every 50 \
+      --num-steps 151 --save-every 50 --extraction-layer 24 --ipc-weight-sync --seed 0"
+    modal run --detach scripts/modal_nla_exp.py --task rl --tag rl_base --nproc 4 --extra "$RLCOMMON"
+    modal run --detach scripts/modal_nla_exp.py --task shells --nshards 4 --cmd "python scripts/mine_av_rollouts.py \
+      --av-ckpt /vol/ckpts/qwen3_8b/av_sft_merged --parquet /vol/data/qwen3_8b/av_sft_train.parquet \
+      --out-dir /vol/data/qwen3_8b/mine_avsft --n-samples 2 --shard {shard} --nshards {nshards}"
+    # EMA / lag / cadence arms (same RLCOMMON):
+    #   rl_ema098   --critic-ema-decay 0.98
+    #   rl_ema0995  --critic-ema-decay 0.995
+    #   rl_lag10    --critic-lag-steps 10
+    #   rl_arevery2 --critic-update-every 2
+    # KL arms: rl_klsup --ar-loss mse_plus_kl --ar-kl-weight W ; rl_klrew --reward-mode vector_plus_kl --downstream-kl-weight W
