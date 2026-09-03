@@ -83,13 +83,19 @@ def build_steering_vector(activation, marker_pos, injection_layer=1):
     """
     from vllm_lens import SteeringVector
 
-    return SteeringVector(
+    kw = dict(
         activations=activation.view(1, 1, -1).cpu().float(),  # [1, 1, d]
         layer_indices=[injection_layer],
         scale=1.0,
         norm_match=True,
         position_indices=[marker_pos],
     )
+    # vllm-metamodel >= the norm_match_ref PR: ask for the FULL residual stream as the
+    # norm reference (== the HF Karvonen hook). Older builds are patched instead
+    # (utils/patch_vllm_lens.py / utils/patch_vllm_metamodel.py) and lack the field.
+    if "norm_match_ref" in getattr(SteeringVector, "model_fields", {}):
+        kw["norm_match_ref"] = "residual_stream"
+    return SteeringVector(**kw)
 
 
 def vllm_attn_kwargs(backend: str | None = None) -> dict:
