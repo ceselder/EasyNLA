@@ -43,7 +43,7 @@ All commands run from the repo root; every stage is `modal run --detach`.
     modal run --detach scripts/modal_nla_exp.py --task rl --tag rl_base --nproc 4 --extra "$RLCOMMON"
     modal run --detach scripts/modal_nla_exp.py --task shells --nshards 4 --cmd "python scripts/mine_av_rollouts.py \
       --av-ckpt /vol/ckpts/qwen3_8b/av_sft_merged --parquet /vol/data/qwen3_8b/av_sft_train.parquet \
-      --out-dir /vol/data/qwen3_8b/mine_avsft --n-samples 2 --shard {shard} --nshards {nshards}"
+      --out-dir /vol/data/qwen3_8b/mine_avsft --n-samples 2 --max-new-tokens 256 --shard {shard} --nshards {nshards}"
     # EMA / lag / cadence arms (same RLCOMMON):
     #   rl_ema098   --critic-ema-decay 0.98
     #   rl_ema0995  --critic-ema-decay 0.995

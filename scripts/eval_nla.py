@@ -104,7 +104,7 @@ def main():
     p.add_argument("--n", type=int, default=1024)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--max-new-tokens", type=int, default=150)
+    p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--judge-n", type=int, default=256)
     p.add_argument("--judge-model", default="claude-sonnet-5")
     p.add_argument("--no-text-judges", action="store_true")

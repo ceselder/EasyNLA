@@ -36,7 +36,7 @@ def main():
     p.add_argument("--sidecar", default=None)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--n-samples", type=int, default=2)
-    p.add_argument("--max-new-tokens", type=int, default=150)
+    p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--nshards", type=int, default=1)
