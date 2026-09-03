@@ -103,3 +103,16 @@ Mining pass 2 (samples 2..5) was restarted on the fork at 11:00 resuming from ro
 | writing quality ↑ | 4.16 | 4.12 |
 Trajectory matched the baseline within eval noise at every 10-step mark (≤1.7 pt apart). Verdict: EMA 0.98 on the critic
 does NOT help at this scale/horizon; the AR is not moving fast enough for a slower target to matter. Next: ema0995, lag10.
+
+### Milestone 1 result (from-scratch ARs; eval 12:47–13:00, 1,024 test rows, AV = av_sft500k_lr1e4, T=1, fork backend)
+| AR warm-start | FVE on the AV's own rollouts | FVE on Opus gold text |
+|---|---|---|
+| ar_sft500k (Opus text, 500k) — baseline | **55.2%** | **78.3%** |
+| ar_onpol (500k on-policy AV samples, scratch) | **60.1%** | 72.7% |
+| ar_le6 (49.5k samples scoring ≤6, scratch) | 54.5% | 69.4% |
+| ar_rand (49.5k random samples, scratch, size-matched) | 55.6% | 69.0% |
+AV rollouts at eval: hallucination 9.42, informativeness 2.11 (Sonnet 5, n=256). Off-policy gap for the Opus-trained AR:
+78.3 → 55.2 (23 pts). Training the AR on on-policy text (same size) closes 5 pts of it (+4.9 on rollouts, −5.6 on gold).
+Hallucination-filtering the AR data does NOT help at matched size (le6 54.5 vs rand 55.6, within noise): the AR must
+read the distribution the AV actually produces, and the ≤6 slice is 4% of it. Continuation variants (`ar_*_cont`) and
+best-of-6 pending. Arm queue reprioritised (queue 2): rlB_ar_onpol → lag10 → lowlr → rlB_ar_onpol_cont → arevery2 → arlr4e5 → ema098_arlr16e5.
