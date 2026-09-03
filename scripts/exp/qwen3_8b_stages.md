@@ -135,3 +135,12 @@ gold (vs 72.7% scratch). Even 49.5k on-policy rows (one 775-step epoch, ~10 min)
 loss on gold. Hallucination filtering again does not help the AR (le6_cont 58.6 vs rand_cont 59.3 on rollouts; 76.2 vs 75.2 on
 gold — the filtered set is slightly closer to Opus text, which is the point: it is *less* on-policy). AV rollouts at eval:
 halluc 9.41, inform 2.25 (n=256). RL arms rlB_ar_onpol (scratch AR) and rlB_ar_onpol_cont queued (queue 2).
+
+### KL smokes (14:20–14:42, 1 GPU, 32 prompts × 8, 4 steps, fork backend) → weights for the KL arms
+- `--ar-loss mse_plus_kl --ar-kl-weight 1.0`: critic recon-KL (coarsened top-k+tail KL between gold-patched and
+  reconstruction-patched continuations, 48 rollouts/step) ≈ 0.14 nats vs MSE ≈ 0.30 → w=1 puts the KL at ~half the MSE scale.
+  Step 31 s vs 23–25 s plain (+25%).
+- `--reward-mode vector_plus_kl --downstream-kl-weight 1.0`: `av/downstream_kl_mean` ≈ 0.16 vs MSE 0.22–0.31; step 31–32 s.
+Both run clean end-to-end (gold cache built, FVE tracked). Arms `rlB_klsup` / `rlB_klrew` use w=1.0 (queue 3, 4 GPUs, starts when
+the best-of-N chain releases its GPUs ≈16:40), followed by `rlB_av_bon6` (distilled AV, baseline AR; HF actor = 500k-merged AV +
+bon6 LoRA, reference = frozen copy of that adapter, vLLM = av_bon6_merged) and the combination `rlB_av_bon6_ar_onpol_cont`.
