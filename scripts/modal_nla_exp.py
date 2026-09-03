@@ -519,6 +519,23 @@ def probe_tokenizer(merged: str = f"{CKPT}/qwen3_8b/av_sft_merged", base: str = 
               "| split_special_tokens:", d.get("split_special_tokens"))
     return "ok"
 
+
+@app.function(volumes=VOLS, timeout=24 * 60 * 60, cpu=4.0, memory=32768, secrets=SECRETS)
+def judge_batch(rollouts_dir: str, source_parquet: str, out_dir: str, phase: str = "both",
+                limit: int = 0, max_parts: int = 0, per_batch: int = 40000):
+    """Sonnet-5 bulk hallucination scoring through the Anthropic Batch API (CPU only)."""
+    import sys
+    _prep(patch_lens=False)
+    cmd = [sys.executable, "scripts/judge_hallucination_batch.py", "--phase", phase,
+           "--rollouts-dir", rollouts_dir, "--source-parquet", source_parquet,
+           "--out-dir", out_dir, "--per-batch", str(per_batch)]
+    if limit:
+        cmd += ["--limit", str(limit)]
+    if max_parts:
+        cmd += ["--max-parts", str(max_parts)]
+    _run(cmd)
+    return out_dir
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -546,6 +563,9 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "shell":
         f = shell.with_options(gpu=f"B200:{gpus or 1}")
         print(f.remote(cmd=cmd))
+    elif task == "judge_batch":
+        print(judge_batch.remote(rollouts_dir=cmd.split("|")[0], source_parquet=cmd.split("|")[1],
+                                 out_dir=cmd.split("|")[2], phase=mode, limit=limit, max_parts=nshards))
     elif task == "probe_tok":
         print(probe_tokenizer.remote())
     elif task == "shells":
