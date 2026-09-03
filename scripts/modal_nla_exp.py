@@ -416,7 +416,8 @@ def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024):
 # --------------------------------------------------------------------- SFT / merge
 @app.function(gpu="B200:4", volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS)
 def train_sft(mode: str, tag: str, nproc: int = 4, model_tag: str = "qwen3_8b",
-              bs: int = 16, accum: int = 1, extra: str = "", data_dir: str = ""):
+              bs: int = 16, accum: int = 1, extra: str = "", data_dir: str = "",
+              data_suffix: str = ""):
     """torchrun -m nla.train_sft (one epoch by default). extra = additional CLI args."""
     import sys
     _prep(patch_lens=False)
@@ -425,7 +426,7 @@ def train_sft(mode: str, tag: str, nproc: int = 4, model_tag: str = "qwen3_8b",
     ddir = data_dir or f"{DATA}/{model_tag}"
     save_dir = f"{CKPT}/{model_tag}/{tag}"
     os.makedirs(save_dir, exist_ok=True)
-    data = f"{ddir}/{mode}_sft_train.parquet"
+    data = f"{ddir}/{mode}_sft_train{data_suffix}.parquet"
     val = f"{ddir}/av_sft_test.parquet"
     launcher = ([sys.executable, "-m", "torch.distributed.run", "--standalone",
                  f"--nproc_per_node={nproc}"] if nproc > 1 else [sys.executable])
@@ -552,6 +553,45 @@ def judge_sync(rollouts_dir: str, source_parquet: str, out_dir: str,
     _run(cmd, env_extra={"NLA_JUDGE_PREFER_FALLBACK": "1"})
     return out_dir
 
+
+@app.function(volumes=VOLS, timeout=2 * 60 * 60, cpu=8.0, memory=65536, secrets=SECRETS)
+def split_sft_rl(model_tag: str = "qwen3_8b", n_sft: int = 500_000):
+    """Protocol: warm-start (AV and AR, same rows) on the first n_sft rows of the shuffled
+    train split; the REST of train is the RL activation pool. Writes
+    {av,ar}_sft_train500k.parquet + av_sft_rl.parquet (+ sidecars) next to the originals."""
+    import shutil
+    import pyarrow.parquet as pq
+    import yaml
+    _prep(patch_lens=False)
+    d = f"{DATA}/{model_tag}"
+    out = {}
+    for stage in ("av", "ar"):
+        src = f"{d}/{stage}_sft_train.parquet"
+        pf = pq.ParquetFile(src)
+        side = yaml.safe_load(open(src + ".nla_meta.yaml"))
+        sft_path = f"{d}/{stage}_sft_train500k.parquet"
+        rl_path = f"{d}/{stage}_sft_rl.parquet"
+        w_sft = pq.ParquetWriter(sft_path, pf.schema_arrow, compression="zstd")
+        w_rl = pq.ParquetWriter(rl_path, pf.schema_arrow, compression="zstd")
+        n_s = n_r = 0
+        for rg in range(pf.num_row_groups):
+            t = pf.read_row_group(rg)
+            if n_s < n_sft:
+                take = min(n_sft - n_s, t.num_rows)
+                w_sft.write_table(t.slice(0, take), row_group_size=5000); n_s += take
+                if take < t.num_rows:
+                    w_rl.write_table(t.slice(take), row_group_size=5000); n_r += t.num_rows - take
+            else:
+                w_rl.write_table(t, row_group_size=5000); n_r += t.num_rows
+        w_sft.close(); w_rl.close()
+        for path, n, tag in ((sft_path, n_s, "sft500k"), (rl_path, n_r, "rl")):
+            m = dict(side); m["row_count"] = n; m["dataset_id"] = side["dataset_id"] + "_" + tag
+            yaml.safe_dump(m, open(path + ".nla_meta.yaml", "w"), sort_keys=False, allow_unicode=True)
+        out[stage] = {"sft": n_s, "rl": n_r}
+        print(f"{stage}: sft={n_s} rl={n_r}", flush=True)
+    vol.commit()
+    return out
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -570,7 +610,7 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "sft":
         f = train_sft.with_options(gpu=f"B200:{gpus or nproc}")
         print(f.remote(mode=mode, tag=tag, nproc=nproc, model_tag=model_tag,
-                       bs=bs, accum=accum, extra=extra, data_dir=data_dir))
+                       bs=bs, accum=accum, extra=extra, data_dir=data_dir, data_suffix=out))
     elif task == "merge_av":
         print(merge_av.remote(av_dir=av_dir, out=out, model_tag=model_tag))
     elif task == "rl":
@@ -591,6 +631,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "judge_batch":
         print(judge_batch.remote(rollouts_dir=cmd.split("|")[0], source_parquet=cmd.split("|")[1],
                                  out_dir=cmd.split("|")[2], phase=mode, limit=limit, max_parts=nshards))
+    elif task == "split":
+        print(split_sft_rl.remote(model_tag=model_tag, n_sft=limit or 500_000))
     elif task == "probe_tok":
         print(probe_tokenizer.remote())
     elif task == "shells":
