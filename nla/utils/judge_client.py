@@ -60,10 +60,15 @@ _PICK_TOOL_OPENAI = {
 
 
 def backend_name() -> str:
-    if os.environ.get("OPENROUTER_API_KEY"):
-        return "openrouter"
+    """Anthropic-native first (cheaper, caching, first-class), OpenRouter otherwise.
+    Force one with NLA_JUDGE_BACKEND=anthropic|openrouter."""
+    forced = os.environ.get("NLA_JUDGE_BACKEND")
+    if forced in ("anthropic", "openrouter"):
+        return forced
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return "openrouter"
     return ""
 
 
@@ -98,8 +103,40 @@ class JudgeClient:
             ws = os.environ.get("ANTHROPIC_WORKSPACE_ID")
             if ws:
                 hdr["anthropic-workspace-id"] = ws
+            # Primary = the low-priority "infinite" key: expected to 429/529 under
+            # load. Per-call, after the SDK's own retries, fall back to the
+            # high-priority key (ANTHROPIC_API_KEY_FALLBACK) when one is configured
+            # -- judge scores feed real results, so a nan eval round is worse than
+            # spending the backup quota. Swaps are counted and logged.
             self._c = anthropic.AsyncAnthropic(max_retries=max_retries, default_headers=hdr)
             self._model_id = model
+            self._fb = None
+            fb_key = os.environ.get("ANTHROPIC_API_KEY_FALLBACK")
+            if fb_key:
+                fb_hdr = {}
+                fb_ws = os.environ.get("ANTHROPIC_WORKSPACE_ID_FALLBACK")
+                if fb_ws:
+                    fb_hdr["anthropic-workspace-id"] = fb_ws
+                self._fb = anthropic.AsyncAnthropic(api_key=fb_key, max_retries=max_retries,
+                                                    default_headers=fb_hdr)
+            self._n_fallback = 0
+
+    async def _anthropic_create(self, **kw):
+        """messages.create on the primary key; on rate-limit/overload exhaustion
+        retry once on the fallback key (if any)."""
+        import anthropic
+        try:
+            return await self._c.messages.create(**kw)
+        except (anthropic.RateLimitError, anthropic.InternalServerError,
+                anthropic.APIStatusError) as e:
+            status = getattr(e, "status_code", None)
+            if self._fb is None or status not in (429, 529, 500, 502, 503, 529):
+                raise
+            self._n_fallback += 1
+            if self._n_fallback in (1, 10, 100, 1000):
+                print(f"  [judge] primary key {status} after retries -> using the "
+                      f"FALLBACK key (swap #{self._n_fallback})", flush=True)
+            return await self._fb.messages.create(**kw)
 
     # ---- structured integer -------------------------------------------------
     async def rate_1_10(self, prompt: str) -> int | None:
@@ -119,7 +156,7 @@ class JudgeClient:
                     if isinstance(s, int) and 1 <= s <= 10:
                         return s
                 return parse_1_10(msg.content or "")
-            r = await self._c.messages.create(
+            r = await self._anthropic_create(
                 model=self._model_id, max_tokens=64,
                 tools=[_RATE_TOOL_ANTHROPIC], tool_choice={"type": "tool", "name": "rate"},
                 messages=[{"role": "user", "content": prompt}],
@@ -156,7 +193,7 @@ class JudgeClient:
                     txt = str(json.loads(msg.tool_calls[0].function.arguments or "{}").get("letter", ""))
                 txt = txt or (msg.content or "")
             else:
-                r = await self._c.messages.create(
+                r = await self._anthropic_create(
                     model=self._model_id, max_tokens=64,
                     tools=[_PICK_TOOL_ANTHROPIC], tool_choice={"type": "tool", "name": "pick"},
                     messages=[{"role": "user", "content": prompt}],
@@ -181,7 +218,7 @@ class JudgeClient:
                     model=self._model_id, max_tokens=max_tokens,
                     messages=[{"role": "user", "content": prompt}])
                 return r.choices[0].message.content
-            r = await self._c.messages.create(
+            r = await self._anthropic_create(
                 model=self._model_id, max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}])
             return "".join(b.text for b in r.content if getattr(b, "type", None) == "text")
