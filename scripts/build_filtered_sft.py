@@ -166,6 +166,14 @@ def main():
                                  "rollouts_dir": args.rollouts_dir, "scores_dir": args.scores_dir}
         yaml.safe_dump(meta, open(f"{args.out_dir}/{stage}_sft_train.parquet.nla_meta.yaml", "w"),
                        sort_keys=False, allow_unicode=True)
+    # the SFT launcher expects the held-out files next to the train parquet
+    src_dir = os.path.dirname(os.path.abspath(args.source_parquet))
+    for fn in ("av_sft_test.parquet", "av_sft_test.parquet.nla_meta.yaml",
+               "ar_sft_test.parquet", "ar_sft_test.parquet.nla_meta.yaml", "av_sft_eval.parquet",
+               "av_sft_eval.parquet.nla_meta.yaml"):
+        sp_ = os.path.join(src_dir, fn)
+        if os.path.exists(sp_) and not os.path.exists(os.path.join(args.out_dir, fn)):
+            shutil.copy2(sp_, os.path.join(args.out_dir, fn))
     stats = {"n_rollouts": n_seen, "n_scored": n_scored, "n_kept": n_keep,
              "rows_with_kept": len(kept), "n_ar_rows": n_ar, "n_av_rows": n_av,
              "max_halluc": args.max_halluc, "min_inform": args.min_inform,
