@@ -1852,9 +1852,24 @@ def main():
     _side_src = _spf(args.sidecar)
     _side_dst = save_dir / "nla_meta.yaml"
     if _side_dst.exists():
+        import time as _time
         import yaml as _yaml
-        _prev = _yaml.safe_load(_side_dst.read_text())
+        # Under torchrun, rank 0 may still be writing this snapshot while another
+        # rank reads it (observed: empty file -> None). Retry briefly, then skip.
+        _prev = None
+        for _try in range(10):
+            try:
+                _prev = _yaml.safe_load(_side_dst.read_text())
+            except Exception:
+                _prev = None
+            if isinstance(_prev, dict):
+                break
+            _time.sleep(1.0)
         _cur = _yaml.safe_load(_side_src.read_text())
+        if not isinstance(_prev, dict):
+            print(f"[sidecar] WARN: could not read {_side_dst} after retries; skipping the "
+                  f"resume-consistency check", flush=True)
+            _prev = dict(_cur)
         for _k in ("tokens", "extraction"):
             assert _prev.get(_k) == _cur.get(_k), (
                 f"save-dir sidecar snapshot disagrees with --sidecar on {_k!r}: "
