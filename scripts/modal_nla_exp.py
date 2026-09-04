@@ -480,7 +480,10 @@ def merge_av(av_dir: str, out: str, model_tag: str = "qwen3_8b", base: str = "")
 
 
 # ------------------------------------------------------------------------------ RL
-@app.function(gpu="B200:4", volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS)
+RL_GPUS = int(os.environ.get("NLA_RL_GPUS", "4"))   # 8 = one rank per GPU, each with its own vLLM engine (2x faster steps)
+
+
+@app.function(gpu=f"B200:{RL_GPUS}", volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS)
 def train_rl(tag: str, nproc: int = 4, model_tag: str = "qwen3_8b", extra: str = "",
              config: str = "configs/rl_vllm.yaml", graphs: int = 1):
     """torchrun -m nla.train_rl_vllm --config <config> <extra>. All run-specific
