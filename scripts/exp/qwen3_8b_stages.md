@@ -413,3 +413,6 @@ arklonly 532 (ckpt@500 59.0). 3 apps, 5/5 chains, no new crashes. Judge fields N
 → peak 69 at ~100–250, then a regime change at ~300 and a slow slide to ≈59–60 (pre-RL 55.2) while the co-trained critic keeps rising: the plain
 MSE co-training recipe reward-hacks its own critic on a long run. klsup so far: 68–70 at every checkpoint through 600 (600: 68.1).
 arklonly: 65 → 59 (500). Final judge fields NaN (keys dead).
+
+### 20:31 check-in — klsup 669 (own 72.9%; ckpt@650 67.4 vs base@650 61.0), arklonly 581 (ckpt@550 58.2). 2 apps, 4/4 chains (base done).
+Judge key still 401 (no re-ping).
