@@ -94,6 +94,9 @@ _add("xattn_flamingo_dense", kind="xattn", layers=list(range(1, 36, 2)), k=1, la
 _add("xattn_plus_karvonen_L1", kind="xattn", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[1])
 _add("freshheads", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[], null_key=True, no_gate=True)
 _add("freshheads_plus_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True)
+_add("freshheads_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared")
+_add("freshheads_film_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", extras=["film"])
+_add("freshheads_dense_plus_karvonen_L8", kind="xattn", layers=list(range(1, 36)), k=1, layers_resid=[8], null_key=True, no_gate=True)
 _add("ipadapter_kv4", kind="ipkv", k=4)                # learned per-layer K/V of 4 marker slots from v (IP-Adapter / prefix-KV)
 _add("ipadapter_kv1", kind="ipkv", k=1)
 _add("ipkv_plus_karvonen_L1", kind="ipkv", k=4, layers_resid=[1])   # fair: learned K/V from v at 4 slots + the marker
@@ -137,13 +140,14 @@ class Feeder(nn.Module):
             self.b = nn.ParameterList([nn.Parameter(torch.zeros(d_model)) for _ in range(n)])
             self.proj = spec["proj"]
         kind = spec["kind"]
+        self.kinds = {kind} | set(spec.get("extras", []))
         if spec.get("all_pos"):
             self.bscale = nn.Parameter(torch.full((len(spec["layers"]),), 0.1))
-        if kind in ("film", "xattn", "ipkv"):
+        if self.kinds & {"film", "xattn", "ipkv"}:
             # shared bottleneck z = GELU(W_s v_rms) (v rms-normalised so the adapters see a fixed scale)
             self.zdim = int(spec.get("zdim", 512))
             self.shared = nn.Sequential(nn.Linear(d_model, self.zdim), nn.GELU())
-        if kind == "film":                                # adaLN-Zero: [gamma_l, beta_l] = Linear_l(z), zero-init
+        if "film" in self.kinds:                          # adaLN-Zero: [gamma_l, beta_l] = Linear_l(z), zero-init
             self.film = nn.ModuleList([nn.Linear(self.zdim, 2 * d_model) for _ in range(spec["n_layers"])])
             for m in self.film:
                 nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
@@ -160,7 +164,7 @@ class Feeder(nn.Module):
                 nn.init.normal_(blk["o"].weight, std=0.02)   # gate is the zero-init (Flamingo); W_o must NOT also be zero
                 self.xa[str(L)] = blk
             self.gate = nn.Parameter(torch.zeros(len(spec["layers"])))
-        if kind == "xattn":                               # Flamingo-style gated cross-attention over 32 chunks of v
+        if "xattn" in self.kinds:                         # Flamingo-style gated cross-attention over 32 chunks of v
             self.n_chunks, self.inner, self.heads = 32, 512, 8
             self.cdim = d_model // self.n_chunks
             self.chunk_proj = nn.Linear(self.cdim, self.inner)
@@ -295,7 +299,7 @@ class Feeder(nn.Module):
                 return output
             return hook
 
-        kind = self.spec["kind"]
+        kind = self.spec["kind"]; kinds = self.kinds
         if kind in ("resid", "kv+resid") and self.spec.get("all_pos"):
             for gi, L in enumerate(self.spec["layers"]):
                 self._handles.append(layers[L].register_forward_hook(broadcast_factory(gi)))
@@ -328,11 +332,11 @@ class Feeder(nn.Module):
                 return hook
             for gi, L in enumerate(self.spec["layers"]):
                 self._handles.append(layers[L].register_forward_hook(xsrc_factory(L, gi)))
-        if kind in ("film", "xattn", "ipkv", "xattn_src"):
+        if kinds & {"film", "xattn", "ipkv", "xattn_src"}:
             # optional plain Karvonen injection on top (layers_resid), sharing the stored vector
             for L in self.spec.get("layers_resid", []):
                 self._handles.append(layers[L].register_forward_hook(resid_hook_factory(L)))
-        if kind == "film":
+        if "film" in kinds:
             def film_factory(li):
                 def hook(module, args, output):
                     if st["mode"] != "inject":
@@ -347,7 +351,7 @@ class Feeder(nn.Module):
                 return hook
             for li, layer in enumerate(layers):
                 self._handles.append(layer.register_forward_hook(film_factory(li)))
-        if kind == "xattn":
+        if "xattn" in kinds:
             def xattn_factory(L, gi):
                 blk = self.xa[str(L)]
                 def hook(module, args, output):
@@ -452,6 +456,35 @@ def read_rows(parquet, n, offset=0, cols=("prompt", "response", "activation_vect
                 break
         seen += m
     return rows
+
+
+class RowStream:
+    """Sequential reader over the first n rows (after offset) of a parquet, one row group in memory at a time."""
+
+    def __init__(self, parquet, n, offset=0, cols=("prompt", "response", "activation_vector",
+                                                     "detokenized_text_truncated", "doc_id")):
+        self.pf = pq.ParquetFile(parquet); self.cols = [c for c in cols if c in self.pf.schema_arrow.names]
+        self.n, self.offset, self.rg, self.buf, self.seen, self.served = n, offset, 0, [], 0, 0
+
+    def _fill(self):
+        while not self.buf and self.rg < self.pf.num_row_groups and self.served < self.n:
+            t = self.pf.read_row_group(self.rg, columns=self.cols); self.rg += 1; m = t.num_rows
+            if self.seen + m <= self.offset:
+                self.seen += m; continue
+            d = t.to_pydict(); start = max(0, self.offset - self.seen)
+            for j in range(start, m):
+                r = {c: d[c][j] for c in self.cols}; r["activation_vector"] = np.asarray(r["activation_vector"], dtype=np.float32)
+                self.buf.append(r)
+            self.seen += m
+
+    def take(self, b):
+        out = []
+        while len(out) < b and self.served < self.n:
+            if not self.buf:
+                self._fill()
+                if not self.buf: break
+            out.append(self.buf.pop(0)); self.served += 1
+        return out
 
 
 def prompt_text(row, tok, inject_char, k):
@@ -594,7 +627,7 @@ def main():
                             "kv+resid": n_layers + len(spec["layers"]), "film": 1, "xattn": 1, "xattn_src": 1,
                             "ipkv": n_layers}[spec["kind"]]) + (k * len(spec.get("layers_resid", [])) if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src") else 0)
     if spec["kind"] in ("film", "xattn", "xattn_src"):
-        expected_writes = 1 + k * len(spec.get("layers_resid", []))   # counted once per row (first block)
+        expected_writes = len({spec["kind"]} | set(spec.get("extras", []))) + k * len(spec.get("layers_resid", []))   # one count per family per row
     if spec.get("all_pos"):
         expected_writes = 1 + k * len(spec.get("layers_resid", []))
     n_feed = sum(p.numel() for p in feeder.parameters())
@@ -611,9 +644,10 @@ def main():
         wb = wandb.init(project="nla-feed-qwen3_8b", name=tag, config={**vars(args), "spec": spec})
 
     # ---- train
-    rows = read_rows(f"{DATA}/{TRAIN_PQ}", args.n_train, args.train_offset)
-    steps = len(rows) // (args.bs * args.accum)
-    print(f"[feed] {len(rows)} train rows -> {steps} optimizer steps (bs {args.bs} x {args.accum})", flush=True)
+    stream = RowStream(f"{DATA}/{TRAIN_PQ}", args.n_train, args.train_offset)
+    n_rows_total = min(args.n_train, stream.pf.metadata.num_rows - args.train_offset)
+    steps = n_rows_total // (args.bs * args.accum)
+    print(f"[feed] {n_rows_total} train rows (streamed) -> {steps} optimizer steps (bs {args.bs} x {args.accum})", flush=True)
 
     def lr_at(s, base):
         if s < args.warmup:
@@ -649,7 +683,7 @@ def main():
             g["lr"] = lr_at(s, args.lr if gi == 0 else args.feeder_lr)
         tot_l, tot_t = 0.0, 0.0
         for a in range(args.accum):
-            chunk = rows[(s * args.accum + a) * args.bs:(s * args.accum + a + 1) * args.bs]
+            chunk = stream.take(args.bs)
             ids, attn, lm, vec = prepare_chunk(chunk, tok, inj_char, k, device, args.max_len)
             out = av_forward(model, feeder, ids, attn, vec, chunk, tok, device, spec["src_ctx"], k)
             ce_sum, n_tok = response_ce(out.logits, ids, lm)
@@ -725,7 +759,7 @@ def main():
     mse_scale_f = resolve_target_scale(cfg.mse_scale, cfg.d_model)
     acts = [r["activation_vector"] for r in gen_rows]
     _, baseline = compute_predict_mean_baselines(torch.tensor(np.stack(acts), dtype=torch.float32), mse_scale_f)
-    metrics = {"variant": args.variant, "spec": spec, "tag": tag, "n_train": len(rows), "steps": steps,
+    metrics = {"variant": args.variant, "spec": spec, "tag": tag, "n_train": n_rows_total, "steps": steps,
                "train_ce_last50": float(np.mean(losses[-50:])), "train_s": train_s,
                "test_ce": test_ce, "test_ppl": math.exp(test_ce), "n_test": len(test),
                "n_gen": len(gen_rows), "extraction_rate": ext, "resp_len_mean": float(np.mean(lens)),
