@@ -323,3 +323,16 @@ dipped on the judge at step 100 after leading at 50 (in-training 8.70 vs 9.27); 
 Putting the KL in the REWARD (w=1) costs 2.5 pts of reconstruction and degrades prose more than the baseline, for the same small
 judge gain as the KL critic. The KL belongs in the critic's loss, not the AV's reward — consistent with the July 27B result
 (downstream-KL reward 65% vs MSE 74%). The 256×8 group's `klonly` arm (reward = −KL only) tests the extreme version overnight.
+
+### 256×8 group — checkpoint evals (fixed critics, 1,024 prompts; judge n=256), 09:35–10:07 check-in
+| run @step | FVE Opus AR | FVE onpol AR | halluc ↓ | inform ↑ | writing ↑ | coherence ↑ |
+|---|---|---|---|---|---|---|
+| base @50 / @100 | 68.2 / 69.3 | 72.3 / 72.8 | 9.07 / 9.19 | 2.47 / 2.54 | 4.61 / 3.96 | 5.84 / 4.93 |
+| klsup (MSE+KL critic) @50 / @100 | 68.8 / 69.3 | 72.1 / – | 8.85 / 9.15 | 2.65 / 2.53 | 4.82 / – | 6.35 / – |
+| klonly (KL-only REWARD) @50 / @100 | 60.8 / 59.8 | 67.5 / – | 9.31 / 9.61 | 2.24 / 1.96 | 3.87 / – | 5.47 / – |
+| **arklonly (KL-only CRITIC) @50** | 64.9 | 68.2 | **8.71** | **2.80** | **5.50** | **7.33** |
+KL-only reward is degenerating (FVE down, hallucination up, informativeness collapsing) — confirms KL does not belong in the
+reward. KL-only CRITIC (no MSE anywhere in the AR loss; AV reward still −MSE of its reconstruction): the AV learns (55→65% by
+the frozen Opus AR, 3 pts behind base at 50) and its text is by far the best of any arm (in-training @50: halluc 8.62, inform
+2.98, writing 5.46, coherence 7.41, repetitiveness 2.62 vs base 4.11/5.17/3.77 @100). Its OWN in-training FVE reads 27% — meaningless
+for a critic never trained on MSE. Watch @100/@150. Runs alive: base step 113, klsup 80, klonly 79, arklonly 63.
