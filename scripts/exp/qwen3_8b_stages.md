@@ -375,3 +375,8 @@ arklonly@250 61.4 (slow drift 64.9 → 61.4 over 200 steps).
 ### 14:31 check-in — 3 runs alive (base 465, klsup 347, arklonly 296), 5/5 chains, no crashes. New ckpt evals: base@400 63.2, base@450 63.9
 (own critic 78.4% — gap ≈15 pts; writing 3.49, repet 5.79); arklonly@250 61.4 / 9.06 / 2.35 / writing 5.62 / coh 6.67 (slow FVE drift continues,
 text still best). klsup in-training @300: halluc 8.93, inform 2.97 (best judge readings of the run), own FVE 70.2 vs ckpt 68.8.
+
+### 15:31 check-in — 3 runs alive (base 537, klsup 399, arklonly 342), 5/5 chains, no crashes. New ckpt evals: base@500 63.7 (5th flat
+checkpoint since the @300 drop; own critic 78.1%; writing 3.44 / coh 4.30 / repet 6.22 — worst yet); klsup@350 68.9 / 9.42 / 2.41 / writing 4.10
+(FVE holding 68–69 at all 7 checkpoints; text ≈ baseline now); arklonly@300 57.1 / 8.69 / 2.56 / writing 5.88 / coh 7.30 (FVE sliding toward
+pre-RL 55.2; stop if @350 < 55).
