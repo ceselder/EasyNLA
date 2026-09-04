@@ -466,10 +466,13 @@ def train_sft(mode: str, tag: str, nproc: int = 4, model_tag: str = "qwen3_8b",
 
 
 @app.function(gpu="B200", volumes=VOLS, timeout=2 * 60 * 60, secrets=SECRETS)
-def merge_av(av_dir: str, out: str, model_tag: str = "qwen3_8b"):
+def merge_av(av_dir: str, out: str, model_tag: str = "qwen3_8b", base: str = ""):
+    """Merge an AV LoRA onto its base. `base` MUST be the model the LoRA was trained on: the raw model for
+    warm-start adapters, but e.g. av_sft500k_lr1e4_merged for a distillation LoRA trained with --base-ckpt on it."""
     import sys
     _prep(patch_lens=False)
-    base = BASE_8B if model_tag == "qwen3_8b" else "Qwen/Qwen3.6-27B"
+    base = base or (BASE_8B if model_tag == "qwen3_8b" else "Qwen/Qwen3.6-27B")
+    print(f"[merge_av] base={base} av_dir={av_dir} -> {out}", flush=True)
     _run([sys.executable, "scripts/merge_lora_to_hf.py", "--base-ckpt", base,
           "--av-dir", av_dir, "--av-out", out, "--ar-dir", "/dev/null",
           "--ar-out", "/dev/null", "--mode", "av"])
@@ -625,7 +628,7 @@ def pyrun(cmd: str):
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
          limit: int = 0, extra: str = "", model_tag: str = "qwen3_8b", gpus: int = 0,
          bs: int = 16, accum: int = 1, config: str = "configs/rl_vllm.yaml",
-         av_dir: str = "", out: str = "", cmd: str = "", data_dir: str = "",
+         av_dir: str = "", out: str = "", cmd: str = "", data_dir: str = "", base: str = "",
          glob: str = "", ncomplete: int = 0):
     if task == "harness":
         print(harness_check.remote())
@@ -641,7 +644,7 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         print(f.remote(mode=mode, tag=tag, nproc=nproc, model_tag=model_tag,
                        bs=bs, accum=accum, extra=extra, data_dir=data_dir, data_suffix=out))
     elif task == "merge_av":
-        print(merge_av.remote(av_dir=av_dir, out=out, model_tag=model_tag))
+        print(merge_av.remote(av_dir=av_dir, out=out, model_tag=model_tag, base=base))
     elif task == "rl":
         f = train_rl.with_options(gpu=f"B200:{gpus or nproc}")
         print(f.remote(tag=tag, nproc=nproc, model_tag=model_tag, extra=extra, config=config,

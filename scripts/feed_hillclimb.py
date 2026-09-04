@@ -98,6 +98,8 @@ _add("film_adaln", kind="film", k=1, layers_resid=[])  # DiT adaLN-Zero: per-lay
 _add("film_plus_karvonen_L1", kind="film", k=1, layers_resid=[1])
 _add("llava_mlp8", layers=["emb"], mode="replace_nm", k=8, proj="mlp")   # LLaVA projector: v -> 8 soft tokens
 _add("llava_mlp4_L1", layers=[1], mode="replace_nm", k=4, proj="mlp")
+_add("xattn_srclayers", kind="xattn_src", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[])   # HyperSteer-flavoured: K/V = the source token's 36 per-layer residuals
+_add("xattn_srclayers_plus_karvonen_L1", kind="xattn_src", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[1])
 _add("broadcast_L1", layers=[1], all_pos=True)                    # v as a per-sequence bias at EVERY position (learned strength)
 _add("broadcast_L1_8_16_24", layers=[1, 8, 16, 24], all_pos=True)
 _add("broadcast_plus_karvonen_L1", layers=[1, 8, 16, 24], all_pos=True, layers_resid=[1])
@@ -132,6 +134,19 @@ class Feeder(nn.Module):
             self.film = nn.ModuleList([nn.Linear(self.zdim, 2 * d_model) for _ in range(spec["n_layers"])])
             for m in self.film:
                 nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+        if kind == "xattn_src":                           # gated cross-attention over the source token's per-layer residuals
+            self.inner, self.heads = 512, 8
+            self.src_ln = nn.LayerNorm(d_model)
+            self.src_proj = nn.Linear(d_model, self.inner)
+            self.src_pos = nn.Parameter(torch.randn(spec["n_layers"], self.inner) * 0.02)
+            self.xa = nn.ModuleDict()
+            for L in spec["layers"]:
+                blk = nn.ModuleDict({"ln": nn.LayerNorm(d_model), "q": nn.Linear(d_model, self.inner, bias=False),
+                                     "kk": nn.Linear(self.inner, self.inner, bias=False), "vv": nn.Linear(self.inner, self.inner, bias=False),
+                                     "o": nn.Linear(self.inner, d_model, bias=False)})
+                nn.init.zeros_(blk["o"].weight)
+                self.xa[str(L)] = blk
+            self.gate = nn.Parameter(torch.zeros(len(spec["layers"])))
         if kind == "xattn":                               # Flamingo-style gated cross-attention over 32 chunks of v
             self.n_chunks, self.inner, self.heads = 32, 512, 8
             self.cdim = d_model // self.n_chunks
@@ -275,7 +290,30 @@ class Feeder(nn.Module):
             for L in self.spec["layers"]:
                 mod = emb if L == "emb" else layers[L]
                 self._handles.append(mod.register_forward_hook(resid_hook_factory(L)))
-        if kind in ("film", "xattn", "ipkv"):
+        if kind == "xattn_src":
+            for li, layer in enumerate(layers):           # capture every layer's residual at the source's last position
+                self._handles.append(layer.register_forward_hook(capture_resid_factory(li)))
+            def xsrc_factory(L, gi):
+                blk = self.xa[str(L)]
+                def hook(module, args, output):
+                    if st["mode"] != "inject":
+                        return output
+                    out_t = output[0] if isinstance(output, tuple) else output
+                    B, T, d = out_t.shape
+                    S = torch.stack([st["src_resid"][li][:, 0] for li in range(len(layers))], dim=1)   # [B, n_layers, d]
+                    C = self.src_proj(self.src_ln(S)) + self.src_pos                                    # [B, n_layers, inner]
+                    q = blk["q"](blk["ln"](out_t.float())).view(B, T, self.heads, -1).transpose(1, 2)
+                    kk = blk["kk"](C).view(B, C.shape[1], self.heads, -1).transpose(1, 2)
+                    vv = blk["vv"](C).view(B, C.shape[1], self.heads, -1).transpose(1, 2)
+                    o = blk["o"](F.scaled_dot_product_attention(q, kk, vv).transpose(1, 2).reshape(B, T, self.inner))
+                    new = out_t + (torch.tanh(self.gate[gi]) * o).to(out_t.dtype)
+                    if gi == 0 and T >= 2:
+                        st["n_writes"] += B
+                    return (new, *output[1:]) if isinstance(output, tuple) else new
+                return hook
+            for gi, L in enumerate(self.spec["layers"]):
+                self._handles.append(layers[L].register_forward_hook(xsrc_factory(L, gi)))
+        if kind in ("film", "xattn", "ipkv", "xattn_src"):
             # optional plain Karvonen injection on top (layers_resid), sharing the stored vector
             for L in self.spec.get("layers_resid", []):
                 self._handles.append(layers[L].register_forward_hook(resid_hook_factory(L)))
@@ -364,7 +402,7 @@ class Feeder(nn.Module):
         # kv+resid: the resid part injects at spec["layers"] (default [1]) with the stored vector
 
     def needs_source(self):
-        return self.spec["kind"] in ("kv", "kv+resid", "srcresid")
+        return self.spec["kind"] in ("kv", "kv+resid", "srcresid", "xattn_src")
 
     def clear(self):
         st = self.state
@@ -529,14 +567,14 @@ def main():
     spec["head_dim"] = int(getattr(_mc, "head_dim", None) or _mc.hidden_size // _mc.num_attention_heads)
     feeder = Feeder(spec, cfg.d_model, device).to(device)
     feeder.install(model, inj_id)
-    if spec["kind"] in ("film", "xattn", "ipkv") or spec.get("proj") == "mlp" or spec.get("all_pos"):
+    if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src") or spec.get("proj") == "mlp" or spec.get("all_pos"):
         if args.feeder_lr == 1e-4:
             args.feeder_lr = 3e-4   # zero/small-init adapters learn faster; identity-init linear maps keep 1e-4
     n_layers = len(model.get_base_model().model.layers)
     expected_writes = k * ({"resid": len(spec["layers"]), "srcresid": len(spec["layers"]), "kv": n_layers,
-                            "kv+resid": n_layers + len(spec["layers"]), "film": 1, "xattn": 1,
-                            "ipkv": n_layers}[spec["kind"]]) + (k * len(spec.get("layers_resid", [])) if spec["kind"] in ("film", "xattn", "ipkv") else 0)
-    if spec["kind"] in ("film", "xattn"):
+                            "kv+resid": n_layers + len(spec["layers"]), "film": 1, "xattn": 1, "xattn_src": 1,
+                            "ipkv": n_layers}[spec["kind"]]) + (k * len(spec.get("layers_resid", [])) if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src") else 0)
+    if spec["kind"] in ("film", "xattn", "xattn_src"):
         expected_writes = 1 + k * len(spec.get("layers_resid", []))   # counted once per row (first block)
     if spec.get("all_pos"):
         expected_writes = 1 + k * len(spec.get("layers_resid", []))
