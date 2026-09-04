@@ -361,3 +361,8 @@ klsup@200 68.1 / 9.31 / 2.36 / writing 4.02, arklonly@150 63.3 / 8.80 / 2.65 / w
 ⚠️ klsup's text quality is NOT holding at this batch past 150: in-training @200 writing 3.76, coherence 4.88, repetitiveness 5.92
 (baseline @200 ckpt: 3.93 / 5.39). The 150-step-arm text-quality advantage does not replicate in the long 256×8 run so far.
 arklonly's own-critic FVE collapsed to 6.7–12.8% @200 (its critic never trained on MSE); frozen-critic eval @200 pending.
+
+### 13:31 check-in — 3 runs alive (base 397, klsup 293, arklonly 249), 5/5 chains. New ckpt evals: base@350 64.7 / 9.30 / 2.50 /
+writing 3.63 / repet 6.16 (stays at the post-300 level; prose worst yet); klsup@250 69.3 / 9.16 / 2.54 / writing 4.34 / coh 5.55 (a point
+ahead on FVE at every checkpoint 50–250, text recovered vs its @200 dip); arklonly@200 62.5 / 8.95 / 2.46 / writing 5.65 / coh 7.18 / repet 2.63
+(AV steady ≈63 by the frozen critic despite its own critic reading 9–17%; text quality still far ahead of both others).
