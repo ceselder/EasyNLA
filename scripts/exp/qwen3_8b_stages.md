@@ -336,3 +336,8 @@ reward. KL-only CRITIC (no MSE anywhere in the AR loss; AV reward still −MSE o
 the frozen Opus AR, 3 pts behind base at 50) and its text is by far the best of any arm (in-training @50: halluc 8.62, inform
 2.98, writing 5.46, coherence 7.41, repetitiveness 2.62 vs base 4.11/5.17/3.77 @100). Its OWN in-training FVE reads 27% — meaningless
 for a critic never trained on MSE. Watch @100/@150. Runs alive: base step 113, klsup 80, klonly 79, arklonly 63.
+
+### 10:31 check-in — new checkpoint evals: base@150 (68.4 / 8.87 / 2.84 / writing 4.03), arklonly@100 (63.1 / 8.71 / 2.75 / writing 5.61)
+Runs alive (base 185, klsup 132, klonly 131, arklonly 106); 6/6 chains alive; no crashes. klonly (KL-only reward) keeps degenerating
+(in-training @100: halluc 9.50, inform 1.96, writing 3.14) → stop after its @150 checkpoint if unchanged. arklonly (KL-only critic):
+FVE by the frozen Opus AR slipping (64.9 → 63.1) while text quality stays far ahead (writing 5.61, coherence 7.19) — a trade, not a win.
