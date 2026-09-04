@@ -295,3 +295,11 @@ Gate passed (−0.48) → round 3 started 06:12 (rows 125k–250k, 8 samples, fr
 - 06:40 (user): both runs on 4 GPUs each instead, batch 128 prompts × 8 samples ("8x128"), 1601 steps (= one pass over the
   RL split, same total samples as 801×256), save every 100 → `rlB_base_b128` / `rlB_klsup_b128`; xl 8-GPU runs stopped
   before their first checkpoint. Checkpoint evals: `STEPS="100 … 1600" launch_xl_evals.sh <tag>`.
+
+### 07:58 (user: "if it runs this fast maybe do 8x256; also try the KL reward on its own") — 256×8 trio launched, b128 pair kept
+`rlB_base_b256` (MSE critic, MSE reward), `rlB_klsup_b256` (MSE+KL critic, MSE reward), `rlB_klonly_b256` (MSE critic,
+`--reward-mode downstream_kl` = reward −KL only). 4×B200 each, 256×8/step, 801 steps (one pass), save every 50 → checkpoint
+evals (`launch_xl_evals.sh`), watchdog `launch_overnight_watchdog_b256.sh`, figure `long_runs_b256.png`. The 128×8 pair keeps
+running as a batch-size robustness check. My GPU use: 5 runs × 4 = 20 B200 + transient 1-GPU evals.
+b128 step-100 checkpoint evals: base 67.2% / 9.26 / 2.43 vs klsup 68.6% / 9.39 / 2.24 (FVE Opus AR / halluc / inform) — the KL run
+dipped on the judge at step 100 after leading at 50 (in-training 8.70 vs 9.27); text quality still ahead (4.83 vs 3.96).
