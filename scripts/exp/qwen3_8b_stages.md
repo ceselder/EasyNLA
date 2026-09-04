@@ -228,3 +228,8 @@ One round of expert iteration moves every metric the right way by a small amount
 Hill-climb round 2 started 02:10 (gate relaxed to −0.15; mines 8×125k from av_bon6_merged → judge → best → SFT → merge --base → eval).
 RL from the distilled AV (rlB_av_bon6, rlB_av_bon6_ar_onpol_cont) is queued in q3b after the KL arms (rlB_klsup launched 02:05).
 GPU note: my side is 4 (q2c) + 4 (q3b) + 2 (hill-climb mining) = 10 B200 for a few hours.
+
+### Arm result: rlB_ar_onpol (RL with the from-scratch on-policy AR, rerun) — finished 03:49, 150 steps
+hallucination @0/50/100/150 = 8.99 / 9.02 / 8.96 / 9.22 (baseline 9.20 / 9.07 / 9.06 / 9.12); informativeness @150 2.54 vs 2.62.
+Same conclusion as rlB_ar_onpol_cont: an AR that reads the AV's own text does not reduce hallucination under RL. Fixed-critic
+eval of its step-150 AV follows. Next in slot A: rlB_lag10 (launched 03:49). Slot B: rlB_klsup at step 75 (03:50).
