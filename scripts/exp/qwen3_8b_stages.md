@@ -273,3 +273,12 @@ First arm that dominates the baseline on every axis → carry the downstream-KL 
 in-training FVE 74.0% (baseline 75.2%); hallucination @0/50/100/150 = 9.14 / 8.91 / 9.12 / 9.19 (baseline 9.20/9.07/9.06/9.12);
 informativeness 2.53 vs 2.62; writing 3.88 / coherence 5.02 / repetitiveness 4.68 (baseline 4.16 / 5.16 / 4.20).
 Verdict: like EMA — no effect. All three slow-critic variants (EMA 0.98, EMA 0.995, lag-10) are now negative. Slot A → rlB_lowlr (AV lr 3e-5 SFT+RL).
+
+### AV hill-climb (expert iteration on the Sonnet judge), round 2 — eval 06:11 (1,024 prompts; judge n=256)
+| AV | FVE Opus AR | FVE onpol AR | halluc ↓ | inform ↑ | writing ↑ | resp len |
+|---|---|---|---|---|---|---|
+| warm-start (500k Opus SFT) | 55.2% | 60.7% | 9.41 | 2.11 | 4.52 | 140 |
+| round 1 (best-of-~4 on 500k) | 57.5% | 62.6% | 9.22 | 2.32 | 4.60 | 139 |
+| round 2 (best-of-8 on 125k fresh rows, from round 1) | 57.2% | 62.2% | **8.75** | **2.69** | 4.77 | 136 |
+Real, not degenerate: length and extraction unchanged, informativeness UP, 1.6% of rows now ≤3 (was 0%). FVE flat.
+Gate passed (−0.48) → round 3 started 06:12 (rows 125k–250k, 8 samples, from av_hc_r2_merged; merge --base av_hc_r2_merged).
