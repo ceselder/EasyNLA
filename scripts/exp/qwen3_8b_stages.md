@@ -426,3 +426,9 @@ still ≥7 pts above the baseline at matched steps), arklonly 581 (ckpt@550 58.2
 
 ### 21:31 check-in — klsup 723 (ckpt@700 63.2 — first drop below 66; own critic 71.8 → gap 8.6 pts; the baseline's equivalent drop came at 300),
 arklonly 630 (ckpt@600 57.9 / onpol AR 59.8; slow drift continues). 2 apps + 4/4 chains alive; keys still 401; no crashes.
+
+### 22:08 — rlB_arklonly_b256 (KL-only critic) STOPPED at step ~650: frozen-critic FVE 54.2% @650, below the pre-RL 55.2 (rule set at 15:31).
+Trajectory: 64.9 63.1 63.3 62.5 61.4 57.1 60.9 59.8 60.9 59.0 58.2 57.9 54.2 (50→650). Its text quality stayed the best of any arm throughout
+(writing 5.5–6.1, coherence 7.0–7.5, repetitiveness 2.6–2.9 while the others fell to 3.3–3.8 / 4.0–4.6 / 5.8–6.2). Verdict: a critic with no
+MSE anchor gives the AV great prose but the AV stops reconstructing — a trade that gets worse with training.
+klsup@750 63.2 (= @700): the KL critic dropped from its 67–70 band at 700 and stayed there; base@750 was 58.3.
