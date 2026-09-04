@@ -128,6 +128,14 @@ _add("hyperinject", layers=list(range(36)), gated=True, gate_init={1: 1.0})
 _add("hyperinject_linproj", layers=list(range(36)), gated=True, gate_init={1: 1.0}, proj="shared")
 _add("hyperinject_all1", layers=list(range(36)), gated=True, gate_init="all1")
 _add("hyperinject_linproj_L8init", layers=list(range(36)), gated=True, gate_init={8: 1.0}, proj="shared")   # start in the L8 basin
+# mHC-STYLE ACTIVATION STREAM (user, after DeepSeek "Manifold-Constrained Hyper-Connections"): at every layer, a CONVEX mix
+# h' = (1-m) h + m a of the token's residual with the activation stream a = ref_l * v_hat (ref_l = typical residual norm at that
+# layer); m in [0,1] per layer (static bias) and optionally per token via a mixing network m = sigmoid(w_l . rmsnorm(h) + b_l).
+# 2 streams => the doubly-stochastic matrix is [[1-m, m],[m, 1-m]] (one scalar). Norm-bounded, m=0 is the base model exactly.
+_add("mhc_marker_static", kind="mhc", layers=list(range(36)), scope="marker", dynamic=False, proj="shared")
+_add("mhc_marker_dyn", kind="mhc", layers=list(range(36)), scope="marker", dynamic=True, proj="shared")
+_add("mhc_all_dyn", kind="mhc", layers=list(range(36)), scope="all", dynamic=True, proj="shared")
+_add("mhc_all_dyn_plus_karvonen_L8", kind="mhc", layers=list(range(36)), scope="all", dynamic=True, proj="shared", layers_resid=[8])
 # norm reference = mean residual norm of the OTHER tokens at that layer (not the already-injected / atypical marker token)
 _add("linproj_L8_layernorm", layers=[8], proj="shared", norm_ref="layer_mean")
 _add("hyperinject_linproj_layernorm", layers=list(range(36)), gated=True, gate_init={1: 1.0}, proj="shared", norm_ref="layer_mean")
@@ -165,6 +173,14 @@ class Feeder(nn.Module):
             init = spec.get("gate_init", {})
             g = torch.ones(len(gl)) if init == "all1" else torch.tensor([float(init.get(L, 0.0)) for L in gl])
             self.lgate = nn.Parameter(g); self.gate_layers = list(gl)
+        if kind == "mhc":
+            nL = len(spec["layers"])
+            b0 = torch.full((nL,), -4.0)                                   # m ~ 0.018 everywhere ...
+            if 8 in spec["layers"] and spec.get("scope") == "marker":
+                b0[spec["layers"].index(8)] = 0.0                          # ... except m = 0.5 at layer 8 for the marker-only versions
+            self.mix_b = nn.Parameter(b0)
+            if spec.get("dynamic"):
+                self.mix_w = nn.Parameter(torch.zeros(nL, d_model))       # zero-init: starts static
         if self.kinds & {"film", "xattn", "ipkv"}:
             # shared bottleneck z = GELU(W_s v_rms) (v rms-normalised so the adapters see a fixed scale)
             self.zdim = int(spec.get("zdim", 512))
@@ -374,6 +390,47 @@ class Feeder(nn.Module):
                 return hook
             for gi, L in enumerate(self.spec["layers"]):
                 self._handles.append(layers[L].register_forward_hook(xsrc_factory(L, gi)))
+        if kind == "mhc":
+            def mhc_factory(L, gi):
+                def hook(module, args, output):
+                    if st["mode"] != "inject" or st["vec"] is None:
+                        return output
+                    out_t = output[0] if isinstance(output, tuple) else output
+                    B, T, d = out_t.shape
+                    h32 = out_t.float()
+                    ids = st["ids"].to(out_t.device) if st["ids"] is not None else None
+                    nm = h32.detach().norm(dim=-1)                                                   # [B, T]
+                    if ids is not None and T >= 2:
+                        keep = (ids != inj_id) & (ids != st.get("pad_id", -1))
+                        ref = ((nm * keep).sum(1) / keep.sum(1).clamp(min=1))                        # [B]
+                    else:
+                        ref = nm[:, -1]                                                              # decode step: own norm
+                    vb = self.state["vec"]
+                    if self.proj == "shared":
+                        vb = vb @ self.W[0].T + self.b[0]
+                    a = ref[:, None] * vb / (vb.norm(dim=-1, keepdim=True) + 1e-6)                   # [B, d] activation stream
+                    logit = self.mix_b[gi]
+                    if self.spec.get("dynamic"):
+                        hn = h32 * torch.rsqrt(h32.pow(2).mean(-1, keepdim=True) + 1e-6)
+                        logit = logit + hn @ self.mix_w[gi]                                          # [B, T]
+                    else:
+                        logit = logit.expand(B, T)
+                    m = torch.sigmoid(logit)[..., None]                                              # [B, T, 1]
+                    if self.spec.get("scope") == "marker":
+                        if ids is None or T < 2:
+                            return output
+                        mask = (ids == inj_id).float()[..., None]
+                        m = m * mask
+                    new = ((1 - m) * h32 + m * a[:, None, :]).to(out_t.dtype)
+                    if gi == 0 and T >= 2:
+                        st["n_writes"] += B
+                        st.setdefault("m_log", {})[L] = float(m.detach().mean())
+                    return (new, *output[1:]) if isinstance(output, tuple) else new
+                return hook
+            for gi, L in enumerate(self.spec["layers"]):
+                self._handles.append(layers[L].register_forward_hook(mhc_factory(L, gi)))
+            for L in self.spec.get("layers_resid", []):
+                self._handles.append(layers[L].register_forward_hook(resid_hook_factory(L)))
         if kinds & {"film", "xattn", "ipkv", "xattn_src"}:
             # optional plain Karvonen injection on top (layers_resid), sharing the stored vector
             for L in self.spec.get("layers_resid", []):
@@ -680,7 +737,7 @@ def main():
     feeder = Feeder(spec, cfg.d_model, device).to(device)
     feeder.state["pad_id"] = tok.pad_token_id
     feeder.install(model, inj_id)
-    if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src") or spec.get("proj") == "mlp" or spec.get("all_pos"):
+    if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src", "mhc") or spec.get("proj") == "mlp" or spec.get("all_pos"):
         if args.feeder_lr == 1e-4:
             args.feeder_lr = 3e-4   # zero/small-init adapters learn faster; identity-init linear maps keep 1e-4
     n_layers = len(model.get_base_model().model.layers)
@@ -689,15 +746,18 @@ def main():
                             "ipkv": n_layers}[spec["kind"]]) + (k * len(spec.get("layers_resid", [])) if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src") else 0)
     if spec["kind"] in ("film", "xattn", "xattn_src"):
         expected_writes = len({spec["kind"]} | set(spec.get("extras", []))) + k * len(spec.get("layers_resid", []))   # one count per family per row
+    if spec["kind"] == "mhc":
+        expected_writes = 1 + k * len(spec.get("layers_resid", []))
     if spec.get("all_pos"):
         expected_writes = 1 + k * len(spec.get("layers_resid", []))
     n_feed = sum(p.numel() for p in feeder.parameters())
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad]
     groups = [{"params": lora_params, "lr": args.lr, "weight_decay": 0.0}]
     if n_feed:
-        fp = [p_ for n_, p_ in feeder.named_parameters() if n_ != "lgate"]
+        fp = [p_ for n_, p_ in feeder.named_parameters() if n_ not in ("lgate", "mix_b")]
         if fp: groups.append({"params": fp, "lr": args.feeder_lr, "weight_decay": 0.0})
         if hasattr(feeder, "lgate"): groups.append({"params": [feeder.lgate], "lr": args.gate_lr, "weight_decay": 0.0})
+        if hasattr(feeder, "mix_b"): groups.append({"params": [feeder.mix_b], "lr": args.gate_lr, "weight_decay": 0.0})
     for g_ in groups: g_["base_lr"] = g_["lr"]
     opt = torch.optim.AdamW(groups, betas=(0.9, 0.999))
     print(f"[feed] lora params {sum(p.numel() for p in lora_params)/1e6:.1f}M, feeder params {n_feed/1e6:.1f}M", flush=True)
@@ -740,6 +800,10 @@ def main():
         if hasattr(feeder, "lgate"):
             for L, g in zip(feeder.gate_layers, feeder.lgate.detach().cpu().tolist()): t[f"gate/L{L:02d}"] = g
             t["feeder/gate_abs_sum"] = float(feeder.lgate.detach().abs().sum())
+        if hasattr(feeder, "mix_b"):
+            for L, b_ in zip(feeder.spec["layers"], torch.sigmoid(feeder.mix_b.detach()).cpu().tolist()): t[f"mix_static/L{L:02d}"] = b_
+            for L, mv in feeder.state.get("m_log", {}).items(): t[f"mix_realized/L{L:02d}"] = mv
+            if hasattr(feeder, "mix_w"): t["feeder/mix_w_norm"] = float(feeder.mix_w.detach().norm())
         return t
 
     model.train(); t0 = time.time(); losses = []; writes = []
