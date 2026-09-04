@@ -218,3 +218,13 @@ av_bon6_cont LoRA was trained on top of av_sft500k_lr1e4_merged → merged model
 (launch_bon6_fix.sh) re-merges onto av_sft500k_lr1e4_merged, redoes eval_bon6_avbon6, then starts the patched hill-climb only
 if round 1 cuts hallucination by ≥0.2 vs the warm-start AV (9.41). Rule: a LoRA must be merged onto the exact model it was
 trained on.
+
+### Distilled AV, corrected merge (eval_bon6_avbon6 redone 02:02; av_bon6_cont = fresh LoRA on the 500k AV trained on its best-of-~4 samples, lr 5e-5)
+| AV (1,024 prompts, T=1) | FVE Opus AR | FVE onpol_cont AR | FVE bon6_cont AR | halluc ↓ | inform ↑ | writing ↑ |
+|---|---|---|---|---|---|---|
+| warm-start AV (500k) | 55.2% | 60.7% | 61.6% | 9.41 | 2.11 | 4.52 |
+| best-of-N self-distilled AV (round 1) | **57.5%** | **62.6%** | **62.6%** | **9.22** | **2.32** | 4.60 |
+One round of expert iteration moves every metric the right way by a small amount (+2.3 FVE, −0.19 halluc ≈ 2 s.e., +0.21 inform).
+Hill-climb round 2 started 02:10 (gate relaxed to −0.15; mines 8×125k from av_bon6_merged → judge → best → SFT → merge --base → eval).
+RL from the distilled AV (rlB_av_bon6, rlB_av_bon6_ar_onpol_cont) is queued in q3b after the KL arms (rlB_klsup launched 02:05).
+GPU note: my side is 4 (q2c) + 4 (q3b) + 2 (hill-climb mining) = 10 B200 for a few hours.
