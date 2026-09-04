@@ -41,8 +41,11 @@ def merge_av(base_ckpt: str, av_dir: Path, out: Path):
     merged = peft.merge_and_unload()
     out.mkdir(parents=True, exist_ok=True)
     merged.save_pretrained(out)
-    # AV LoRA dir carries the tokenizer files; preserve them so vLLM can load.
-    AutoTokenizer.from_pretrained(str(av_dir)).save_pretrained(out)
+    # AV LoRA dir carries the tokenizer files (SFT checkpoints); RL checkpoints hold only the adapter,
+    # so fall back to the base model's tokenizer. Either way vLLM needs tokenizer files next to the weights.
+    tok_src = str(av_dir) if (Path(av_dir) / "tokenizer_config.json").exists() else base_ckpt
+    print(f"[merge] tokenizer from {tok_src}")
+    AutoTokenizer.from_pretrained(tok_src).save_pretrained(out)
     _copy_sidecar(av_dir, out)
     del base, peft, merged
     torch.cuda.empty_cache()
