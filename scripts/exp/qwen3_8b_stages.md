@@ -350,3 +350,8 @@ KL-critic @150: 69.5% (base 68.4), halluc 9.27 (8.87), inform 2.38 (2.84) — at
 ### 11:31 check-in — base@200 ckpt 67.4 / 9.16 / 2.59 (frozen-critic FVE flat ≈68 since step 50 while its own critic reads 76%);
 klsup at step 186 (own 69.2%; ckpt@150 69.5 / 9.27 / 2.38 / writing 4.48 vs base 68.4 / 8.87 / 2.84 / 4.03); arklonly at step 152
 (in-training @150: halluc 8.70, inform 2.69, writing 5.66, coherence 7.12, own FVE 17% — ckpt@150 eval pending). 3 runs alive, 5/5 chains alive.
+
+### 12:25 — baseline @300: frozen-critic FVE DROPS to 63.8% (was ≈68 at 50–250) while its own co-trained critic reads 76.7%
+13-pt gap between the co-trained critic's view and a frozen critic's view; halluc 9.43 (ckpt) / 9.30 (in-training); coherence 4.98,
+repetitiveness 5.26, writing 3.98. Past ~250 steps the plain-MSE recipe is optimising its own critic, not reconstruction as an
+independent critic sees it. Compare klsup@300 (due ~12:50) and arklonly@200.
