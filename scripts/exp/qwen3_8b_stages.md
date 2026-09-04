@@ -395,3 +395,9 @@ New ckpt evals: base@600 57.0, base@650 61.0 (own critic 69–77 → gap ≥8), 
 
 ### 18:31 check-in — base resumed OK (step 714, own critic 79.2%; @700 in-training halluc 9.31 / writing 3.36 / coh 4.05), klsup 558 (own 72.0;
 ckpt@500 67.2 / 9.15 / 2.61 / writing 3.82), arklonly 483 (ckpt@450 60.9 / 9.09 / 2.36 / writing 5.90 / coh 7.11). 5/5 chains, 3 apps. No new crashes.
+
+### ⚠️ 19:08 — ALL judge API keys dead: Anthropic infinite + fallback keys → 401 "API key is invalid" (from this box AND inside the Modal
+secret nla-exp-secrets, which someone modified at 19:05); OpenRouter "infinite" key → 401 "API key expired". Since ~18:55 every
+Sonnet judge call fails (in-training halluc@ = NaN, checkpoint-eval judge fields NaN). FVE evals (no API) unaffected; training unaffected.
+Discord ping sent 19:09. Needs new keys in ~/.anthropic_env and the Modal secret; judge-less checkpoints can be re-judged afterwards
+(eval_nla.py on the saved av<step>_merged dirs — NOTE the eval chain deletes merged dirs after eval; the iter_* adapters remain, so re-merge).
