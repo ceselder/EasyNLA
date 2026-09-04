@@ -116,6 +116,12 @@ _add("llava_mlp8", layers=["emb"], mode="replace_nm", k=8, proj="mlp")   # LLaVA
 _add("llava_mlp4_L1", layers=[1], mode="replace_nm", k=4, proj="mlp")
 _add("xattn_srclayers", kind="xattn_src", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[])   # HyperSteer-flavoured: K/V = the source token's 36 per-layer residuals
 _add("xattn_srclayers_plus_karvonen_L1", kind="xattn_src", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[1])
+# HYPERINJECTION (user, 2026-09-04): norm-matched marker injection at EVERY layer, each with a learnable gate g_l
+# (h + g_l*||h||*v_hat); init g_1 = 1, others 0 => starts as the baseline and learns where the vector should enter.
+_add("hyperinject", layers=list(range(36)), gated=True, gate_init={1: 1.0})
+_add("hyperinject_linproj", layers=list(range(36)), gated=True, gate_init={1: 1.0}, proj="shared")
+_add("hyperinject_all1", layers=list(range(36)), gated=True, gate_init="all1")
+_add("hyperinject_film_linproj", kind="film", layers=list(range(36)), layers_resid=list(range(36)), gated=True, gate_init={8: 1.0}, proj="shared")
 _add("broadcast_L1", layers=[1], all_pos=True)                    # v as a per-sequence bias at EVERY position (learned strength)
 _add("broadcast_L1_8_16_24", layers=[1, 8, 16, 24], all_pos=True)
 _add("broadcast_plus_karvonen_L1", layers=[1, 8, 16, 24], all_pos=True, layers_resid=[1])
@@ -143,6 +149,11 @@ class Feeder(nn.Module):
         self.kinds = {kind} | set(spec.get("extras", []))
         if spec.get("all_pos"):
             self.bscale = nn.Parameter(torch.full((len(spec["layers"]),), 0.1))
+        if spec.get("gated"):                              # per-injection-layer gate on the norm-matched add
+            gl = spec.get("layers_resid") if kind != "resid" else spec["layers"]
+            init = spec.get("gate_init", {})
+            g = torch.ones(len(gl)) if init == "all1" else torch.tensor([float(init.get(L, 0.0)) for L in gl])
+            self.lgate = nn.Parameter(g); self.gate_layers = list(gl)
         if self.kinds & {"film", "xattn", "ipkv"}:
             # shared bottleneck z = GELU(W_s v_rms) (v rms-normalised so the adapters see a fixed scale)
             self.zdim = int(spec.get("zdim", 512))
@@ -283,7 +294,13 @@ class Feeder(nn.Module):
                     v = st["src_resid"][layer_key][rows, slot]      # [N, d]
                 else:
                     v = self.vec_for(rows, slot)
-                new[rows, cols] = self.combine(h, v.to(h.device), self.spec["mode"]).to(new.dtype)
+                if self.spec.get("gated") and layer_key in self.gate_layers:
+                    g = self.lgate[self.gate_layers.index(layer_key)]
+                    h32 = h.float(); vv = v.to(h.device)
+                    upd = h32 + g * h32.norm(dim=-1, keepdim=True) * vv / (vv.norm(dim=-1, keepdim=True) + 1e-6)
+                    new[rows, cols] = upd.to(new.dtype)
+                else:
+                    new[rows, cols] = self.combine(h, v.to(h.device), self.spec["mode"]).to(new.dtype)
                 st["n_writes"] += rows.numel()
                 return (new, *output[1:]) if isinstance(output, tuple) else new
             return hook
@@ -562,6 +579,7 @@ def main():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--min-lr", type=float, default=1e-5)
     p.add_argument("--feeder-lr", type=float, default=1e-4)
+    p.add_argument("--gate-lr", type=float, default=3e-3, help="lr for per-layer injection gates (hyperinjection)")
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--max-len", type=int, default=1024)
     p.add_argument("--n-test", type=int, default=1000)
@@ -634,7 +652,10 @@ def main():
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad]
     groups = [{"params": lora_params, "lr": args.lr, "weight_decay": 0.0}]
     if n_feed:
-        groups.append({"params": list(feeder.parameters()), "lr": args.feeder_lr, "weight_decay": 0.0})
+        fp = [p_ for n_, p_ in feeder.named_parameters() if n_ != "lgate"]
+        if fp: groups.append({"params": fp, "lr": args.feeder_lr, "weight_decay": 0.0})
+        if hasattr(feeder, "lgate"): groups.append({"params": [feeder.lgate], "lr": args.gate_lr, "weight_decay": 0.0})
+    for g_ in groups: g_["base_lr"] = g_["lr"]
     opt = torch.optim.AdamW(groups, betas=(0.9, 0.999))
     print(f"[feed] lora params {sum(p.numel() for p in lora_params)/1e6:.1f}M, feeder params {n_feed/1e6:.1f}M", flush=True)
 
@@ -673,6 +694,9 @@ def main():
         if hasattr(feeder, "bscale"): t["feeder/broadcast_scale_mean"] = float(feeder.bscale.mean())
         if hasattr(feeder, "W"): t["feeder/W_dev_from_identity"] = float((feeder.W[0] - torch.eye(feeder.d, device=feeder.W[0].device)).norm())
         if hasattr(feeder, "film"): t["feeder/film_gamma_rms"] = float(torch.stack([m.weight.norm() for m in feeder.film]).mean())
+        if hasattr(feeder, "lgate"):
+            for L, g in zip(feeder.gate_layers, feeder.lgate.detach().cpu().tolist()): t[f"gate/L{L:02d}"] = g
+            t["feeder/gate_abs_sum"] = float(feeder.lgate.detach().abs().sum())
         return t
 
     model.train(); t0 = time.time(); losses = []; writes = []
@@ -680,7 +704,7 @@ def main():
         if wb and s % 100 == 0 and s > 0:
             wb.log({"heldout/ce": heldout_ce(test_small), "step": s, **feeder_telemetry()})
         for gi, g in enumerate(opt.param_groups):
-            g["lr"] = lr_at(s, args.lr if gi == 0 else args.feeder_lr)
+            g["lr"] = lr_at(s, g.get("base_lr", args.lr))
         tot_l, tot_t = 0.0, 0.0
         for a in range(args.accum):
             chunk = stream.take(args.bs)
