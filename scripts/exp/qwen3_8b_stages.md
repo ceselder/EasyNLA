@@ -175,3 +175,17 @@ merge, 1,024-prompt eval with the baseline AR and `ar_onpol_cont` (`eval_hc_rR.j
 hallucination drops ≥ 0.2 vs the previous round (n=256 judged, s.e. ≈ 0.09). Outputs `/vol/ckpts/qwen3_8b/av_hc_rR{,_merged}`,
 `/vol/data/qwen3_8b/hc/rR/{mine,scores,set}`. Queue 3b (KL arms, av_bon6 RL arm, combo) now waits for "[hc] hill-climb done".
 Slot A meanwhile: rlB_ar_onpol_cont (running since 23:46) → rlB_ar_onpol (rerun; crashed dir deleted) → lag10 → lowlr → arevery2 → arlr4e5.
+
+### Fixed-critic evals of step-150 AVs (`launch_arm_evals.sh`, 1,024 held-out prompts, T=1; judge n=256) — the comparable FVE
+In-training `eval/fve_pct` is scored by each arm's OWN co-trained AR and is not comparable across arms with different ARs.
+| arm (AV @150) | FVE, Opus-trained AR (fixed) | FVE, on-policy-continued AR (fixed) | halluc ↓ | inform ↑ |
+|---|---|---|---|---|
+| AV before RL (step 0) | 55.2% | 60.7% | 9.42 | 2.11 |
+| rlB_base | 68.5% | 72.7% | 9.26 | 2.50 |
+| rlB_ema098 | 69.9% | (see json) | 9.28 | 2.43 |
+(more arms appended by the chain as they finish → `data/eval_arm_<tag>.json`.)
+Note: RL checkpoints hold only the LoRA adapter; `merge_lora_to_hf.py` now falls back to the base tokenizer (fixed 00:06).
+
+### rlB_ar_onpol_cont (RL with the on-policy-continued AR) — in flight; step-50 judge: hallucination 9.19 vs baseline 9.07,
+informativeness 2.47 vs 2.66. Together with the crashed rlB_ar_onpol (9.25 @50): a critic that reads the AV's own text does
+NOT reduce hallucination in the first 50 steps. Final read at 150 (~01:35).
