@@ -136,6 +136,12 @@ _add("mhc_marker_static", kind="mhc", layers=list(range(36)), scope="marker", dy
 _add("mhc_marker_dyn", kind="mhc", layers=list(range(36)), scope="marker", dynamic=True, proj="shared")
 _add("mhc_all_dyn", kind="mhc", layers=list(range(36)), scope="all", dynamic=True, proj="shared")
 _add("mhc_all_dyn_plus_karvonen_L8", kind="mhc", layers=list(range(36)), scope="all", dynamic=True, proj="shared", layers_resid=[8])
+_add("mhc2_all_dyn", kind="mhc", layers=list(range(36)), scope="all", dynamic=True, proj="shared", two_stream=True)   # stream carries state across layers
+_add("mhc2_all_dyn_plus_karvonen_L8", kind="mhc", layers=list(range(36)), scope="all", dynamic=True, proj="shared", two_stream=True, layers_resid=[8])
+_add("mhc_freshheads_linproj_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared",
+     extras=["mhc"], mhc_layers=list(range(36)), scope="all", dynamic=True)                      # stack the two new channels
+_add("freshheadsP_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", heads_use_proj=True)
+_add("freshheads_dense_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared")
 # norm reference = mean residual norm of the OTHER tokens at that layer (not the already-injected / atypical marker token)
 _add("linproj_L8_layernorm", layers=[8], proj="shared", norm_ref="layer_mean")
 _add("hyperinject_linproj_layernorm", layers=list(range(36)), gated=True, gate_init={1: 1.0}, proj="shared", norm_ref="layer_mean")
@@ -173,11 +179,12 @@ class Feeder(nn.Module):
             init = spec.get("gate_init", {})
             g = torch.ones(len(gl)) if init == "all1" else torch.tensor([float(init.get(L, 0.0)) for L in gl])
             self.lgate = nn.Parameter(g); self.gate_layers = list(gl)
-        if kind == "mhc":
-            nL = len(spec["layers"])
+        if "mhc" in self.kinds:
+            self.mhc_layers = spec["layers"] if kind == "mhc" else spec.get("mhc_layers", list(range(spec["n_layers"])))
+            nL = len(self.mhc_layers)
             b0 = torch.full((nL,), -4.0)                                   # m ~ 0.018 everywhere ...
-            if 8 in spec["layers"] and spec.get("scope") == "marker":
-                b0[spec["layers"].index(8)] = 0.0                          # ... except m = 0.5 at layer 8 for the marker-only versions
+            if 8 in self.mhc_layers and spec.get("scope") == "marker":
+                b0[self.mhc_layers.index(8)] = 0.0                         # ... except m = 0.5 at layer 8 for the marker-only versions
             self.mix_b = nn.Parameter(b0)
             if spec.get("dynamic"):
                 self.mix_w = nn.Parameter(torch.zeros(nL, d_model))       # zero-init: starts static
@@ -390,7 +397,7 @@ class Feeder(nn.Module):
                 return hook
             for gi, L in enumerate(self.spec["layers"]):
                 self._handles.append(layers[L].register_forward_hook(xsrc_factory(L, gi)))
-        if kind == "mhc":
+        if "mhc" in kinds:
             def mhc_factory(L, gi):
                 def hook(module, args, output):
                     if st["mode"] != "inject" or st["vec"] is None:
@@ -409,6 +416,11 @@ class Feeder(nn.Module):
                     if self.proj == "shared":
                         vb = vb @ self.W[0].T + self.b[0]
                     a = ref[:, None] * vb / (vb.norm(dim=-1, keepdim=True) + 1e-6)                   # [B, d] activation stream
+                    if self.spec.get("two_stream"):
+                        # the stream persists across layers within this forward: a_l is [B, T, d]; reset at the first mhc layer
+                        if gi == 0 or st.get("a_stream") is None or st["a_stream"].shape[:2] != (B, T):
+                            st["a_stream"] = a[:, None, :].expand(B, T, d).clone()
+                        a_full = st["a_stream"]
                     logit = self.mix_b[gi]
                     if self.spec.get("dynamic"):
                         hn = h32 * torch.rsqrt(h32.pow(2).mean(-1, keepdim=True) + 1e-6)
@@ -421,16 +433,21 @@ class Feeder(nn.Module):
                             return output
                         mask = (ids == inj_id).float()[..., None]
                         m = m * mask
-                    new = ((1 - m) * h32 + m * a[:, None, :]).to(out_t.dtype)
+                    if self.spec.get("two_stream"):
+                        new = ((1 - m) * h32 + m * a_full).to(out_t.dtype)
+                        st["a_stream"] = (m * h32 + (1 - m) * a_full).detach() if not torch.is_grad_enabled() else (m * h32 + (1 - m) * a_full)
+                    else:
+                        new = ((1 - m) * h32 + m * a[:, None, :]).to(out_t.dtype)
                     if gi == 0 and T >= 2:
                         st["n_writes"] += B
                         st.setdefault("m_log", {})[L] = float(m.detach().mean())
                     return (new, *output[1:]) if isinstance(output, tuple) else new
                 return hook
-            for gi, L in enumerate(self.spec["layers"]):
+            for gi, L in enumerate(self.mhc_layers):
                 self._handles.append(layers[L].register_forward_hook(mhc_factory(L, gi)))
-            for L in self.spec.get("layers_resid", []):
-                self._handles.append(layers[L].register_forward_hook(resid_hook_factory(L)))
+            if kind == "mhc":
+                for L in self.spec.get("layers_resid", []):
+                    self._handles.append(layers[L].register_forward_hook(resid_hook_factory(L)))
         if kinds & {"film", "xattn", "ipkv", "xattn_src"}:
             # optional plain Karvonen injection on top (layers_resid), sharing the stored vector
             for L in self.spec.get("layers_resid", []):
@@ -461,7 +478,10 @@ class Feeder(nn.Module):
                     if self.spec.get("const_memory"):
                         C = self.const_mem.unsqueeze(0).expand(B, -1, -1)                        # no information about v
                     else:
-                        v = st["vec"]; v = v / (v.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
+                        v = st["vec"]
+                        if self.spec.get("heads_use_proj") and self.proj == "shared":
+                            v = v @ self.W[0].T + self.b[0]
+                        v = v / (v.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
                         C = self.chunk_proj(v.view(B, self.n_chunks, self.cdim)) + self.chunk_pos   # [B, 32, inner]
                     q = blk["q"](blk["ln"](out_t.float())).view(B, T, self.heads, -1).transpose(1, 2)      # [B,H,T,dh]
                     kk = blk["kk"](C).view(B, self.n_chunks, self.heads, -1).transpose(1, 2)              # [B,H,32,dh]
@@ -546,7 +566,7 @@ class Feeder(nn.Module):
     def clear(self):
         st = self.state
         st["vec"] = None; st["mode"] = "off"; st["src_pos"] = None
-        st["src_k"].clear(); st["src_v"].clear(); st["src_resid"].clear()
+        st["src_k"].clear(); st["src_v"].clear(); st["src_resid"].clear(); st["a_stream"] = None
 
 
 # --------------------------------------------------------------------------- data
@@ -743,11 +763,13 @@ def main():
     n_layers = len(model.get_base_model().model.layers)
     expected_writes = k * ({"resid": len(spec["layers"]), "srcresid": len(spec["layers"]), "kv": n_layers,
                             "kv+resid": n_layers + len(spec["layers"]), "film": 1, "xattn": 1, "xattn_src": 1,
-                            "ipkv": n_layers}[spec["kind"]]) + (k * len(spec.get("layers_resid", [])) if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src") else 0)
+                            "ipkv": n_layers}.get(spec["kind"], 0)) + (k * len(spec.get("layers_resid", [])) if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src") else 0)
     if spec["kind"] in ("film", "xattn", "xattn_src"):
         expected_writes = len({spec["kind"]} | set(spec.get("extras", []))) + k * len(spec.get("layers_resid", []))   # one count per family per row
     if spec["kind"] == "mhc":
         expected_writes = 1 + k * len(spec.get("layers_resid", []))
+    if "mhc" in spec.get("extras", []):
+        expected_writes += 1
     if spec.get("all_pos"):
         expected_writes = 1 + k * len(spec.get("layers_resid", []))
     n_feed = sum(p.numel() for p in feeder.parameters())
@@ -801,7 +823,7 @@ def main():
             for L, g in zip(feeder.gate_layers, feeder.lgate.detach().cpu().tolist()): t[f"gate/L{L:02d}"] = g
             t["feeder/gate_abs_sum"] = float(feeder.lgate.detach().abs().sum())
         if hasattr(feeder, "mix_b"):
-            for L, b_ in zip(feeder.spec["layers"], torch.sigmoid(feeder.mix_b.detach()).cpu().tolist()): t[f"mix_static/L{L:02d}"] = b_
+            for L, b_ in zip(feeder.mhc_layers, torch.sigmoid(feeder.mix_b.detach()).cpu().tolist()): t[f"mix_static/L{L:02d}"] = b_
             for L, mv in feeder.state.get("m_log", {}).items(): t[f"mix_realized/L{L:02d}"] = mv
             if hasattr(feeder, "mix_w"): t["feeder/mix_w_norm"] = float(feeder.mix_w.detach().norm())
         return t
