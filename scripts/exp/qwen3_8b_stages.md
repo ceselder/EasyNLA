@@ -404,3 +404,6 @@ Discord ping sent 19:09. Needs new keys in ~/.anthropic_env and the Modal secret
 
 ### 19:15 check-in — base 768 (own 79.3%; ckpt@700 58.9, @750 58.3 — 21-pt gap to its own critic), klsup 599 (own 71.6%; ckpt@550 69.8 = its best),
 arklonly 518 (ckpt@500 59.0). Judge keys still 401 → hallucination/text fields NaN from 18:55 on. 3 apps + 5/5 chains alive; no crashes.
+
+### 19:31 check-in — base 788/800 (own critic 79.4%; ckpt@700 58.9, @750 58.3 — gap ≈21 pts), klsup 613 (own 71.5%; ckpt@550 69.8, @600 68.1),
+arklonly 532 (ckpt@500 59.0). 3 apps, 5/5 chains, no new crashes. Judge fields NaN since ~18:55 (keys dead; already pinged 19:09).
