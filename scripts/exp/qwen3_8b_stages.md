@@ -380,3 +380,7 @@ text still best). klsup in-training @300: halluc 8.93, inform 2.97 (best judge r
 checkpoint since the @300 drop; own critic 78.1%; writing 3.44 / coh 4.30 / repet 6.22 — worst yet); klsup@350 68.9 / 9.42 / 2.41 / writing 4.10
 (FVE holding 68–69 at all 7 checkpoints; text ≈ baseline now); arklonly@300 57.1 / 8.69 / 2.56 / writing 5.88 / coh 7.30 (FVE sliding toward
 pre-RL 55.2; stop if @350 < 55).
+
+### 16:31 check-in — 3 runs alive (base 603, klsup 451, arklonly 389), 5/5 chains, no crashes. New ckpt evals: base@550 61.3 (own critic 77;
+writing 3.16 — still falling); klsup@400 69.0 / 9.15 / 2.68 / writing 4.21 (8 checkpoints in the 68–69 band); arklonly@350 60.9 / 8.57 / 2.66 /
+writing 5.63 / coh 7.11 (bounced from 57.1; kept running). Baseline and KL-only critic are now level on frozen-critic FVE (~61) with opposite prose.
