@@ -366,3 +366,8 @@ arklonly's own-critic FVE collapsed to 6.7–12.8% @200 (its critic never traine
 writing 3.63 / repet 6.16 (stays at the post-300 level; prose worst yet); klsup@250 69.3 / 9.16 / 2.54 / writing 4.34 / coh 5.55 (a point
 ahead on FVE at every checkpoint 50–250, text recovered vs its @200 dip); arklonly@200 62.5 / 8.95 / 2.46 / writing 5.65 / coh 7.18 / repet 2.63
 (AV steady ≈63 by the frozen critic despite its own critic reading 9–17%; text quality still far ahead of both others).
+
+### 13:47 — KEY: klsup@300 = 68.8% by the frozen Opus critic vs base@300 63.8% (base@400 63.2%). The KL critic did NOT drop where the
+baseline did; halluc 9.14 vs 9.43, inform 2.65 vs 2.40. The downstream-KL term keeps the co-trained critic honest: the baseline's
+own-critic FVE (77%) vs frozen-critic FVE (63%) gap is the reward-hacking signature, and the KL-critic run's gap is ~2 pts (70.5 vs 68.8).
+arklonly@250 61.4 (slow drift 64.9 → 61.4 over 200 steps).
