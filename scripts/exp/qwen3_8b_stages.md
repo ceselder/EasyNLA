@@ -341,3 +341,8 @@ for a critic never trained on MSE. Watch @100/@150. Runs alive: base step 113, k
 Runs alive (base 185, klsup 132, klonly 131, arklonly 106); 6/6 chains alive; no crashes. klonly (KL-only reward) keeps degenerating
 (in-training @100: halluc 9.50, inform 1.96, writing 3.14) → stop after its @150 checkpoint if unchanged. arklonly (KL-only critic):
 FVE by the frozen Opus AR slipping (64.9 → 63.1) while text quality stays far ahead (writing 5.61, coherence 7.19) — a trade, not a win.
+
+### 11:05 — rlB_klonly_b256 (reward = −downstream-KL only) STOPPED at step ~160: conclusively degenerate
+Fixed-critic FVE 60.8 → 59.8 → 56.3 (@50/100/150; pre-RL 55.2), hallucination 9.31 → 9.61 → 9.55, informativeness 2.24 → 1.96 → 1.98,
+writing 3.87 → 3.07. Pure behavioural (KL) reward makes the AV write vaguer text that perturbs the model less, not better explanations.
+KL-critic @150: 69.5% (base 68.4), halluc 9.27 (8.87), inform 2.38 (2.84) — at this batch no judge edge at 150; FVE +1.
