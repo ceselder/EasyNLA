@@ -355,3 +355,9 @@ klsup at step 186 (own 69.2%; ckpt@150 69.5 / 9.27 / 2.38 / writing 4.48 vs base
 13-pt gap between the co-trained critic's view and a frozen critic's view; halluc 9.43 (ckpt) / 9.30 (in-training); coherence 4.98,
 repetitiveness 5.26, writing 3.98. Past ~250 steps the plain-MSE recipe is optimising its own critic, not reconstruction as an
 independent critic sees it. Compare klsup@300 (due ~12:50) and arklonly@200.
+
+### 12:31 check-in — 3 runs alive (base 323, klsup 238, arklonly 200), 5/5 chains. New ckpt evals: base@250 68.3, base@300 63.8 (drop),
+klsup@200 68.1 / 9.31 / 2.36 / writing 4.02, arklonly@150 63.3 / 8.80 / 2.65 / writing 5.54.
+⚠️ klsup's text quality is NOT holding at this batch past 150: in-training @200 writing 3.76, coherence 4.88, repetitiveness 5.92
+(baseline @200 ckpt: 3.93 / 5.39). The 150-step-arm text-quality advantage does not replicate in the long 256×8 run so far.
+arklonly's own-critic FVE collapsed to 6.7–12.8% @200 (its critic never trained on MSE); frozen-critic eval @200 pending.
