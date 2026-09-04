@@ -190,3 +190,30 @@ Note: RL checkpoints hold only the LoRA adapter; `merge_lora_to_hf.py` now falls
 ### rlB_ar_onpol_cont (RL with the on-policy-continued AR) — in flight; step-50 judge: hallucination 9.19 vs baseline 9.07,
 informativeness 2.47 vs 2.66. Together with the crashed rlB_ar_onpol (9.25 @50): a critic that reads the AV's own text does
 NOT reduce hallucination in the first 50 steps. Final read at 150 (~01:35).
+
+### Arm result: rlB_ar_onpol_cont (RL with the on-policy-continued AR) — finished 01:47, 150 steps
+| | rlB_base | rlB_ar_onpol_cont |
+|---|---|---|
+| hallucination @0 / @50 / @100 / @150 | 9.20 / 9.07 / 9.06 / 9.12 | 9.08 / 9.19 / 9.09 / 9.18 |
+| informativeness @150 | 2.62 | 2.50 |
+| in-training FVE @150 (own AR — not comparable) | 75.2% | 76.2% |
+**A critic that reads the AV's own text does NOT reduce hallucination** (nor did the crashed from-scratch variant, 9.25 @50).
+Fixed-critic eval of its step-150 AV follows (launch_arm_evals.sh). rlB_ar_onpol (scratch AR) relaunched 01:47 (save-dir cleared).
+
+### Best-of-N ARs (eval_bon6_avbase, 01:45; same AV/rollouts as milestone 1)
+| AR | FVE on AV rollouts | FVE on gold |
+|---|---|---|
+| ar_sft500k (baseline) | 55.7% | 78.3% |
+| ar_bon6 (best-of-~4, scratch) | 61.0% | 73.4% |
+| ar_bon6_cont | **61.6%** | 75.3% |
+| ar_bon6le6_cont (68k best≤6) | 59.2% | 76.0% |
+Best-of-N data ≈ plain on-policy data for the AR (61.6 vs 60.7 cont): picking the least-hallucinated sample per activation
+gives at most +1 pt. ar_bon6_cont is the best on-policy reader so far.
+
+### ⚠️ Mis-merge bug (found 01:50): `av_bon6_merged` was built by the merge_av Modal task with base=Qwen/Qwen3-8B, but the
+av_bon6_cont LoRA was trained on top of av_sft500k_lr1e4_merged → merged model = raw base + delta (no SFT) → garbage AV
+(eval: FVE −57%, informativeness 1.00; its "hallucination 8.76" is meaningless). The AV hill-climb chain
+(launch_av_hillclimb.sh, round 2 mining from that AV) was stopped at 01:52; merge_av now takes `--base`; the fix chain
+(launch_bon6_fix.sh) re-merges onto av_sft500k_lr1e4_merged, redoes eval_bon6_avbon6, then starts the patched hill-climb only
+if round 1 cuts hallucination by ≥0.2 vs the warm-start AV (9.41). Rule: a LoRA must be merged onto the exact model it was
+trained on.
