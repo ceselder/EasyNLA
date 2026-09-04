@@ -371,3 +371,7 @@ ahead on FVE at every checkpoint 50–250, text recovered vs its @200 dip); arkl
 baseline did; halluc 9.14 vs 9.43, inform 2.65 vs 2.40. The downstream-KL term keeps the co-trained critic honest: the baseline's
 own-critic FVE (77%) vs frozen-critic FVE (63%) gap is the reward-hacking signature, and the KL-critic run's gap is ~2 pts (70.5 vs 68.8).
 arklonly@250 61.4 (slow drift 64.9 → 61.4 over 200 steps).
+
+### 14:31 check-in — 3 runs alive (base 465, klsup 347, arklonly 296), 5/5 chains, no crashes. New ckpt evals: base@400 63.2, base@450 63.9
+(own critic 78.4% — gap ≈15 pts; writing 3.49, repet 5.79); arklonly@250 61.4 / 9.06 / 2.35 / writing 5.62 / coh 6.67 (slow FVE drift continues,
+text still best). klsup in-training @300: halluc 8.93, inform 2.97 (best judge readings of the run), own FVE 70.2 vs ckpt 68.8.
