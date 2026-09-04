@@ -97,6 +97,10 @@ _add("freshheads_plus_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), 
 _add("freshheads_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared")
 _add("freshheads_film_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", extras=["film"])
 _add("freshheads_dense_plus_karvonen_L8", kind="xattn", layers=list(range(1, 36)), k=1, layers_resid=[8], null_key=True, no_gate=True)
+# MARKER-ONLY fresh heads (user): the same activation-reading heads, but queries/writes only at the marker position(s) —
+# the marker's residual gets a state-dependent refresh from v at 18 depths; every other token still reads the marker via pretrained attention.
+_add("markerheads_linproj_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", marker_only=True)
+_add("markerheads4_linproj_L8", kind="xattn", layers=list(range(1, 36, 2)), k=4, layers_resid=[8], null_key=True, no_gate=True, proj="per_pos", marker_only=True)
 # CONTROL: identical fresh heads but their keys/values come from 32 LEARNED CONSTANT tokens (no dependence on v) -> pure capacity
 _add("freshheads_const_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", const_memory=True)
 _add("ipadapter_kv4", kind="ipkv", k=4)                # learned per-layer K/V of 4 marker slots from v (IP-Adapter / prefix-KV)
@@ -123,6 +127,7 @@ _add("xattn_srclayers_plus_karvonen_L1", kind="xattn_src", layers=[3, 7, 11, 15,
 _add("hyperinject", layers=list(range(36)), gated=True, gate_init={1: 1.0})
 _add("hyperinject_linproj", layers=list(range(36)), gated=True, gate_init={1: 1.0}, proj="shared")
 _add("hyperinject_all1", layers=list(range(36)), gated=True, gate_init="all1")
+_add("hyperinject_linproj_L8init", layers=list(range(36)), gated=True, gate_init={8: 1.0}, proj="shared")   # start in the L8 basin
 _add("hyperinject_film_linproj", kind="film", layers=list(range(36)), layers_resid=list(range(36)), gated=True, gate_init={8: 1.0}, proj="shared")
 _add("broadcast_L1", layers=[1], all_pos=True)                    # v as a per-sequence bias at EVERY position (learned strength)
 _add("broadcast_L1_8_16_24", layers=[1, 8, 16, 24], all_pos=True)
@@ -391,6 +396,20 @@ class Feeder(nn.Module):
                     if self.spec.get("null_key"):   # a key the head can attend to instead of the activation (value 0)
                         nk = self.null_k.view(1, self.heads, 1, -1).expand(B, -1, 1, -1)
                         kk = torch.cat([kk, nk], dim=2); vv = torch.cat([vv, torch.zeros_like(nk)], dim=2)
+                    if self.spec.get("marker_only"):
+                        if st["ids"] is None or T < 2:
+                            return output
+                        pos = self.positions(st["ids"].to(out_t.device), inj_id)
+                        if pos is None:
+                            return output
+                        rows, cols, _ = pos
+                        qm = q[rows, :, cols]                                                                  # [N,H,dh]
+                        om = F.scaled_dot_product_attention(qm.unsqueeze(2), kk[rows], vv[rows]).squeeze(2)    # [N,H,dh]
+                        om = blk["o"](om.reshape(rows.numel(), self.inner))
+                        new = out_t.clone(); new[rows, cols] = (new[rows, cols].float() + om).to(new.dtype)
+                        if gi == 0:
+                            st["n_writes"] += B
+                        return (new, *output[1:]) if isinstance(output, tuple) else new
                     o = F.scaled_dot_product_attention(q, kk, vv)                                          # [B,H,T,dh]
                     o = blk["o"](o.transpose(1, 2).reshape(B, T, self.inner))
                     g = 1.0 if self.spec.get("no_gate") else torch.tanh(self.gate[gi])
