@@ -416,3 +416,7 @@ arklonly: 65 → 59 (500). Final judge fields NaN (keys dead).
 
 ### 20:31 check-in — klsup 669 (own 72.9%; ckpt@650 67.4 vs base@650 61.0), arklonly 581 (ckpt@550 58.2). 2 apps, 4/4 chains (base done).
 Judge key still 401 (no re-ping).
+
+### 20:31 check-in — rlB_base_b256 FINISHED (800 steps, 19:50): final frozen-critic FVE 60.4% vs own-critic 79.3% (19-pt gap); trajectory by the frozen
+Opus AR: 68.2/69.3/68.4/67.4/68.3 (50–250) → 63.8/64.7/63.2/63.9/63.7/61.3/57.0/61.0/58.9/58.3/60.4 (300–800). klsup 669 (ckpt@600 68.1, @650 67.4 —
+still ≥7 pts above the baseline at matched steps), arklonly 581 (ckpt@550 58.2). Judge keys still 401. 2 apps + 4 chains alive (base eval chain done).
