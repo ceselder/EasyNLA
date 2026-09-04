@@ -292,3 +292,6 @@ Gate passed (−0.48) → round 3 started 06:12 (rows 125k–250k, 8 samples, fr
   checkpoint with the fixed critics + judge (1,024 prompts) → data/eval_xl_<tag>_<step>.json (merged AVs deleted after eval).
 - Disaggregated serving (2 GPUs vLLM + 6 trainer) NOT done: weight sync is CUDA-IPC to the rank's own co-located engine;
   a cross-process (NCCL/broadcast) sync path would be ~a day of work.
+- 06:40 (user): both runs on 4 GPUs each instead, batch 128 prompts × 8 samples ("8x128"), 1601 steps (= one pass over the
+  RL split, same total samples as 801×256), save every 100 → `rlB_base_b128` / `rlB_klsup_b128`; xl 8-GPU runs stopped
+  before their first checkpoint. Checkpoint evals: `STEPS="100 … 1600" launch_xl_evals.sh <tag>`.
