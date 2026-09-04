@@ -423,3 +423,6 @@ still ≥7 pts above the baseline at matched steps), arklonly 581 (ckpt@550 58.2
 
 ### 21:31 check-in — klsup 723 (own 71.8%; ckpt@700 63.2 — first drop from its 67–70 band; base@700 was 58.9), arklonly 630 (ckpt@600 57.9).
 2 apps, 4/4 chains, no crashes. Judge key still 401.
+
+### 21:31 check-in — klsup 723 (ckpt@700 63.2 — first drop below 66; own critic 71.8 → gap 8.6 pts; the baseline's equivalent drop came at 300),
+arklonly 630 (ckpt@600 57.9 / onpol AR 59.8; slow drift continues). 2 apps + 4/4 chains alive; keys still 401; no crashes.
