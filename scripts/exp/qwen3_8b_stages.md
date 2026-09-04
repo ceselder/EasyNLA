@@ -303,3 +303,7 @@ evals (`launch_xl_evals.sh`), watchdog `launch_overnight_watchdog_b256.sh`, figu
 running as a batch-size robustness check. My GPU use: 5 runs × 4 = 20 B200 + transient 1-GPU evals.
 b128 step-100 checkpoint evals: base 67.2% / 9.26 / 2.43 vs klsup 68.6% / 9.39 / 2.24 (FVE Opus AR / halluc / inform) — the KL run
 dipped on the judge at step 100 after leading at 50 (in-training 8.70 vs 9.27); text quality still ahead (4.83 vs 3.96).
+- 08:05 (user): 128×8 pair stopped (redundant; fewer GPUs). Added `rlB_arklonly_b256` (`--ar-loss downstream_kl`: critic trained
+  with the downstream-KL ONLY, MSE reward). 256×8 group = 4 runs × 4 GPUs = 16 B200: base / klsup / klonly / arklonly.
+- ⚠️ rlB_klsup_b128 crashed at step ~110 with CUDA OOM on rank 0 (178 GB GPU full: HF actor + critic + vLLM 0.35 + the KL
+  critic's fwd/bwd through the base). Watchdog auto-resumed it (before the pair was stopped). Risk for the KL-critic b256 runs.
