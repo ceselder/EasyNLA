@@ -384,3 +384,7 @@ pre-RL 55.2; stop if @350 < 55).
 ### 16:31 check-in — 3 runs alive (base 603, klsup 451, arklonly 389), 5/5 chains, no crashes. New ckpt evals: base@550 61.3 (own critic 77;
 writing 3.16 — still falling); klsup@400 69.0 / 9.15 / 2.68 / writing 4.21 (8 checkpoints in the 68–69 band); arklonly@350 60.9 / 8.57 / 2.66 /
 writing 5.63 / coh 7.11 (bounced from 57.1; kept running). Baseline and KL-only critic are now level on frozen-critic FVE (~61) with opposite prose.
+
+### 17:20 — rlB_base_b256 CUDA-OOM'd at step 661 (rank 0, 178 GB full; MSE-only run, vLLM 0.35) → watchdog resumed from iter_000650
+(+ critic_latest). Base eval chain re-armed for 700/750/800. Ckpt evals: base@600 57.0 (near pre-RL 55.2; own critic 77), base@650 61.0;
+klsup@450 66.5 (first reading below its 68–69 band); arklonly@400 59.8 / 8.53 (now ahead of the baseline on frozen-critic FVE too).
