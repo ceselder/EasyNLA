@@ -49,10 +49,12 @@ from nla.schema import (INJECT_PLACEHOLDER, compute_predict_mean_baselines,  # n
                         extract_explanation, resolve_target_scale)
 from nla.utils.arch_adapters import resolve_lora_target_modules  # noqa: E402
 
-BASE = "Qwen/Qwen3-8B"
-DATA = "/vol/data/qwen3_8b"
-AR0 = "/vol/ckpts/qwen3_8b/ar_sft500k/iter_0007813"
-AR_ONPOL = "/vol/ckpts/qwen3_8b/ar_onpol_cont/iter_0007813"
+MODELS = {
+    "qwen3_8b": dict(base="Qwen/Qwen3-8B", data="/vol/data/qwen3_8b", train="av_sft_train500k.parquet",
+                     ar=["ar=/vol/ckpts/qwen3_8b/ar_sft500k/iter_0007813", "ar_onpol_cont=/vol/ckpts/qwen3_8b/ar_onpol_cont/iter_0007813"]),
+    "qwen36_27b": dict(base="Qwen/Qwen3.6-27B", data="/vol/data/qwen36_27b", train="av_sft_train.parquet", ar=[]),
+}
+BASE = MODELS["qwen3_8b"]["base"]; DATA = MODELS["qwen3_8b"]["data"]; TRAIN_PQ = MODELS["qwen3_8b"]["train"]
 
 # --------------------------------------------------------------------------- variants
 V = {}
@@ -484,11 +486,21 @@ def main():
     p.add_argument("--save-dir", default=None)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--no-ar-onpol", action="store_true")
+    p.add_argument("--model", default="qwen3_8b", choices=sorted(MODELS))
+    p.add_argument("--ar-ckpts", nargs="*", default=None, help="name=path critics (default: per-model list)")
+    p.add_argument("--layers", default=None, help="override spec layers, e.g. '1,8,16' or 'emb'")
+    p.add_argument("--layers-resid", default=None, help="override spec layers_resid")
     args = p.parse_args()
+    global BASE, DATA, TRAIN_PQ
+    BASE, DATA, TRAIN_PQ = MODELS[args.model]["base"], MODELS[args.model]["data"], MODELS[args.model]["train"]
     spec = dict(V[args.variant])
+    if args.layers:
+        spec["layers"] = [x if x == "emb" else int(x) for x in args.layers.split(",")]
+    if args.layers_resid is not None:
+        spec["layers_resid"] = [int(x) for x in args.layers_resid.split(",") if x]
     if args.src_ctx:
         spec["src_ctx"] = args.src_ctx
-    tag = args.tag or f"{args.variant}_n{args.n_train // 1000}k"
+    tag = args.tag or f"{args.variant}_n{args.n_train // 1000}k" + ("" if args.model == "qwen3_8b" else f"_{args.model}") + (f"_L{args.layers.replace(',', '-')}" if args.layers else "")
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     device = "cuda"
     os.makedirs(args.out_dir, exist_ok=True)
@@ -499,7 +511,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(BASE)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
-    cfg = load_nla_config(f"{DATA}/av_sft_train500k.parquet", tok)
+    cfg = load_nla_config(f"{DATA}/{TRAIN_PQ}", tok)
     inj_id, inj_char = cfg.injection_token_id, cfg.injection_char
     k = spec["k"]
     # marker sanity: k repeated chars must tokenize to exactly k marker ids
@@ -542,7 +554,7 @@ def main():
         wb = wandb.init(project="nla-feed-qwen3_8b", name=tag, config={**vars(args), "spec": spec})
 
     # ---- train
-    rows = read_rows(f"{DATA}/av_sft_train500k.parquet", args.n_train, args.train_offset)
+    rows = read_rows(f"{DATA}/{TRAIN_PQ}", args.n_train, args.train_offset)
     steps = len(rows) // (args.bs * args.accum)
     print(f"[feed] {len(rows)} train rows -> {steps} optimizer steps (bs {args.bs} x {args.accum})", flush=True)
 
@@ -552,8 +564,30 @@ def main():
         t = (s - args.warmup) / max(1, steps - args.warmup)
         return args.min_lr / args.lr * base + (base - args.min_lr / args.lr * base) * 0.5 * (1 + math.cos(math.pi * t))
 
+    test_small = read_rows(f"{DATA}/av_sft_test.parquet", 200)
+
+    def heldout_ce(rows_):
+        model.eval(); ce_s, tk = 0.0, 0.0
+        with torch.no_grad():
+            for cs in range(0, len(rows_), 16):
+                ch = rows_[cs:cs + 16]
+                ids, attn, lm, vec = prepare_chunk(ch, tok, inj_char, k, device, args.max_len)
+                out = av_forward(model, feeder, ids, attn, vec, ch, tok, device, spec["src_ctx"], k)
+                a, b = response_ce(out.logits, ids, lm); ce_s += float(a); tk += float(b); feeder.clear()
+        model.train(); return ce_s / max(tk, 1)
+
+    def feeder_telemetry():
+        t = {}
+        if hasattr(feeder, "gate"): t["feeder/gate_tanh_mean"] = float(torch.tanh(feeder.gate).abs().mean())
+        if hasattr(feeder, "bscale"): t["feeder/broadcast_scale_mean"] = float(feeder.bscale.mean())
+        if hasattr(feeder, "W"): t["feeder/W_dev_from_identity"] = float((feeder.W[0] - torch.eye(feeder.d, device=feeder.W[0].device)).norm())
+        if hasattr(feeder, "film"): t["feeder/film_gamma_rms"] = float(torch.stack([m.weight.norm() for m in feeder.film]).mean())
+        return t
+
     model.train(); t0 = time.time(); losses = []; writes = []
     for s in range(steps):
+        if wb and s % 100 == 0 and s > 0:
+            wb.log({"heldout/ce": heldout_ce(test_small), "step": s, **feeder_telemetry()})
         for gi, g in enumerate(opt.param_groups):
             g["lr"] = lr_at(s, args.lr if gi == 0 else args.feeder_lr)
         tot_l, tot_t = 0.0, 0.0
@@ -577,6 +611,8 @@ def main():
             if wb:
                 wb.log({"train/ce": losses[-1], "train/lr": opt.param_groups[0]["lr"], "step": s})
     train_s = time.time() - t0
+    if wb:
+        wb.log({"heldout/ce": heldout_ce(test_small), "step": steps, **feeder_telemetry()})
     assert np.mean(writes) >= 1.0 - 1e-6, f"feeder writes/row = {np.mean(writes)} (expected >= 1.0)"
 
     # ---- held-out CE
@@ -638,7 +674,10 @@ def main():
                "n_gen": len(gen_rows), "extraction_rate": ext, "resp_len_mean": float(np.mean(lens)),
                "gen_s": gen_s, "feeder_params": n_feed, "temperature": args.temperature}
     del opt; torch.cuda.empty_cache()
-    crits = [("ar", AR0)] + ([] if args.no_ar_onpol else [("ar_onpol_cont", AR_ONPOL)])
+    _specs = args.ar_ckpts if args.ar_ckpts is not None else MODELS[args.model]["ar"]
+    crits = [tuple(x.split("=", 1)) for x in _specs]
+    if args.no_ar_onpol:
+        crits = [c for c in crits if c[0] != "ar_onpol_cont"]
     golds = [extract_explanation(r["response"]) if r.get("response") else None for r in gen_rows]
     for key, path in crits:
         critic = NLACriticModel.from_pretrained(path, torch_dtype=torch.bfloat16).to(device).eval()
