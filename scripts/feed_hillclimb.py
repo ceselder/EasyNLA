@@ -768,8 +768,6 @@ def main():
         expected_writes = len({spec["kind"]} | set(spec.get("extras", []))) + k * len(spec.get("layers_resid", []))   # one count per family per row
     if spec["kind"] == "mhc":
         expected_writes = 1 + k * len(spec.get("layers_resid", []))
-    if "mhc" in spec.get("extras", []):
-        expected_writes += 1
     if spec.get("all_pos"):
         expected_writes = 1 + k * len(spec.get("layers_resid", []))
     n_feed = sum(p.numel() for p in feeder.parameters())
