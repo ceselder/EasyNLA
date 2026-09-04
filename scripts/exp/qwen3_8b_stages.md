@@ -310,3 +310,16 @@ dipped on the judge at step 100 after leading at 50 (in-training 8.70 vs 9.27); 
 - 08:15: rlB_klsup_b256 and rlB_arklonly_b256 relaunched with `--vllm-gpu-mem 0.30` (was 0.35) for OOM headroom — objective
   unchanged; rollout KV budget slightly smaller. RL task deliberately unsets PYTORCH_CUDA_ALLOC_CONF (IPC weight sync needs
   the legacy allocator), so expandable_segments is not an option there.
+
+### Arm result: rlB_klrew (reward = −MSE − 1.0·downstream-KL; MSE critic) — finished ~08:00, 150 steps @62 s/step
+| @150 | rlB_base | rlB_klsup (KL critic) | rlB_klrew (KL reward) |
+|---|---|---|---|
+| fixed-critic FVE, Opus AR (1,024) | 68.5% | 69.4% | **66.0%** |
+| fixed-critic FVE, on-policy AR | 72.7% | 73.0% | 71.5% |
+| hallucination ↓ (256) | 9.26 | 9.05 | 9.08 |
+| informativeness ↑ | 2.50 | 2.65 | 2.65 |
+| writing quality ↑ | 4.06 | 4.98 | **3.73** |
+| repetitiveness ↓ | 4.27 | 3.30 | 4.62 |
+Putting the KL in the REWARD (w=1) costs 2.5 pts of reconstruction and degrades prose more than the baseline, for the same small
+judge gain as the KL critic. The KL belongs in the critic's loss, not the AV's reward — consistent with the July 27B result
+(downstream-KL reward 65% vs MSE 74%). The 256×8 group's `klonly` arm (reward = −KL only) tests the extreme version overnight.
