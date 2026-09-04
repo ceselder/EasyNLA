@@ -401,3 +401,6 @@ secret nla-exp-secrets, which someone modified at 19:05); OpenRouter "infinite" 
 Sonnet judge call fails (in-training halluc@ = NaN, checkpoint-eval judge fields NaN). FVE evals (no API) unaffected; training unaffected.
 Discord ping sent 19:09. Needs new keys in ~/.anthropic_env and the Modal secret; judge-less checkpoints can be re-judged afterwards
 (eval_nla.py on the saved av<step>_merged dirs — NOTE the eval chain deletes merged dirs after eval; the iter_* adapters remain, so re-merge).
+
+### 19:15 check-in — base 768 (own 79.3%; ckpt@700 58.9, @750 58.3 — 21-pt gap to its own critic), klsup 599 (own 71.6%; ckpt@550 69.8 = its best),
+arklonly 518 (ckpt@500 59.0). Judge keys still 401 → hallucination/text fields NaN from 18:55 on. 3 apps + 5/5 chains alive; no crashes.
