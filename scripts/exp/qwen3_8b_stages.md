@@ -407,3 +407,9 @@ arklonly 518 (ckpt@500 59.0). Judge keys still 401 → hallucination/text fields
 
 ### 19:31 check-in — base 788/800 (own critic 79.4%; ckpt@700 58.9, @750 58.3 — gap ≈21 pts), klsup 613 (own 71.5%; ckpt@550 69.8, @600 68.1),
 arklonly 532 (ckpt@500 59.0). 3 apps, 5/5 chains, no new crashes. Judge fields NaN since ~18:55 (keys dead; already pinged 19:09).
+
+### 19:50 — rlB_base_b256 FINISHED (800 steps, 256×8, one OOM resume at 650). Own critic 79.3% at 800; frozen Opus critic by checkpoint:
+50:68.2 100:69.3 150:68.4 200:67.4 250:68.3 | 300:63.8 350:64.7 400:63.2 450:63.9 500:63.7 550:61.3 600:57.0 650:61.0 700:58.9 750:58.3 800:60.4
+→ peak 69 at ~100–250, then a regime change at ~300 and a slow slide to ≈59–60 (pre-RL 55.2) while the co-trained critic keeps rising: the plain
+MSE co-training recipe reward-hacks its own critic on a long run. klsup so far: 68–70 at every checkpoint through 600 (600: 68.1).
+arklonly: 65 → 59 (500). Final judge fields NaN (keys dead).
