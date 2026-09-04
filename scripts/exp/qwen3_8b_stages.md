@@ -346,3 +346,7 @@ FVE by the frozen Opus AR slipping (64.9 → 63.1) while text quality stays far 
 Fixed-critic FVE 60.8 → 59.8 → 56.3 (@50/100/150; pre-RL 55.2), hallucination 9.31 → 9.61 → 9.55, informativeness 2.24 → 1.96 → 1.98,
 writing 3.87 → 3.07. Pure behavioural (KL) reward makes the AV write vaguer text that perturbs the model less, not better explanations.
 KL-critic @150: 69.5% (base 68.4), halluc 9.27 (8.87), inform 2.38 (2.84) — at this batch no judge edge at 150; FVE +1.
+
+### 11:31 check-in — base@200 ckpt 67.4 / 9.16 / 2.59 (frozen-critic FVE flat ≈68 since step 50 while its own critic reads 76%);
+klsup at step 186 (own 69.2%; ckpt@150 69.5 / 9.27 / 2.38 / writing 4.48 vs base 68.4 / 8.87 / 2.84 / 4.03); arklonly at step 152
+(in-training @150: halluc 8.70, inform 2.69, writing 5.66, coherence 7.12, own FVE 17% — ckpt@150 eval pending). 3 runs alive, 5/5 chains alive.
