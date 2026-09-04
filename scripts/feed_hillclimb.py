@@ -92,11 +92,17 @@ _add("srcresid_L4_12_24", kind="srcresid", layers=[4, 12, 24], mode="replace_nm"
 _add("xattn_flamingo", kind="xattn", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[])   # gated x-attn over 32 chunks of v
 _add("xattn_flamingo_dense", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[])
 _add("xattn_plus_karvonen_L1", kind="xattn", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[1])
+_add("freshheads", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[], null_key=True, no_gate=True)
+_add("freshheads_plus_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True)
 _add("ipadapter_kv4", kind="ipkv", k=4)                # learned per-layer K/V of 4 marker slots from v (IP-Adapter / prefix-KV)
 _add("ipadapter_kv1", kind="ipkv", k=1)
+_add("ipkv_plus_karvonen_L1", kind="ipkv", k=4, layers_resid=[1])   # fair: learned K/V from v at 4 slots + the marker
+_add("ipkv_plus_karvonen_L8", kind="ipkv", k=4, layers_resid=[8])
 _add("film_adaln", kind="film", k=1, layers_resid=[])  # DiT adaLN-Zero: per-layer scale/shift of the residual from v
 _add("film_plus_karvonen_L1", kind="film", k=1, layers_resid=[1])
 _add("film_plus_karvonen_L8", kind="film", k=1, layers_resid=[8])
+_add("film_linproj_karvonen_L8", kind="film", k=1, layers_resid=[8], proj="shared")   # the three wins combined
+_add("linproj_L8", layers=[8], proj="shared")
 _add("xattn_plus_karvonen_L8", kind="xattn", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[8])
 _add("llava_mlp8", layers=["emb"], mode="replace_nm", k=8, proj="mlp")   # LLaVA projector: v -> 8 soft tokens
 _add("llava_mlp4_L1", layers=[1], mode="replace_nm", k=4, proj="mlp")
@@ -162,6 +168,8 @@ class Feeder(nn.Module):
                 nn.init.normal_(blk["o"].weight, std=0.02)   # gate is the zero-init (Flamingo); W_o must NOT also be zero
                 self.xa[str(L)] = blk
             self.gate = nn.Parameter(torch.zeros(len(spec["layers"])))
+            if spec.get("null_key"):
+                self.null_k = nn.Parameter(torch.randn(self.inner) * 0.02)
         if kind == "ipkv":                                # per-layer K/V for the k marker slots, from z
             self.kv_out = spec["n_kv_heads"] * spec["head_dim"]
             self.ipk = nn.ModuleList([nn.Linear(self.zdim, self.k * self.kv_out) for _ in range(spec["n_layers"])])
@@ -347,9 +355,13 @@ class Feeder(nn.Module):
                     q = blk["q"](blk["ln"](out_t.float())).view(B, T, self.heads, -1).transpose(1, 2)      # [B,H,T,dh]
                     kk = blk["kk"](C).view(B, self.n_chunks, self.heads, -1).transpose(1, 2)              # [B,H,32,dh]
                     vv = blk["vv"](C).view(B, self.n_chunks, self.heads, -1).transpose(1, 2)
+                    if self.spec.get("null_key"):   # a key the head can attend to instead of the activation (value 0)
+                        nk = self.null_k.view(1, self.heads, 1, -1).expand(B, -1, 1, -1)
+                        kk = torch.cat([kk, nk], dim=2); vv = torch.cat([vv, torch.zeros_like(nk)], dim=2)
                     o = F.scaled_dot_product_attention(q, kk, vv)                                          # [B,H,T,dh]
                     o = blk["o"](o.transpose(1, 2).reshape(B, T, self.inner))
-                    new = out_t + (torch.tanh(self.gate[gi]) * o).to(out_t.dtype)
+                    g = 1.0 if self.spec.get("no_gate") else torch.tanh(self.gate[gi])
+                    new = out_t + (g * o).to(out_t.dtype)
                     if gi == 0 and T >= 2:
                         st["n_writes"] += B
                     return (new, *output[1:]) if isinstance(output, tuple) else new

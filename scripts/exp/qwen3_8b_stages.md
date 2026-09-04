@@ -234,3 +234,17 @@ GPU note: my side is 4 (q2c) + 4 (q3b) + 2 (hill-climb mining) = 10 B200 for a f
 hallucination @0/50/100/150 = 8.99 / 9.02 / 8.96 / 9.22 (baseline 9.20 / 9.07 / 9.06 / 9.12); informativeness @150 2.54 vs 2.62.
 Same conclusion as rlB_ar_onpol_cont: an AR that reads the AV's own text does not reduce hallucination under RL. Fixed-critic
 eval of its step-150 AV follows. Next in slot A: rlB_lag10 (launched 03:49). Slot B: rlB_klsup at step 75 (03:50).
+
+### rlB_klsup (AR loss = MSE + 1.0·downstream-KL) — interim at step 100 (04:15)
+| @100 | rlB_base | rlB_klsup |
+|---|---|---|
+| hallucination ↓ (source-grounded) | 9.06 | 8.99 |
+| informativeness ↑ | 2.68 | 2.76 |
+| writing quality ↑ (text-only rubric) | 4.08 | **5.17** |
+| coherence ↑ | 5.13 | **6.29** |
+| repetitiveness ↓ | 4.16 | **3.14** |
+Text-quality trajectories: baseline writing 5.03→4.34→4.08→4.16, coherence 6.36→5.16, repetitiveness 3.29→4.20 (RL with the
+plain MSE critic degrades the prose); klsup writing 4.85→5.13→5.17, coherence 6.48→6.29, repetitiveness 3.34→3.14 (held).
+The on-policy-AR arms degrade like the baseline (ar_onpol_cont writing 4.45→4.10, repet 3.01→4.55); ema0995 partially holds
+(4.77→4.61). Hallucination itself: 8.88 @50 / 8.99 @100 for klsup vs 9.07 / 9.06 — small. In-training FVE (own KL-trained
+critic) 68% @100 is NOT comparable; fixed-critic eval at 150 decides whether reconstruction was sacrificed.
