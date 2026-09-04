@@ -185,6 +185,7 @@ In-training `eval/fve_pct` is scored by each arm's OWN co-trained AR and is not 
 | rlB_ema098 | 69.9% | 73.5% | 9.28 | 2.43 |
 | rlB_ema0995 | 69.6% | 72.05% | 9.02 | 2.70 |
 | rlB_ar_onpol_cont | 68.5% | 73.12% | 9.39 | 2.37 |
+| rlB_ar_onpol | 68.7% | 73.10% | 9.27 | 2.39 |
 (more arms appended by the chain as they finish → `data/eval_arm_<tag>.json`.)
 Note: RL checkpoints hold only the LoRA adapter; `merge_lora_to_hf.py` now falls back to the base tokenizer (fixed 00:06).
 
