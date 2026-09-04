@@ -267,3 +267,8 @@ whether reconstruction paid for it. Slot B → rlB_klrew (KL in the reward) laun
 Frozen Opus AR 69.4% (baseline arm 68.5%), frozen on-policy AR 73.0% (72.7%); hallucination 9.05 vs 9.26; informativeness
 2.65 vs 2.50; text judges on the same 256 rows: writing 4.98 vs 4.06, coherence 5.92 vs 5.05, repetitiveness 3.30 vs 4.27.
 First arm that dominates the baseline on every axis → carry the downstream-KL critic loss forward (27B phase; combos).
+
+### Arm result: rlB_lag10 (hard-lag scoring critic, refreshed every 10 critic updates) — finished 05:49, 150 steps
+in-training FVE 74.0% (baseline 75.2%); hallucination @0/50/100/150 = 9.14 / 8.91 / 9.12 / 9.19 (baseline 9.20/9.07/9.06/9.12);
+informativeness 2.53 vs 2.62; writing 3.88 / coherence 5.02 / repetitiveness 4.68 (baseline 4.16 / 5.16 / 4.20).
+Verdict: like EMA — no effect. All three slow-critic variants (EMA 0.98, EMA 0.995, lag-10) are now negative. Slot A → rlB_lowlr (AV lr 3e-5 SFT+RL).
