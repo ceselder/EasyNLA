@@ -128,6 +128,10 @@ _add("hyperinject", layers=list(range(36)), gated=True, gate_init={1: 1.0})
 _add("hyperinject_linproj", layers=list(range(36)), gated=True, gate_init={1: 1.0}, proj="shared")
 _add("hyperinject_all1", layers=list(range(36)), gated=True, gate_init="all1")
 _add("hyperinject_linproj_L8init", layers=list(range(36)), gated=True, gate_init={8: 1.0}, proj="shared")   # start in the L8 basin
+# norm reference = mean residual norm of the OTHER tokens at that layer (not the already-injected / atypical marker token)
+_add("linproj_L8_layernorm", layers=[8], proj="shared", norm_ref="layer_mean")
+_add("hyperinject_linproj_layernorm", layers=list(range(36)), gated=True, gate_init={1: 1.0}, proj="shared", norm_ref="layer_mean")
+_add("freshheads_linproj_L8_layernorm", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", norm_ref="layer_mean")
 _add("hyperinject_film_linproj", kind="film", layers=list(range(36)), layers_resid=list(range(36)), gated=True, gate_init={8: 1.0}, proj="shared")
 _add("broadcast_L1", layers=[1], all_pos=True)                    # v as a per-sequence bias at EVERY position (learned strength)
 _add("broadcast_L1_8_16_24", layers=[1, 8, 16, 24], all_pos=True)
@@ -303,10 +307,22 @@ class Feeder(nn.Module):
                     v = st["src_resid"][layer_key][rows, slot]      # [N, d]
                 else:
                     v = self.vec_for(rows, slot)
+                if self.spec.get("norm_ref") == "layer_mean":
+                    # per-row mean residual norm over non-marker, non-pad positions at this layer
+                    nm = out_t.detach().float().norm(dim=-1)                                   # [B, T]
+                    keep = (ids.to(out_t.device) != inj_id) & (ids.to(out_t.device) != st.get("pad_id", -1))
+                    ref_row = (nm * keep).sum(1) / keep.sum(1).clamp(min=1)                     # [B]
+                    ref = ref_row[rows].unsqueeze(-1)                                           # [N, 1]
+                else:
+                    ref = h.float().norm(dim=-1, keepdim=True)
                 if self.spec.get("gated") and layer_key in self.gate_layers:
                     g = self.lgate[self.gate_layers.index(layer_key)]
                     h32 = h.float(); vv = v.to(h.device)
-                    upd = h32 + g * h32.norm(dim=-1, keepdim=True) * vv / (vv.norm(dim=-1, keepdim=True) + 1e-6)
+                    upd = h32 + g * ref * vv / (vv.norm(dim=-1, keepdim=True) + 1e-6)
+                    new[rows, cols] = upd.to(new.dtype)
+                elif self.spec.get("norm_ref") == "layer_mean":
+                    h32 = h.float(); vv = v.to(h.device)
+                    upd = h32 + ref * vv / (vv.norm(dim=-1, keepdim=True) + 1e-6)
                     new[rows, cols] = upd.to(new.dtype)
                 else:
                     new[rows, cols] = self.combine(h, v.to(h.device), self.spec["mode"]).to(new.dtype)
@@ -662,6 +678,7 @@ def main():
     spec["n_layers"] = int(_mc.num_hidden_layers); spec["n_kv_heads"] = int(_mc.num_key_value_heads)
     spec["head_dim"] = int(getattr(_mc, "head_dim", None) or _mc.hidden_size // _mc.num_attention_heads)
     feeder = Feeder(spec, cfg.d_model, device).to(device)
+    feeder.state["pad_id"] = tok.pad_token_id
     feeder.install(model, inj_id)
     if spec["kind"] in ("film", "xattn", "ipkv", "xattn_src") or spec.get("proj") == "mlp" or spec.get("all_pos"):
         if args.feeder_lr == 1e-4:
