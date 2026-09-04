@@ -186,6 +186,7 @@ In-training `eval/fve_pct` is scored by each arm's OWN co-trained AR and is not 
 | rlB_ema0995 | 69.6% | 72.05% | 9.02 | 2.70 |
 | rlB_ar_onpol_cont | 68.5% | 73.12% | 9.39 | 2.37 |
 | rlB_ar_onpol | 68.7% | 73.10% | 9.27 | 2.39 |
+| **rlB_klsup** | **69.4%** | 73.0% | **9.05** | **2.65** |
 (more arms appended by the chain as they finish → `data/eval_arm_<tag>.json`.)
 Note: RL checkpoints hold only the LoRA adapter; `merge_lora_to_hf.py` now falls back to the base tokenizer (fixed 00:06).
 
@@ -261,3 +262,8 @@ critic) 68% @100 is NOT comparable; fixed-critic eval at 150 decides whether rec
 Text quality held at its step-0 level through 150 steps while every MSE-only arm lost ~1 pt of writing quality and ~1.2 of
 coherence. Hallucination unchanged. Fixed-critic eval of its step-150 AV launched 05:12 (launch_arm_eval_one.sh) to see
 whether reconstruction paid for it. Slot B → rlB_klrew (KL in the reward) launched 05:09.
+
+### rlB_klsup fixed-critic eval (05:21): the KL-trained critic cost NOTHING in reconstruction
+Frozen Opus AR 69.4% (baseline arm 68.5%), frozen on-policy AR 73.0% (72.7%); hallucination 9.05 vs 9.26; informativeness
+2.65 vs 2.50; text judges on the same 256 rows: writing 4.98 vs 4.06, coherence 5.92 vs 5.05, repetitiveness 3.30 vs 4.27.
+First arm that dominates the baseline on every axis → carry the downstream-KL critic loss forward (27B phase; combos).
