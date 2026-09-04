@@ -307,3 +307,6 @@ dipped on the judge at step 100 after leading at 50 (in-training 8.70 vs 9.27); 
   with the downstream-KL ONLY, MSE reward). 256×8 group = 4 runs × 4 GPUs = 16 B200: base / klsup / klonly / arklonly.
 - ⚠️ rlB_klsup_b128 crashed at step ~110 with CUDA OOM on rank 0 (178 GB GPU full: HF actor + critic + vLLM 0.35 + the KL
   critic's fwd/bwd through the base). Watchdog auto-resumed it (before the pair was stopped). Risk for the KL-critic b256 runs.
+- 08:15: rlB_klsup_b256 and rlB_arklonly_b256 relaunched with `--vllm-gpu-mem 0.30` (was 0.35) for OOM headroom — objective
+  unchanged; rollout KV budget slightly smaller. RL task deliberately unsets PYTORCH_CUDA_ALLOC_CONF (IPC weight sync needs
+  the legacy allocator), so expandable_segments is not an option there.
