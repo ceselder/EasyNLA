@@ -248,3 +248,16 @@ plain MSE critic degrades the prose); klsup writing 4.85→5.13→5.17, coherenc
 The on-policy-AR arms degrade like the baseline (ar_onpol_cont writing 4.45→4.10, repet 3.01→4.55); ema0995 partially holds
 (4.77→4.61). Hallucination itself: 8.88 @50 / 8.99 @100 for klsup vs 9.07 / 9.06 — small. In-training FVE (own KL-trained
 critic) 68% @100 is NOT comparable; fixed-critic eval at 150 decides whether reconstruction was sacrificed.
+
+### Arm result: rlB_klsup (AR loss = MSE + 1.0·downstream-KL) — finished 05:09, 150 steps
+| @150 | rlB_base | rlB_klsup |
+|---|---|---|
+| hallucination ↓ | 9.12 | 9.07 |
+| informativeness ↑ | 2.62 | 2.66 |
+| writing quality ↑ | 4.16 | **5.03** |
+| coherence ↑ | 5.16 | **6.04** |
+| repetitiveness ↓ | 4.20 | **3.23** |
+| in-training FVE (own critic; not comparable) | 75.2% | 70.5% |
+Text quality held at its step-0 level through 150 steps while every MSE-only arm lost ~1 pt of writing quality and ~1.2 of
+coherence. Hallucination unchanged. Fixed-critic eval of its step-150 AV launched 05:12 (launch_arm_eval_one.sh) to see
+whether reconstruction paid for it. Slot B → rlB_klrew (KL in the reward) launched 05:09.
