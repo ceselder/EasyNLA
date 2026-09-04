@@ -142,6 +142,10 @@ _add("mhc_freshheads_linproj_L8", kind="xattn", layers=list(range(1, 36, 2)), k=
      extras=["mhc"], mhc_layers=list(range(36)), scope="all", dynamic=True)                      # stack the two new channels
 _add("freshheadsP_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", heads_use_proj=True)
 _add("freshheads_dense_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared")
+_add("freshheads_big_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared",
+     heads=16, inner=1024, n_chunks=64)                                                            # wider heads, finer chunks
+_add("freshheads_kpos4proj_L8", kind="xattn", layers=list(range(1, 36, 2)), k=4, layers_resid=[8], null_key=True, no_gate=True, proj="per_pos")   # 4 projected markers + heads
+_add("freshheads_linproj_L8_16", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8, 16], null_key=True, no_gate=True, proj="shared")
 # norm reference = mean residual norm of the OTHER tokens at that layer (not the already-injected / atypical marker token)
 _add("linproj_L8_layernorm", layers=[8], proj="shared", norm_ref="layer_mean")
 _add("hyperinject_linproj_layernorm", layers=list(range(36)), gated=True, gate_init={1: 1.0}, proj="shared", norm_ref="layer_mean")
@@ -210,7 +214,8 @@ class Feeder(nn.Module):
                 self.xa[str(L)] = blk
             self.gate = nn.Parameter(torch.zeros(len(spec["layers"])))
         if "xattn" in self.kinds:                         # Flamingo-style gated cross-attention over 32 chunks of v
-            self.n_chunks, self.inner, self.heads = 32, 512, 8
+            self.n_chunks, self.inner, self.heads = int(spec.get("n_chunks", 32)), int(spec.get("inner", 512)), int(spec.get("heads", 8))
+            assert d_model % self.n_chunks == 0
             self.cdim = d_model // self.n_chunks
             self.chunk_proj = nn.Linear(self.cdim, self.inner)
             self.chunk_pos = nn.Parameter(torch.randn(self.n_chunks, self.inner) * 0.02)
@@ -717,6 +722,7 @@ def main():
     p.add_argument("--ar-ckpts", nargs="*", default=None, help="name=path critics (default: per-model list)")
     p.add_argument("--layers", default=None, help="override spec layers, e.g. '1,8,16' or 'emb'")
     p.add_argument("--layers-resid", default=None, help="override spec layers_resid")
+    p.add_argument("--lora-scope", default="attn", choices=["attn", "all"])
     args = p.parse_args()
     global BASE, DATA, TRAIN_PQ
     BASE, DATA, TRAIN_PQ = MODELS[args.model]["base"], MODELS[args.model]["data"], MODELS[args.model]["train"]
@@ -750,7 +756,7 @@ def main():
     model.enable_input_require_grads()
     model = get_peft_model(model, LoraConfig(r=128, lora_alpha=16, lora_dropout=0.0, bias="none",
                                              task_type="CAUSAL_LM", use_rslora=True,
-                                             target_modules=resolve_lora_target_modules(model.config, "attn")))
+                                             target_modules=resolve_lora_target_modules(model.config, args.lora_scope)))
     _mc = model.config
     spec["n_layers"] = int(_mc.num_hidden_layers); spec["n_kv_heads"] = int(_mc.num_key_value_heads)
     spec["head_dim"] = int(getattr(_mc, "head_dim", None) or _mc.hidden_size // _mc.num_attention_heads)
