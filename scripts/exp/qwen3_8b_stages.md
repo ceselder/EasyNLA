@@ -282,3 +282,13 @@ Verdict: like EMA — no effect. All three slow-critic variants (EMA 0.98, EMA 0
 | round 2 (best-of-8 on 125k fresh rows, from round 1) | 57.2% | 62.2% | **8.75** | **2.69** | 4.77 | 136 |
 Real, not degenerate: length and extraction unchanged, informativeness UP, 1.6% of rows now ≤3 (was 0%). FVE flat.
 Gate passed (−0.48) → round 3 started 06:12 (rows 125k–250k, 8 samples, from av_hc_r2_merged; merge --base av_hc_r2_merged).
+
+### 06:05–06:30 reprioritisation (user: "just do RL", "8×B200", "compare the normal run against this objective")
+- Hill-climb (expert iteration) STOPPED after round 2 (apps nla-hc-r3-* killed); no further distillation. rlB_av_bon6 arms dropped.
+- Queues q2c/q3c killed (lowlr stopped at step ~15; arevery2/arlr4e5/lowlr not run). rlB_klrew (KL in the REWARD, 4 GPUs) left running.
+- NEW: `NLA_RL_GPUS=8 ... --nproc 8` → 8-way DP, one vLLM engine per rank (32 prompts × 8 per rank). Launched 06:28:
+  `rlB_base_xl` (MSE critic) and `rlB_klsup_xl` (MSE + 1.0·downstream-KL critic), 801 steps each (256×8/step → the 235k RL split
+  once, no repeats), evals every 10, judge every 50, save every 50. `launch_xl_evals.sh <tag>` evaluates every saved
+  checkpoint with the fixed critics + judge (1,024 prompts) → data/eval_xl_<tag>_<step>.json (merged AVs deleted after eval).
+- Disaggregated serving (2 GPUs vLLM + 6 trainer) NOT done: weight sync is CUDA-IPC to the rank's own co-located engine;
+  a cross-process (NCCL/broadcast) sync path would be ~a day of work.
