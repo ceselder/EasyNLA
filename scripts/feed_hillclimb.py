@@ -86,6 +86,19 @@ _add("kv_patch_last4", kind="kv", k=4)
 _add("kv_plus_karvonen_L1", kind="kv+resid", k=1)
 _add("srcresid_L8_16_24", kind="srcresid", layers=[8, 16, 24], mode="replace_nm")
 _add("srcresid_L4_12_24", kind="srcresid", layers=[4, 12, 24], mode="replace_nm")
+# ---- "zero-to-one" mechanisms borrowed from image conditioning (all still see ONLY the single L24 vector)
+_add("xattn_flamingo", kind="xattn", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[])   # gated x-attn over 32 chunks of v
+_add("xattn_flamingo_dense", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[])
+_add("xattn_plus_karvonen_L1", kind="xattn", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[1])
+_add("ipadapter_kv4", kind="ipkv", k=4)                # learned per-layer K/V of 4 marker slots from v (IP-Adapter / prefix-KV)
+_add("ipadapter_kv1", kind="ipkv", k=1)
+_add("film_adaln", kind="film", k=1, layers_resid=[])  # DiT adaLN-Zero: per-layer scale/shift of the residual from v
+_add("film_plus_karvonen_L1", kind="film", k=1, layers_resid=[1])
+_add("llava_mlp8", layers=["emb"], mode="replace_nm", k=8, proj="mlp")   # LLaVA projector: v -> 8 soft tokens
+_add("llava_mlp4_L1", layers=[1], mode="replace_nm", k=4, proj="mlp")
+_add("broadcast_L1", layers=[1], all_pos=True)                    # v as a per-sequence bias at EVERY position (learned strength)
+_add("broadcast_L1_8_16_24", layers=[1, 8, 16, 24], all_pos=True)
+_add("broadcast_plus_karvonen_L1", layers=[1, 8, 16, 24], all_pos=True, layers_resid=[1])
 
 
 # --------------------------------------------------------------------------- feeder
@@ -98,11 +111,44 @@ class Feeder(nn.Module):
         self.k = int(spec["k"])
         self.d = d_model
         self.proj = None
-        if spec.get("proj"):
+        if spec.get("proj") == "mlp":
+            self.mlp = nn.Sequential(nn.Linear(d_model, 2048), nn.GELU(), nn.Linear(2048, self.k * d_model))
+            self.proj = "mlp"
+        elif spec.get("proj"):
             n = self.k if spec["proj"] == "per_pos" else 1
             self.W = nn.ParameterList([nn.Parameter(torch.eye(d_model)) for _ in range(n)])
             self.b = nn.ParameterList([nn.Parameter(torch.zeros(d_model)) for _ in range(n)])
             self.proj = spec["proj"]
+        kind = spec["kind"]
+        if spec.get("all_pos"):
+            self.bscale = nn.Parameter(torch.full((len(spec["layers"]),), 0.1))
+        if kind in ("film", "xattn", "ipkv"):
+            # shared bottleneck z = GELU(W_s v_rms) (v rms-normalised so the adapters see a fixed scale)
+            self.zdim = 512
+            self.shared = nn.Sequential(nn.Linear(d_model, self.zdim), nn.GELU())
+        if kind == "film":                                # adaLN-Zero: [gamma_l, beta_l] = Linear_l(z), zero-init
+            self.film = nn.ModuleList([nn.Linear(self.zdim, 2 * d_model) for _ in range(spec["n_layers"])])
+            for m in self.film:
+                nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+        if kind == "xattn":                               # Flamingo-style gated cross-attention over 32 chunks of v
+            self.n_chunks, self.inner, self.heads = 32, 512, 8
+            self.cdim = d_model // self.n_chunks
+            self.chunk_proj = nn.Linear(self.cdim, self.inner)
+            self.chunk_pos = nn.Parameter(torch.randn(self.n_chunks, self.inner) * 0.02)
+            self.xa = nn.ModuleDict()
+            for L in spec["layers"]:
+                blk = nn.ModuleDict({"ln": nn.LayerNorm(d_model), "q": nn.Linear(d_model, self.inner, bias=False),
+                                     "kk": nn.Linear(self.inner, self.inner, bias=False), "vv": nn.Linear(self.inner, self.inner, bias=False),
+                                     "o": nn.Linear(self.inner, d_model, bias=False)})
+                nn.init.zeros_(blk["o"].weight)
+                self.xa[str(L)] = blk
+            self.gate = nn.Parameter(torch.zeros(len(spec["layers"])))
+        if kind == "ipkv":                                # per-layer K/V for the k marker slots, from z
+            self.kv_out = spec["n_kv_heads"] * spec["head_dim"]
+            self.ipk = nn.ModuleList([nn.Linear(self.zdim, self.k * self.kv_out) for _ in range(spec["n_layers"])])
+            self.ipv = nn.ModuleList([nn.Linear(self.zdim, self.k * self.kv_out) for _ in range(spec["n_layers"])])
+            for m in list(self.ipk) + list(self.ipv):
+                nn.init.normal_(m.weight, std=0.02); nn.init.zeros_(m.bias)
         self.device = device
         self.state = {"ids": None, "vec": None, "mode": "off", "src_pos": None,
                       "src_k": {}, "src_v": {}, "src_resid": {}, "n_writes": 0}
@@ -122,10 +168,19 @@ class Feeder(nn.Module):
             slot[sel] = torch.arange(sel.numel(), device=rows.device)
         return rows, cols, slot
 
+    def z(self):
+        v = self.state["vec"]                                        # [B, d] fp32
+        v = v / (v.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)      # unit RMS
+        return self.shared(v)                                        # [B, zdim]
+
     def vec_for(self, rows, slot):
         v = self.state["vec"][rows]  # [N, d] fp32
         if self.proj is None:
             return v
+        if self.proj == "mlp":
+            vb = self.state["vec"]; vb = vb / (vb.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
+            toks = self.mlp(vb).view(vb.shape[0], self.k, self.d)   # [B, k, d]
+            return toks[rows, slot]
         if self.proj == "shared":
             return v @ self.W[0].T + self.b[0]
         out = torch.empty_like(v)
@@ -160,6 +215,19 @@ class Feeder(nn.Module):
             st["ids"] = ids
             return output
         self._handles.append(emb.register_forward_hook(embed_hook, with_kwargs=True))
+
+        def broadcast_factory(gi):
+            def hook(module, args, output):
+                if st["mode"] != "inject":
+                    return output
+                out_t = output[0] if isinstance(output, tuple) else output
+                v = st["vec"]; vhat = v / (v.norm(dim=-1, keepdim=True) + 1e-6)              # [B, d]
+                h32 = out_t.float()
+                new = (h32 + self.bscale[gi] * h32.norm(dim=-1, keepdim=True) * vhat[:, None, :]).to(out_t.dtype)
+                if gi == 0 and out_t.shape[1] >= 2:
+                    st["n_writes"] += out_t.shape[0]
+                return (new, *output[1:]) if isinstance(output, tuple) else new
+            return hook
 
         def resid_hook_factory(layer_key):
             def hook(module, args, output):
@@ -196,10 +264,76 @@ class Feeder(nn.Module):
             return hook
 
         kind = self.spec["kind"]
-        if kind in ("resid", "kv+resid"):
+        if kind in ("resid", "kv+resid") and self.spec.get("all_pos"):
+            for gi, L in enumerate(self.spec["layers"]):
+                self._handles.append(layers[L].register_forward_hook(broadcast_factory(gi)))
+            for L in self.spec.get("layers_resid", []):
+                self._handles.append(layers[L].register_forward_hook(resid_hook_factory(L)))
+        elif kind in ("resid", "kv+resid"):
             for L in self.spec["layers"]:
                 mod = emb if L == "emb" else layers[L]
                 self._handles.append(mod.register_forward_hook(resid_hook_factory(L)))
+        if kind in ("film", "xattn", "ipkv"):
+            # optional plain Karvonen injection on top (layers_resid), sharing the stored vector
+            for L in self.spec.get("layers_resid", []):
+                self._handles.append(layers[L].register_forward_hook(resid_hook_factory(L)))
+        if kind == "film":
+            def film_factory(li):
+                def hook(module, args, output):
+                    if st["mode"] != "inject":
+                        return output
+                    out_t = output[0] if isinstance(output, tuple) else output
+                    gb = self.film[li](self.z()).to(out_t.dtype)                 # [B, 2d]
+                    g, b = gb.chunk(2, dim=-1)
+                    new = out_t * (1 + g[:, None, :]) + b[:, None, :]
+                    if li == 0 and out_t.shape[1] >= 2:      # count prefill only (decode steps also get conditioned)
+                        st["n_writes"] += out_t.shape[0]
+                    return (new, *output[1:]) if isinstance(output, tuple) else new
+                return hook
+            for li, layer in enumerate(layers):
+                self._handles.append(layer.register_forward_hook(film_factory(li)))
+        if kind == "xattn":
+            def xattn_factory(L, gi):
+                blk = self.xa[str(L)]
+                def hook(module, args, output):
+                    if st["mode"] != "inject":
+                        return output
+                    out_t = output[0] if isinstance(output, tuple) else output
+                    B, T, d = out_t.shape
+                    v = st["vec"]; v = v / (v.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
+                    C = self.chunk_proj(v.view(B, self.n_chunks, self.cdim)) + self.chunk_pos   # [B, 32, inner]
+                    q = blk["q"](blk["ln"](out_t.float())).view(B, T, self.heads, -1).transpose(1, 2)      # [B,H,T,dh]
+                    kk = blk["kk"](C).view(B, self.n_chunks, self.heads, -1).transpose(1, 2)              # [B,H,32,dh]
+                    vv = blk["vv"](C).view(B, self.n_chunks, self.heads, -1).transpose(1, 2)
+                    o = F.scaled_dot_product_attention(q, kk, vv)                                          # [B,H,T,dh]
+                    o = blk["o"](o.transpose(1, 2).reshape(B, T, self.inner))
+                    new = out_t + (torch.tanh(self.gate[gi]) * o).to(out_t.dtype)
+                    if gi == 0 and T >= 2:
+                        st["n_writes"] += B
+                    return (new, *output[1:]) if isinstance(output, tuple) else new
+                return hook
+            for gi, L in enumerate(self.spec["layers"]):
+                self._handles.append(layers[L].register_forward_hook(xattn_factory(L, gi)))
+        if kind == "ipkv":
+            def ipkv_factory(li, which):
+                def hook(module, args, output):
+                    if st["mode"] != "inject" or st["ids"] is None or output.shape[1] < 2:
+                        return output
+                    pos = self.positions(st["ids"].to(output.device), inj_id)
+                    if pos is None:
+                        return output
+                    rows, cols, slot = pos
+                    proj = (self.ipk if which == "k" else self.ipv)[li]
+                    kv = proj(self.z()).view(-1, self.k, self.kv_out)                    # [B, k, Dkv]
+                    new = output.clone()
+                    new[rows, cols] = kv[rows, slot].to(new.dtype)
+                    if which == "k":
+                        st["n_writes"] += rows.numel()
+                    return new
+                return hook
+            for li, layer in enumerate(layers):
+                self._handles.append(layer.self_attn.k_proj.register_forward_hook(ipkv_factory(li, "k")))
+                self._handles.append(layer.self_attn.v_proj.register_forward_hook(ipkv_factory(li, "v")))
         if kind == "srcresid":
             for L in self.spec["layers"]:
                 self._handles.append(layers[L].register_forward_hook(capture_resid_factory(L)))
@@ -378,11 +512,22 @@ def main():
     model = get_peft_model(model, LoraConfig(r=128, lora_alpha=16, lora_dropout=0.0, bias="none",
                                              task_type="CAUSAL_LM", use_rslora=True,
                                              target_modules=resolve_lora_target_modules(model.config, "attn")))
+    _mc = model.config
+    spec["n_layers"] = int(_mc.num_hidden_layers); spec["n_kv_heads"] = int(_mc.num_key_value_heads)
+    spec["head_dim"] = int(getattr(_mc, "head_dim", None) or _mc.hidden_size // _mc.num_attention_heads)
     feeder = Feeder(spec, cfg.d_model, device).to(device)
     feeder.install(model, inj_id)
+    if spec["kind"] in ("film", "xattn", "ipkv") or spec.get("proj") == "mlp" or spec.get("all_pos"):
+        if args.feeder_lr == 1e-4:
+            args.feeder_lr = 3e-4   # zero/small-init adapters learn faster; identity-init linear maps keep 1e-4
     n_layers = len(model.get_base_model().model.layers)
     expected_writes = k * ({"resid": len(spec["layers"]), "srcresid": len(spec["layers"]), "kv": n_layers,
-                            "kv+resid": n_layers + len(spec["layers"])}[spec["kind"]])
+                            "kv+resid": n_layers + len(spec["layers"]), "film": 1, "xattn": 1,
+                            "ipkv": n_layers}[spec["kind"]]) + (k * len(spec.get("layers_resid", [])) if spec["kind"] in ("film", "xattn", "ipkv") else 0)
+    if spec["kind"] in ("film", "xattn"):
+        expected_writes = 1 + k * len(spec.get("layers_resid", []))   # counted once per row (first block)
+    if spec.get("all_pos"):
+        expected_writes = 1 + k * len(spec.get("layers_resid", []))
     n_feed = sum(p.numel() for p in feeder.parameters())
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad]
     groups = [{"params": lora_params, "lr": args.lr, "weight_decay": 0.0}]
