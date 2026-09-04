@@ -142,6 +142,7 @@ _add("mhc_freshheads_linproj_L8", kind="xattn", layers=list(range(1, 36, 2)), k=
      extras=["mhc"], mhc_layers=list(range(36)), scope="all", dynamic=True)                      # stack the two new channels
 _add("freshheadsP_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", heads_use_proj=True)
 _add("freshheads_dense_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared")
+_add("freshheads_denseP_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", heads_use_proj=True)
 _add("freshheads_big_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared",
      heads=16, inner=1024, n_chunks=64)                                                            # wider heads, finer chunks
 _add("freshheads_kpos4proj_L8", kind="xattn", layers=list(range(1, 36, 2)), k=4, layers_resid=[8], null_key=True, no_gate=True, proj="per_pos")   # 4 projected markers + heads
