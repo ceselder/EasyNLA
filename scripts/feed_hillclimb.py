@@ -96,6 +96,8 @@ _add("ipadapter_kv4", kind="ipkv", k=4)                # learned per-layer K/V o
 _add("ipadapter_kv1", kind="ipkv", k=1)
 _add("film_adaln", kind="film", k=1, layers_resid=[])  # DiT adaLN-Zero: per-layer scale/shift of the residual from v
 _add("film_plus_karvonen_L1", kind="film", k=1, layers_resid=[1])
+_add("film_plus_karvonen_L8", kind="film", k=1, layers_resid=[8])
+_add("xattn_plus_karvonen_L8", kind="xattn", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[8])
 _add("llava_mlp8", layers=["emb"], mode="replace_nm", k=8, proj="mlp")   # LLaVA projector: v -> 8 soft tokens
 _add("llava_mlp4_L1", layers=[1], mode="replace_nm", k=4, proj="mlp")
 _add("xattn_srclayers", kind="xattn_src", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[])   # HyperSteer-flavoured: K/V = the source token's 36 per-layer residuals
@@ -144,7 +146,7 @@ class Feeder(nn.Module):
                 blk = nn.ModuleDict({"ln": nn.LayerNorm(d_model), "q": nn.Linear(d_model, self.inner, bias=False),
                                      "kk": nn.Linear(self.inner, self.inner, bias=False), "vv": nn.Linear(self.inner, self.inner, bias=False),
                                      "o": nn.Linear(self.inner, d_model, bias=False)})
-                nn.init.zeros_(blk["o"].weight)
+                nn.init.normal_(blk["o"].weight, std=0.02)   # gate is the zero-init (Flamingo); W_o must NOT also be zero
                 self.xa[str(L)] = blk
             self.gate = nn.Parameter(torch.zeros(len(spec["layers"])))
         if kind == "xattn":                               # Flamingo-style gated cross-attention over 32 chunks of v
@@ -157,7 +159,7 @@ class Feeder(nn.Module):
                 blk = nn.ModuleDict({"ln": nn.LayerNorm(d_model), "q": nn.Linear(d_model, self.inner, bias=False),
                                      "kk": nn.Linear(self.inner, self.inner, bias=False), "vv": nn.Linear(self.inner, self.inner, bias=False),
                                      "o": nn.Linear(self.inner, d_model, bias=False)})
-                nn.init.zeros_(blk["o"].weight)
+                nn.init.normal_(blk["o"].weight, std=0.02)   # gate is the zero-init (Flamingo); W_o must NOT also be zero
                 self.xa[str(L)] = blk
             self.gate = nn.Parameter(torch.zeros(len(spec["layers"])))
         if kind == "ipkv":                                # per-layer K/V for the k marker slots, from z
