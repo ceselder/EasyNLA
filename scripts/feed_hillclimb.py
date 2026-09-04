@@ -103,6 +103,11 @@ _add("film_plus_karvonen_L1", kind="film", k=1, layers_resid=[1])
 _add("film_plus_karvonen_L8", kind="film", k=1, layers_resid=[8])
 _add("film_linproj_karvonen_L8", kind="film", k=1, layers_resid=[8], proj="shared")   # the three wins combined
 _add("linproj_L8", layers=[8], proj="shared")
+_add("mlpproj_L8", layers=[8], proj="mlp", k=1)                      # nonlinear pre-projection of v before the marker add
+_add("multi_linproj_L1_8_16_24", layers=[1, 8, 16, 24], proj="shared")
+_add("kpos4proj_L8", layers=[8], k=4, proj="per_pos")
+_add("film1024_plus_karvonen_L8", kind="film", k=1, layers_resid=[8], zdim=1024)
+_add("film_mlpproj_karvonen_L8", kind="film", k=1, layers_resid=[8], proj="mlp")
 _add("xattn_plus_karvonen_L8", kind="xattn", layers=[3, 7, 11, 15, 19, 23, 27, 31, 35], k=1, layers_resid=[8])
 _add("llava_mlp8", layers=["emb"], mode="replace_nm", k=8, proj="mlp")   # LLaVA projector: v -> 8 soft tokens
 _add("llava_mlp4_L1", layers=[1], mode="replace_nm", k=4, proj="mlp")
@@ -136,7 +141,7 @@ class Feeder(nn.Module):
             self.bscale = nn.Parameter(torch.full((len(spec["layers"]),), 0.1))
         if kind in ("film", "xattn", "ipkv"):
             # shared bottleneck z = GELU(W_s v_rms) (v rms-normalised so the adapters see a fixed scale)
-            self.zdim = 512
+            self.zdim = int(spec.get("zdim", 512))
             self.shared = nn.Sequential(nn.Linear(d_model, self.zdim), nn.GELU())
         if kind == "film":                                # adaLN-Zero: [gamma_l, beta_l] = Linear_l(z), zero-init
             self.film = nn.ModuleList([nn.Linear(self.zdim, 2 * d_model) for _ in range(spec["n_layers"])])
