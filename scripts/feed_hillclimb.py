@@ -97,6 +97,8 @@ _add("freshheads_plus_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), 
 _add("freshheads_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared")
 _add("freshheads_film_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", extras=["film"])
 _add("freshheads_dense_plus_karvonen_L8", kind="xattn", layers=list(range(1, 36)), k=1, layers_resid=[8], null_key=True, no_gate=True)
+# CONTROL: identical fresh heads but their keys/values come from 32 LEARNED CONSTANT tokens (no dependence on v) -> pure capacity
+_add("freshheads_const_linproj_karvonen_L8", kind="xattn", layers=list(range(1, 36, 2)), k=1, layers_resid=[8], null_key=True, no_gate=True, proj="shared", const_memory=True)
 _add("ipadapter_kv4", kind="ipkv", k=4)                # learned per-layer K/V of 4 marker slots from v (IP-Adapter / prefix-KV)
 _add("ipadapter_kv1", kind="ipkv", k=1)
 _add("ipkv_plus_karvonen_L1", kind="ipkv", k=4, layers_resid=[1])   # fair: learned K/V from v at 4 slots + the marker
@@ -180,6 +182,8 @@ class Feeder(nn.Module):
             self.cdim = d_model // self.n_chunks
             self.chunk_proj = nn.Linear(self.cdim, self.inner)
             self.chunk_pos = nn.Parameter(torch.randn(self.n_chunks, self.inner) * 0.02)
+            if spec.get("const_memory"):
+                self.const_mem = nn.Parameter(torch.randn(self.n_chunks, self.inner) * 0.02)
             self.xa = nn.ModuleDict()
             for L in spec["layers"]:
                 blk = nn.ModuleDict({"ln": nn.LayerNorm(d_model), "q": nn.Linear(d_model, self.inner, bias=False),
@@ -376,8 +380,11 @@ class Feeder(nn.Module):
                         return output
                     out_t = output[0] if isinstance(output, tuple) else output
                     B, T, d = out_t.shape
-                    v = st["vec"]; v = v / (v.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
-                    C = self.chunk_proj(v.view(B, self.n_chunks, self.cdim)) + self.chunk_pos   # [B, 32, inner]
+                    if self.spec.get("const_memory"):
+                        C = self.const_mem.unsqueeze(0).expand(B, -1, -1)                        # no information about v
+                    else:
+                        v = st["vec"]; v = v / (v.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6)
+                        C = self.chunk_proj(v.view(B, self.n_chunks, self.cdim)) + self.chunk_pos   # [B, 32, inner]
                     q = blk["q"](blk["ln"](out_t.float())).view(B, T, self.heads, -1).transpose(1, 2)      # [B,H,T,dh]
                     kk = blk["kk"](C).view(B, self.n_chunks, self.heads, -1).transpose(1, 2)              # [B,H,32,dh]
                     vv = blk["vv"](C).view(B, self.n_chunks, self.heads, -1).transpose(1, 2)
