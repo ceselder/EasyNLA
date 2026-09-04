@@ -392,3 +392,6 @@ klsup@450 66.5 (first reading below its 68–69 band); arklonly@400 59.8 / 8.53 
 ### 17:31 check-in — klsup 504 (in-training @500: halluc 8.92, inform 2.95 — best of any run at that step; ckpt@450 66.5), arklonly 436
 (ckpt@400 59.8 / 8.53 / writing 6.04 / coh 7.44; in-training @400 writing 6.07), base resumed at 17:21 from iter_000650 (initialising at 17:31).
 New ckpt evals: base@600 57.0, base@650 61.0 (own critic 69–77 → gap ≥8), klsup@450 66.5, arklonly@400 59.8. 5/5 chains alive.
+
+### 18:31 check-in — base resumed OK (step 714, own critic 79.2%; @700 in-training halluc 9.31 / writing 3.36 / coh 4.05), klsup 558 (own 72.0;
+ckpt@500 67.2 / 9.15 / 2.61 / writing 3.82), arklonly 483 (ckpt@450 60.9 / 9.09 / 2.36 / writing 5.90 / coh 7.11). 5/5 chains, 3 apps. No new crashes.
