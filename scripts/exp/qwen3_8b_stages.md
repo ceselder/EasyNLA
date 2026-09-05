@@ -508,3 +508,6 @@ smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no lon
 - 23:14 rlQ36_klsup OOM'd (rank at 174 GB, 4.7 GB alloc) with the yaml memory settings + KL critic; rlQ36_base is fine (step 2, 229 s/step
   → ≈25 h for 401). Relaunched 23:2x with `--ar-kl-max-rollouts 16 --vllm-gpu-mem 0.30 --logp-micro-batch 4` (KL objective unchanged;
   fewer rollouts in the KL term per step, smaller KV cache, smaller logp micro-batch). Watchdog EXTRA updated to match.
+- 23:22 rlQ36_klsup failed again: vLLM "No available memory for the cache blocks" at gpu_mem 0.30 — 0.30×178 GB = 53 GB < the 54 GB of
+  bf16 weights, so no KV room. 27B needs vLLM ≥0.35. Relaunched 23:2x with vllm 0.35 and trainer-side savings instead:
+  --logp-micro-batch 4 --critic-micro-batch 2 --ar-kl-max-rollouts 16. Watchdog EXTRA updated.
