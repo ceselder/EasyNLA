@@ -466,3 +466,14 @@ dead, so its distinguishing text-quality metrics could not be measured anyway). 
 `iter_000400/` (best judge readings) and `iter_000650/` (final) LoRA adapters on Qwen/Qwen3-8B, each with the frozen `reference/` (SFT) adapter;
 model card has the recipe and loading snippet. The run's final critic is still on the volume at ckpts/qwen3_8b/rlB_arklonly_b256/critic_latest.
 Also: rollout reader for MSE vs KL critics at reports/nla-experiments/rollouts_mse_vs_kl.html (build_rollout_viewer.py; data/samples/*.parquet).
+
+## Qwen3.6-27B phase (2026-09-05 22:30→) — MSE critic vs MSE+downstream-KL critic
+Warm-starts from the August volume (read-only at /vol_q36): AV LoRA `ckpts/qwen36_av/iter_0007813` (500k rows), AR LoRA
+`ckpts/qwen36_ar/iter_0007813` (`ar_lora_value_head.safetensors`, scope all, r64); RL data `data/rl/rl_shuf.parquet`; eval
+`data/sft/av_sft_val.parquet`. Recipe = July's `configs/rl_vllm_qwen36_27b.yaml` + scripts/legacy/run_rl_klcoh2_qwen36.sh:
+vLLM loads the RAW Qwen3.6-27B snapshot (`--av-ckpt $BASE_SNAP --vllm-model $BASE_SNAP`, name map qwen3_5_wrapper) and the
+trainer force-syncs the LoRA-merged actor at step 0; AR critic = LoRA (full-FT critic does not fit next to the 54 GB actor).
+`$BASE_SNAP` is resolved inside the Modal task (snapshot_download). Flags: RLCOMMON_Q36.txt. July baseline: 400 steps in 28.6 h
+on 6×B200 (54.6 → 74.0% own-critic FVE). August EMA sweep (dsv4-nla, project easynla-qwen36-ema, 128×8, HF path) mostly crashed
+(rl_none 55.8% @269, ar_d0p98 53.5% @225) — not a usable 27B baseline. Smokes (2 GPUs, 16×8, 3 steps) → launch_q36_runs.sh
+launches rlQ36_base / rlQ36_klsup on 6×B200 each (252×8, 401 steps, save 50). Judge keys still dead → FVE-only.
