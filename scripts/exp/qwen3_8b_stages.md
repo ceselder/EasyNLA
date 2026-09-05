@@ -446,3 +446,18 @@ FVE peaks ≈69 at 100–250, breaks at ≈300 and ends at 60 (pre-RL 55.2) whil
 the critic loss delays that by ≈400 steps (68–70 through 650, 63–64 at 700–800; own-critic gap 8 vs 19 pts) but does not prevent it;
 (3) KL-only critic: best prose of all arms, reconstruction drifts below pre-RL; (4) KL-only reward: degenerate within 150 steps.
 Judge metrics (hallucination/informativeness/text quality) are NaN from ~18:55 on (all API keys dead) — re-judge the saved iter_* adapters when keys return.
+
+### FINAL — 256×8 long runs (2026-09-05 01:40 check-in; all runs ended)
+| run | steps | own-critic FVE @end | frozen Opus-AR FVE trajectory (every 50) | end |
+|---|---|---|---|---|
+| rlB_base_b256 | 800 ✓ | 79.3% | 68.2 69.3 68.4 67.4 68.3 │ 63.8 64.7 63.2 63.9 63.7 61.3 57.0 61.0 58.9 58.3 60.4 | 60.4% |
+| rlB_klsup_b256 | 800 ✓ | 72.9% | 68.8 69.3 69.5 68.1 69.3 68.8 68.9 69.0 66.5 67.2 69.8 68.1 67.4 │ 63.2 63.2 64.4 | 64.4% |
+| rlB_arklonly_b256 | 659 (crash) | ~8% (meaningless) | 64.9 63.1 63.3 62.5 61.4 57.1 60.9 59.8 60.9 59.0 58.2 57.9 54.2 | 54.2% @650 |
+| rlB_klonly_b256 | 160 (stopped) | – | 60.8 59.8 56.3 | degenerate |
+Conclusions: (1) the plain-MSE recipe reward-hacks its co-trained critic after ~250 steps (19-pt own-vs-frozen gap by 800);
+(2) the MSE+downstream-KL critic delays that drift by ~400 steps (7–11 pts ahead of the baseline at matched steps 300–650) but
+shows the same drop from ~700 — it does not prevent it; (3) prose quality degrades in both MSE-reward arms (writing ~4.9 → 3.3–3.8,
+repetitiveness 3 → 6); (4) a KL-only critic preserves prose (writing 5.5–6.0, coherence 7+) at the cost of a slow reconstruction drift
+below pre-RL; (5) KL in the reward degenerates. arklonly crashed at 22:08 with an NCCL heartbeat timeout on rank 2 (RemoteError);
+the watchdog mis-detected it as finished because the Modal entrypoint prints "done." after a RemoteError — not resumed (judge keys
+dead, so its distinguishing text-quality metrics could not be measured anyway). Judge keys (Anthropic ×2, OpenRouter) dead since 18:55.
