@@ -466,6 +466,19 @@ def train_sft(mode: str, tag: str, nproc: int = 4, model_tag: str = "qwen3_8b",
 
 
 @app.function(gpu="B200", volumes=VOLS, timeout=2 * 60 * 60, secrets=SECRETS)
+def merge_ar(ar_dir: str, out: str, model_tag: str = "qwen3_8b", base: str = ""):
+    """Merge a LoRA AR checkpoint (ar_lora_value_head.safetensors + ar_meta.json) into a prepared HF critic dir
+    (value_head.safetensors + merged truncated backbone) — what train_rl_vllm/eval_nla expect for --ar-ckpt."""
+    import sys
+    _prep(patch_lens=False)
+    base = base or (BASE_8B if model_tag == "qwen3_8b" else "Qwen/Qwen3.6-27B")
+    print(f"[merge_ar] base={base} ar_dir={ar_dir} -> {out}", flush=True)
+    _run([sys.executable, "scripts/merge_lora_to_hf.py", "--base-ckpt", base, "--av-dir", "/dev/null", "--av-out", "/dev/null",
+          "--ar-dir", ar_dir, "--ar-out", out, "--mode", "ar"])
+    return out
+
+
+@app.function(gpu="B200", volumes=VOLS, timeout=2 * 60 * 60, secrets=SECRETS)
 def merge_av(av_dir: str, out: str, model_tag: str = "qwen3_8b", base: str = ""):
     """Merge an AV LoRA onto its base. `base` MUST be the model the LoRA was trained on: the raw model for
     warm-start adapters, but e.g. av_sft500k_lr1e4_merged for a distillation LoRA trained with --base-ckpt on it."""
@@ -654,6 +667,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         f = train_sft.with_options(gpu=f"B200:{gpus or nproc}")
         print(f.remote(mode=mode, tag=tag, nproc=nproc, model_tag=model_tag,
                        bs=bs, accum=accum, extra=extra, data_dir=data_dir, data_suffix=out))
+    elif task == "merge_ar":
+        print(merge_ar.remote(ar_dir=av_dir, out=out, model_tag=model_tag, base=base))
     elif task == "merge_av":
         print(merge_av.remote(av_dir=av_dir, out=out, model_tag=model_tag, base=base))
     elif task == "rl":
