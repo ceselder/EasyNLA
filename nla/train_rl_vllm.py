@@ -2902,7 +2902,7 @@ def main():
                 for gi in _zv_groups:
                     _live &= ~(group_t == gi)
                 _stats = torch.tensor([float(adv[_live].double().pow(2).sum()), float(adv[_live].double().sum()),
-                                       float(_live.sum())], dtype=torch.float64)
+                                       float(_live.sum())], dtype=torch.float64, device=device)   # NCCL group: CUDA tensor
                 if is_dist:
                     dist.all_reduce(_stats)
                 _n = _stats[2].item()
