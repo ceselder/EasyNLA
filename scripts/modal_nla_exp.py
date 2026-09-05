@@ -492,6 +492,14 @@ def train_rl(tag: str, nproc: int = 4, model_tag: str = "qwen3_8b", extra: str =
     os.environ["NLA_VLLM_GRAPHS"] = str(graphs)   # 0 -> eager even on the metamodel image
     _prep(patch_lens=True)
     save_dir = f"{CKPT}/{model_tag}/{tag}"
+    if "$BASE_SNAP" in extra:
+        # Qwen3.6-27B path: vLLM loads the RAW base snapshot (--av-ckpt/--vllm-model) and the trainer
+        # force-syncs the LoRA-merged actor weights at step 0 (see train_rl_vllm: vllm_model != av_ckpt).
+        from huggingface_hub import snapshot_download
+        base_id = "Qwen/Qwen3.6-27B" if model_tag == "qwen36_27b" else BASE_8B
+        snap = snapshot_download(base_id, token=os.environ.get("HF_TOKEN"))
+        print(f"[rl] $BASE_SNAP -> {snap}", flush=True)
+        extra = extra.replace("$BASE_SNAP", snap)
     cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone",
            f"--nproc_per_node={nproc}", "-m", "nla.train_rl_vllm",
            "--config", config, "--save-dir", save_dir,
