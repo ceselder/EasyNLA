@@ -461,3 +461,8 @@ repetitiveness 3 → 6); (4) a KL-only critic preserves prose (writing 5.5–6.0
 below pre-RL; (5) KL in the reward degenerates. arklonly crashed at 22:08 with an NCCL heartbeat timeout on rank 2 (RemoteError);
 the watchdog mis-detected it as finished because the Modal entrypoint prints "done." after a RemoteError — not resumed (judge keys
 dead, so its distinguishing text-quality metrics could not be measured anyway). Judge keys (Anthropic ×2, OpenRouter) dead since 18:55.
+
+### 2026-09-05 — KL-only-critic AV adapters uploaded (private): https://huggingface.co/ceselder/nla-qwen3-8b-av-klonly-critic
+`iter_000400/` (best judge readings) and `iter_000650/` (final) LoRA adapters on Qwen/Qwen3-8B, each with the frozen `reference/` (SFT) adapter;
+model card has the recipe and loading snippet. The run's final critic is still on the volume at ckpts/qwen3_8b/rlB_arklonly_b256/critic_latest.
+Also: rollout reader for MSE vs KL critics at reports/nla-experiments/rollouts_mse_vs_kl.html (build_rollout_viewer.py; data/samples/*.parquet).
