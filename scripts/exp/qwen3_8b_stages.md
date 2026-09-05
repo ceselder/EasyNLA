@@ -487,3 +487,9 @@ smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no lon
 - 27B smoke failure #2 (22:21): vLLM `max_num_seqs (1024) exceeds available Mamba cache blocks (137) … CUDA graph capture cannot
   proceed` — Qwen3.6's linear-attention layers need one Mamba cache block per decode sequence and the fork's decode CUDA graphs
   capture at max_num_seqs. Fix: eager vLLM for 27B (`NLA_VLLM_GRAPHS=0`, the July path); the trainer has no --max-num-seqs flag.
+
+### 22:40 — ScaleRL-recipe pair launched on Qwen3-8B (4×B200 each, 256×8, 801 steps, save 50): `rlB_cispo_b256` (MSE critic) and
+`rlB_klsup_cispo_b256` (MSE+KL critic, vllm mem 0.30), both with `--loss cispo --cispo-eps-max 5 --adv-mode batch --zero-var-filter
+--loss-agg prompt` (smoke_cispo ran 4 clean steps; run_config confirms the flags). Together with rlB_base_b256 / rlB_klsup_b256 this is a
+2×2 (recipe × critic). Watchdog launch_watchdog_cispo.sh, eval chains, figure long_runs_cispo.png. 27B: base smoke passed in eager mode
+(exit3 0, 99 s/step at 16×8 on 2 GPUs); klsup smoke running; full 6-GPU pair launches automatically on pass.
