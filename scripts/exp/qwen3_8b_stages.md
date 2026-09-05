@@ -496,3 +496,7 @@ smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no lon
 - 22:41 both CISPO runs crashed at step 0: my `--adv-mode batch` all-reduced a CPU float64 tensor ("No backend type associated with
   device type cpu" — the DP group is NCCL-only; the smoke was 1 GPU so never hit it). Fixed (CUDA tensor, 5f57745); watchdog relaunches
   both from scratch with the fixed code; eval chains re-armed by rearm_cispo_evals.sh.
+- 22:55: both 27B smokes passed (exit 0; base 99 s/step, klsup 175 s/step at 16×8 on 2 GPUs, eager vLLM) but the launch gate's
+  `^step 0003` anchor failed (DP ranks concatenate lines) → rlQ36_base / rlQ36_klsup launched directly (6×B200 each, 252×8, 401 steps,
+  save 50, eager). Watchdogs (cispo, q36) fixed: STEP=0 guard when a run dies before its first checkpoint (the cispo watchdog had died on
+  `10#` arithmetic). CISPO pair relaunched fresh 22:52 with the CUDA all-reduce fix.
