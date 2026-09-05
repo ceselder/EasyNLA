@@ -500,3 +500,8 @@ smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no lon
   `^step 0003` anchor failed (DP ranks concatenate lines) → rlQ36_base / rlQ36_klsup launched directly (6×B200 each, 252×8, 401 steps,
   save 50, eager). Watchdogs (cispo, q36) fixed: STEP=0 guard when a run dies before its first checkpoint (the cispo watchdog had died on
   `10#` arithmetic). CISPO pair relaunched fresh 22:52 with the CUDA all-reduce fix.
+- 22:54 27B crash #3: ranks died with "Qwen/Qwen3.6-27B does not appear to have a file named model-000XX-of-00015.safetensors" — the
+  volume-backed HF cache showed a partial/stale snapshot to a fresh 6-rank container (Modal volume eventual consistency). Fix (490378a):
+  train_rl downloads the base to the container's local disk (/root/base_snap), verifies every shard in the index (re-downloads
+  missing ones), and rewrites --base-ckpt/--av-ckpt/--vllm-model to that path. rlQ36_base was auto-resumed from scratch at 22:54
+  (pre-fix code, so far fine); rlQ36_klsup crashed the same way → watchdog relaunches it with the fixed code.
