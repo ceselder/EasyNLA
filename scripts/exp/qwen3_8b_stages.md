@@ -493,3 +493,6 @@ smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no lon
 --loss-agg prompt` (smoke_cispo ran 4 clean steps; run_config confirms the flags). Together with rlB_base_b256 / rlB_klsup_b256 this is a
 2×2 (recipe × critic). Watchdog launch_watchdog_cispo.sh, eval chains, figure long_runs_cispo.png. 27B: base smoke passed in eager mode
 (exit3 0, 99 s/step at 16×8 on 2 GPUs); klsup smoke running; full 6-GPU pair launches automatically on pass.
+- 22:41 both CISPO runs crashed at step 0: my `--adv-mode batch` all-reduced a CPU float64 tensor ("No backend type associated with
+  device type cpu" — the DP group is NCCL-only; the smoke was 1 GPU so never hit it). Fixed (CUDA tensor, 5f57745); watchdog relaunches
+  both from scratch with the fixed code; eval chains re-armed by rearm_cispo_evals.sh.
