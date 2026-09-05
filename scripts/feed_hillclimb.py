@@ -724,6 +724,8 @@ def main():
     p.add_argument("--layers", default=None, help="override spec layers, e.g. '1,8,16' or 'emb'")
     p.add_argument("--layers-resid", default=None, help="override spec layers_resid")
     p.add_argument("--lora-scope", default="attn", choices=["attn", "all"])
+    p.add_argument("--lora-r", type=int, default=128)
+    p.add_argument("--lora-alpha", type=int, default=16)
     args = p.parse_args()
     global BASE, DATA, TRAIN_PQ
     BASE, DATA, TRAIN_PQ = MODELS[args.model]["base"], MODELS[args.model]["data"], MODELS[args.model]["train"]
@@ -755,7 +757,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(BASE, dtype=torch.bfloat16, attn_implementation="sdpa").to(device)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
-    model = get_peft_model(model, LoraConfig(r=128, lora_alpha=16, lora_dropout=0.0, bias="none",
+    model = get_peft_model(model, LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0, bias="none",
                                              task_type="CAUSAL_LM", use_rslora=True,
                                              target_modules=resolve_lora_target_modules(model.config, args.lora_scope)))
     _mc = model.config
