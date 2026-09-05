@@ -511,3 +511,7 @@ smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no lon
 - 23:22 rlQ36_klsup failed again: vLLM "No available memory for the cache blocks" at gpu_mem 0.30 — 0.30×178 GB = 53 GB < the 54 GB of
   bf16 weights, so no KV room. 27B needs vLLM ≥0.35. Relaunched 23:2x with vllm 0.35 and trainer-side savings instead:
   --logp-micro-batch 4 --critic-micro-batch 2 --ar-kl-max-rollouts 16. Watchdog EXTRA updated.
+
+### 23:48 check-in — rlB_cispo_b256 OOM'd at step ~74 (rank 0 at 178 GB; own FVE 71.7% @70; ckpt@50 67.1 vs EasyNLA-recipe base 68.2);
+watchdog resumes from iter_000050, relaunch flags now add --vllm-gpu-mem 0.30. rlB_klsup_cispo_b256 step 57 (own 66.1% @50, 58 s/step).
+rlQ36_base step 10 (own 68.0% @10, 224 s/step → ≈25 h); rlQ36_klsup step 4 (57.9% @0, 189 s/step → ≈21 h) — both 27B runs finally stable.
