@@ -432,3 +432,17 @@ Trajectory: 64.9 63.1 63.3 62.5 61.4 57.1 60.9 59.8 60.9 59.0 58.2 57.9 54.2 (50
 (writing 5.5–6.1, coherence 7.0–7.5, repetitiveness 2.6–2.9 while the others fell to 3.3–3.8 / 4.0–4.6 / 5.8–6.2). Verdict: a critic with no
 MSE anchor gives the AV great prose but the AV stops reconstructing — a trade that gets worse with training.
 klsup@750 63.2 (= @700): the KL critic dropped from its 67–70 band at 700 and stayed there; base@750 was 58.3.
+
+### 2026-09-05 00:40 — 256×8 group FINISHED (session was down 23:03–00:39; watchdog pinged Discord at 22:59)
+Frozen Opus-critic FVE by checkpoint (1,024 held-out prompts):
+| step | 50 | 100 | 150 | 200 | 250 | 300 | 350 | 400 | 450 | 500 | 550 | 600 | 650 | 700 | 750 | 800 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base (MSE critic) | 68.2 | 69.3 | 68.4 | 67.4 | 68.3 | 63.8 | 64.7 | 63.2 | 63.9 | 63.7 | 61.3 | 57.0 | 61.0 | 58.9 | 58.3 | **60.4** |
+| klsup (MSE+KL critic) | 68.8 | 69.3 | 69.5 | 68.1 | 69.3 | 68.8 | 68.9 | 69.0 | 66.5 | 67.2 | 69.8 | 68.1 | 67.4 | 63.2 | 63.2 | **64.4** |
+| arklonly (KL-only critic) | 64.9 | 63.1 | 63.3 | 62.5 | 61.4 | 57.1 | 60.9 | 59.8 | 60.9 | 59.0 | 58.2 | 57.9 | 54.2 (stopped) | | | |
+| klonly (KL-only reward) | 60.8 | 59.8 | 56.3 (stopped) | | | | | | | | | | | | | |
+Own-critic FVE at the end: base 79.3%, klsup 72.9%. Verdict: (1) the paper recipe reward-hacks its co-trained critic on a long run — frozen-critic
+FVE peaks ≈69 at 100–250, breaks at ≈300 and ends at 60 (pre-RL 55.2) while the co-trained critic reads 79; (2) adding the downstream-KL term to
+the critic loss delays that by ≈400 steps (68–70 through 650, 63–64 at 700–800; own-critic gap 8 vs 19 pts) but does not prevent it;
+(3) KL-only critic: best prose of all arms, reconstruction drifts below pre-RL; (4) KL-only reward: degenerate within 150 steps.
+Judge metrics (hallucination/informativeness/text quality) are NaN from ~18:55 on (all API keys dead) — re-judge the saved iter_* adapters when keys return.
