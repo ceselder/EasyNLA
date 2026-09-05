@@ -509,10 +509,30 @@ def train_rl(tag: str, nproc: int = 4, model_tag: str = "qwen3_8b", extra: str =
         # Qwen3.6-27B path: vLLM loads the RAW base snapshot (--av-ckpt/--vllm-model) and the trainer
         # force-syncs the LoRA-merged actor weights at step 0 (see train_rl_vllm: vllm_model != av_ckpt).
         from huggingface_hub import snapshot_download
+        import json as _json
         base_id = "Qwen/Qwen3.6-27B" if model_tag == "qwen36_27b" else BASE_8B
-        snap = snapshot_download(base_id, token=os.environ.get("HF_TOKEN"))
+        # Download the base to the container's LOCAL disk, not the shared volume cache: two 6-rank runs reading a
+        # volume-backed HF cache saw a stale/partial snapshot ("does not appear to have a file named model-0000X-of-00015")
+        # and every rank died. Local disk is private to this container and verified below.
+        snap = snapshot_download(base_id, token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap",
+                                 allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
+        idx = os.path.join(snap, "model.safetensors.index.json")
+        if os.path.exists(idx):
+            shards = sorted(set(_json.load(open(idx))["weight_map"].values()))
+            missing = [f for f in shards if not os.path.exists(os.path.join(snap, f))]
+            for _try in range(3):
+                if not missing:
+                    break
+                print(f"[rl] base snapshot missing {len(missing)} shard(s) -> re-download (try {_try+1})", flush=True)
+                snapshot_download(base_id, token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap", force_download=True,
+                                  allow_patterns=missing)
+                missing = [f for f in shards if not os.path.exists(os.path.join(snap, f))]
+            assert not missing, f"base snapshot incomplete after retries: {missing}"
+            print(f"[rl] base snapshot verified: {len(shards)} shards", flush=True)
         print(f"[rl] $BASE_SNAP -> {snap}", flush=True)
         extra = extra.replace("$BASE_SNAP", snap)
+        # HF actor/critic base too: load from the verified local dir instead of resolving the repo id via the volume cache
+        extra = extra.replace(f"--base-ckpt {base_id}", f"--base-ckpt {snap}")
     cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone",
            f"--nproc_per_node={nproc}", "-m", "nla.train_rl_vllm",
            "--config", config, "--save-dir", save_dir,
