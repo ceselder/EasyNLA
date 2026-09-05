@@ -477,3 +477,10 @@ trainer force-syncs the LoRA-merged actor at step 0; AR critic = LoRA (full-FT c
 on 6×B200 (54.6 → 74.0% own-critic FVE). August EMA sweep (dsv4-nla, project easynla-qwen36-ema, 128×8, HF path) mostly crashed
 (rl_none 55.8% @269, ar_d0p98 53.5% @225) — not a usable 27B baseline. Smokes (2 GPUs, 16×8, 3 steps) → launch_q36_runs.sh
 launches rlQ36_base / rlQ36_klsup on 6×B200 each (252×8, 401 steps, save 50). Judge keys still dead → FVE-only.
+
+### 2026-09-05 23:1x — ScaleRL options ported from maemm (~/modlens-scalerl/rl/rl_disagg.py, SCALERL_BUNDLE): `--loss cispo`
+(sg(min(exp(new−old_vllm), 5))·A·log π; old = vLLM sampler logprob), `--adv-mode batch` (group-centred, one global std, DP all-reduced,
+zero-variance groups zeroed), `--zero-var-filter`, `--loss-agg prompt` (each group 1/G_kept, tokens 1/Σ_g|y|). fp32 head: already the
+case (chunked_response_logp does fp32 logits). Not ported: No-Positive-Resampling (continuous reward), max_lag (synchronous trainer).
+Smoke `smoke_cispo` (1 GPU, 32×8, 4 steps). 27B: AR LoRA merged → /vol/ckpts/qwen36_27b/ar_sft_merged (MERGE COMPLETE 23:0x);
+smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no longer exists; scope "all" is the default).
