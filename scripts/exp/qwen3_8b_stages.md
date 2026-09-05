@@ -484,3 +484,6 @@ zero-variance groups zeroed), `--zero-var-filter`, `--loss-agg prompt` (each gro
 case (chunked_response_logp does fp32 logits). Not ported: No-Positive-Resampling (continuous reward), max_lag (synchronous trainer).
 Smoke `smoke_cispo` (1 GPU, 32×8, 4 steps). 27B: AR LoRA merged → /vol/ckpts/qwen36_27b/ar_sft_merged (MERGE COMPLETE 23:0x);
 smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no longer exists; scope "all" is the default).
+- 27B smoke failure #2 (22:21): vLLM `max_num_seqs (1024) exceeds available Mamba cache blocks (137) … CUDA graph capture cannot
+  proceed` — Qwen3.6's linear-attention layers need one Mamba cache block per decode sequence and the fork's decode CUDA graphs
+  capture at max_num_seqs. Fix: eager vLLM for 27B (`NLA_VLLM_GRAPHS=0`, the July path); the trainer has no --max-num-seqs flag.
