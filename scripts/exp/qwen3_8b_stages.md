@@ -505,3 +505,6 @@ smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no lon
   train_rl downloads the base to the container's local disk (/root/base_snap), verifies every shard in the index (re-downloads
   missing ones), and rewrites --base-ckpt/--av-ckpt/--vllm-model to that path. rlQ36_base was auto-resumed from scratch at 22:54
   (pre-fix code, so far fine); rlQ36_klsup crashed the same way → watchdog relaunches it with the fixed code.
+- 23:14 rlQ36_klsup OOM'd (rank at 174 GB, 4.7 GB alloc) with the yaml memory settings + KL critic; rlQ36_base is fine (step 2, 229 s/step
+  → ≈25 h for 401). Relaunched 23:2x with `--ar-kl-max-rollouts 16 --vllm-gpu-mem 0.30 --logp-micro-batch 4` (KL objective unchanged;
+  fewer rollouts in the KL term per step, smaller KV cache, smaller logp micro-batch). Watchdog EXTRA updated to match.
