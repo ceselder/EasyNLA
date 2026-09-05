@@ -1197,7 +1197,7 @@ def resolve_kl_beta(kl_beta, kl_estimator):
 
 
 def grpo_token_loss(new_lp, ref_lp, advantage, *, kl_beta=0.01, kl_tok=None,
-                    length_normalizer=None):
+                    length_normalizer=None, old_lp=None, loss_mode="reinforce", cispo_eps_max=5.0):
     """Per-token policy-gradient loss + KL for ONE sample's response tokens.
 
     PURELY ON-POLICY: NO importance ratio. The rollouts are on-policy (vLLM holds the
@@ -1209,7 +1209,15 @@ def grpo_token_loss(new_lp, ref_lp, advantage, *, kl_beta=0.01, kl_tok=None,
     it replaces the k3 term (bounded gradient, no exp of a single-sample Δ).
 
     Returns (loss, kl_mean): loss = mean_t -(surrogate - kl_beta*kl)."""
-    surrogate = advantage * new_lp                     # ratio == 1; grad = A * d new_lp
+    if loss_mode == "cispo" and old_lp is not None and old_lp.numel() >= new_lp.numel():
+        # ScaleRL / MiniMax-M1 CISPO (as in maemm's rl_disagg.py): truncated-IS REINFORCE.
+        # weight = sg(min(exp(new - old), eps_max)) with old = the vLLM sampler's logprob of the
+        # sampled token; every token keeps a gradient (no PPO clip of the objective).
+        with torch.no_grad():
+            is_w = torch.exp(new_lp.detach() - old_lp[: new_lp.numel()].to(new_lp.device)).clamp(max=cispo_eps_max)
+        surrogate = is_w * advantage * new_lp
+    else:
+        surrogate = advantage * new_lp                 # ratio == 1; grad = A * d new_lp
     if kl_tok is not None:
         kl = kl_tok                                    # distributional KL (see --kl-estimator dist)
     else:
@@ -1314,8 +1322,13 @@ def grpo_update_microbatched(
     dp_world_size=1, kl_estimator="k3", kl_topk=64, n_total=None,
     length_normalizer=None,
     old_logps_list=None, sampler_mismatch_thresh=0.0,
+    sample_normalizers=None, loss_mode="reinforce", cispo_eps_max=5.0,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
+
+    sample_normalizers: optional per-sample scalars (indexed like full_ids_list) overriding
+    length_normalizer — used for ScaleRL prompt-level loss aggregation (each GROUP weighs equally,
+    tokens within a group weigh 1/sum_g|y|). loss_mode "cispo" adds the truncated-IS weight.
 
     Each micro-batch: forward (LoRA on, grad) → ref forward (LoRA off, no grad)
     → per-chunk GRPO loss → backward → release graph → next chunk.
@@ -1421,9 +1434,10 @@ def grpo_update_microbatched(
                         and sample_lpdiff_log[-1] > sampler_mismatch_thresh):
                     mismatch_masked_idx.append(i)
                     continue
+            _ln = (sample_normalizers[i] if sample_normalizers is not None else length_normalizer)
             sample_loss, kl_m = grpo_token_loss(
                 new_lp, ref_lp, advantages[i], kl_beta=kl_beta, kl_tok=kl_tok,
-                length_normalizer=length_normalizer,
+                length_normalizer=_ln, old_lp=_olp, loss_mode=loss_mode, cispo_eps_max=cispo_eps_max,
             )
             chunk_losses.append(sample_loss)
             sample_kls_log.append(kl_m.item())
@@ -1763,6 +1777,20 @@ def main():
     p.add_argument("--ar-kl-weight", type=float, default=1.0,
                    help="Weight w on the downstream-KL term in --ar-loss mse_plus_kl "
                         "(critic loss = MSE + w * KL on a subsample of rollouts).")
+    p.add_argument("--loss", choices=["reinforce", "cispo"], default="reinforce",
+                   help="reinforce (DEFAULT, EasyNLA: on-policy A*log pi, no ratio) | cispo (ScaleRL/MiniMax-M1 "
+                        "truncated-IS REINFORCE: sg(min(exp(new-old_vllm), eps_max))*A*log pi; maemm rl_disagg recipe)")
+    p.add_argument("--cispo-eps-max", type=float, default=5.0, help="CISPO IS-weight truncation (maemm bundle: 5)")
+    p.add_argument("--adv-mode", choices=["group", "none", "batch"], default=None,
+                   help="group (DEFAULT) = GRPO per-group mean/std; none = Dr.GRPO centring only (== --dr-grpo); "
+                        "batch = ScaleRL: per-group centring, zero-variance groups zeroed, ONE std over all surviving "
+                        "advantages of the global (DP all-reduced) batch")
+    p.add_argument("--zero-var-filter", action="store_true", default=False,
+                   help="ScaleRL: groups whose rewards are identical (std<=1e-6) leave the effective batch (weight 0, out "
+                        "of the loss denominators)")
+    p.add_argument("--loss-agg", choices=["seq", "prompt"], default="seq",
+                   help="seq (DEFAULT): each rollout weighs 1/n_total, its tokens 1/|y| (Dr.GRPO: 1/max_new_tokens); "
+                        "prompt (ScaleRL): each GROUP weighs 1/G_kept, its tokens 1/sum_g|y|")
     p.add_argument("--critic-lag-steps", type=int, default=0,
                    help="HARD-LAG scoring critic (target network): rollouts are scored "
                         "by a snapshot of the AR refreshed every N critic updates; the "
@@ -2849,6 +2877,42 @@ def main():
             else:
                 sd = group_r.std() if group_r.numel() > 1 else torch.tensor(1.0, device=device)
                 adv[mask] = (group_r - mu) / (sd + 1e-6)
+        # ---- ScaleRL variants (maemm rl_disagg recipe): --adv-mode batch / --zero-var-filter / --loss-agg prompt ----
+        _adv_mode = args.adv_mode or ("none" if args.dr_grpo else "group")
+        _zv_groups = set()
+        if _adv_mode == "batch" or args.zero_var_filter or args.loss_agg == "prompt":
+            _gsd = {}
+            for gi in range(args.batch_prompts):
+                mask = (group_t == gi) & inject_ok_t
+                if mask.sum() == 0:
+                    continue
+                _gr = rewards_t[mask]
+                _gsd[gi] = float(_gr.std()) if _gr.numel() > 1 else 0.0
+                if args.zero_var_filter and _gsd[gi] <= 1e-6:
+                    _zv_groups.add(gi)
+            if _adv_mode == "batch":
+                # centre per group (already done above when dr_grpo; redo from rewards to be explicit)
+                adv = torch.zeros_like(rewards_t)
+                for gi in range(args.batch_prompts):
+                    mask = (group_t == gi) & inject_ok_t
+                    if mask.sum() == 0 or gi in _zv_groups:
+                        continue
+                    adv[mask] = rewards_t[mask] - rewards_t[mask].mean()
+                _live = inject_ok_t.clone()
+                for gi in _zv_groups:
+                    _live &= ~(group_t == gi)
+                _stats = torch.tensor([float(adv[_live].double().pow(2).sum()), float(adv[_live].double().sum()),
+                                       float(_live.sum())], dtype=torch.float64)
+                if is_dist:
+                    dist.all_reduce(_stats)
+                _n = _stats[2].item()
+                _std = math.sqrt(max(_stats[0].item() / _n - (_stats[1].item() / _n) ** 2, 0.0)) if _n > 1 else 1.0
+                adv = adv / (_std + 1e-6)
+                shape_terms["scalerl/batch_adv_std"] = _std
+            if _zv_groups:
+                for gi in _zv_groups:
+                    adv[group_t == gi] = 0.0
+                shape_terms["scalerl/zero_var_groups"] = float(len(_zv_groups))
         t_score_end = time.time()  # [timing] end of scoring+shaping+advantage
 
         # ---- GRPO update: fused forward+loss+backward per micro-batch ----
@@ -2866,7 +2930,17 @@ def main():
         # Drop ONLY injection-failed rollouts from the AV update (marker-drifted
         # prompts would crash the hook; cjk garbage adds no signal). Truncated
         # rollouts stay in — their -2 failure reward is the anti-runaway gradient.
-        keep = [i for i, ok in enumerate(inject_ok) if ok]
+        keep = [i for i, ok in enumerate(inject_ok) if ok and all_prompt_group[i] not in _zv_groups]
+        # prompt-level aggregation: sample i weighs n_total / (G_kept * T_group(i)) so that the existing
+        # sum/n_total reduces to sum_g (1/G_kept) * sum_{i in g} per_tok_i.sum() / T_g.
+        _sample_norm = None
+        if args.loss_agg == "prompt":
+            _tok_i = [max(int(all_full_ids[i].numel() - all_prompt_lens[i]), 1) for i in range(len(inject_ok))]
+            _tg = {}
+            for i in keep:
+                _tg[all_prompt_group[i]] = _tg.get(all_prompt_group[i], 0) + _tok_i[i]
+            _gk = max(len(_tg), 1)
+            _sample_norm = [(_gk * _tg.get(all_prompt_group[i], 1)) / max(len(inject_ok), 1) for i in range(len(inject_ok))]
         # GLOBAL skip decision (see _any_rank): if any rank's whole slice failed,
         # every rank skips this step together so the NCCL collectives stay matched.
         if _any_rank(not keep, is_dist, device):
@@ -2897,6 +2971,8 @@ def main():
             length_normalizer=(args.max_new_tokens if args.dr_grpo else None),
             old_logps_list=upd_old_logps,
             sampler_mismatch_thresh=args.sampler_mismatch_thresh,
+            sample_normalizers=([_sample_norm[i] for i in keep] if _sample_norm is not None else None),
+            loss_mode=args.loss, cispo_eps_max=args.cispo_eps_max,
         )
         t_grpo_end = time.time()  # [timing] end of GRPO forward+backward+step
         # Build a scalar-tensor stand-in for the existing logging path that
