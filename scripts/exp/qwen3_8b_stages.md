@@ -568,3 +568,11 @@ checkpoint in 68–70). 27B: base step 168 (own 74.7% @160, 223 s/step, ≈14.5 
 
 ### 11:48 check-in — 3 runs alive, 3/3 chains, no crashes. cispo+KL step 768 (own 71.3% @760; ckpt@700 67.9, @750 68.9 — back in band where the
 EasyNLA KL critic stayed at 63). 27B: base step 199 (own 74.8% @190, 221 s/step, ≈12.5 h), klsup step 224 (own 71.8% @220, 196 s/step, ≈9.5 h).
+
+### 12:3x — rlB_klsup_cispo_b256 (ScaleRL recipe, MSE+KL critic) FINISHED, 800 steps. Frozen Opus-critic FVE by checkpoint:
+50:68.0 100:68.4 150:68.3 200:68.3 250:67.5 300:70.1 350:69.7 400:68.9 450:69.0 500:69.1 550:69.9 600:68.3 650:69.5 700:67.9 750:68.9 800:67.8
+Own critic 70.3% at the end (own-vs-frozen gap 2.5 pts). ALL 16 checkpoints in 67.5–70.1 — no collapse at all, better than the EasyNLA-recipe
+KL critic (which dropped to 63–64 at 700–800). 2×2 verdict (recipe × critic), frozen-critic FVE at 800 / peak: EasyNLA+MSE 60.4/69.3;
+ScaleRL+MSE 56.2/68.2; EasyNLA+KL 64.4/69.8; ScaleRL+KL 67.8/70.1. The critic loss is the first-order factor (KL term prevents the
+reward-hacking collapse); the ScaleRL recipe adds nothing with the MSE critic but pairs well with the KL critic (no late dip). Text-quality/
+hallucination judge numbers unavailable for these runs (keys dead) — re-judge the saved adapters later.
