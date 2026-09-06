@@ -554,3 +554,8 @@ cispo+KL …/69.0/69.1 @450–500 (10 checkpoints in 68–70). 27B: base step 13
 ### 08:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo …/60.3/51.7 @650–700 (own 78.2%, 50 steps left);
 cispo+KL …/69.1/69.9 @500–550 (11 checkpoints in 68–70). 27B: base step 152 (own 73.8% @150, 219 s/step), klsup step 169 (own 72.3% @160,
 194 s/step).
+
+### 09:36 — rlB_cispo_b256 (ScaleRL recipe, MSE critic) FINISHED, 800 steps. Frozen Opus-critic FVE by checkpoint:
+50:67.1 100:67.7 150:66.4 200:67.5 250:68.2 | 300:64.7 350:67.8 400:65.2 450:62.1 500:56.9 550:58.7 600:52.2 650:60.3 700:51.7 750:53.2 800:56.2
+Own critic 78% at the end. Same shape as the EasyNLA-recipe baseline (peak ≈68 to 250, break at 300, ≈52–60 after 500, end 56 vs pre-RL 55):
+CISPO + batch advantages + zero-variance filter + prompt-level aggregation do not prevent the co-trained critic from being hacked.
