@@ -546,3 +546,7 @@ same collapse as the EasyNLA baseline, arriving a little later and steeper); cis
 
 ### 06:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo …/56.9/58.7 @500–550 (own 77.3%); cispo+KL
 …/68.9/69.0 @400–450 (9 checkpoints in 68–70). 27B: base step 120 (own 72.6% @120, 223 s/step), klsup step 133 (own 71.3% @130, 189 s/step).
+
+### 07:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo …/58.7/52.2/60.3 @550–650 (own 77.7%);
+cispo+KL …/69.0/69.1 @450–500 (10 checkpoints in 68–70). 27B: base step 136 (own 74.1% @130, 225 s/step), klsup step 151 (own 71.2% @150,
+196 s/step).
