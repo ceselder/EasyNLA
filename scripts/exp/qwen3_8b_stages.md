@@ -565,3 +565,6 @@ checkpoint in 68–70). 27B: base step 168 (own 74.7% @160, 223 s/step, ≈14.5 
 
 ### 10:48 check-in — 3 runs alive, 3/3 chains, no crashes. cispo+KL step 710 (own 70.4% @710; ckpt@650 69.5, @700 67.9). 27B: base step 184
 (own 74.5% @180, 215 s/step, ≈13 h left), klsup step 206 (own 72.2% @200, 193 s/step, ≈10.5 h left).
+
+### 11:48 check-in — 3 runs alive, 3/3 chains, no crashes. cispo+KL step 768 (own 71.3% @760; ckpt@700 67.9, @750 68.9 — back in band where the
+EasyNLA KL critic stayed at 63). 27B: base step 199 (own 74.8% @190, 221 s/step, ≈12.5 h), klsup step 224 (own 71.8% @220, 196 s/step, ≈9.5 h).
