@@ -559,3 +559,6 @@ cispo+KL …/69.1/69.9 @500–550 (11 checkpoints in 68–70). 27B: base step 15
 50:67.1 100:67.7 150:66.4 200:67.5 250:68.2 | 300:64.7 350:67.8 400:65.2 450:62.1 500:56.9 550:58.7 600:52.2 650:60.3 700:51.7 750:53.2 800:56.2
 Own critic 78% at the end. Same shape as the EasyNLA-recipe baseline (peak ≈68 to 250, break at 300, ≈52–60 after 500, end 56 vs pre-RL 55):
 CISPO + batch advantages + zero-variance filter + prompt-level aggregation do not prevent the co-trained critic from being hacked.
+
+### 09:48 check-in — 3 runs alive (rlB_cispo_b256 finished 09:36), 3/3 chains, no crashes. cispo+KL step 652 (own 70.1% @650; ckpt@600 68.3, 12th
+checkpoint in 68–70). 27B: base step 168 (own 74.7% @160, 223 s/step, ≈14.5 h left), klsup step 188 (own 70.5% @180, 193 s/step, ≈11.5 h left).
