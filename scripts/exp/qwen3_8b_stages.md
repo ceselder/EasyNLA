@@ -580,3 +580,8 @@ hallucination judge numbers unavailable for these runs (keys dead) — re-judge 
 ### 21:48 check-in — rlQ36_klsup (27B, MSE+KL critic) FINISHED 400 steps: own-critic FVE 57.9% @0 → 73.5% @400 (eval every 10, 128 prompts;
 trajectory ≈ 66.9 @20, 69.9 @40, 71.2 @150, 72.3 @200, 73.0 @350, 73.5 @400). rlQ36_base at step 353 (own 76.8% @350; ≈3 h left). No
 frozen-critic eval exists for 27B yet — the own-critic numbers are not comparable across the two runs (the KL critic reads differently).
+
+### 22:48 check-in — rlQ36_base died at step 355 (21:55): Modal FunctionTimeoutError — the train_rl function timeout is 23 h (82,800 s) and the
+27B baseline needs ≈25 h at 229 s/step. Not in the watchdog's failure pattern → no auto-resume. Resumed manually 22:5x from iter_000350
+(+critic_latest, --start-step 350), ≈3.2 h left. Watchdog patterns now include FunctionTimeoutError. Lesson: 27B runs >23 h need either a
+longer function timeout or a planned resume. rlQ36_klsup finished (400) at 21:4x.
