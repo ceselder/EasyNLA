@@ -515,3 +515,7 @@ smokes rerun with `--ar-ckpt` = merged critic (the `--ar-lora-scope` flag no lon
 ### 23:48 check-in — rlB_cispo_b256 OOM'd at step ~74 (rank 0 at 178 GB; own FVE 71.7% @70; ckpt@50 67.1 vs EasyNLA-recipe base 68.2);
 watchdog resumes from iter_000050, relaunch flags now add --vllm-gpu-mem 0.30. rlB_klsup_cispo_b256 step 57 (own 66.1% @50, 58 s/step).
 rlQ36_base step 10 (own 68.0% @10, 224 s/step → ≈25 h); rlQ36_klsup step 4 (57.9% @0, 189 s/step → ≈21 h) — both 27B runs finally stable.
+
+### 2026-09-06 00:48 check-in — all 4 runs alive, 4/4 chains. 8B ScaleRL pair ckpt (frozen Opus AR): cispo 67.1 @50 → 67.7 @100 (EasyNLA base
+68.2 → 69.3); cispo+KL 68.0 → 68.4 (EasyNLA klsup 68.8 → 69.3) — no separation from the recipe so far. cispo resumed from 50 (OOM @74) at 23:50.
+27B: base step 26 (own 69.0% @20, 217 s/step), klsup step 22 (own 66.9% @20, 188 s/step). Judge keys still dead.
