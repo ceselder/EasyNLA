@@ -543,3 +543,6 @@ rlQ36_base step 10 (own 68.0% @10, 224 s/step → ≈25 h); rlQ36_klsup step 4 (
 ### 05:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo …/65.2/62.1/56.9 @400–500 (own critic 77.9% —
 same collapse as the EasyNLA baseline, arriving a little later and steeper); cispo+KL …/70.1/69.7/68.9 @300–400 (holds). 27B: base step 104
 (own 73.0% @100, 224 s/step), klsup step 114 (own 72.3% @110, 192 s/step). Modal app limit was transient; @400 klsup_cispo eval retried OK.
+
+### 06:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo …/56.9/58.7 @500–550 (own 77.3%); cispo+KL
+…/68.9/69.0 @400–450 (9 checkpoints in 68–70). 27B: base step 120 (own 72.6% @120, 223 s/step), klsup step 133 (own 71.3% @130, 189 s/step).
