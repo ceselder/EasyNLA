@@ -576,3 +576,7 @@ KL critic (which dropped to 63–64 at 700–800). 2×2 verdict (recipe × criti
 ScaleRL+MSE 56.2/68.2; EasyNLA+KL 64.4/69.8; ScaleRL+KL 67.8/70.1. The critic loss is the first-order factor (KL term prevents the
 reward-hacking collapse); the ScaleRL recipe adds nothing with the MSE critic but pairs well with the KL critic (no late dip). Text-quality/
 hallucination judge numbers unavailable for these runs (keys dead) — re-judge the saved adapters later.
+
+### 21:48 check-in — rlQ36_klsup (27B, MSE+KL critic) FINISHED 400 steps: own-critic FVE 57.9% @0 → 73.5% @400 (eval every 10, 128 prompts;
+trajectory ≈ 66.9 @20, 69.9 @40, 71.2 @150, 72.3 @200, 73.0 @350, 73.5 @400). rlQ36_base at step 353 (own 76.8% @350; ≈3 h left). No
+frozen-critic eval exists for 27B yet — the own-critic numbers are not comparable across the two runs (the KL critic reads differently).
