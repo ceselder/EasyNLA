@@ -523,3 +523,7 @@ rlQ36_base step 10 (own 68.0% @10, 224 s/step → ≈25 h); rlQ36_klsup step 4 (
 ### 01:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo 67.1/67.7/66.4 @50/100/150 (EasyNLA base
 68.2/69.3/68.4); cispo+KL 68.0/68.4/68.3 (EasyNLA klsup 68.8/69.3/69.5). 27B: base step 41 (own 71.5% @40, 221 s/step), klsup step 41
 (own 69.9% @40, 190 s/step).
+
+### 02:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo 67.1/67.7/66.4/67.5/68.2 @50–250 (EasyNLA base
+68.2/69.3/68.4/67.4/68.3); cispo+KL 68.0/68.4/68.3/68.3 @50–200 (EasyNLA klsup 68.8/69.3/69.5/68.1). 27B: base step 57 (own 71.3% @50,
+224 s/step), klsup step 59 (own 69.1% @50, 192 s/step). cispo@300 (the EasyNLA baseline's break point) due ≈03:00.
