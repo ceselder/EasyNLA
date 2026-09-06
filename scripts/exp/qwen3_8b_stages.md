@@ -562,3 +562,6 @@ CISPO + batch advantages + zero-variance filter + prompt-level aggregation do no
 
 ### 09:48 check-in — 3 runs alive (rlB_cispo_b256 finished 09:36), 3/3 chains, no crashes. cispo+KL step 652 (own 70.1% @650; ckpt@600 68.3, 12th
 checkpoint in 68–70). 27B: base step 168 (own 74.7% @160, 223 s/step, ≈14.5 h left), klsup step 188 (own 70.5% @180, 193 s/step, ≈11.5 h left).
+
+### 10:48 check-in — 3 runs alive, 3/3 chains, no crashes. cispo+KL step 710 (own 70.4% @710; ckpt@650 69.5, @700 67.9). 27B: base step 184
+(own 74.5% @180, 215 s/step, ≈13 h left), klsup step 206 (own 72.2% @200, 193 s/step, ≈10.5 h left).
