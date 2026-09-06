@@ -539,3 +539,7 @@ rlQ36_base step 10 (own 68.0% @10, 224 s/step → ≈25 h); rlQ36_klsup step 4 (
   saved; RE-RUN its eval later). Only 7 apps are non-stopped, so the limit counts recently stopped ephemeral apps too (each checkpoint eval
   creates 2). Risk: watchdog relaunches would also fail while the limit holds. TODO: retry missing checkpoint evals; consider one long-lived
   eval app per run instead of 2 apps per checkpoint.
+
+### 05:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo …/65.2/62.1/56.9 @400–500 (own critic 77.9% —
+same collapse as the EasyNLA baseline, arriving a little later and steeper); cispo+KL …/70.1/69.7/68.9 @300–400 (holds). 27B: base step 104
+(own 73.0% @100, 224 s/step), klsup step 114 (own 72.3% @110, 192 s/step). Modal app limit was transient; @400 klsup_cispo eval retried OK.
