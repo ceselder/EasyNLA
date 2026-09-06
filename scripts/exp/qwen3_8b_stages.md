@@ -535,3 +535,7 @@ rlQ36_base step 10 (own 68.0% @10, 224 s/step → ≈25 h); rlQ36_klsup step 4 (
 ### 04:48 check-in — all 4 alive, 4/4 chains, no crashes. 8B ScaleRL ckpt (frozen AR): cispo …/68.2/64.7/67.8/65.2 @250–400 (post-300 level
 ≈65–68 vs EasyNLA base 63–64); cispo+KL …/67.5/70.1/69.7 @250–350 (KL critic holds 68–70 under the ScaleRL recipe too). 27B: base step 89
 (own 72.1% @80, 222 s/step), klsup step 96 (own 70.1% @90, 195 s/step).
+- 05:32 Modal: "App creation failed: reached limit of 100 ephemeral apps" — the klsup_cispo@400 checkpoint merge/eval was skipped (adapter
+  saved; RE-RUN its eval later). Only 7 apps are non-stopped, so the limit counts recently stopped ephemeral apps too (each checkpoint eval
+  creates 2). Risk: watchdog relaunches would also fail while the limit holds. TODO: retry missing checkpoint evals; consider one long-lived
+  eval app per run instead of 2 apps per checkpoint.
