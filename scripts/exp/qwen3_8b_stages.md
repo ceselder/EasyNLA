@@ -600,3 +600,14 @@ Nothing of mine is running on Modal now.
 - 01:35 launched `launch_q36_evals.sh`: frozen-critic evals for the 27B pair via the trainer as harness (resume AV ckpt, `--lr 0 --critic-lr 0
   --no-train-critic` so the critic = ar_sft_merged (Opus-trained SFT AR), one no-op step, built-in eval on 1,024 val prompts; nproc 1, eager
   vLLM). 9 evals (pre-RL AV, base/klsup @100/200/300/400) in 3 lanes → data/eval_q36_frozen.json.
+
+### 02:24 — 27B frozen-critic evals DONE (critic = ar_sft_merged, the Opus-trained SFT AR; 1,024 val prompts; trainer-as-harness, lr 0)
+| step | 0 (pre-RL) | 100 | 200 | 300 | 400 | own-critic @400 | own−frozen gap |
+|---|---|---|---|---|---|---|---|
+| rlQ36_base (MSE critic) | 55.6 | 65.8 | 66.0 | 65.3 | 66.6 | 77.4 | 10.8 |
+| rlQ36_klsup (MSE+KL critic) | 55.6 | 66.1 | 66.3 | 66.6 | 65.7 | 73.5 | 7.8 |
+Verdict at 27B/400 steps/252×8: both recipes lift frozen-critic FVE by ≈10 pts in the first 100 steps and are then FLAT (65–67) through 400
+while own-critic FVE keeps climbing (base +11 pts of inflation, KL +8). No collapse within 400 steps for either (the 8B collapse began at
+step 300 at 256×8; 27B may need more steps or may be more robust). No frozen-critic advantage for the KL critic at this horizon — the
+two arms are indistinguishable (±0.7). The KL critic's only measurable effect at 27B is a smaller own-vs-frozen gap (less critic drift).
+Judge metrics unavailable (keys dead). Data: data/eval_q36_frozen.json; logs evalQ36_*.log.
