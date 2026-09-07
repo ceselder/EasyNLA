@@ -2,7 +2,9 @@
 30 min after the last request; Gradio behind basic auth. Deploy: `modal deploy scripts/modal_playground.py`."""
 import os, sys
 import modal
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.join(os.environ.get("PYTHONPATH", "/root/easyNLA").split(":")[0], "scripts")):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)   # local: scripts/ ; in the container: <REPO_REMOTE>/scripts
 from modal_nla_exp import image_base, VOLS, SECRETS, REPO_LOCAL, REPO_REMOTE, REPO_IGNORE  # noqa: E402
 
 image = (image_base.pip_install("gradio==5.29.0", "fastapi[standard]")
