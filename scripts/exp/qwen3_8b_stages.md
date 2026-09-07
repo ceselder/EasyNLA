@@ -585,3 +585,15 @@ frozen-critic eval exists for 27B yet — the own-critic numbers are not compara
 27B baseline needs ≈25 h at 229 s/step. Not in the watchdog's failure pattern → no auto-resume. Resumed manually 22:5x from iter_000350
 (+critic_latest, --start-step 350), ≈3.2 h left. Watchdog patterns now include FunctionTimeoutError. Lesson: 27B runs >23 h need either a
 longer function timeout or a planned resume. rlQ36_klsup finished (400) at 21:4x.
+
+### 2026-09-07 01:21 — Qwen3.6-27B pair FINISHED (400 steps each, 252×8, 6×B200; base resumed once after the 23 h Modal timeout).
+Own-critic held-out FVE (128 prompts, every 10 steps):
+| step | 0 | 50 | 100 | 150 | 200 | 250 | 300 | 350 | 400 |
+|---|---|---|---|---|---|---|---|---|---|
+| rlQ36_base (MSE critic) | 55.2 | 71.3 | 73.0 | 73.8 | 74.6 | 76.2 | 76.2 | 76.8 | 77.4 |
+| rlQ36_klsup (MSE+KL critic) | 57.9 | 69.1 | 71.1 | 71.2 | 72.2 | 72.5 | 72.4 | 73.0 | 73.5 |
+The July 27B baseline reached 74.0 @399 with the same recipe; ours 77.4 @400. As on 8B, own-critic FVE is NOT comparable between the two
+arms (the KL-trained critic reads differently and the MSE critic inflates). OUTSTANDING: (1) a frozen-critic eval of both runs' saved
+checkpoints (iter_000050…400 + critic_latest on /vol/ckpts/qwen36_27b/) — needs the 27B eval path (merged AV in vLLM via the qwen3_5
+wrapper, or an HF-side generation path) with the frozen critic ar_sft_merged; (2) re-judge all post-Sep-4 checkpoints once judge keys exist.
+Nothing of mine is running on Modal now.
