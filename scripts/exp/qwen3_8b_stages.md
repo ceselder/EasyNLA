@@ -597,3 +597,6 @@ arms (the KL-trained critic reads differently and the MSE critic inflates). OUTS
 checkpoints (iter_000050…400 + critic_latest on /vol/ckpts/qwen36_27b/) — needs the 27B eval path (merged AV in vLLM via the qwen3_5
 wrapper, or an HF-side generation path) with the frozen critic ar_sft_merged; (2) re-judge all post-Sep-4 checkpoints once judge keys exist.
 Nothing of mine is running on Modal now.
+- 01:35 launched `launch_q36_evals.sh`: frozen-critic evals for the 27B pair via the trainer as harness (resume AV ckpt, `--lr 0 --critic-lr 0
+  --no-train-critic` so the critic = ar_sft_merged (Opus-trained SFT AR), one no-op step, built-in eval on 1,024 val prompts; nproc 1, eager
+  vLLM). 9 evals (pre-RL AV, base/klsup @100/200/300/400) in 3 lanes → data/eval_q36_frozen.json.
