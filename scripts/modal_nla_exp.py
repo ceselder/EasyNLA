@@ -66,9 +66,10 @@ image = (
         "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
         "PYTHONPATH": REPO_REMOTE,
     })
-    .add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False,
-                   ignore=[".git", ".venv", "__pycache__", "*.pyc", "*.parquet"])
 )
+REPO_IGNORE = [".git", ".venv", "__pycache__", "*.pyc", "*.parquet"]
+image_base = image                      # everything except the repo mount (add_local_dir must be the LAST layer)
+image = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE)
 
 app = modal.App(APP_NAME, image=image)
 vol = modal.Volume.from_name(VOL, create_if_missing=True)

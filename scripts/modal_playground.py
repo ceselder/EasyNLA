@@ -3,9 +3,10 @@
 import os, sys
 import modal
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from modal_nla_exp import image as base_image, VOLS, SECRETS  # noqa: E402
+from modal_nla_exp import image_base, VOLS, SECRETS, REPO_LOCAL, REPO_REMOTE, REPO_IGNORE  # noqa: E402
 
-image = base_image.pip_install("gradio==5.29.0", "fastapi[standard]")
+image = (image_base.pip_install("gradio==5.29.0", "fastapi[standard]")
+         .add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE))
 app = modal.App("nla-playground", image=image)
 
 
