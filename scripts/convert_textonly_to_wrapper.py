@@ -17,6 +17,17 @@ def main():
     for shard in sorted(set(idx["weight_map"].values())):
         sd = load_file(os.path.join(a.src, shard)); out = {rename(k): v for k, v in sd.items()}
         save_file(out, os.path.join(a.dst, shard), metadata={"format": "pt"}); new_map.update({k: shard for k in out}); print("converted", shard, len(out), flush=True)
+    # add every tensor the merged text-only model lacks (vision tower, mtp head, ...) from the base wrapper snapshot
+    base_dir = os.path.dirname(a.base_config); bidx = json.load(open(os.path.join(base_dir, "model.safetensors.index.json")))
+    missing_by_shard = {}
+    for k, sh in bidx["weight_map"].items():
+        if k not in new_map: missing_by_shard.setdefault(sh, []).append(k)
+    extra = {}
+    for sh, keys in missing_by_shard.items():
+        sd = load_file(os.path.join(base_dir, sh)); extra.update({k: sd[k] for k in keys}); print("from base", sh, len(keys), "tensors", flush=True)
+    if extra:
+        save_file(extra, os.path.join(a.dst, "model-extra-from-base.safetensors"), metadata={"format": "pt"}); new_map.update({k: "model-extra-from-base.safetensors" for k in extra})
+        print("added", len(extra), "base tensors (e.g.", sorted(extra)[:3], ")", flush=True)
     json.dump({"metadata": idx.get("metadata", {}), "weight_map": new_map}, open(os.path.join(a.dst, "model.safetensors.index.json"), "w"), indent=1)
     base_cfg = json.load(open(a.base_config)); src_cfg = json.load(open(os.path.join(a.src, "config.json")))
     # keep the base wrapper config (architectures, text_config, vision config) — the merged weights only changed values, not shapes
