@@ -44,5 +44,20 @@ def test_evaluate_cpu():
         assert k in out and torch.isfinite(torch.tensor(out[k])), k
 
 
+
+
+def test_cond_model():
+    from nla.flow.model import Denoiser
+    from nla.flow.cond_model import CondDenoiser, cond_fm_loss
+    torch.manual_seed(0); prior = Denoiser(16, 32, 64, 2); cm = CondDenoiser(prior, 24, n_slots=4, n_heads=2, d_head=8, gate_rank=4)
+    x = torch.randn(8, 16); t = torch.rand(8); enc = torch.randn(8, 7, 24); mask = torch.ones(8, 7, dtype=torch.bool)
+    assert torch.allclose(prior(x, t), cm(x, t, enc, mask), atol=1e-5)            # zero-init == prior
+    opt = torch.optim.Adam(cm.adapter_parameters(), lr=1e-2)
+    for _ in range(20):
+        l, _, _ = cond_fm_loss(cm, x, enc, mask, p_uncond=0.5); opt.zero_grad(); l.backward(); opt.step()
+    m2 = mask.clone(); m2[:4] = False; out = cm(x, t, enc, m2); ref = prior(x, t)
+    assert torch.allclose(out[:4], ref[:4], atol=1e-5) and (out[4:] - ref[4:]).abs().mean() > 1e-4 and torch.isfinite(out).all()
+
+
 if __name__ == "__main__":
-    test_model_and_sampler(); test_shards(); test_evaluate_cpu(); print("flow CPU tests OK")
+    test_model_and_sampler(); test_shards(); test_evaluate_cpu(); test_cond_model(); print("flow CPU tests OK")
