@@ -1,0 +1,9 @@
+# LR sweep at the chosen global batch: short runs (60M samples), FineWeb only, no snapshots. Launch with
+#   modal run scripts/modal_glp.py --task pretrain_g4 --tag glp27b_lr1e4 --config configs/glp/lrsweep.yaml --sets "train.lr=1e-4 train.batch=<per-GPU>"
+data:
+  sources:
+    - {name: fineweb, kind: hf_text, dataset: HuggingFaceFW/fineweb, config: sample-10BT, weight: 1.0}
+train: {total_samples: 6.0e7, warmup: 0.02}
+eval: {every: 500}
+ckpt: {every: 100000, snapshot_every_samples: 1.0e12}
+max_hours: 2.5
