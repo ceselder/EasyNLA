@@ -224,10 +224,12 @@ def main():
             print(f"[train] step {step} loss {rec['train/loss']:.4f} lr {lr:.2e} gn {float(gn):.2f} {rec['train/samples_per_s']/1e3:.1f}k/s ready {rec['train/ready_shards']} {samples/1e6:.0f}M", flush=True)
             if not a.no_wandb: import wandb; wandb.log(rec, step=step)
             loss_acc, n_acc = 0.0, 0
-        if rank == 0 and held is not None and step % a.eval_every == 0:
+        if held is not None and step % a.eval_every == 0:
+            # ALL ranks must run this: under FSDP every forward is a collective (weight all-gather); rank-0-only eval deadlocks the job
             ev = evaluate(ema, norm, held, device, a.eval_n, a.sample_steps, a.d_input, raw_model=model)
-            print("[eval] " + " ".join(f"{k.split('/')[1]}={v:.4f}" for k, v in ev.items() if not k.endswith(("_t0.1","_t0.3","_t0.5","_t0.7","_t0.9"))), flush=True)
-            if not a.no_wandb: import wandb; wandb.log(ev, step=step)
+            if rank == 0:
+                print("[eval] " + " ".join(f"{k.split('/')[1]}={v:.4f}" for k, v in ev.items() if not k.endswith(("_t0.1","_t0.3","_t0.5","_t0.7","_t0.9"))), flush=True)
+                if not a.no_wandb: import wandb; wandb.log(ev, step=step)
         if step % a.ckpt_every == 0:
             t_ck = time.time(); save_latest(latest, model, ema, opt, step, samples, a, a.fsdp)
             if samples >= next_snapshot:
