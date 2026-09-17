@@ -18,8 +18,7 @@ FAMILIES = {
         critics={"frozen Opus-trained AR (ar_sft500k)": "/vol/ckpts/qwen3_8b/ar_sft500k/iter_0007813",
                  "on-policy-continued AR (ar_onpol_cont)": "/vol/ckpts/qwen3_8b/ar_onpol_cont/iter_0007813"},
         max_critics=3, gold_name="Opus gold explanation",
-        default_labels=lambda labels: [l for l in labels if l.startswith("av_sft500k_lr1e4")][-1:]
-                                      + [l for l in labels if l in ("rlB_base_b256 @ 800", "rlB_klsup_cispo_b256 @ 800")],
+        default_labels=lambda labels: [l for l in labels if l.endswith(("rlB_base_b256 @ 800", "rlB_klsup_b256 @ 800", "rlB_arklonly_b256 @ 650"))],
     ),
     "qwen36_27b": dict(
         title="Qwen3.6-27B", base_id="Qwen/Qwen3.6-27B", local_snapshot=True, extraction_layer=42,
@@ -29,10 +28,22 @@ FAMILIES = {
         run_ok=lambda run: not run.startswith(("evalQ36", "smoke")),
         critics={"frozen SFT AR (ar_sft_merged, 43 blocks)": "/vol/ckpts/qwen36_27b/ar_sft_merged"},
         max_critics=2, gold_name="gold explanation (SFT target)",
-        default_labels=lambda labels: [l for l in labels if l.startswith("qwen36_av")][-1:]
-                                      + [l for l in labels if l in ("rlQ36_base @ 400", "rlQ36_klsup @ 400")],
+        default_labels=lambda labels: [l for l in labels if l.endswith(("rlQ36_base @ 400", "rlQ36_klsup @ 400", "qwen36_av @ 7813"))],
     ),
 }
+# human-readable prefix per run tag (critic variant / recipe); runs not listed keep their raw tag
+FRIENDLY = {
+    "rlB_base_b256": "MSE critic (normal NLA)", "rlB_klsup_b256": "MSE+KL critic", "rlB_arklonly_b256": "KL-only critic",
+    "rlB_cispo_b256": "MSE critic, CISPO recipe", "rlB_klsup_cispo_b256": "MSE+KL critic, CISPO recipe",
+    "rlB_base_b128": "MSE critic, 128x8", "rlB_klsup_b128": "MSE+KL critic, 128x8", "rlB_base": "MSE critic, 150-step pilot", "rlB_klsup": "MSE+KL critic, 150-step pilot",
+    "rlB_klonly_b256": "KL-only REWARD (degenerate, not the KL critic)", "rlB_klrew": "KL-in-reward (vector+KL reward)",
+    "rlB_ar_onpol": "MSE critic, on-policy AR from scratch", "rlB_ar_onpol_cont": "MSE critic, on-policy-continued AR",
+    "rlB_ema098": "MSE critic, EMA 0.98", "rlB_ema0995": "MSE critic, EMA 0.995", "rlB_lag10": "MSE critic, lag-10 critic", "rl_base": "MSE critic, first pilot",
+    "av_sft500k_lr1e4": "SFT verbalizer (start of every RL run)", "av_sft500k_lr3e5": "SFT verbalizer, lr 3e-5",
+    "qwen36_av": "SFT verbalizer (start of every RL run)", "rlQ36_base": "MSE critic (normal NLA)", "rlQ36_klsup": "MSE+KL critic",
+    "qwen36_rl_none": "July EMA experiment, no EMA", "qwen36_rl_av_d0p98": "July EMA experiment, AV EMA 0.98", "qwen36_rl_ar_d0p98": "July EMA experiment, AR EMA 0.98",
+}
+MAIN_FIRST = ("rlB_base_b256", "rlB_klsup_b256", "rlB_arklonly_b256", "av_sft500k_lr1e4", "rlQ36_base", "rlQ36_klsup", "qwen36_av")
 MAX_CTX = 4096
 DEV = "cuda"
 S = {}   # service state
@@ -69,8 +80,11 @@ def catalog(F):
             if not F["run_ok"](run) or not os.path.exists(os.path.join(d, "adapter_config.json")):
                 continue
             step = int(it.replace("iter_", ""))
-            out.append((f"{run} @ {step}", d))
-    return out
+            pre = FRIENDLY.get(run); label = f"{pre} — {run} @ {step}" if pre else f"{run} @ {step}"
+            out.append((label, d))
+    # the three critic variants + SFT start first, then everything else
+    rank = lambda item: (MAIN_FIRST.index(item[1].split("/")[-2]) if item[1].split("/")[-2] in MAIN_FIRST else len(MAIN_FIRST), item[1])
+    return sorted(out, key=rank)
 
 
 def load_rows(parquet, n=1024):
@@ -119,7 +133,7 @@ def init(family=None):
 
 
 def _safe(name):
-    return name.replace(" @ ", "__s").replace("/", "_")
+    return name.split(" — ")[-1].replace(" @ ", "__s").replace("/", "_")
 
 
 def ensure_adapter(label):
@@ -141,7 +155,7 @@ def get_critic(key, run_label=None):
         run_dir = os.path.dirname(dict(S["catalog"])[run_label]); path = f"{run_dir}/critic_latest"
         if not os.path.exists(os.path.join(path, "value_head.safetensors")):
             return None
-        key = f"own critic: {run_label.split(' @ ')[0]}"
+        key = f"own critic: {run_label.split(' @ ')[0].split(' — ')[-1]}"
         if key in S["critics"]:
             return S["critics"][key]
     else:
@@ -266,7 +280,7 @@ def build_ui(family=None):
                     f"{n_rows} held-out eval rows. Frozen-critic FVE-equiv = 1 − MSE / predict-the-mean baseline ({S['baseline']:.3f}); "
                     f"the {n_rows}-row averages in the report are the same quantity averaged. Model load took {S['load_s']:.0f}s; adapters hot-swap in seconds.")
         with gr.Row():
-            ck = gr.Dropdown(labels, value=default, multiselect=True, label="checkpoints (run @ step)")
+            ck = gr.Dropdown(labels, value=default, multiselect=True, label="checkpoints — critic variant — run @ step (type to search, e.g. \"KL-only\" or \"800\")")
         with gr.Row():
             mode = gr.Radio(["eval row", "custom text"], value="eval row", label="input")
             row = gr.Number(value=0, precision=0, label=f"eval row index (0–{n_rows-1})")
