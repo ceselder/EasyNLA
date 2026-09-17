@@ -51,9 +51,10 @@ def main():
             loss, _ = fm_loss(model, x0.to(torch.bfloat16), t, eps.to(torch.bfloat16))
             loss.backward()
             small_norm2.append(grad_vec_norm2(model))
-            flat = [p.grad.float() for p in model.parameters() if p.grad is not None]
-            if accum is None: accum = [g.clone() for g in flat]
-            else: torch._foreach_add_(accum, flat)
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            if accum is None: accum = [g.float() for g in grads]          # one fp32 accumulator (55 GB for 13.7B)
+            else:
+                for acc, g in zip(accum, grads): acc.add_(g.float())      # one temporary at a time (was: all fp32 copies at once -> OOM)
         big_norm2 = sum(float((g / a.n_small).pow(2).sum()) for g in accum)
         e_small = sum(small_norm2) / len(small_norm2)
         tr_sigma = (e_small - big_norm2) / (1 / B_small - 1 / B_big); g2 = e_small - tr_sigma / B_small
