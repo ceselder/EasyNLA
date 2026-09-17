@@ -112,12 +112,13 @@ def main():
         rng = np.random.default_rng(3); gm = torch.Generator(device=dev).manual_seed(11)
         for i in range(a.match_n):
             cands = [mz[i]] + [mz[j] for j in rng.choice([j for j in range(a.match_n) if j != i], K - 1, replace=False)]
+            order = rng.permutation(K); cands = [cands[o] for o in order]; true_idx = int(np.where(order == 0)[0][0])   # shuffle: ties must not favour the true one
             e, mk = enc_batch(cands); xi = norm.normalize(mh[i:i+1].to(dev)).expand(K, -1); score = torch.zeros(K, device=dev)
             for r in range(8):
                 tt = torch.rand(1, device=dev, generator=gm).expand(K); ee = torch.randn(xi.shape[1:], device=dev, generator=gm)[None].expand(K, -1)
                 with torch.autocast("cuda", dtype=torch.bfloat16): v = model((1 - tt)[:, None] * xi + tt[:, None] * ee, tt, e, mk).float()
                 score += ((v - (ee - xi)) ** 2).mean(-1)
-            correct += int(score.argmin().item() == 0)
+            correct += int(score.argmin().item() == true_idx and (score < score[true_idx]).sum().item() == 0 and (score == score[true_idx]).sum().item() == 1)   # strict best
         out["eval/source_match_acc"] = correct / a.match_n; out["eval/source_match_chance"] = 1 / K
         model.train()
         print(f"[eval@{step}] fm uncond {out['eval/fm_uncond']:.4f} cond {out['eval/fm_cond']:.4f} shuf {out['eval/fm_shuf']:.4f} | gain {out['eval/gain_bits_per_dim']*x0.shape[1]:.1f} bits/activation | cond FVE(x0@0.9) {out['eval/cond_fve_x0_t0.9']:.1f}% | source-match {100*out['eval/source_match_acc']:.1f}% (chance 12.5%)", flush=True)
