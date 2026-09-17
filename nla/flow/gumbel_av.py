@@ -34,7 +34,7 @@ def main():
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--batch", type=int, default=16); p.add_argument("--gen-len", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-5); p.add_argument("--tau-start", type=float, default=1.0); p.add_argument("--tau-end", type=float, default=0.5)
     p.add_argument("--eval-every", type=int, default=200); p.add_argument("--eval-n", type=int, default=128); p.add_argument("--train-skip", type=int, default=0)
-    p.add_argument("--kl-beta", type=float, default=0.1, help="weight of KL(AV || frozen SFT AV) per generated token (language anchor; 0 = off)"); p.add_argument("--max-train-rows", type=int, default=100000); p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="gumbel_av")
+    p.add_argument("--eval-at-start", action="store_true", help="evaluate the untrained (SFT) adapter on the same rows first"); p.add_argument("--kl-beta", type=float, default=0.1, help="weight of KL(AV || frozen SFT AV) per generated token (language anchor; 0 = off)"); p.add_argument("--max-train-rows", type=int, default=100000); p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="gumbel_av")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
@@ -128,6 +128,9 @@ def main():
         return fve
 
     rng = torch.Generator().manual_seed(a.seed); t0 = time.time(); best = -1e9
+    if a.eval_at_start:
+        fve0 = evaluate(0)
+        if use_wandb: wandb.log({"eval/fve": fve0}, step=0)
     for step in range(1, a.steps + 1):
         idx = torch.randint(0, tr_acts.shape[0], (a.batch,), generator=rng); acts = tr_acts[idx]
         tau = a.tau_start + (a.tau_end - a.tau_start) * step / a.steps
