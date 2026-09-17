@@ -53,8 +53,29 @@ def eval_lm(tag: str, ckpt: str = "final", extra: str = ""):
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
+@app.function(gpu="B200:2", timeout=8 * 3600, **COMMON)
+def gen_onpolicy(n_prompts: int = 300000, extra: str = ""):
+    """vLLM: Qwen3.6-27B responses to WildChat first-turn prompts -> /vol_glp/data/wildchat_onpolicy_*.parquet (+ wildchat_original.parquet)."""
+    import subprocess
+    from playground_app import resolve_base
+    os.environ["NLA_VLLM_GRAPHS"] = "0"
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    cmd = [sys.executable, "-m", "nla.flow.gen_onpolicy", "--base", base, "--out-dir", "/vol_glp/data", "--n-prompts", str(n_prompts), "--tp", "2"] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
+@app.function(gpu="B200", timeout=2 * 3600, **COMMON)
+def bnoise(tag: str, ckpt: str = "init", extra: str = ""):
+    """Gradient-noise-scale / critical-batch estimate at a checkpoint (or at init) of run <tag>."""
+    import subprocess
+    ck = "init" if ckpt == "init" else f"/vol_glp/{tag}/ckpts/{ckpt}"
+    out = f"/vol_glp/{tag}/bnoise_{ckpt}.json"
+    cmd = [sys.executable, "-m", "nla.flow.bnoise", "--ckpt", ck, "--stats", f"/vol_glp/{tag}/rep_statistics.pt", "--heldout", f"/vol_glp/{tag}/heldout_acts.pt", "--out", out] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
 @app.local_entrypoint()
-def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = ""):
+def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
     if task == "smoke":
         print("rc", smoke.remote(tag or "smoke_glp", sets))
@@ -63,3 +84,7 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", pretrain.remote(tag, config, sets))
     elif task == "eval_lm":
         print("rc", eval_lm.remote(tag, ckpt, extra))
+    elif task == "bnoise":
+        print("rc", bnoise.remote(tag, ckpt, extra))
+    elif task == "gen_onpolicy":
+        print("rc", gen_onpolicy.remote(n_prompts, extra))

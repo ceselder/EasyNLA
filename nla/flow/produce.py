@@ -12,9 +12,9 @@ class _Stop(Exception):
     pass
 
 
-def build_model(base, layer, device):
+def build_model(base, layer, device, attn_impl="sdpa"):
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16, attn_implementation="sdpa").to(device).eval()
+    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16, attn_implementation=attn_impl).to(device).eval()
     inner = model.model
     layers = inner.layers if hasattr(inner, "layers") else inner.language_model.layers
     # keep blocks 0..layer (the activation is the OUTPUT of block `layer`, HF hidden_states[layer+1]); drop the rest
@@ -33,16 +33,56 @@ def build_model(base, layer, device):
     return model, cap
 
 
-def doc_stream(n_producers, index, skip, seed, hf_token, dataset, config):
+def _hf_text_stream(dataset, config, n_producers, index, skip, seed, hf_token, field="text"):
     from datasets import load_dataset
     from datasets.distributed import split_dataset_by_node
     ds = load_dataset(dataset, name=config, split="train", streaming=True, token=hf_token)
     ds = ds.shuffle(seed=seed, buffer_size=10_000)
     ds = split_dataset_by_node(ds, rank=index, world_size=n_producers)
-    if skip:
-        ds = ds.skip(skip)
+    if skip: ds = ds.skip(skip)
     for ex in ds:
-        yield ex["text"]
+        yield ex[field]
+
+
+def _chat_parquet_stream(pattern, n_producers, index, skip, seed, tok):
+    """Rows with a `messages` JSON column -> chat-template text (loops forever over the files; shuffled per pass)."""
+    import glob, json, random
+    import pyarrow.parquet as pq
+    files = sorted(glob.glob(pattern)); assert files, f"no chat parquet matches {pattern}"
+    rng = random.Random(seed + index); n = 0; epoch = 0
+    while True:
+        rows = []
+        for f in files:
+            t = pq.read_table(f, columns=["messages"]).to_pylist(); rows += [r["messages"] for r in t]
+        rows = rows[index::n_producers]; rng.shuffle(rows)
+        for msgs in rows:
+            n += 1
+            if n <= skip: continue
+            msgs = json.loads(msgs) if isinstance(msgs, str) else msgs
+            yield tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+        epoch += 1
+
+
+def doc_stream(sources, n_producers, index, skips, seed, hf_token, tok):
+    """Interleave weighted sources: sources = [{name, weight, kind: hf_text|chat_parquet, ...}]. skips = {name: docs already consumed}."""
+    import random
+    rng = random.Random(seed * 1000 + index)
+    its, names, weights = [], [], []
+    for src in sources:
+        if src.get("weight", 0) <= 0: continue
+        if src["kind"] == "hf_text":
+            it = _hf_text_stream(src["dataset"], src.get("config"), n_producers, index, skips.get(src["name"], 0), seed, hf_token, src.get("field", "text"))
+        elif src["kind"] == "chat_parquet":
+            it = _chat_parquet_stream(src["pattern"], n_producers, index, skips.get(src["name"], 0), seed, tok)
+        else:
+            raise ValueError(src["kind"])
+        its.append(it); names.append(src["name"]); weights.append(float(src["weight"]))
+    while its:
+        i = rng.choices(range(len(its)), weights=weights)[0]
+        try:
+            yield names[i], next(its[i])
+        except StopIteration:
+            print(f"[prod{index}] source {names[i]} exhausted", flush=True); its.pop(i); names.pop(i); weights.pop(i)
 
 
 class Welford:
@@ -64,7 +104,8 @@ def main():
     p.add_argument("--shard-size", type=int, default=16384); p.add_argument("--max-ready", type=int, default=48)
     p.add_argument("--max-len", type=int, default=2048); p.add_argument("--min-len", type=int, default=16)
     p.add_argument("--tokens-per-batch", type=int, default=32768); p.add_argument("--buffer-docs", type=int, default=512)
-    p.add_argument("--dataset", default="HuggingFaceFW/fineweb"); p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--sources-json", required=True, help="JSON list of sources: [{name, weight, kind: hf_text|chat_parquet, dataset/config | pattern}]")
+    p.add_argument("--attn-impl", default="sdpa")
     p.add_argument("--seed", type=int, default=0); p.add_argument("--stats-n", type=int, default=2_000_000)
     p.add_argument("--heldout-n", type=int, default=65536); p.add_argument("--heldout-docs-full", type=int, default=64)
     p.add_argument("--max-tokens", type=float, default=float("inf"), help="stop after this many tokens (this producer)")
@@ -76,16 +117,18 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.base); tok.padding_side = "right"
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
-    model, cap = build_model(a.base, a.layer, device)
+    model, cap = build_model(a.base, a.layer, device, a.attn_impl)
     os.makedirs(a.out_dir, exist_ok=True)
     prog_path = os.path.join(a.out_dir, f"progress_{a.index}.json")
-    prog = json.load(open(prog_path)) if os.path.exists(prog_path) else {"docs": 0, "tokens": 0, "acts": 0, "shards": 0}
+    prog = json.load(open(prog_path)) if os.path.exists(prog_path) else {"docs": 0, "tokens": 0, "acts": 0, "shards": 0, "per_source": {}}
+    prog.setdefault("per_source", {})
     print(f"[prod{a.index}] resume {prog}", flush=True)
     stats_path = os.path.join(a.out_dir, "rep_statistics.pt"); held_path = os.path.join(a.out_dir, "heldout_acts.pt")
     do_stats = a.index == 0 and not os.path.exists(stats_path); do_held = a.index == 0 and not os.path.exists(held_path)
     welford = Welford(model.config.hidden_size if hasattr(model.config, "hidden_size") else model.config.text_config.hidden_size, device) if do_stats else None
     held = {"acts": [], "doc": [], "pos": [], "n": 0, "full_docs": []} if do_held else None
-    stream = doc_stream(a.n_producers, a.index, prog["docs"], a.seed, os.environ.get("HF_TOKEN"), a.dataset, a.dataset_config)
+    sources = json.loads(a.sources_json)
+    stream = doc_stream(sources, a.n_producers, a.index, {k: v.get("docs", 0) for k, v in prog["per_source"].items()}, a.seed, os.environ.get("HF_TOKEN"), tok)
     buf_acts, buf_doc, buf_pos, buf_tokens = [], [], [], 0
     t0 = time.time(); tok_since = 0; last_log = t0
     docs_buf = []
@@ -99,12 +142,14 @@ def main():
         prog["shards"] += 1; prog["acts"] += int(acts.shape[0])
         buf_acts = [rest] if rest.shape[0] else []; buf_doc = [doc[a.shard_size:]] if rest.shape[0] else []; buf_pos = [pos[a.shard_size:]] if rest.shape[0] else []; buf_tokens = 0
         json.dump(prog, open(prog_path + ".tmp", "w")); os.replace(prog_path + ".tmp", prog_path)
-    for text in stream:
+    for src_name, text in stream:
         if a.stop_file and os.path.exists(a.stop_file): break
         if prog["tokens"] >= a.max_tokens: break
-        docs_buf.append(text)
+        docs_buf.append((src_name, text))
         if len(docs_buf) < a.buffer_docs: continue
-        enc = tok(docs_buf, add_special_tokens=False, truncation=True, max_length=a.max_len)["input_ids"]
+        enc = tok([t for _, t in docs_buf], add_special_tokens=False, truncation=True, max_length=a.max_len)["input_ids"]
+        for (sn, _), ids in zip(docs_buf, enc):
+            ps = prog["per_source"].setdefault(sn, {"docs": 0, "tokens": 0}); ps["docs"] += 1; ps["tokens"] += len(ids)
         docs_buf = []
         items = sorted([(len(ids), ids) for ids in enc if len(ids) >= a.min_len], key=lambda x: x[0])
         # length-bucketed batches with <= tokens_per_batch padded tokens

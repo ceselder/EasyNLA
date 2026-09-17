@@ -7,8 +7,11 @@ gpus:
   producers: 4                 # GPUs streaming activations (LM truncated to 43 blocks); ~12.5k tok/s each (measured)
   consumers: 4                 # FSDP trainer GPUs
 data:
-  dataset: HuggingFaceFW/fineweb
-  config: sample-10BT
+  sources:                     # weighted mixture; chat sources are rendered with the Qwen chat template (so the prior covers chat-formatted + on-policy text)
+    - {name: fineweb, kind: hf_text, dataset: HuggingFaceFW/fineweb, config: sample-10BT, weight: 0.85}
+    - {name: wildchat_onpolicy, kind: chat_parquet, pattern: /vol_glp/data/wildchat_onpolicy_*.parquet, weight: 0.10}   # Qwen3.6-27B's own responses (vLLM, T=0.7)
+    - {name: wildchat_original, kind: chat_parquet, pattern: /vol_glp/data/wildchat_original.parquet, weight: 0.05}     # WildChat's GPT responses
+  attn_impl: sdpa              # HF attention kernel for the producer LM
   max_len: 2048                # docs truncated to this many tokens
   min_len: 16                  # shorter docs dropped
   tokens_per_batch: 32768      # padded tokens per LM forward (length-bucketed, right padding)
@@ -30,7 +33,7 @@ model:                         # GLP TransformerMLPDenoiser; d_model = 2 x d_act
 train:
   batch: 4096                  # per GPU (GLP: 4096 total on one A100)
   lr: 5.0e-5                   # GLP value; NOT scaled for the 3x larger global batch (ablate)
-  total_samples: 2.0e9         # single pass, no activation seen twice
+  total_samples: 8.0e9         # single pass, no activation seen twice (8x GLP; ~56 h at 4:4 -> relaunch the same tag to resume across 23 h windows)
   warmup: 0.01
   min_lr_frac: 0.1             # cosine floor
   clip: 1.0
@@ -43,6 +46,6 @@ eval:
   n: 32768                     # held-out activations scored (FD uses 16384 + reports the real-vs-real floor)
   sample_steps: 50             # Euler steps for FD samples
 ckpt:
-  every: 10000                 # steps -> latest/ (resumable, sharded, ~190 GB for 13.7B)
+  every: 20000                 # steps -> latest/ (resumable, sharded DCP ~220 GB for 13.7B; ~10 min at 360 MB/s)
   snapshot_every_samples: 2.56e8   # full bf16 EMA snapshots (27 GB each)
 max_hours: 22.3                # stop + save before Modal's 23 h limit; relaunch resumes from latest/

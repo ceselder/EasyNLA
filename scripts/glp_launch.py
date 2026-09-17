@@ -26,7 +26,7 @@ def main():
     def start_prod(i):
         cmd = [sys.executable, "-m", "nla.flow.produce", "--base", base, "--layer", str(C["layer"]), "--n-producers", str(n_prod), "--index", str(i),
                "--shard-dir", a.shard_dir, "--out-dir", a.out_dir, "--max-tokens", str(D["max_tokens_per_producer"]), "--stop-file", stop_file,
-               "--dataset", D["dataset"], "--dataset-config", D["config"], "--max-len", str(D["max_len"]), "--min-len", str(D["min_len"]),
+               "--sources-json", json.dumps(D["sources"]), "--attn-impl", D.get("attn_impl", "sdpa"), "--max-len", str(D["max_len"]), "--min-len", str(D["min_len"]),
                "--tokens-per-batch", str(D["tokens_per_batch"]), "--buffer-docs", str(D["buffer_docs"]), "--seed", str(D["seed"]),
                "--shard-size", str(S["size"]), "--max-ready", str(S["max_ready"]), "--stats-n", str(ST["n"]), "--heldout-n", str(ST["heldout_n"]),
                "--heldout-docs-full", str(ST["heldout_docs_full"])] + ([] if D.get("drop_pos0", True) else ["--keep-pos0"])

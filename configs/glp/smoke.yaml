@@ -2,7 +2,10 @@
 gpus: {producers: 2, consumers: 1}
 model: {d_model: 2048, d_mlp: 4096, n_layers: 4}
 train: {batch: 2048, total_samples: 8.0e6, fsdp: true}
-data: {max_tokens_per_producer: 6.0e6}
+data:
+  max_tokens_per_producer: 6.0e6
+  sources:
+    - {name: fineweb, kind: hf_text, dataset: HuggingFaceFW/fineweb, config: sample-10BT, weight: 1.0}
 shards: {size: 8192}
 stats: {n: 200000, heldout_n: 16384, heldout_docs_full: 16}
 eval: {every: 100, n: 8192}
