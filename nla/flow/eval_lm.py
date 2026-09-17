@@ -15,7 +15,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base", required=True); p.add_argument("--ckpt", required=True); p.add_argument("--stats", required=True); p.add_argument("--heldout", required=True)
     p.add_argument("--out", required=True); p.add_argument("--layer", type=int, default=42); p.add_argument("--n-docs", type=int, default=64); p.add_argument("--pos-per-doc", type=int, default=6)
-    p.add_argument("--k-next", type=int, default=16); p.add_argument("--t-start", type=float, nargs="*", default=[0.3, 0.5, 0.7]); p.add_argument("--n-steps", type=int, default=20)
+    p.add_argument("--weights", default="ema", choices=["ema", "raw"]); p.add_argument("--k-next", type=int, default=16); p.add_argument("--t-start", type=float, nargs="*", default=[0.3, 0.5, 0.7]); p.add_argument("--n-steps", type=int, default=20)
     a = p.parse_args(); dev = "cuda"
     from transformers import AutoModelForCausalLM
     lm = AutoModelForCausalLM.from_pretrained(a.base, dtype=torch.bfloat16, attn_implementation="sdpa").to(dev).eval()
@@ -23,7 +23,11 @@ def main():
     norm = Normalizer.load(a.stats).to(dev)
     m = torch.load(os.path.join(a.ckpt, "model.pt"), map_location="cpu"); cfg = m["args"]
     den = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"]).to(dev)
-    e = torch.load(os.path.join(a.ckpt, "ema.pt"), map_location="cpu"); den.load_state_dict({k: v.float() for k, v in e["ema"].items()}); den.eval()
+    if a.weights == "raw" and m.get("model") is not None:
+        den.load_state_dict({k: v.float() for k, v in m["model"].items()}); print("[eval_lm] raw weights", flush=True)
+    else:
+        e = torch.load(os.path.join(a.ckpt, "ema.pt"), map_location="cpu"); den.load_state_dict({k: v.float() for k, v in e["ema"].items()}); print("[eval_lm] EMA weights", flush=True)
+    den.eval()
     held = torch.load(a.heldout, map_location="cpu"); docs = held["full_docs"][: a.n_docs]
     g = torch.Generator(device=dev).manual_seed(0); rng = torch.Generator().manual_seed(0)
     patch = {"vec": None, "pos": None}
@@ -58,7 +62,7 @@ def main():
                     nll = F.cross_entropy(logits, ids[0, pos + 1: pos + a.k_next + 1], reduction="mean").item()
                     res[c].append(nll)
                 patch["vec"] = None
-    out = {"n_positions": len(res["orig"]), "k_next": a.k_next, "ckpt": a.ckpt, "nll": {c: sum(v) / len(v) for c, v in res.items()}}
+    out = {"n_positions": len(res["orig"]), "k_next": a.k_next, "ckpt": a.ckpt, "weights": a.weights, "nll": {c: sum(v) / len(v) for c, v in res.items()}}
     out["delta_nll_vs_orig"] = {c: out["nll"][c] - out["nll"]["orig"] for c in conds if c != "orig"}
     out["geometry"] = {k: {kk: sum(vv) / max(1, len(vv)) for kk, vv in v.items()} for k, v in geo.items() if v["cos"]}
     out["seconds"] = time.time() - t0

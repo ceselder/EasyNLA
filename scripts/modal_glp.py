@@ -57,7 +57,7 @@ def eval_lm(tag: str, ckpt: str = "final", extra: str = ""):
     import subprocess
     from playground_app import resolve_base
     base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
-    out = f"/vol_glp/{tag}/eval_lm_{ckpt}.json"
+    out = f"/vol_glp/{tag}/eval_lm_{ckpt}{'_raw' if '--weights raw' in extra else ''}.json"
     cmd = [sys.executable, "-m", "nla.flow.eval_lm", "--base", base, "--ckpt", f"/vol_glp/{tag}/ckpts/{ckpt}", "--stats", f"/vol_glp/{tag}/rep_statistics.pt",
            "--heldout", f"/vol_glp/{tag}/heldout_acts.pt", "--out", out] + extra.split()
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
