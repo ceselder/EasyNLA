@@ -22,16 +22,16 @@ def _serve(family):
 
 
 # Qwen3-8B: https://safety-sahan--nla-playground-web.modal.run
-@app.function(gpu="B200", volumes=VOLS, secrets=SECRETS, timeout=60 * 60, scaledown_window=1800, max_containers=1)
+@app.function(gpu=["B200", "H200", "H100", "A100-80GB"], volumes=VOLS, secrets=SECRETS, timeout=60 * 60, scaledown_window=1800, max_containers=1)
 @modal.concurrent(max_inputs=4)
 @modal.asgi_app()
-def web():
+def web():   # 8B: 16 GB base + 11 GB per critic -> any 80 GB card is fine; ordered by preference, Modal takes the first with capacity
     return _serve("qwen3_8b")
 
 
 # Qwen3.6-27B: https://safety-sahan--nla-playground-web-q36.modal.run (cold start downloads the 54 GB base to local disk)
-@app.function(gpu="B200", volumes=VOLS, secrets=SECRETS, timeout=60 * 60, scaledown_window=1800, max_containers=1)
+@app.function(gpu=["B200", "H200"], volumes=VOLS, secrets=SECRETS, timeout=60 * 60, scaledown_window=1800, max_containers=1)
 @modal.concurrent(max_inputs=4)
 @modal.asgi_app()
-def web_q36():
+def web_q36():   # 27B: 54 GB base + 36 GB critic (+ a second critic) needs >= 141 GB -> B200 or H200 only
     return _serve("qwen36_27b")
