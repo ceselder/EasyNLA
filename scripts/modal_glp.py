@@ -11,7 +11,8 @@ from modal_nla_exp import image_base, SECRETS, REPO_LOCAL, REPO_REMOTE, REPO_IGN
 
 vol_glp = modal.Volume.from_name("nla-glp", create_if_missing=True)
 vol_exp = modal.Volume.from_name("nla-exp")
-VOLS = {"/vol_glp": vol_glp, "/vol": vol_exp}
+vol_q36 = modal.Volume.from_name("nla-qwen36-ema")
+VOLS = {"/vol_glp": vol_glp, "/vol": vol_exp, "/vol_q36": vol_q36}
 image = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE)
 app = modal.App("nla-glp", image=image)
 COMMON = dict(volumes=VOLS, secrets=SECRETS, cpu=32, memory=256 * 1024, ephemeral_disk=600 * 1024)
@@ -125,8 +126,20 @@ def sample_diag(tag: str, ckpt: str, extra: str = ""):
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
+@app.function(gpu="B200", timeout=23 * 3600, **COMMON)
+def train_cond(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = ""):
+    """Stage 2: conditional adapter on (activation, explanation) pairs (27B SFT pairs), frozen prior + frozen 27B encoder."""
+    import subprocess
+    from playground_app import resolve_base
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    out = f"/vol_glp/cond/{tag}"
+    cmd = [sys.executable, "-m", "nla.flow.train_cond", "--prior", f"/vol_glp/{prior_tag}/ckpts/{prior_ckpt}", "--stats", f"/vol_glp/{prior_tag}/rep_statistics.pt",
+           "--base", base, "--train-parquet", "/vol_q36/data/sft/av_sft_train.parquet", "--val-parquet", "/vol_q36/data/sft/av_sft_val.parquet", "--out", out, "--tag", tag] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
 @app.local_entrypoint()
-def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768):
+def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768, prior_tag: str = "glp27b_main"):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
     if task == "smoke":
         print("rc", smoke.remote(tag or "smoke_glp", sets))
@@ -142,6 +155,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", bench_producer.remote(attn_impl, tokens_per_batch, extra=extra))
     elif task == "gumbel_av":
         print("rc", gumbel_av.remote(tag or "gumbel_av", extra))
+    elif task == "train_cond":
+        print("rc", train_cond.remote(tag or "cond_smoke", prior_tag, ckpt, extra))
     elif task == "sample_diag":
         print("rc", sample_diag.remote(tag, ckpt, extra))
     elif task == "bnoise":
