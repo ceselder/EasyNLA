@@ -1731,7 +1731,7 @@ def main():
     # ---- reward mode (actor reward; the AR/critic always trains on vector-MSE) ----
     p.add_argument("--reward-mode",
                    choices=["vector_mse", "downstream_mse", "downstream_plus_fve",
-                            "downstream_kl", "downstream_ladder", "vector_plus_kl"],
+                            "downstream_kl", "downstream_ladder", "vector_plus_kl", "flow"],
                    default="vector_mse",
                    help="ACTOR reward. vector_mse (DEFAULT) = -MSE(reconstruction, gold) "
                         "in L42 activation space (the classic NLA reward). downstream_mse "
@@ -1804,7 +1804,18 @@ def main():
                         "1%% test split). When set, the trainer trains on ALL rows of "
                         "--rl-parquet (no doc-hash carve-out) and evaluates on the first "
                         "--eval-n-prompts rows of this file.")
-    p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl"],
+    # ---- flow critic (--ar-loss flow): the text-conditional activation flow replaces the MSE reconstructor. Reward (--reward-mode flow)
+    # = -mean_k FM loss at a fixed t grid with ONE eps per GRPO group (a K-point estimate of -log p(h|z) up to group-shared constants);
+    # the adapter is co-trained on the rollouts with the FM loss; the vector FVE curve comes from the flow's x0-prediction at t=0.9.
+    p.add_argument("--flow-prior", default=None, help="prior snapshot dir with model.pt (nla.flow.train snapshot)")
+    p.add_argument("--flow-adapter", default=None, help="stage-2 conditional adapter (adapter_latest.pt from nla.flow.train_cond)")
+    p.add_argument("--flow-stats", default=None, help="rep_statistics.pt of the prior run (per-dim mean/std)")
+    p.add_argument("--flow-lr", type=float, default=1e-4)
+    p.add_argument("--flow-p-uncond", type=float, default=0.1)
+    p.add_argument("--flow-t-grid", default="0.2,0.4,0.6,0.8", help="noise levels for the reward estimate (shared eps per group)")
+    p.add_argument("--flow-enc-layer", type=int, default=42, help="layer of the frozen base (actor with adapters off) read as the explanation encoder")
+    p.add_argument("--flow-micro-batch", type=int, default=32)
+    p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl", "flow"],
                    default="vector_mse",
                    help="Critic (AR) TRAINING loss. vector_mse (DEFAULT) = classic "
                         "reconstruction MSE. downstream_kl = train the AR with the SAME "
@@ -2127,16 +2138,37 @@ def main():
         if (_crit_latest / "value_head.safetensors").exists():
             ar_src = str(_crit_latest)
             print(f"[critic] RESUMING co-trained critic from {ar_src}")
-    print(f"[critic] loading {ar_src}")
-    critic = NLACriticModel.from_pretrained(
-        ar_src, torch_dtype=torch.bfloat16,
-    ).to(device)
-    # NLACriticModel.from_pretrained returns params with requires_grad=True by
-    # default. Freeze everything first, then conditionally unfreeze backbone.
-    for p_ in critic.parameters():
-        p_.requires_grad_(False)
+    flow = None
+    if args.ar_loss == "flow":
+        # the flow critic replaces the MSE reconstructor entirely (no NLACriticModel in memory; --ar-ckpt is unused)
+        from nla.flow.rl_critic import FlowCritic
+        assert args.flow_prior and args.flow_adapter and args.flow_stats, "--ar-loss flow needs --flow-prior/--flow-adapter/--flow-stats"
+        if args.reward_mode != "flow":
+            print(f"[flow] NOTE: --ar-loss flow with --reward-mode {args.reward_mode}: the actor is rewarded by the flow's x0-prediction MSE", flush=True)
+        critic = None
+        flow = FlowCritic(args.flow_prior, args.flow_adapter, args.flow_stats, actor, tokenizer, device, enc_layer=args.flow_enc_layer,
+                          lr=args.flow_lr, p_uncond=args.flow_p_uncond, t_grid=[float(x) for x in args.flow_t_grid.split(",")],
+                          micro_batch=args.flow_micro_batch, train_adapter=args.train_critic)
+        _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
+        if args.resume_from_lora is not None and _flow_latest.exists():
+            print(f"[flow] RESUMING co-trained flow adapter from {_flow_latest} (rl step {flow.load(str(_flow_latest))})", flush=True)
+    else:
+        print(f"[critic] loading {ar_src}")
+        critic = NLACriticModel.from_pretrained(
+            ar_src, torch_dtype=torch.bfloat16,
+        ).to(device)
+        # NLACriticModel.from_pretrained returns params with requires_grad=True by
+        # default. Freeze everything first, then conditionally unfreeze backbone.
+        for p_ in critic.parameters():
+            p_.requires_grad_(False)
     critic_optim = None
-    if args.train_critic:
+    if args.train_critic and flow is not None:
+        critic_trainable = flow.trainable
+        critic_optim = flow.optim
+        critic_ema = CriticEMA(flow.model, args.critic_ema_decay, lag_steps=args.critic_lag_steps)
+        print(f"[critic] FLOW critic CO-TRAINED (conditioning adapter, frozen prior), lr={args.flow_lr}, "
+              f"trainable={sum(p.numel() for p in critic_trainable)/1e6:.0f}M params; EMA decay={args.critic_ema_decay}", flush=True)
+    elif args.train_critic:
         # Per paper §RL training: AR is co-trained simultaneously with AV on
         # the SAME explanations the actor produces this step. Loss = MSE against
         # the gold activation, normalised. AR's gradient does NOT flow back into
@@ -2200,8 +2232,9 @@ def main():
                              "frozen critic there is nothing to average.")
         critic_ema = NoEMA()
         print(f"[critic] FROZEN (eval-only scorer)")
-    critic.eval()  # Qwen3 has no dropout — eval mode is fine for both grad/no-grad
-    print(f"[critic] value_head shape={tuple(critic.value_head.weight.shape)}")
+    if critic is not None:
+        critic.eval()  # Qwen3 has no dropout — eval mode is fine for both grad/no-grad
+        print(f"[critic] value_head shape={tuple(critic.value_head.weight.shape)}")
 
     # ---- karvonen hook on actor (for training-time forward only; rollout uses vLLM) ----
     vectors_ref = [None]
@@ -2406,7 +2439,7 @@ def main():
                 print(f"[resume] WARN: actor optimizer state incompatible "
                       f"({_e}) — Adam moments restart.", flush=True)
             if critic_ema.enabled and "critic_ema" in _opt_st:
-                if args.ar_lora:
+                if args.ar_lora and flow is None:
                     # Same reason the critic optimizer restore is skipped below:
                     # the saved shadow belongs to the merged-away LoRA params.
                     print("[resume] --ar-lora: skipping critic EMA restore "
@@ -2416,7 +2449,7 @@ def main():
                     critic_ema.load_state_dict(_opt_st["critic_ema"])
                     print("[resume] critic EMA shadow restored.", flush=True)
             if critic_optim is not None and "critic_optim" in _opt_st:
-                if args.ar_lora:
+                if args.ar_lora and flow is None:
                     # critic_latest is saved MERGED and resume injects a FRESH
                     # zero-init LoRA — the saved moments belong to the old,
                     # merged-away LoRA parameters. Restoring them would apply
@@ -2745,17 +2778,24 @@ def main():
         # --critic-ema-decay > 0; the co-train loss below always runs on live
         # weights. swapped() restores in a finally, so a crash here cannot
         # leave EMA weights in the live slots.
+        flow_rewards = None
         with critic_ema.swapped():
-            rewards, recon_preds = score_with_critic(
-                critic, tokenizer, all_explanations, all_activations,
-                template, mse_scale_f, device,
-            )
+            if flow is not None:
+                # flow reward (shared eps per group, fixed t grid) + vector-MSE of the x0-prediction @ t=0.9 (the FVE curve)
+                flow_rewards, rewards, recon_preds = flow.score(all_explanations, all_activations, all_prompt_group, seed=step)
+            else:
+                rewards, recon_preds = score_with_critic(
+                    critic, tokenizer, all_explanations, all_activations,
+                    template, mse_scale_f, device,
+                )
         # TRUNCATED -> FAILED: a rollout that hit the max_new_tokens cap must not
         # be scored as if its explanation were complete (a cut-off <explanation>
         # that still parses scores artificially — the "FVE peaks then drops"
         # pathology). The -2 failure reward it gets instead IS trained on — the
         # anti-runaway gradient — and keeps FVE/extraction_rate honest.
         rewards = [None if t else r for r, t in zip(rewards, all_truncated)]
+        if flow_rewards is not None:
+            flow_rewards = [None if t else r for r, t in zip(flow_rewards, all_truncated)]
 
         # ---- downstream-MSE reward (actor-only; the critic still trains on the
         # vector-MSE targets, untouched). reward = -MSE on the FINAL pre-lm_head
@@ -2813,6 +2853,8 @@ def main():
                 None if (rv is None or rd is None) else (rv + _w * rd)
                 for rv, rd in zip(rewards, ds_rewards)
             ]
+        elif args.reward_mode == "flow":
+            actor_rewards = flow_rewards
         else:  # downstream_plus_fve: -mse_vec + w * -mse_downstream, per sample
             _w = args.downstream_fve_weight
             actor_rewards = [
@@ -2837,6 +2879,11 @@ def main():
         # Subtracted from the GRPO signal (rewards_t) only, so FVE stays a pure
         # reconstruction metric. Default (0) is a no-op.
         shape_terms = {}
+        if flow_rewards is not None:
+            _fv = [r for r in flow_rewards if r is not None]
+            if _fv:
+                shape_terms["av/flow_reward_mean"] = float(np.mean(_fv))
+                shape_terms["av/flow_fm_loss"] = -float(np.mean(_fv))   # conditional FM loss of the rollouts (lower = explanation explains h better)
         if ds_rewards is not None:
             _dsv = [r for r in ds_rewards if r is not None]
             if _dsv:
@@ -3019,6 +3066,7 @@ def main():
         if args.train_critic and critic_optim is not None and _critic_now:
             crit_inputs = []
             crit_golds = []
+            crit_texts = []   # raw explanation strings (flow critic encodes them itself)
             crit_pg = []   # prompt_group per crit input (for the AR downstream-KL loss)
             # `keep` excludes injection-failed rollouts (cjk/marker) — don't train the
             # AR reconstructor on garbage explanations (corrupt regression targets).
@@ -3040,6 +3088,7 @@ def main():
                     continue
                 crit_inputs.append(torch.tensor(ids, dtype=torch.long))
                 crit_golds.append(act)
+                crit_texts.append(expl)
                 crit_pg.append(all_prompt_group[i])
             # AR downstream-KL is fwd+bwd-through-base per rollout — cap the count
             # (strided subsample so it spans prompts, not just the first few groups).
@@ -3063,7 +3112,13 @@ def main():
                 finite = True
                 cmb = max(1, args.critic_micro_batch)
                 _use_kl_ar = (args.ar_loss == "downstream_kl" and kl_gold_cache)
-                for cs in range(0, bs_total, cmb):
+                if flow is not None:
+                    # flow critic: conditional FM loss on the kept rollouts (per-sample condition dropout); grads on the adapter
+                    accumulated = flow.train_backward(crit_texts, crit_golds, accum)
+                    finite = math.isfinite(accumulated)
+                    if not finite:
+                        print(f"step {step}: flow critic loss non-finite, skipping", flush=True)
+                for cs in ([] if flow is not None else range(0, bs_total, cmb)):
                     chunk = list(range(cs, min(cs + cmb, bs_total)))
                     bs = len(chunk)
                     if _use_kl_ar:
@@ -3310,6 +3365,11 @@ def main():
 
             def _score_eval_rows():
                 """Reward per eval row under whatever critic weights are live now."""
+                if flow is not None:
+                    _fr, _vr, _ = flow.score(_eval_expls, [_eval_prompts_with_acts[ei][1] for ei in range(len(eval_rows))],
+                                             list(range(len(eval_rows))), seed=7_777_777 + step)
+                    _score_eval_rows.flow = _fr
+                    return [(-2.0 if v is None else v) for v in _vr]
                 out = []
                 for ei in range(len(eval_rows)):
                     activation = _eval_prompts_with_acts[ei][1]
@@ -3332,6 +3392,20 @@ def main():
                 return out
 
             eval_rewards_s = _score_eval_rows()          # live critic (canonical)
+            if flow is not None:
+                _efr = getattr(_score_eval_rows, "flow", [])
+                _efv = [r for r in _efr if r is not None]
+                if _efv:
+                    log["eval/flow_reward_mean"] = float(np.mean(_efv))
+                    log["eval/flow_fm_loss"] = -float(np.mean(_efv))
+                # dump the eval rollouts WITH their activations so a frozen scorer (MSE critic / frozen stage-2 flow) can be run offline
+                try:
+                    _dump_dir = save_dir / "eval_rollouts"; _dump_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save({"step": step, "explanations": _eval_expls, "vector_rewards": eval_rewards_s, "flow_rewards": _efr,
+                                "activations": torch.stack([torch.as_tensor(_eval_prompts_with_acts[ei][1]).to(torch.float16).cpu() for ei in range(len(eval_rows))])},
+                               str(_dump_dir / f"step_{step:06d}_r{int(os.environ.get('RANK', 0))}.pt"))
+                except Exception as _e:
+                    print(f"[eval] rollout dump failed: {_e}", flush=True)
             eval_rewards_ema = None
             if critic_ema.enabled:
                 with critic_ema.swapped():
@@ -3482,7 +3556,9 @@ def main():
             out_dir = save_dir / f"iter_{step + 1:06d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             actor.save_pretrained(str(out_dir))
-            if args.train_critic:
+            if args.train_critic and flow is not None:
+                flow.save(str(save_dir / "flow_latest"), step + 1)
+            elif args.train_critic:
                 # The co-trained critic is the reward model behind this run's
                 # FVE curve; without it, resume/eval scores against the stale
                 # SFT critic. Full-model save is ~11GB, so keep latest-only:

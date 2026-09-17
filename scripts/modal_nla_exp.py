@@ -75,7 +75,8 @@ app = modal.App(APP_NAME, image=image)
 vol = modal.Volume.from_name(VOL, create_if_missing=True)
 vol_q36 = modal.Volume.from_name(VOL_Q36)
 SECRETS = [modal.Secret.from_name("nla-exp-secrets")]
-VOLS = {"/vol": vol, "/vol_q36": vol_q36}
+vol_glp = modal.Volume.from_name("nla-glp", create_if_missing=True)   # flow prior + stage-2 adapters (flow critic for RL)
+VOLS = {"/vol": vol, "/vol_q36": vol_q36, "/vol_glp": vol_glp}
 
 BASE_8B = "Qwen/Qwen3-8B"
 LAYER_8B = 24
