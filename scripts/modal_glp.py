@@ -138,8 +138,21 @@ def train_cond(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
+@app.function(gpu="B200", timeout=6 * 3600, **COMMON)
+def mine_pairs(tag: str, av_merged: str, parquet: str = "/vol_q36/data/rl/rl_shuf.parquet", n_samples: int = 2, shard: int = 0, nshards: int = 8, extra: str = ""):
+    """On-policy (activation, explanation) pairs: sample from a merged 27B AV through the vllm-lens injection path (same as RL rollouts)."""
+    import subprocess
+    from modal_nla_exp import _prep
+    os.environ.update({"NLA_VLLM_GRAPHS": "0", "NLA_VLLM_EAGER": "1", "VLLM_ATTENTION_BACKEND": "FLASH_ATTN"})
+    _prep(patch_lens=True)
+    out = f"/vol_glp/pairs/{tag}"
+    cmd = [sys.executable, f"{REPO_REMOTE}/scripts/mine_av_rollouts.py", "--av-ckpt", av_merged, "--parquet", parquet, "--sidecar", parquet, "--out-dir", out,
+           "--n-samples", str(n_samples), "--shard", str(shard), "--nshards", str(nshards), "--vllm-gpu-mem", "0.85", "--vllm-max-len", "1024"] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
 @app.local_entrypoint()
-def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768, prior_tag: str = "glp27b_main"):
+def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768, prior_tag: str = "glp27b_main", av_merged: str = "/vol/ckpts/qwen36_27b/av_sft_merged", nshards: int = 8):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
     if task == "smoke":
         print("rc", smoke.remote(tag or "smoke_glp", sets))
@@ -155,6 +168,9 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", bench_producer.remote(attn_impl, tokens_per_batch, extra=extra))
     elif task == "gumbel_av":
         print("rc", gumbel_av.remote(tag or "gumbel_av", extra))
+    elif task == "mine_pairs":   # all shards in parallel, one B200 each
+        calls = [mine_pairs.spawn(tag or "sft_av", av_merged, shard=i, nshards=nshards, extra=extra) for i in range(nshards)]
+        print("rc", [c.get() for c in calls])
     elif task == "train_cond":
         print("rc", train_cond.remote(tag or "cond_smoke", prior_tag, ckpt, extra))
     elif task == "sample_diag":
