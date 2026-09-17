@@ -154,7 +154,7 @@ def load_latest(path, model, ema, opt, fsdp):
     return ck["step"], ck["samples"]
 
 
-def save_snapshot(path, ema, model, step, samples, args, with_raw=False):
+def save_snapshot(path, ema, model, step, samples, args, with_raw=True):   # raw weights too: the noise-scale / lr diagnostics must run at the raw point (the EMA lags and gives a huge consistent gradient)
     """Full (unsharded) bf16 EMA weights for downstream use: <path>/ema.pt {"ema": sd}, <path>/model.pt {"args", "step", "samples"[, "model"]}."""
     ema_sd = _full_sd(ema); raw_sd = _full_sd(model) if with_raw else None
     if dist.get_rank() == 0:
