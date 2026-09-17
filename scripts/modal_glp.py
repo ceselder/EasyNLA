@@ -151,7 +151,7 @@ def mine_pairs(tag: str, av_merged: str, parquet: str = "/vol_q36/data/rl/rl_shu
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
-@app.function(timeout=2 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=200 * 1024, ephemeral_disk=300 * 1024)
+@app.function(timeout=2 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=200 * 1024, ephemeral_disk=600 * 1024)   # Modal minimum is 512 GiB
 def convert_wrapper(src: str, dst: str):
     """Text-only merged checkpoint -> vLLM wrapper layout (Qwen3_5ForConditionalGeneration)."""
     import subprocess
