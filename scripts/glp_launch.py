@@ -47,7 +47,7 @@ def main():
     gpus = ",".join(str(i) for i in range(n_prod, n_prod + n_cons)); M, T, E, K = C["model"], C["train"], C["eval"], C["ckpt"]
     cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={n_cons}", "-m", "nla.flow.train",
            "--shard-dir", a.shard_dir, "--stats", stats, "--heldout", held, "--ckpt-dir", os.path.join(a.out_dir, "ckpts"),
-           "--d-model", str(M["d_model"]), "--d-mlp", str(M["d_mlp"]), "--n-layers", str(M["n_layers"]), "--batch", str(T["batch"]), "--lr", str(T["lr"]),
+           "--d-model", str(M["d_model"]), "--d-mlp", str(M["d_mlp"]), "--n-layers", str(M["n_layers"]), "--batch", str(T["batch"]), "--grad-accum", str(T.get("grad_accum", 1)), "--lr", str(T["lr"]),
            "--total-samples", str(T["total_samples"]), "--warmup", str(T["warmup"]), "--min-lr-frac", str(T["min_lr_frac"]), "--clip", str(T["clip"]),
            "--wd", str(T["wd"]), "--ema", str(T["ema"]), "--eval-every", str(E["every"]), "--eval-n", str(E["n"]), "--sample-steps", str(E["sample_steps"]),
            "--ckpt-every", str(K["every"]), "--snapshot-every-samples", str(K["snapshot_every_samples"]), "--max-hours", str(C["max_hours"]),

@@ -17,7 +17,7 @@ def get_args():
     p.add_argument("--shard-dir", required=True); p.add_argument("--stats", required=True); p.add_argument("--heldout", default=None)
     p.add_argument("--ckpt-dir", required=True); p.add_argument("--d-input", type=int, default=5120)
     p.add_argument("--d-model", type=int, default=10240); p.add_argument("--d-mlp", type=int, default=20480); p.add_argument("--n-layers", type=int, default=6)
-    p.add_argument("--batch", type=int, default=4096, help="per GPU"); p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--batch", type=int, default=4096, help="per GPU per micro-step"); p.add_argument("--grad-accum", type=int, default=1, help="micro-steps per optimizer step"); p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--total-samples", type=float, default=2e9); p.add_argument("--warmup", type=float, default=0.01); p.add_argument("--min-lr-frac", type=float, default=0.1)
     p.add_argument("--clip", type=float, default=1.0); p.add_argument("--wd", type=float, default=0.0); p.add_argument("--ema", type=float, default=0.9999)
     p.add_argument("--ckpt-every", type=int, default=2000); p.add_argument("--snapshot-every-samples", type=float, default=128e6)
@@ -187,7 +187,7 @@ def main():
     else:
         fwd = DDP(model, device_ids=[device.index], gradient_as_bucket_view=True)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd, fused=not a.fsdp)
-    global_batch = a.batch * world; total_steps = int(a.total_samples // global_batch)
+    global_batch = a.batch * a.grad_accum * world; total_steps = int(a.total_samples // global_batch)
     step, samples = 0, 0
     latest = os.path.join(a.ckpt_dir, "latest")
     if os.path.exists(os.path.join(latest, "meta.json" if a.fsdp else "state.pt")):
@@ -204,17 +204,22 @@ def main():
     t_start = time.time(); t_log = time.time(); loss_acc, n_acc = 0.0, 0; next_snapshot = (samples // a.snapshot_every_samples + 1) * a.snapshot_every_samples
     stop_flag = torch.zeros(1, device=device)
     while step < total_steps:
-        x0 = feeder.next()
-        stop_flag.fill_(1.0 if (x0 is None or (time.time() - t_start) / 3600 > a.max_hours or (a.stop_file and os.path.exists(a.stop_file))) else 0.0)
+        xs = [feeder.next() for _ in range(a.grad_accum)]
+        ended = any(x is None for x in xs)
+        stop_flag.fill_(1.0 if (ended or (time.time() - t_start) / 3600 > a.max_hours or (a.stop_file and os.path.exists(a.stop_file))) else 0.0)
         dist.all_reduce(stop_flag, op=dist.ReduceOp.MAX)
         if stop_flag.item() > 0:
-            if rank == 0: print(f"[train] stopping at step {step}: {'stream ended' if x0 is None else 'time budget / stop file'}", flush=True)
+            if rank == 0: print(f"[train] stopping at step {step}: {'stream ended' if ended else 'time budget / stop file'}", flush=True)
             break
         lr = lr_at(step, total_steps, a.lr, a.warmup, a.min_lr_frac)
         for g in opt.param_groups: g["lr"] = lr
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, _ = fm_loss(fwd, x0)
-        opt.zero_grad(set_to_none=True); loss.backward()
+        opt.zero_grad(set_to_none=True); loss_sum = 0.0
+        for mi, x0 in enumerate(xs):   # gradient accumulation: skip the FSDP reduce-scatter on all but the last micro-step
+            if a.fsdp and a.grad_accum > 1: model.set_requires_gradient_sync(mi == len(xs) - 1)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, _ = fm_loss(fwd, x0)
+            (loss / len(xs)).backward(); loss_sum += loss.item()
+        loss = torch.tensor(loss_sum / len(xs))
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
         gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn
         opt.step(); ema_update(ema, model, a.ema if step > 100 else 0.0)
