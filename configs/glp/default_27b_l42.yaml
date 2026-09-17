@@ -33,7 +33,7 @@ model:                         # GLP TransformerMLPDenoiser; d_model = 2 x d_act
 train:
   batch: 8192                  # per GPU per micro-step -> global 32768 on 4 consumers (x grad_accum)
   grad_accum: 1                # micro-steps per optimizer step (16384/GPU does NOT fit in 2-way FSDP; use batch 8192 x accum 2 on B200:4) = gradient noise scale B_noise measured on the pilot at 137M samples (33k; 5.2k at init). On B200:4 use 16384/GPU.
-  lr: 5.0e-5                   # GLP value at batch 4096; the 3-point sweep at batch 32768 (1e-4 / 2e-4 / 4e-4, 60M samples each) picks the main-run value
+  lr: 2.0e-4                   # sweep at batch 32768 (16M samples): held-out 1.271 @2e-4 vs 1.303 @1e-4; 3e-4 and 4e-4 diverged (GLP used 5e-5 at batch 4096)
   total_samples: 2.0e9         # single pass, no activation seen twice (2x GLP; ~14 h at 4:4). batch/lr to be set from the pilot's gradient-noise scale
   warmup: 0.01
   min_lr_frac: 0.1             # cosine floor
