@@ -2,7 +2,7 @@
 E|g_B|^2 = |G|^2 + tr(Sigma)/B.  We measure per-microbatch gradient norms at B_small and the norm of their average (B_big = n * B_small):
   tr(Sigma) = (E|g_small|^2 - |g_big|^2) / (1/B_small - 1/B_big),   |G|^2 = E|g_small|^2 - tr(Sigma)/B_small,   B_noise = tr(Sigma)/|G|^2.
 B_crit ~ B_noise: below it, doubling the batch nearly halves the steps needed; above it, extra batch is wasted.
-Single GPU, fp32 grads, bf16 compute. Usage:
+Single GPU, bf16 params/grads, fp32 accumulator. Usage:
   python -m nla.flow.bnoise --ckpt <snap dir with ema.pt+model.pt | 'init'> --stats rep_statistics.pt --heldout heldout_acts.pt --out bnoise.json
   (--shard-dir to use fresh training shards instead of the held-out set)"""
 import argparse, glob, json, os, time
@@ -29,7 +29,7 @@ def main():
         model = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"]).to(dev)
         sd = m.get("model") or torch.load(os.path.join(a.ckpt, "ema.pt"), map_location="cpu")["ema"]   # raw weights if saved, else EMA
         model.load_state_dict({k: v.float() for k, v in sd.items()})
-    model.train()
+    model = model.to(torch.bfloat16); model.train()   # bf16 params+grads (27+27 GB) + one fp32 accumulator (55 GB) fits a B200; fp32 everywhere does not
     # data: held-out activations (fixed) or fresh shards
     if a.shard_dir:
         files = sorted(glob.glob(os.path.join(a.shard_dir, "ready", "*.pt")))[:8]; acts = torch.cat([torch.load(f)["acts"] for f in files])
@@ -48,8 +48,7 @@ def main():
             t = torch.full((B_small,), a.t_fixed, device=dev) if a.t_fixed is not None else torch.rand(B_small, device=dev, generator=g_noise)
             eps = torch.randn(x0.shape, device=dev, generator=g_noise)
             model.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, _ = fm_loss(model, x0, t, eps)
+            loss, _ = fm_loss(model, x0.to(torch.bfloat16), t, eps.to(torch.bfloat16))
             loss.backward()
             small_norm2.append(grad_vec_norm2(model))
             flat = [p.grad.float() for p in model.parameters() if p.grad is not None]
