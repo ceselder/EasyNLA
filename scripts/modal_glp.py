@@ -162,6 +162,19 @@ def convert_wrapper(src: str, dst: str):
     vol_exp.commit(); return rc
 
 
+@app.function(gpu="B200", timeout=4 * 3600, **COMMON)
+def eval_cond(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = ""):
+    """Likelihood-level eval of a conditional adapter: exact log p(h|z) via ODE, PMI per pair, hedging/edit test vs the MSE critic."""
+    import subprocess
+    from playground_app import resolve_base
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    out = f"/vol_glp/cond/{tag}/eval_cond.json"
+    cmd = [sys.executable, "-m", "nla.flow.eval_cond", "--prior", f"/vol_glp/{prior_tag}/ckpts/{prior_ckpt}", "--adapter", f"/vol_glp/cond/{tag}/adapter_latest.pt",
+           "--stats", f"/vol_glp/{prior_tag}/rep_statistics.pt", "--base", base, "--val-parquet", "/vol_q36/data/sft/av_sft_val.parquet",
+           "--critic", "/vol/ckpts/qwen36_27b/ar_sft_merged", "--out", out] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
 @app.local_entrypoint()
 def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768, prior_tag: str = "glp27b_main", av_merged: str = "/vol/ckpts/qwen36_27b/av_sft_merged", nshards: int = 8):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
@@ -182,6 +195,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
     elif task == "mine_pairs":   # all shards in parallel, one B200 each
         calls = [mine_pairs.spawn(tag or "sft_av", av_merged, shard=i, nshards=nshards, extra=extra) for i in range(nshards)]
         print("rc", [c.get() for c in calls])
+    elif task == "eval_cond":
+        print("rc", eval_cond.remote(tag, prior_tag, ckpt, extra))
     elif task == "train_cond":
         print("rc", train_cond.remote(tag or "cond_smoke", prior_tag, ckpt, extra))
     elif task == "sample_diag":
