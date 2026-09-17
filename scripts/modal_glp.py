@@ -10,7 +10,8 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.join(os.environ.g
 from modal_nla_exp import image_base, SECRETS, REPO_LOCAL, REPO_REMOTE, REPO_IGNORE  # noqa: E402
 
 vol_glp = modal.Volume.from_name("nla-glp", create_if_missing=True)
-VOLS = {"/vol_glp": vol_glp}
+vol_exp = modal.Volume.from_name("nla-exp")
+VOLS = {"/vol_glp": vol_glp, "/vol": vol_exp}
 image = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE)
 app = modal.App("nla-glp", image=image)
 COMMON = dict(volumes=VOLS, secrets=SECRETS, cpu=32, memory=256 * 1024, ephemeral_disk=600 * 1024)
@@ -105,6 +106,17 @@ def bench_producer(attn_impl: str = "sdpa", tokens_per_batch: int = 32768, max_t
     return rc
 
 
+@app.function(gpu="B200", timeout=12 * 3600, **COMMON)
+def gumbel_av(tag: str, extra: str = ""):
+    """De-Diffusion-style end-to-end AV training through the frozen 8B MSE critic (Gumbel-softmax text)."""
+    import subprocess
+    out = f"/vol_glp/gumbel/{tag}"
+    cmd = [sys.executable, "-m", "nla.flow.gumbel_av", "--base", "Qwen/Qwen3-8B", "--av-adapter", "/vol/ckpts/qwen3_8b/av_sft500k_lr1e4/iter_0007813",
+           "--critic", "/vol/ckpts/qwen3_8b/ar_sft500k/iter_0007813", "--train-parquet", "/vol/data/qwen3_8b/av_sft_rl.parquet",
+           "--eval-parquet", "/vol/data/qwen3_8b/av_sft_eval.parquet", "--out", out, "--tag", tag] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
 @app.local_entrypoint()
 def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
@@ -120,6 +132,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", eval_lm.remote(tag, ckpt, extra))
     elif task == "bench_producer":
         print("rc", bench_producer.remote(attn_impl, tokens_per_batch, extra=extra))
+    elif task == "gumbel_av":
+        print("rc", gumbel_av.remote(tag or "gumbel_av", extra))
     elif task == "bnoise":
         print("rc", bnoise.remote(tag, ckpt, extra))
     elif task == "gen_onpolicy":
