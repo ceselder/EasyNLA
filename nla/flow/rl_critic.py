@@ -26,7 +26,7 @@ class _Stop(Exception):
 
 class FlowCritic:
     def __init__(self, prior_dir: str, adapter_path: str, stats_path: str, actor, tokenizer, device, *, enc_layer: int = 42,
-                 lr: float = 1e-4, p_uncond: float = 0.1, t_grid=(0.2, 0.4, 0.6, 0.8), fve_t: float = 0.9, micro_batch: int = 32,
+                 lr: float = 1e-4, p_uncond: float = 0.1, t_grid=(0.2, 0.4, 0.6, 0.8), fve_t: float = 0.9, micro_batch: int = 16,
                  max_len: int = 192, prior_weights: str = "raw", train_adapter: bool = True):
         self.actor, self.tok, self.device, self.enc_layer = actor, tokenizer, device, enc_layer
         self.dev_type = torch.device(device).type
@@ -51,11 +51,18 @@ class FlowCritic:
         if train_adapter:
             for p_ in self.model.adapter_parameters(): p_.requires_grad_(True)
             self.trainable = list(self.model.adapter_parameters())
-        self.optim = torch.optim.AdamW(self.trainable, lr=lr, betas=(0.9, 0.95), weight_decay=0.0) if self.trainable else None
+        self.optim = None
+        if self.trainable:
+            try:   # 8-bit Adam (same choice as the LoRA MSE critic): 777M adapter params -> ~1.6 GB of optimizer state instead of 6.2 GB
+                import bitsandbytes as _bnb
+                self.optim = _bnb.optim.AdamW8bit(self.trainable, lr=lr, betas=(0.9, 0.95), weight_decay=0.0); opt_name = "AdamW8bit"
+            except ImportError:
+                self.optim = torch.optim.AdamW(self.trainable, lr=lr, betas=(0.9, 0.95), weight_decay=0.0); opt_name = "AdamW"
+        else: opt_name = "none"
         self.d = cfg["d_input"]; self.msf = math.sqrt(self.d); self.adapter_step = int(ad.get("step", 0))
         self.cfg, self.adapter_args = cfg, aa
         print(f"[flow] prior {cfg['n_layers']} blocks ({prior_weights} weights, {prior_dir}); adapter step {self.adapter_step} from {adapter_path}; "
-              f"trainable {sum(p.numel() for p in self.trainable)/1e6:.0f}M; t grid {self.t_grid}; encoder = actor (adapters off) @ layer {enc_layer}", flush=True)
+              f"trainable {sum(p.numel() for p in self.trainable)/1e6:.0f}M ({opt_name}); t grid {self.t_grid}; encoder = actor (adapters off) @ layer {enc_layer}", flush=True)
 
     def _ac(self):
         return torch.autocast(device_type=self.dev_type, dtype=torch.bfloat16)
@@ -122,6 +129,8 @@ class FlowCritic:
                 a, b = fl[r].item(), mse[r].item()
                 if math.isfinite(a) and math.isfinite(b):
                     fr[i] = -a; vr[i] = -b; preds[i] = x0_hat[r].detach().float().cpu()
+        del enc, mask, gold, x0, eps, tot, v, x_t, x0_hat
+        if self.dev_type == "cuda": torch.cuda.empty_cache()
         return fr, vr, preds
 
     # ------------------------------------------------------------------ co-training
@@ -139,6 +148,8 @@ class FlowCritic:
                 loss, _, _ = cond_fm_loss(self.model, x0, enc, mask, p_uncond=self.p_uncond)
             if not torch.isfinite(loss): return float("nan")
             (loss * (B / n) / accum).backward(); total += loss.item() * B / n
+            del enc, mask, x0, loss
+        if self.dev_type == "cuda": torch.cuda.empty_cache()
         return total
 
     def save(self, out_dir: str, step: int):

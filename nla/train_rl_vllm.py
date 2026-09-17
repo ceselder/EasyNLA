@@ -1814,7 +1814,7 @@ def main():
     p.add_argument("--flow-p-uncond", type=float, default=0.1)
     p.add_argument("--flow-t-grid", default="0.2,0.4,0.6,0.8", help="noise levels for the reward estimate (shared eps per group)")
     p.add_argument("--flow-enc-layer", type=int, default=42, help="layer of the frozen base (actor with adapters off) read as the explanation encoder")
-    p.add_argument("--flow-micro-batch", type=int, default=32)
+    p.add_argument("--flow-micro-batch", type=int, default=16)
     p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl", "flow"],
                    default="vector_mse",
                    help="Critic (AR) TRAINING loss. vector_mse (DEFAULT) = classic "
