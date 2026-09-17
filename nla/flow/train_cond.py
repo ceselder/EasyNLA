@@ -75,11 +75,16 @@ class ARVecEncoder(torch.nn.Module):
     def __init__(self, ar_dir, tok, device, lora_r=64, lora_alpha=16, grad_ckpt=True):
         super().__init__()
         from nla.models import NLACriticModel
-        from peft import LoraConfig, get_peft_model
+        from peft import LoraConfig, inject_adapter_in_model
         crit = NLACriticModel.from_pretrained(ar_dir, dtype=torch.bfloat16).to(device)
         for p_ in crit.parameters(): p_.requires_grad_(False)
         tm = r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))"
-        crit.backbone = get_peft_model(crit.backbone, LoraConfig(r=lora_r, lora_alpha=lora_alpha, use_rslora=True, target_modules=tm, lora_dropout=0.0, bias="none"))
+        # inject LoRA IN PLACE (no PeftModel wrapper): NLACriticModel.forward unwraps its backbone to the inner transformer and needs the module structure intact
+        inject_adapter_in_model(LoraConfig(r=lora_r, lora_alpha=lora_alpha, use_rslora=True, target_modules=tm, lora_dropout=0.0, bias="none"), crit.backbone)
+        for n_, p_ in crit.backbone.named_parameters(): p_.requires_grad_("lora_" in n_)
+        for m_ in crit.backbone.modules():
+            if hasattr(m_, "lora_A"):
+                for sub in list(m_.lora_A.values()) + list(m_.lora_B.values()): sub.float()   # fp32 LoRA weights (bf16 base)
         if grad_ckpt:
             try: crit.backbone.gradient_checkpointing_enable(); crit.backbone.enable_input_require_grads()
             except Exception as e: print("[arvec] grad ckpt off:", e, flush=True)
