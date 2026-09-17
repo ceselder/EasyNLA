@@ -41,11 +41,25 @@ def smoke(tag: str = "smoke_glp", sets: str = ""):
     return _run(args)
 
 
+@app.function(gpu="B200", timeout=3 * 3600, **COMMON)
+def eval_lm(tag: str, ckpt: str = "final", extra: str = ""):
+    """Delta-LM-loss eval of a trained prior on the held-out docs (needs the FULL 27B)."""
+    import subprocess
+    from playground_app import resolve_base
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    out = f"/vol_glp/{tag}/eval_lm_{ckpt}.json"
+    cmd = [sys.executable, "-m", "nla.flow.eval_lm", "--base", base, "--ckpt", f"/vol_glp/{tag}/ckpts/{ckpt}", "--stats", f"/vol_glp/{tag}/rep_statistics.pt",
+           "--heldout", f"/vol_glp/{tag}/heldout_acts.pt", "--out", out] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
 @app.local_entrypoint()
-def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = ""):
+def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = ""):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
     if task == "smoke":
         print("rc", smoke.remote(tag or "smoke_glp", sets))
     elif task == "pretrain":
         assert tag, "--tag required"
         print("rc", pretrain.remote(tag, config, sets))
+    elif task == "eval_lm":
+        print("rc", eval_lm.remote(tag, ckpt, extra))
