@@ -18,16 +18,17 @@ Relaunching the same `--tag` resumes from `<out>/ckpts/latest` (producers resume
 ## Knobs (dotted keys)
 | key | default | what it ablates |
 |---|---|---|
-| `model.n_layers` / `model.d_model` / `model.d_mlp` | 6 / 10240 / 20480 | denoiser size (GLP: loss follows a power law in compute) |
+| `model.n_layers` / `model.d_model` / `model.d_mlp` | 16 / 10240 / 20480 (13.7B params) | denoiser size (GLP: loss follows a power law in compute; their largest was 6 blocks / 3.3B) |
 | `train.lr`, `train.batch`, `train.warmup`, `train.min_lr_frac`, `train.wd`, `train.clip`, `train.ema` | 5e-5, 4096, 0.01, 0.1, 0, 1.0, 0.9999 | optimiser |
 | `train.total_samples` | 2e9 | how many activations (one pass) |
 | `data.max_len`, `data.min_len`, `data.drop_pos0`, `data.dataset`, `data.config`, `data.seed` | 2048, 16, true, fineweb sample-10BT, 0 | activation distribution |
 | `layer` | 42 | which residual stream |
-| `gpus.producers` / `gpus.consumers` | 5 / 3 | throughput split (producers ≈ 15k tok/s each, consumers ≈ 30k samples/s each at 5.35B) |
+| `gpus.producers` / `gpus.consumers` | 4 / 4 | throughput split (measured: producers ≈ 12.5k tok/s each; consumers ≈ 10k samples/s each at 13.7B, FSDP2) |
+| `train.fsdp` | true | shard params/grads/Adam across consumer GPUs (DDP only fits ≤ ~5B) |
 | `shards.size`, `shards.max_ready`, `stats.n`, `stats.heldout_n` | 16384, 48, 2e6, 65536 | pipeline / eval set sizes |
-| `eval.every`, `eval.n`, `eval.sample_steps`, `ckpt.every`, `ckpt.snapshot_every_samples`, `max_hours` | 1000, 16384, 50, 2000, 1.28e8, 22.3 | bookkeeping |
+| `eval.every`, `eval.n`, `eval.sample_steps`, `ckpt.every`, `ckpt.snapshot_every_samples`, `max_hours` | 2000, 32768, 50, 10000, 2.56e8, 22.3 | bookkeeping (latest/ is a sharded DCP checkpoint ~190 GB; snapshots are full bf16 EMA, 27 GB) |
 
 ## Metrics logged (wandb project `nla-glp`)
-`train/loss` (velocity MSE), `eval/fm_loss` on held-out activations at t ∈ {0.1,…,0.9} with fixed noise, `eval/fd_normalised` (Fréchet distance of
-4096 EMA samples vs real, standardised space), sample vs real norm and per-dim std. The LM-side check (delta LM loss of on-manifold
+`train/loss` (velocity MSE), `eval/fm_loss` (EMA) and `eval/fm_loss_raw` on held-out activations at t ∈ {0.1,…,0.9} with fixed noise, `eval/fd_normalised` (Fréchet distance of
+16384 EMA samples vs real, standardised space) next to `eval/fd_floor_real_vs_real` (finite-sample floor), sample vs real norm and per-dim std. The LM-side check (delta LM loss of on-manifold
 projections, GLP Table 1) runs as a separate job on `heldout_acts.pt` full docs.
