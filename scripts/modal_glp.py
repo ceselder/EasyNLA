@@ -151,6 +151,16 @@ def mine_pairs(tag: str, av_merged: str, parquet: str = "/vol_q36/data/rl/rl_shu
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
+@app.function(timeout=2 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=200 * 1024, ephemeral_disk=300 * 1024)
+def convert_wrapper(src: str, dst: str):
+    """Text-only merged checkpoint -> vLLM wrapper layout (Qwen3_5ForConditionalGeneration)."""
+    import subprocess
+    from playground_app import resolve_base
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    rc = subprocess.call([sys.executable, f"{REPO_REMOTE}/scripts/convert_textonly_to_wrapper.py", "--src", src, "--dst", dst, "--base-config", f"{base}/config.json"], cwd=REPO_REMOTE)
+    vol_exp.commit(); return rc
+
+
 @app.local_entrypoint()
 def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768, prior_tag: str = "glp27b_main", av_merged: str = "/vol/ckpts/qwen36_27b/av_sft_merged", nshards: int = 8):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
