@@ -4,7 +4,8 @@ activations in place of images and an autoregressive LM in place of the parallel
   activation h --(inject)--> AV (LoRA, trainable) --straight-through Gumbel-softmax, L tokens--> soft one-hots Y (B, L, V)
       --> Y @ E_reader --> frozen reader --> loss(h)  ;  d loss / d LoRA flows through the text (and through the KV cache, i.e. BPTT over generation)
 
-Reader v0 = the frozen MSE critic (NLACriticModel): loss = MSE(normalise(value_head(...)), normalise(h)), the same quantity the RL reward uses.
+Reader v0 = the frozen MSE critic (NLACriticModel): loss = MSE(normalise(value_head(...)), normalise(h)), the same quantity the RL reward uses,
+plus kl_beta * KL(AV || frozen SFT AV) per generated token as a language anchor (without it the text drifts into an unreadable code within ~600 steps).
 Reader v1 (later) = the text-conditional activation flow: loss = denoising loss at fixed (t, eps).
 Eval: normal sampling from the AV (no Gumbel) on held-out rows -> frozen-critic FVE, exactly as every other arm is scored."""
 import argparse, json, math, os, time
@@ -33,7 +34,7 @@ def main():
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--batch", type=int, default=16); p.add_argument("--gen-len", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-5); p.add_argument("--tau-start", type=float, default=1.0); p.add_argument("--tau-end", type=float, default=0.5)
     p.add_argument("--eval-every", type=int, default=200); p.add_argument("--eval-n", type=int, default=128); p.add_argument("--train-skip", type=int, default=0)
-    p.add_argument("--max-train-rows", type=int, default=100000); p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="gumbel_av")
+    p.add_argument("--kl-beta", type=float, default=0.1, help="weight of KL(AV || frozen SFT AV) per generated token (language anchor; 0 = off)"); p.add_argument("--max-train-rows", type=int, default=100000); p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="gumbel_av")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
@@ -48,6 +49,9 @@ def main():
     cfg = load_nla_config(a.eval_parquet, tok); msf = resolve_target_scale(cfg.mse_scale, cfg.d_model)
     base = AutoModelForCausalLM.from_pretrained(a.base, dtype=torch.bfloat16, attn_implementation="sdpa").to(dev)
     av = PeftModel.from_pretrained(base, a.av_adapter, is_trainable=True); av.train()
+    av.load_adapter(a.av_adapter, adapter_name="ref"); av.set_adapter("default")   # frozen SFT copy = language anchor (KL target), like kl_beta in the RL loop
+    for n_, p_ in av.named_parameters():
+        if ".ref." in n_: p_.requires_grad_(False)
     vectors_ref = [None]; register_karvonen_hook(av, vectors_ref, cfg.injection_token_id, cfg.injection_left_neighbor_id, cfg.injection_right_neighbor_id, layer_idx=1)
     critic = NLACriticModel.from_pretrained(a.critic, dtype=torch.bfloat16).to(dev).eval(); critic.requires_grad_(False)
     E_av = av.get_input_embeddings().weight            # (V, d) bf16, frozen (LoRA only)
@@ -66,18 +70,30 @@ def main():
         try: import wandb; wandb.init(project=a.wandb, name=a.tag, config=vars(a) | {"reader": "mse_critic"})
         except Exception as e: print("[gumbel] wandb off:", e, flush=True); use_wandb = False
 
+    def _ref_forward(**kw):
+        av.set_adapter("ref")
+        with torch.no_grad(): out = av(**kw)
+        av.set_adapter("default"); return out
+
     def differentiable_generate(acts, tau):
-        """Returns soft one-hots Y (B, L, V) (hard fwd / soft grad) and the hard token ids."""
+        """Returns soft one-hots Y (B, L, V) (hard fwd / soft grad), the hard token ids, and mean per-token KL(AV || ref)."""
         B = acts.shape[0]; vectors_ref[0] = acts.to(dev)
         ids = pre_ids.expand(B, -1)
         out = av(input_ids=ids, use_cache=True); past = out.past_key_values; logits = out.logits[:, -1].float()
-        Ys, toks = [], []
+        if a.kl_beta > 0:
+            rout = _ref_forward(input_ids=ids, use_cache=True); rpast = rout.past_key_values; rlogits = rout.logits[:, -1].float()
+        Ys, toks, kls = [], [], []
         for _ in range(a.gen_len):
+            if a.kl_beta > 0:   # KL(p_av || p_ref) at this position (differentiable through logits; ref fixed)
+                lp = F.log_softmax(logits, -1); kls.append((lp.exp() * (lp - F.log_softmax(rlogits, -1))).sum(-1).mean())
             y, idx = st_gumbel_softmax(logits, tau); Ys.append(y); toks.append(idx)
             emb = (y.to(E_av.dtype) @ E_av)[:, None]                 # soft token embedding fed back (grad flows through the KV cache too)
             out = av(inputs_embeds=emb, past_key_values=past, use_cache=True); past = out.past_key_values; logits = out.logits[:, -1].float()
+            if a.kl_beta > 0:
+                rout = _ref_forward(inputs_embeds=emb.detach(), past_key_values=rpast, use_cache=True); rpast = rout.past_key_values; rlogits = rout.logits[:, -1].float()
         vectors_ref[0] = None
-        return torch.stack(Ys, 1), torch.stack(toks, 1)
+        kl = torch.stack(kls).mean() if kls else torch.zeros((), device=dev)
+        return torch.stack(Ys, 1), torch.stack(toks, 1), kl
 
     def reader_loss(Y, acts):
         B = Y.shape[0]
@@ -116,13 +132,14 @@ def main():
         idx = torch.randint(0, tr_acts.shape[0], (a.batch,), generator=rng); acts = tr_acts[idx]
         tau = a.tau_start + (a.tau_end - a.tau_start) * step / a.steps
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            Y, toks = differentiable_generate(acts, tau)
-            loss, _ = reader_loss(Y, acts)
+            Y, toks, kl = differentiable_generate(acts, tau)
+            rec, _ = reader_loss(Y, acts)
+        loss = rec + a.kl_beta * kl
         opt.zero_grad(set_to_none=True); loss.backward()
         gn = torch.nn.utils.clip_grad_norm_([p for p in av.parameters() if p.requires_grad], 1.0); opt.step()
         if step % 10 == 0:
-            print(f"[gumbel] step {step} loss {loss.item():.4f} (FVE-equiv {100*(1-loss.item()/baseline):.1f}%) tau {tau:.2f} gn {float(gn):.2f} {(time.time()-t0)/step:.1f}s/step | {tok.decode(toks[0][:24])!r}", flush=True)
-            if use_wandb: wandb.log({"train/loss": loss.item(), "train/fve_equiv": 100*(1-loss.item()/baseline), "train/tau": tau, "train/grad_norm": float(gn)}, step=step)
+            print(f"[gumbel] step {step} rec {rec.item():.4f} (FVE-equiv {100*(1-rec.item()/baseline):.1f}%) kl {kl.item():.3f} tau {tau:.2f} gn {float(gn):.2f} {(time.time()-t0)/step:.1f}s/step | {tok.decode(toks[0][:24])!r}", flush=True)
+            if use_wandb: wandb.log({"train/rec_mse": rec.item(), "train/fve_equiv": 100*(1-rec.item()/baseline), "train/kl_ref": kl.item(), "train/tau": tau, "train/grad_norm": float(gn)}, step=step)
         if step % a.eval_every == 0 or step == a.steps:
             fve = evaluate(step)
             if use_wandb: wandb.log({"eval/fve": fve}, step=step)
