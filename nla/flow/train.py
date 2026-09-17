@@ -38,7 +38,10 @@ class ShardFeeder:
         threading.Thread(target=self._run, daemon=True).start()
     def _run(self):
         while True:
-            got = claim_shard(self.shard_dir, timeout=self.timeout, stop_file=self.stop_file)
+            try:
+                got = claim_shard(self.shard_dir, timeout=self.timeout, stop_file=self.stop_file)
+            except Exception as e:          # never let the feeder thread die silently (a dead feeder hangs the whole DDP job)
+                print(f"[feeder] claim_shard error, retrying: {type(e).__name__}: {e}", flush=True); time.sleep(1); continue
             if got is None:
                 self.q.put(None); self.done = True; return
             _, payload = got

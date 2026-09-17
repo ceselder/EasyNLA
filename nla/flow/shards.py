@@ -30,8 +30,11 @@ def write_shard(root, name, payload, max_ready=None, poll=2.0, stop_file=None):
 def claim_shard(root, poll=1.0, timeout=None, stop_file=None):
     """Claim the oldest ready shard; returns (path, payload) or None on timeout / stop_file."""
     d = dirs(root); t0 = time.time()
+    def _mtime(p):
+        try: return os.path.getmtime(p)
+        except FileNotFoundError: return float("inf")   # claimed by another consumer between glob and stat
     while True:
-        ready = sorted(glob.glob(os.path.join(d["ready"], "*.pt")), key=os.path.getmtime)
+        ready = sorted(glob.glob(os.path.join(d["ready"], "*.pt")), key=_mtime)
         for p in ready:
             dst = os.path.join(d["claimed"], os.path.basename(p))
             try:
