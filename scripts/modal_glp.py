@@ -74,8 +74,29 @@ def bnoise(tag: str, ckpt: str = "init", extra: str = ""):
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
+@app.function(gpu="B200", timeout=1800, **COMMON)
+def bench_producer(attn_impl: str = "sdpa", tokens_per_batch: int = 32768, max_tokens: float = 4e6, extra: str = ""):
+    """Time the activation producer alone (tok/s) under different settings; writes shards to local disk only."""
+    import subprocess, json, time
+    from playground_app import resolve_base
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    try:
+        import flash_attn; print("[bench] flash_attn", flash_attn.__version__, flush=True)
+    except Exception as e:
+        print("[bench] flash_attn not importable:", e, flush=True)
+    src = json.dumps([{"name": "fineweb", "kind": "hf_text", "dataset": "HuggingFaceFW/fineweb", "config": "sample-10BT", "weight": 1.0}])
+    out = f"/tmp/bench_{attn_impl}_{tokens_per_batch}"; os.makedirs(out, exist_ok=True)
+    cmd = [sys.executable, "-m", "nla.flow.produce", "--base", base, "--layer", "42", "--n-producers", "1", "--index", "0", "--shard-dir", "/tmp/shards_bench",
+           "--out-dir", out, "--sources-json", src, "--attn-impl", attn_impl, "--tokens-per-batch", str(tokens_per_batch), "--max-tokens", str(max_tokens),
+           "--stats-n", "1000", "--heldout-n", "1000", "--heldout-docs-full", "1", "--max-ready", "100000"] + extra.split()
+    t = time.time(); rc = subprocess.call(cmd, cwd=REPO_REMOTE); dt = time.time() - t
+    prog = json.load(open(f"{out}/progress_0.json"))
+    print(f"[bench] attn={attn_impl} tokens_per_batch={tokens_per_batch}: {prog['tokens']/1e6:.1f}M tokens in {dt:.0f}s incl. model load -> {prog['tokens']/dt/1e3:.1f}k tok/s (wall)", flush=True)
+    return rc
+
+
 @app.local_entrypoint()
-def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000):
+def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
     if task == "smoke":
         print("rc", smoke.remote(tag or "smoke_glp", sets))
@@ -84,6 +105,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", pretrain.remote(tag, config, sets))
     elif task == "eval_lm":
         print("rc", eval_lm.remote(tag, ckpt, extra))
+    elif task == "bench_producer":
+        print("rc", bench_producer.remote(attn_impl, tokens_per_batch, extra=extra))
     elif task == "bnoise":
         print("rc", bnoise.remote(tag, ckpt, extra))
     elif task == "gen_onpolicy":
