@@ -107,10 +107,10 @@ def evaluate(ema, norm, held, device, n, sample_steps, d, raw_model=None):
     out["eval/fd_normalised"] = frechet_distance(samp.cpu(), real.cpu())   # double-precision 5120x5120 covariances on CPU: keeps GPU memory for training
     if _FD_FLOOR.get("v") is None:   # finite-sample floor: two disjoint halves of the real held-out set
         _FD_FLOOR["v"] = frechet_distance(x0[: n // 2].cpu(), x0[n // 2: 2 * (n // 2)].cpu())
-    del samp, noise
     out["eval/fd_floor_real_vs_real"] = _FD_FLOOR["v"]
     out["eval/sample_norm_mean"] = norm.denormalize(samp).norm(dim=-1).mean().item(); out["eval/real_norm_mean"] = norm.denormalize(real).norm(dim=-1).mean().item()
     out["eval/sample_std_mean"] = samp.std(0).mean().item(); out["eval/real_std_mean"] = real.std(0).mean().item()
+    del samp, noise
     ema.train()
     for m in (ema, raw_model):   # FSDP2: a forward without backward leaves the root module's params all-gathered; reshard so the EMA update sees matching local shards
         if m is not None and hasattr(m, "reshard"): m.reshard()
