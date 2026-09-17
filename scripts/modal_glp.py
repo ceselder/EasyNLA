@@ -58,7 +58,8 @@ def gen_onpolicy(n_prompts: int = 300000, extra: str = ""):
     """vLLM: Qwen3.6-27B responses to WildChat first-turn prompts -> /vol_glp/data/wildchat_onpolicy_*.parquet (+ wildchat_original.parquet)."""
     import subprocess
     from playground_app import resolve_base
-    os.environ["NLA_VLLM_GRAPHS"] = "0"
+    # same vLLM env as the RL path: FlashInfer / DeepGEMM JIT need nvcc, which the image lacks
+    os.environ.update({"VLLM_ATTENTION_BACKEND": "FLASH_ATTN", "VLLM_USE_FLASHINFER_SAMPLER": "0", "VLLM_USE_DEEP_GEMM": "0", "NLA_VLLM_GRAPHS": "0"})
     base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
     cmd = [sys.executable, "-m", "nla.flow.gen_onpolicy", "--base", base, "--out-dir", "/vol_glp/data", "--n-prompts", str(n_prompts), "--tp", "2"] + extra.split()
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc

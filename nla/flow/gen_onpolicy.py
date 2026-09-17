@@ -33,7 +33,8 @@ def main():
         if len(prompts) >= a.n_prompts: break
     print(f"[gen] {len(prompts)} prompts, {len(originals)} originals", flush=True)
     pq.write_table(pa.Table.from_pylist(originals), os.path.join(a.out_dir, "wildchat_original.parquet"))
-    llm = LLM(model=a.base, tensor_parallel_size=a.tp, gpu_memory_utilization=a.gpu_mem, max_model_len=8192, enable_prefix_caching=True, trust_remote_code=True)
+    llm = LLM(model=a.base, tensor_parallel_size=a.tp, gpu_memory_utilization=a.gpu_mem, max_model_len=8192, enable_prefix_caching=True, trust_remote_code=True,
+              enforce_eager=True)   # Qwen3.6 hybrid: CUDA-graph capture breaks on the Mamba cache (see RL notes)
     sp = SamplingParams(temperature=a.temperature, top_p=a.top_p, max_tokens=a.max_new_tokens)
     rows, t0 = [], time.time(); part = 0
     for i in range(0, len(prompts), a.batch):
