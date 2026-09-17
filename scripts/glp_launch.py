@@ -71,8 +71,11 @@ def main():
     tr.wait(); print(f"[launch] trainer exited with {tr.returncode}", flush=True)
     open(stop_file, "w").write("trainer exited")
     for i, (pr, lf, n) in prods.items():
-        try: pr.wait(timeout=600)
-        except subprocess.TimeoutExpired: pr.kill()
+        try: pr.wait(timeout=90)
+        except subprocess.TimeoutExpired:
+            pr.terminate()
+            try: pr.wait(timeout=30)
+            except subprocess.TimeoutExpired: pr.kill()
     print("[launch] done", flush=True)
     sys.exit(tr.returncode)
 

@@ -140,7 +140,7 @@ def main():
         payload = {"acts": acts.to(torch.bfloat16), "doc": doc[: a.shard_size], "pos": pos[: a.shard_size], "producer": a.index, "n_tokens": buf_tokens}
         # no back-pressure while stats/held-out are still being produced: the trainer only starts once rep_statistics.pt exists,
         # so blocking here would deadlock (seen with stats_n 2M > max_ready x shard_size)
-        write_shard(a.shard_dir, f"p{a.index}_{prog['shards']:07d}", payload, max_ready=None if (welford is not None or held is not None) else a.max_ready)
+        write_shard(a.shard_dir, f"p{a.index}_{prog['shards']:07d}", payload, max_ready=None if (welford is not None or held is not None) else a.max_ready, stop_file=a.stop_file)
         prog["shards"] += 1; prog["acts"] += int(acts.shape[0])
         buf_acts = [rest] if rest.shape[0] else []; buf_doc = [doc[a.shard_size:]] if rest.shape[0] else []; buf_pos = [pos[a.shard_size:]] if rest.shape[0] else []; buf_tokens = 0
         json.dump(prog, open(prog_path + ".tmp", "w")); os.replace(prog_path + ".tmp", prog_path)

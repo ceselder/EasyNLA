@@ -14,14 +14,17 @@ def dirs(root):
     return d
 
 
-def write_shard(root, name, payload, max_ready=None, poll=2.0):
+def write_shard(root, name, payload, max_ready=None, poll=2.0, stop_file=None):
     d = dirs(root)
-    if max_ready is not None:   # back-pressure: wait while the ready queue is long
+    if max_ready is not None:   # back-pressure: wait while the ready queue is long (but never past a STOP request)
         while len(os.listdir(d["ready"])) >= max_ready:
+            if stop_file and os.path.exists(stop_file):
+                return False
             time.sleep(poll)
     tmp = os.path.join(d["tmp"], name + ".pt")
     torch.save(payload, tmp)
     os.rename(tmp, os.path.join(d["ready"], name + ".pt"))
+    return True
 
 
 def claim_shard(root, poll=1.0, timeout=None, stop_file=None):
