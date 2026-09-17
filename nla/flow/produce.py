@@ -48,9 +48,11 @@ def _chat_parquet_stream(pattern, n_producers, index, skip, seed, tok):
     """Rows with a `messages` JSON column -> chat-template text (loops forever over the files; shuffled per pass)."""
     import glob, json, random
     import pyarrow.parquet as pq
-    files = sorted(glob.glob(pattern)); assert files, f"no chat parquet matches {pattern}"
     rng = random.Random(seed + index); n = 0; epoch = 0
     while True:
+        files = sorted(glob.glob(pattern))   # re-glob every pass: parts written later (e.g. by a still-running generator) get picked up
+        if not files:
+            print(f"[chat_stream] no files match {pattern} yet; sleeping 10 min", flush=True); import time; time.sleep(600); continue
         rows = []
         for f in files:
             t = pq.read_table(f, columns=["messages"]).to_pylist(); rows += [r["messages"] for r in t]
