@@ -63,7 +63,7 @@ def eval_lm(tag: str, ckpt: str = "final", extra: str = ""):
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
-@app.function(gpu="B200:2", timeout=8 * 3600, **COMMON)
+@app.function(gpu="B200:2", timeout=12 * 3600, **COMMON)
 def gen_onpolicy(n_prompts: int = 300000, extra: str = ""):
     """vLLM: Qwen3.6-27B responses to WildChat first-turn prompts -> /vol_glp/data/wildchat_onpolicy_*.parquet (+ wildchat_original.parquet)."""
     import subprocess
