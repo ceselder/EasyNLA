@@ -53,7 +53,7 @@ def main():
            "--ckpt-every", str(K["every"]), "--snapshot-every-samples", str(K["snapshot_every_samples"]), "--max-hours", str(C["max_hours"]),
            "--stream-timeout", str(C.get("stream_timeout", 1800)), "--stop-file", stop_file] + (["--compile"] if T.get("compile") else []) + (["--fsdp"] if T.get("fsdp") else []) + (["--wandb-name", a.wandb_name] if a.wandb_name else [])
     print("[launch] trainer:", " ".join(cmd), flush=True)
-    tr = subprocess.Popen(cmd, env=dict(env, CUDA_VISIBLE_DEVICES=gpus, OMP_NUM_THREADS="8"))
+    tr = subprocess.Popen(cmd, env=dict(env, CUDA_VISIBLE_DEVICES=gpus, OMP_NUM_THREADS="8", PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"))
     while tr.poll() is None:
         time.sleep(30)
         for i, (pr, lf, n) in list(prods.items()):
