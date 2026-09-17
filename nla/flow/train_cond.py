@@ -133,7 +133,11 @@ def main():
         prior = prior.to(dev).requires_grad_(True)
         model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens).to(dev)
         mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-        for blk in (model.blocks if use_tokens else prior.layers): fully_shard(blk, mp_policy=mp)
+        # shard the prior block and the adapter modules SEPARATELY: prior.layers[i] is also referenced as blocks[i].base, and FSDP2 refuses to
+        # re-shard a module it already reached through the other path (the root would otherwise meet DTensor params -> "value was None")
+        for i, pblk in enumerate(prior.layers):
+            fully_shard(pblk, mp_policy=mp)
+            if use_tokens: fully_shard(model.blocks[i].read, mp_policy=mp); fully_shard(model.blocks[i].gate_mod, mp_policy=mp)
         fully_shard(model, mp_policy=mp)
     else:
         prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
