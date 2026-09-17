@@ -32,10 +32,14 @@ class FlowCritic:
         self.dev_type = torch.device(device).type
         self.p_uncond, self.t_grid, self.fve_t, self.micro_batch, self.max_len = p_uncond, tuple(float(t) for t in t_grid), fve_t, micro_batch, max_len
         self.norm = Normalizer.load(stats_path).to(device)
-        m = torch.load(os.path.join(prior_dir, "model.pt"), map_location="cpu"); cfg = m["args"]
-        sd = m.get("model") if prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(prior_dir, "ema.pt"), map_location="cpu")["ema"]
-        prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"]); prior.load_state_dict({k: v.float() for k, v in sd.items()})
-        prior = prior.to(torch.bfloat16).to(device).requires_grad_(False)
+        # build the 13.7B prior on the meta device and stream the checkpoint in with mmap: no 55 GB fp32 CPU copy per rank
+        m = torch.load(os.path.join(prior_dir, "model.pt"), map_location="cpu", mmap=True); cfg = m["args"]
+        sd = m.get("model") if prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(prior_dir, "ema.pt"), map_location="cpu", mmap=True)["ema"]
+        with torch.device("meta"):
+            prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"])
+        prior = prior.to_empty(device=device).to(torch.bfloat16)
+        prior.load_state_dict(sd, strict=True)                    # copies with dtype conversion, tensor by tensor
+        prior.requires_grad_(False); del sd, m
         ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]
         self.model = CondDenoiser(prior, cfg["d_input"], aa["n_slots"], aa["n_heads"], aa["d_head"], aa.get("gate_rank", 128),
                                   d_cvec=0, use_tokens=True).to(device)
