@@ -140,9 +140,12 @@ def main():
         mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         # shard the prior block and the adapter modules SEPARATELY: prior.layers[i] is also referenced as blocks[i].base, and FSDP2 refuses to
         # re-shard a module it already reached through the other path (the root would otherwise meet DTensor params -> "value was None")
+        # shard at the granularity of modules whose forward() is actually CALLED: CondMLPBlock reaches into base.ln / gate_proj / ... directly,
+        # so sharding the prior block as a unit leaves its DTensor params un-gathered ("mixed torch.Tensor and DTensor" in layer_norm)
         for i, pblk in enumerate(prior.layers):
-            fully_shard(pblk, mp_policy=mp)
+            for sub in (pblk.ln, pblk.up_proj, pblk.gate_proj, pblk.time_proj, pblk.down_proj): fully_shard(sub, mp_policy=mp)
             if use_tokens: fully_shard(model.blocks[i].read, mp_policy=mp); fully_shard(model.blocks[i].gate_mod, mp_policy=mp)
+        for sub in (prior.in_proj, prior.time_embed, prior.ln, prior.out_proj): fully_shard(sub, mp_policy=mp)
         fully_shard(model, mp_policy=mp)
     else:
         prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
