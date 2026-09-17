@@ -56,43 +56,57 @@ class CondMLPBlock(nn.Module):
 
 
 class CondDenoiser(nn.Module):
-    """Wraps a pretrained Denoiser; forward(x_t, t, enc=None, enc_mask=None). enc=None -> exactly the unconditional prior."""
-    def __init__(self, prior: Denoiser, d_enc: int, n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128):
+    """Wraps a pretrained Denoiser. forward(x_t, t, enc=None, enc_mask=None, cvec=None):
+       enc/enc_mask = token states for the cross-attention reads; cvec [B, d_cvec] = an AR summary vector (e.g. the MSE critic's
+       affine output + its last hidden) projected (zero-init) into the time embedding of every block. Both None -> exactly the prior."""
+    def __init__(self, prior: Denoiser, d_enc: int, n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, d_cvec: int = 0, use_tokens: bool = True):
         super().__init__()
-        self.prior = prior
-        self.blocks = nn.ModuleList([CondMLPBlock(blk, d_enc, n_slots, n_heads, d_head, gate_rank) for blk in prior.layers])
-        self.d_enc = d_enc
+        self.prior = prior; self.use_tokens = use_tokens
+        self.blocks = nn.ModuleList([CondMLPBlock(blk, d_enc, n_slots, n_heads, d_head, gate_rank) for blk in prior.layers]) if use_tokens else None
+        self.d_enc = d_enc; self.d_cvec = d_cvec
+        if d_cvec:
+            self.cvec_ln = nn.LayerNorm(d_cvec)
+            self.cvec_proj = nn.Sequential(nn.Linear(d_cvec, prior.d_model), nn.SiLU(), nn.Linear(prior.d_model, prior.d_model))
+            nn.init.zeros_(self.cvec_proj[2].weight); nn.init.zeros_(self.cvec_proj[2].bias)
 
-    def forward(self, x_t, t, enc=None, enc_mask=None):
+    def forward(self, x_t, t, enc=None, enc_mask=None, cvec=None):
         p = self.prior; dt = p.in_proj.weight.dtype
         emb = p.time_embed(timestep_embedding(t * 1000.0, p.d_model).to(dt))
+        if cvec is not None and self.d_cvec:
+            emb = emb + self.cvec_proj(self.cvec_ln(cvec.float())).to(dt)
         h = p.in_proj(x_t.to(dt))
-        if enc is not None:
-            enc = enc.to(dt)
-            if enc_mask is None: enc_mask = torch.ones(enc.shape[:2], dtype=torch.bool, device=enc.device)
-        for blk in self.blocks:
-            h = blk(h, emb, enc, enc_mask)
+        if self.use_tokens:
+            if enc is not None:
+                enc = enc.to(dt)
+                if enc_mask is None: enc_mask = torch.ones(enc.shape[:2], dtype=torch.bool, device=enc.device)
+            for blk in self.blocks: h = blk(h, emb, enc, enc_mask)
+        else:
+            for blk in p.layers: h = blk(h, emb)
         return p.out_proj(p.ln(h))
 
     def adapter_parameters(self):
-        for blk in self.blocks:
-            yield from blk.read.parameters(); yield from blk.gate_mod.parameters()
+        if self.use_tokens:
+            for blk in self.blocks:
+                yield from blk.read.parameters(); yield from blk.gate_mod.parameters()
+        if self.d_cvec:
+            yield from self.cvec_ln.parameters(); yield from self.cvec_proj.parameters()
 
     def n_adapter_params(self):
         return sum(p.numel() for p in self.adapter_parameters())
 
 
-def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0):
+def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=None):
     """Conditional flow-matching loss with condition dropout (per-sample: enc replaced by None-equivalent via mask of all False -> we
     implement dropout by zeroing the mask and letting the read attend to a learned null; simpler: drop the whole batch's condition with prob p)."""
     B = x0.shape[0]
     if t is None: t = torch.rand(B, device=x0.device)
     if eps is None: eps = torch.randn_like(x0)
     x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
-    if enc is None:
+    if enc is None and cvec is None:
         return F.mse_loss(model(x_t, t).float(), (eps - x0).float()), t, False
-    if p_uncond > 0:   # PER-SAMPLE condition dropout: an all-False mask makes the adapter contribute exactly zero for that sample
+    if p_uncond > 0:   # PER-SAMPLE condition dropout: all-False mask / zeroed cvec -> the adapter contributes exactly the prior for that sample
         drop = torch.rand(B, device=x0.device) < p_uncond
-        enc_mask = enc_mask & ~drop[:, None]
-    v = model(x_t, t, enc, enc_mask)
+        if enc_mask is not None: enc_mask = enc_mask & ~drop[:, None]
+        if cvec is not None: cvec = cvec * (~drop)[:, None].to(cvec.dtype)   # NOTE: cvec_proj has a bias after training; dropped samples are then 'null-conditioned', not exactly the prior
+    v = model(x_t, t, enc, enc_mask, cvec)
     return F.mse_loss(v.float(), (eps - x0).float()), t, True

@@ -53,7 +53,7 @@ def exact_logp(model, x0, enc, mk, n_steps=40, probes=1, gen=None):
                 v = model(x, tt, enc, mk) if enc is not None else model(x, tt)
             v = v.float(); div = torch.zeros(B, device=x.device)
             for _ in range(probes):
-                e = torch.randint(0, 2, x.shape, device=x.device, generator=gen).float() * 2 - 1
+                e = (torch.randint(0, 2, (1, x.shape[1]), device=x.device, generator=gen).float() * 2 - 1).expand_as(x)   # same probe for every row -> paired across variants
                 (vjp,) = torch.autograd.grad((v * e).sum(), x, retain_graph=True); div += (vjp * e).sum(-1) / probes
         return v.detach(), div.detach()
     for i in range(n_steps):
@@ -69,7 +69,7 @@ def main():
     p.add_argument("--prior", required=True); p.add_argument("--adapter", required=True); p.add_argument("--stats", required=True); p.add_argument("--base", required=True)
     p.add_argument("--val-parquet", required=True); p.add_argument("--critic", default=None, help="frozen MSE critic dir (NLACriticModel) for the comparison")
     p.add_argument("--out", required=True); p.add_argument("--n", type=int, default=256); p.add_argument("--n-edit", type=int, default=128); p.add_argument("--K", type=int, default=16)
-    p.add_argument("--ode-steps", type=int, default=40); p.add_argument("--enc-layer", type=int, default=42)
+    p.add_argument("--ode-steps", type=int, default=40); p.add_argument("--probes", type=int, default=1); p.add_argument("--enc-layer", type=int, default=42)
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(0)
     norm = Normalizer.load(a.stats).to(dev)
     m = torch.load(os.path.join(a.prior, "model.pt"), map_location="cpu"); cfg = m["args"]
@@ -116,7 +116,8 @@ def main():
         names = [k for k in ("orig", "wrong", "hedge", "delete")]; texts = [var[k] for k in names]
         x0 = x0_all[i:i+1].expand(len(texts), -1); enc, mk = encode(texts)
         lc, lu = denoise_gain(model, x0, enc, mk, a.K * 2, gen)
-        lpc = exact_logp(model, x0, enc, mk, a.ode_steps, 1, gen); lpu = exact_logp(model, x0[:1], None, None, a.ode_steps, 1, gen)
+        g_c = torch.Generator(device=dev).manual_seed(12345 + i); g_u = torch.Generator(device=dev).manual_seed(12345 + i)   # paired probes across variants
+        lpc = exact_logp(model, x0, enc, mk, a.ode_steps, a.probes, g_c); lpu = exact_logp(model, x0[:1], None, None, a.ode_steps, a.probes, g_u)
         r = {"flow_pmi_bits": {n: float((lpc[j] - lpu[0]) / math.log(2)) for j, n in enumerate(names)}, "flow_elbo_gain": {n: float((lu[j] - lc[j]) / 2 * d / math.log(2)) for j, n in enumerate(names)}}
         if critic: r["critic_mse"] = {n: critic_mse(texts[j], acts[i]) for j, n in enumerate(names)}
         rows.append(r)
