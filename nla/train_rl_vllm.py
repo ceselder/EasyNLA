@@ -3392,20 +3392,20 @@ def main():
                 return out
 
             eval_rewards_s = _score_eval_rows()          # live critic (canonical)
-            if flow is not None:
-                _efr = getattr(_score_eval_rows, "flow", [])
-                _efv = [r for r in _efr if r is not None]
-                if _efv:
-                    log["eval/flow_reward_mean"] = float(np.mean(_efv))
-                    log["eval/flow_fm_loss"] = -float(np.mean(_efv))
-                # dump the eval rollouts WITH their activations so a frozen scorer (MSE critic / frozen stage-2 flow) can be run offline
-                try:
-                    _dump_dir = save_dir / "eval_rollouts"; _dump_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save({"step": step, "explanations": _eval_expls, "vector_rewards": eval_rewards_s, "flow_rewards": _efr,
-                                "activations": torch.stack([torch.as_tensor(_eval_prompts_with_acts[ei][1]).to(torch.float16).cpu() for ei in range(len(eval_rows))])},
-                               str(_dump_dir / f"step_{step:06d}_r{int(os.environ.get('RANK', 0))}.pt"))
-                except Exception as _e:
-                    print(f"[eval] rollout dump failed: {_e}", flush=True)
+            _efr = getattr(_score_eval_rows, "flow", []) if flow is not None else []
+            _efv = [r for r in _efr if r is not None]
+            if _efv:
+                log["eval/flow_reward_mean"] = float(np.mean(_efv))
+                log["eval/flow_fm_loss"] = -float(np.mean(_efv))
+            # dump the eval rollouts WITH their activations (every reward mode) so a frozen scorer (SFT MSE critic / frozen stage-2
+            # flow) can be run offline on identical generations across arms
+            try:
+                _dump_dir = save_dir / "eval_rollouts"; _dump_dir.mkdir(parents=True, exist_ok=True)
+                torch.save({"step": step, "explanations": _eval_expls, "vector_rewards": eval_rewards_s, "flow_rewards": _efr,
+                            "activations": torch.stack([torch.as_tensor(_eval_prompts_with_acts[ei][1]).to(torch.float16).cpu() for ei in range(len(eval_rows))])},
+                           str(_dump_dir / f"step_{step:06d}_r{int(os.environ.get('RANK', 0))}.pt"))
+            except Exception as _e:
+                print(f"[eval] rollout dump failed: {_e}", flush=True)
             eval_rewards_ema = None
             if critic_ema.enabled:
                 with critic_ema.swapped():
