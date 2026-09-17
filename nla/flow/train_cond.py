@@ -34,12 +34,17 @@ def load_encoder(base, layer, device):
 
 
 def load_pairs(parquet, n, skip=0):
-    pf = pq.ParquetFile(parquet); t = pf.read(columns=["activation_vector", "response"]).slice(skip, n)
-    ac = np.asarray(t.column("activation_vector").combine_chunks().flatten(), dtype=np.float32).reshape(t.num_rows, -1)
+    """Row-batched read (a single 500k x 5120 list array overflows pyarrow's int32 offsets)."""
     from nla.schema import extract_explanation
-    zs = [(extract_explanation(r) or r or "").strip() for r in t.column("response").to_pylist()]
-    keep = [i for i, z in enumerate(zs) if z]
-    return torch.tensor(ac[keep]), [zs[i] for i in keep]
+    pf = pq.ParquetFile(parquet); acts, zs, seen = [], [], 0
+    for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "response"]):
+        if seen + rb.num_rows <= skip: seen += rb.num_rows; continue
+        a = np.asarray(rb.column("activation_vector").flatten(), dtype=np.float32).reshape(rb.num_rows, -1)
+        z = [(extract_explanation(r) or r or "").strip() for r in rb.column("response").to_pylist()]
+        lo = max(0, skip - seen); a, z = a[lo:], z[lo:]; seen += rb.num_rows
+        keep = [i for i, zz in enumerate(z) if zz]; acts.append(torch.tensor(a[keep])); zs += [z[i] for i in keep]
+        if len(zs) >= n: break
+    acts = torch.cat(acts)[:n]; return acts, zs[:n]
 
 
 def main():
@@ -48,8 +53,8 @@ def main():
     p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42)
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
-    p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=32); p.add_argument("--n-heads", type=int, default=8); p.add_argument("--d-head", type=int, default=64)
-    p.add_argument("--max-train", type=int, default=500000); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
+    p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
+    p.add_argument("--max-train", type=int, default=200000); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
     p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     norm = Normalizer.load(a.stats).to(dev)
@@ -59,7 +64,7 @@ def main():
     prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
     encode, tok = load_encoder(a.base, a.enc_layer, dev)
     d_enc = cfg["d_input"]
-    model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head).to(dev)
+    model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank).to(dev)
     for blk in model.blocks: blk.read.float(); blk.gate_mod.float()                     # adapter in fp32
     n_ad = model.n_adapter_params(); print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}", flush=True)
     tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train); va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)

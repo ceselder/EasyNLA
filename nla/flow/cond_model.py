@@ -13,7 +13,7 @@ from nla.flow.model import Denoiser, MLPBlock, timestep_embedding
 
 class CrossRead(nn.Module):
     """S query slots carved from the block hidden state attend over encoder token states; output projected back to d_model (zero-init)."""
-    def __init__(self, d_model: int, d_enc: int, n_slots: int = 32, n_heads: int = 8, d_head: int = 64):
+    def __init__(self, d_model: int, d_enc: int, n_slots: int = 8, n_heads: int = 4, d_head: int = 64):
         super().__init__()
         self.n_slots, self.n_heads, self.d_head = n_slots, n_heads, d_head
         d_attn = n_heads * d_head
@@ -33,11 +33,14 @@ class CrossRead(nn.Module):
 
 
 class CondMLPBlock(nn.Module):
-    def __init__(self, base: MLPBlock, d_enc: int, n_slots: int, n_heads: int, d_head: int):
+    def __init__(self, base: MLPBlock, d_enc: int, n_slots: int, n_heads: int, d_head: int, gate_rank: int = 128):
         super().__init__()
         self.base = base
-        self.read = CrossRead(base.ln.normalized_shape[0], d_enc, n_slots, n_heads, d_head)
-        self.gate_mod = nn.Linear(base.ln.normalized_shape[0], base.up_proj.out_features); nn.init.zeros_(self.gate_mod.weight); nn.init.zeros_(self.gate_mod.bias)
+        d_model = base.ln.normalized_shape[0]
+        self.read = CrossRead(d_model, d_enc, n_slots, n_heads, d_head)
+        # low-rank gate modulation (d_model -> rank -> d_mlp), zero-init on the output side
+        self.gate_mod = nn.Sequential(nn.Linear(d_model, gate_rank, bias=False), nn.Linear(gate_rank, base.up_proj.out_features))
+        nn.init.zeros_(self.gate_mod[1].weight); nn.init.zeros_(self.gate_mod[1].bias)
 
     def forward(self, x, t_emb, enc=None, enc_mask=None):
         b = self.base; h = b.ln(x)
@@ -51,10 +54,10 @@ class CondMLPBlock(nn.Module):
 
 class CondDenoiser(nn.Module):
     """Wraps a pretrained Denoiser; forward(x_t, t, enc=None, enc_mask=None). enc=None -> exactly the unconditional prior."""
-    def __init__(self, prior: Denoiser, d_enc: int, n_slots: int = 32, n_heads: int = 8, d_head: int = 64):
+    def __init__(self, prior: Denoiser, d_enc: int, n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128):
         super().__init__()
         self.prior = prior
-        self.blocks = nn.ModuleList([CondMLPBlock(blk, d_enc, n_slots, n_heads, d_head) for blk in prior.layers])
+        self.blocks = nn.ModuleList([CondMLPBlock(blk, d_enc, n_slots, n_heads, d_head, gate_rank) for blk in prior.layers])
         self.d_enc = d_enc
 
     def forward(self, x_t, t, enc=None, enc_mask=None):
