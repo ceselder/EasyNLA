@@ -24,12 +24,14 @@ class CrossRead(nn.Module):
     def forward(self, h: torch.Tensor, enc: torch.Tensor, enc_mask: torch.Tensor) -> torch.Tensor:
         """h [B, d_model]; enc [B, T, d_enc]; enc_mask [B, T] bool (True = real token). Returns [B, d_model]."""
         B, T, _ = enc.shape
+        has = enc_mask.any(-1)                                                                        # samples with a condition (per-sample dropout = all-False mask)
+        safe_mask = enc_mask | (~has)[:, None]                                                        # avoid all-masked rows (NaN) — their output is zeroed below
         e = self.enc_ln(enc)
         q = self.q(h).view(B, self.n_slots, self.n_heads, self.d_head).transpose(1, 2)              # [B, H, S, dh]
         k = self.k(e).view(B, T, self.n_heads, self.d_head).transpose(1, 2)                          # [B, H, T, dh]
         v = self.v(e).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        att = F.scaled_dot_product_attention(q, k, v, attn_mask=enc_mask[:, None, None, :])          # [B, H, S, dh]
-        return self.out(att.transpose(1, 2).reshape(B, -1))
+        att = F.scaled_dot_product_attention(q, k, v, attn_mask=safe_mask[:, None, None, :])         # [B, H, S, dh]
+        return self.out(att.transpose(1, 2).reshape(B, -1)) * has[:, None].to(h.dtype)
 
 
 class CondMLPBlock(nn.Module):
@@ -47,8 +49,9 @@ class CondMLPBlock(nn.Module):
         if enc is None:
             g = b.gate_proj(h) * b.time_proj(t_emb)
             return x + b.down_proj(F.silu(g) * b.up_proj(h))
-        r = self.read(h, enc, enc_mask)                                       # [B, d_model], zero at init
-        g = b.gate_proj(h) * b.time_proj(t_emb) * (1 + self.gate_mod(r))
+        r = self.read(h, enc, enc_mask)                                       # [B, d_model], zero at init and zero for condition-dropped samples
+        has = enc_mask.any(-1)[:, None].to(h.dtype)
+        g = b.gate_proj(h) * b.time_proj(t_emb) * (1 + self.gate_mod(r) * has)   # dropped samples: exactly the prior block
         return x + b.down_proj(F.silu(g) * b.up_proj(h)) + r
 
 
@@ -86,6 +89,10 @@ def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0):
     if t is None: t = torch.rand(B, device=x0.device)
     if eps is None: eps = torch.randn_like(x0)
     x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
-    use_cond = enc is not None and (p_uncond <= 0 or torch.rand(()) >= p_uncond)
-    v = model(x_t, t, enc if use_cond else None, enc_mask if use_cond else None)
-    return F.mse_loss(v.float(), (eps - x0).float()), t, use_cond
+    if enc is None:
+        return F.mse_loss(model(x_t, t).float(), (eps - x0).float()), t, False
+    if p_uncond > 0:   # PER-SAMPLE condition dropout: an all-False mask makes the adapter contribute exactly zero for that sample
+        drop = torch.rand(B, device=x0.device) < p_uncond
+        enc_mask = enc_mask & ~drop[:, None]
+    v = model(x_t, t, enc, enc_mask)
+    return F.mse_loss(v.float(), (eps - x0).float()), t, True
