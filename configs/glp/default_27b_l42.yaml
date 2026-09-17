@@ -4,8 +4,8 @@
 base_id: Qwen/Qwen3.6-27B
 layer: 42                      # activation = output of decoder block 42 (HF hidden_states[43]), same as the NLA AR/AV
 gpus:
-  producers: 5                 # GPUs streaming activations (LM truncated to 43 blocks)
-  consumers: 3                 # DDP trainer GPUs
+  producers: 4                 # GPUs streaming activations (LM truncated to 43 blocks); ~12.5k tok/s each (measured)
+  consumers: 4                 # FSDP trainer GPUs
 data:
   dataset: HuggingFaceFW/fineweb
   config: sample-10BT
@@ -26,7 +26,7 @@ stats:
 model:                         # GLP TransformerMLPDenoiser; d_model = 2 x d_act, d_mlp = 2 x d_model
   d_model: 10240
   d_mlp: 20480
-  n_layers: 6                  # -> 5.35B params
+  n_layers: 16                 # -> 13.7B params (GLP's largest was 6 blocks / 3.3B); deep so every block can later read the explanation
 train:
   batch: 4096                  # per GPU (GLP: 4096 total on one A100)
   lr: 5.0e-5                   # GLP value; NOT scaled for the 3x larger global batch (ablate)
@@ -37,11 +37,12 @@ train:
   wd: 0.0
   ema: 0.9999
   compile: false
+  fsdp: true                   # shard params/grads/Adam across consumer GPUs (needed above ~5B params)
 eval:
-  every: 1000                  # steps
-  n: 16384                     # held-out activations scored
+  every: 2000                  # steps
+  n: 32768                     # held-out activations scored (FD uses 16384 + reports the real-vs-real floor)
   sample_steps: 50             # Euler steps for FD samples
 ckpt:
-  every: 2000                  # steps -> latest/ (resumable)
-  snapshot_every_samples: 1.28e8   # bf16 EMA snapshots (GLP: every 32M)
+  every: 10000                 # steps -> latest/ (resumable, sharded, ~190 GB for 13.7B)
+  snapshot_every_samples: 2.56e8   # full bf16 EMA snapshots (27 GB each)
 max_hours: 22.3                # stop + save before Modal's 23 h limit; relaunch resumes from latest/

@@ -1,11 +1,11 @@
 # tiny end-to-end check (B200:3). Inherits default_27b_l42.yaml; keys here override.
 gpus: {producers: 2, consumers: 1}
-model: {d_model: 2048, d_mlp: 4096, n_layers: 3}
-train: {batch: 2048, total_samples: 3.0e7}
-data: {max_tokens_per_producer: 1.5e7}
+model: {d_model: 2048, d_mlp: 4096, n_layers: 4}
+train: {batch: 2048, total_samples: 8.0e6, fsdp: true}
+data: {max_tokens_per_producer: 6.0e6}
 shards: {size: 8192}
 stats: {n: 200000, heldout_n: 16384, heldout_docs_full: 16}
 eval: {every: 100, n: 8192}
-ckpt: {every: 200, snapshot_every_samples: 1.0e7}
+ckpt: {every: 300, snapshot_every_samples: 4.0e6}
 max_hours: 1.0
 stream_timeout: 300

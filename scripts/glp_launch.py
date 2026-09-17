@@ -51,7 +51,7 @@ def main():
            "--total-samples", str(T["total_samples"]), "--warmup", str(T["warmup"]), "--min-lr-frac", str(T["min_lr_frac"]), "--clip", str(T["clip"]),
            "--wd", str(T["wd"]), "--ema", str(T["ema"]), "--eval-every", str(E["every"]), "--eval-n", str(E["n"]), "--sample-steps", str(E["sample_steps"]),
            "--ckpt-every", str(K["every"]), "--snapshot-every-samples", str(K["snapshot_every_samples"]), "--max-hours", str(C["max_hours"]),
-           "--stream-timeout", str(C.get("stream_timeout", 1800)), "--stop-file", stop_file] + (["--compile"] if T.get("compile") else []) + (["--wandb-name", a.wandb_name] if a.wandb_name else [])
+           "--stream-timeout", str(C.get("stream_timeout", 1800)), "--stop-file", stop_file] + (["--compile"] if T.get("compile") else []) + (["--fsdp"] if T.get("fsdp") else []) + (["--wandb-name", a.wandb_name] if a.wandb_name else [])
     print("[launch] trainer:", " ".join(cmd), flush=True)
     tr = subprocess.Popen(cmd, env=dict(env, CUDA_VISIBLE_DEVICES=gpus, OMP_NUM_THREADS="8"))
     while tr.poll() is None:
