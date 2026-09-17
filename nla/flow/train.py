@@ -111,6 +111,8 @@ def evaluate(ema, norm, held, device, n, sample_steps, d, raw_model=None):
     out["eval/sample_norm_mean"] = norm.denormalize(samp).norm(dim=-1).mean().item(); out["eval/real_norm_mean"] = norm.denormalize(real).norm(dim=-1).mean().item()
     out["eval/sample_std_mean"] = samp.std(0).mean().item(); out["eval/real_std_mean"] = real.std(0).mean().item()
     ema.train()
+    for m in (ema, raw_model):   # FSDP2: a forward without backward leaves the root module's params all-gathered; reshard so the EMA update sees matching local shards
+        if m is not None and hasattr(m, "reshard"): m.reshard()
     return out
 
 
