@@ -117,6 +117,14 @@ def gumbel_av(tag: str, extra: str = ""):
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
+@app.function(gpu="B200", timeout=3600, **COMMON)
+def sample_diag(tag: str, ckpt: str, extra: str = ""):
+    import subprocess
+    out = f"/vol_glp/{tag}/sample_diag_{ckpt}.json"
+    cmd = [sys.executable, "-m", "nla.flow.sample_diag", "--ckpt", f"/vol_glp/{tag}/ckpts/{ckpt}", "--stats", f"/vol_glp/{tag}/rep_statistics.pt", "--heldout", f"/vol_glp/{tag}/heldout_acts.pt", "--out", out] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
 @app.local_entrypoint()
 def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
@@ -134,6 +142,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", bench_producer.remote(attn_impl, tokens_per_batch, extra=extra))
     elif task == "gumbel_av":
         print("rc", gumbel_av.remote(tag or "gumbel_av", extra))
+    elif task == "sample_diag":
+        print("rc", sample_diag.remote(tag, ckpt, extra))
     elif task == "bnoise":
         print("rc", bnoise.remote(tag, ckpt, extra))
     elif task == "gen_onpolicy":
