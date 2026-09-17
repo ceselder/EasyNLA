@@ -111,7 +111,7 @@ def main():
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
-    p.add_argument("--max-train", type=int, default=200000); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=400000); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
+    p.add_argument("--max-train", type=int, default=200000); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
     p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
@@ -157,10 +157,13 @@ def main():
     if is0: print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}; unfreeze_prior={a.unfreeze_prior} world={world}", flush=True)
     tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train); va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)
     n_sft = len(tr_z)
+    mv_acts, mv_z = None, None
     if a.mined_dir:
         m_acts, m_z = load_mined_pairs(a.mined_dir, a.mined_acts_parquet, a.max_mined)
+        if len(m_z) > a.mined_val_n:   # hold out the tail of the on-policy pairs as a second eval distribution
+            mv_acts, mv_z = m_acts[-a.mined_val_n:], m_z[-a.mined_val_n:]; m_acts, m_z = m_acts[:-a.mined_val_n], m_z[:-a.mined_val_n]
         if len(m_z): tr_acts = torch.cat([tr_acts, m_acts]); tr_z = tr_z + m_z
-        print(f"[cond] mined on-policy pairs: {len(m_z)}", flush=True)
+        if is0: print(f"[cond] mined on-policy pairs: {len(m_z)} train + {0 if mv_z is None else len(mv_z)} held-out", flush=True)
     if is0: print(f"[cond] {len(tr_z)} train pairs ({n_sft} SFT/Opus + {len(tr_z)-n_sft} on-policy), {len(va_z)} val pairs; d_enc {d_enc}", flush=True)
     from nla.schema import compute_predict_mean_baselines, resolve_target_scale, normalize_activation
     msf = math.sqrt(cfg["d_input"]); _, base_mse = compute_predict_mean_baselines(va_acts[: a.eval_n], msf)
@@ -187,36 +190,40 @@ def main():
             return e, mk, cv
 
     @torch.no_grad()
-    def evaluate(step):
+    def evaluate(step, ev_acts=None, ev_z=None, prefix="eval"):
+        ev_acts = va_acts if ev_acts is None else ev_acts; ev_z = va_z if ev_z is None else ev_z; n_ev = min(a.eval_n, len(ev_z))
         model.eval(); out = {}
-        x0 = norm.normalize(va_acts[: a.eval_n].to(dev)); g = torch.Generator(device=dev).manual_seed(0)
-        perm = torch.randperm(a.eval_n, generator=torch.Generator().manual_seed(1))
-        zs = va_z[: a.eval_n]; zs_shuf = [zs[i] for i in perm.tolist()]
+        if arvec is not None: arvec.eval()
+        x0 = norm.normalize(ev_acts[: n_ev].to(dev)); g = torch.Generator(device=dev).manual_seed(0)
+        perm = torch.randperm(n_ev, generator=torch.Generator().manual_seed(1))
+        zs = ev_z[: n_ev]; zs_shuf = [zs[i] for i in perm.tolist()]
         for t_val in (0.1, 0.3, 0.5, 0.7, 0.9):
-            eps = torch.randn(x0.shape, device=dev, generator=g); t = torch.full((a.eval_n,), t_val, device=dev)
+            eps = torch.randn(x0.shape, device=dev, generator=g); t = torch.full((n_ev,), t_val, device=dev)
             for name, cond in (("uncond", None), ("cond", zs), ("shuf", zs_shuf)):
                 ls = []
-                for i in range(0, a.eval_n, 128):
-                    e, mk = enc_batch(cond[i:i+128]) if cond is not None else (None, None)
+                for i in range(0, n_ev, 128):
+                    e, mk, cv = enc_batch(cond[i:i+128]) if cond is not None else (None, None, None)
                     with torch.autocast("cuda", dtype=torch.bfloat16):
-                        x_t = (1 - t_val) * x0[i:i+128] + t_val * eps[i:i+128]; v = model(x_t, t[i:i+128], e, mk)
+                        x_t = (1 - t_val) * x0[i:i+128] + t_val * eps[i:i+128]; v = model(x_t, t[i:i+128], e, mk, cv)
                     ls.append(F.mse_loss(v.float(), (eps[i:i+128] - x0[i:i+128]).float(), reduction="sum").item() / x0.shape[1])
-                out[f"eval/fm_{name}_t{t_val}"] = sum(ls) / a.eval_n
+                out[f"eval/fm_{name}_t{t_val}"] = sum(ls) / n_ev
         for name in ("uncond", "cond", "shuf"): out[f"eval/fm_{name}"] = sum(out[f"eval/fm_{name}_t{t}"] for t in (0.1, 0.3, 0.5, 0.7, 0.9)) / 5
         out["eval/gain_bits_per_dim"] = (out["eval/fm_uncond"] - out["eval/fm_cond"]) / (2 * math.log(2))   # ELBO-flavoured: 0.5*Δmse per dim in nats -> bits (uniform-t weighting)
         # conditional FVE: x0-prediction at high noise, x0_hat = x_t - t*v ; NLA convention: unit-L2 to sqrt(d), MSE, predict-mean baseline
-        t_val = 0.9; eps = torch.randn(x0.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(7)); t = torch.full((a.eval_n,), t_val, device=dev)
+        t_val = 0.9; eps = torch.randn(x0.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(7)); t = torch.full((n_ev,), t_val, device=dev)
         preds = []
-        for i in range(0, a.eval_n, 128):
+        for i in range(0, n_ev, 128):
             e, mk, cv = enc_batch(zs[i:i+128]); x_t = (1 - t_val) * x0[i:i+128] + t_val * eps[i:i+128]
             with torch.autocast("cuda", dtype=torch.bfloat16): v = model(x_t, t[i:i+128], e, mk, cv).float()
             preds.append(norm.denormalize(x_t - t_val * v))
-        pred = normalize_activation(torch.cat(preds), msf); gold = normalize_activation(va_acts[: a.eval_n].to(dev), msf)
+        pred = normalize_activation(torch.cat(preds), msf); gold = normalize_activation(ev_acts[: n_ev].to(dev), msf)
         mse = ((pred - gold) ** 2).mean().item(); out["eval/cond_fve_x0_t0.9"] = 100 * (1 - mse / base_mse); out["eval/cond_mse_x0_t0.9"] = mse
         # source match: for each of match_n held-out pairs, rank the true explanation against 7 distractors by mean denoising loss over 8 (t, eps)
+        do_match = ev_acts is va_acts and len(va_z) >= a.eval_n + a.match_n
         mh = va_acts[a.eval_n: a.eval_n + a.match_n]; mz = va_z[a.eval_n: a.eval_n + a.match_n]; K = 8; correct = 0
+        n_match = a.match_n if do_match else 0
         rng = np.random.default_rng(3); gm = torch.Generator(device=dev).manual_seed(11)
-        for i in range(a.match_n):
+        for i in range(n_match):
             cands = [mz[i]] + [mz[j] for j in rng.choice([j for j in range(a.match_n) if j != i], K - 1, replace=False)]
             order = rng.permutation(K); cands = [cands[o] for o in order]; true_idx = int(np.where(order == 0)[0][0])   # shuffle: ties must not favour the true one
             e, mk, cv = enc_batch(cands); xi = norm.normalize(mh[i:i+1].to(dev)).expand(K, -1); score = torch.zeros(K, device=dev)
@@ -225,16 +232,25 @@ def main():
                 with torch.autocast("cuda", dtype=torch.bfloat16): v = model((1 - tt)[:, None] * xi + tt[:, None] * ee, tt, e, mk, cv).float()
                 score += ((v - (ee - xi)) ** 2).mean(-1)
             correct += int(score.argmin().item() == true_idx and (score < score[true_idx]).sum().item() == 0 and (score == score[true_idx]).sum().item() == 1)   # strict best
-        out["eval/source_match_acc"] = correct / a.match_n; out["eval/source_match_chance"] = 1 / K
+        out["eval/source_match_acc"] = (correct / n_match) if n_match else float("nan"); out["eval/source_match_chance"] = 1 / K
+        if prefix != "eval": out = {k.replace("eval/", prefix + "/"): v for k, v in out.items()}
         model.train()
-        print(f"[eval@{step}] fm uncond {out['eval/fm_uncond']:.4f} cond {out['eval/fm_cond']:.4f} shuf {out['eval/fm_shuf']:.4f} | gain {out['eval/gain_bits_per_dim']*x0.shape[1]:.1f} bits/activation | cond FVE(x0@0.9) {out['eval/cond_fve_x0_t0.9']:.1f}% | source-match {100*out['eval/source_match_acc']:.1f}% (chance 12.5%)", flush=True)
-        json.dump(out, open(os.path.join(a.out, f"eval_{step:06d}.json"), "w"), indent=1)
+        if arvec is not None: arvec.train()
+        P = prefix
+        if not is0: return out
+        print(f"[{P}@{step}] fm uncond {out[P+'/fm_uncond']:.4f} cond {out[P+'/fm_cond']:.4f} shuf {out[P+'/fm_shuf']:.4f} | gain {out[P+'/gain_bits_per_dim']*x0.shape[1]:.1f} bits/activation | cond FVE(x0@0.9) {out[P+'/cond_fve_x0_t0.9']:.1f}% | source-match {100*out[P+'/source_match_acc']:.1f}% (chance 12.5%)", flush=True)
+        json.dump(out, open(os.path.join(a.out, f"{P}_{step:06d}.json"), "w"), indent=1)
         return out
 
     rng = torch.Generator().manual_seed(a.seed + rank); t0 = time.time(); evaluate(0)
+    if mv_z is not None: evaluate(0, mv_acts, mv_z, prefix="eval_onpolicy")
+    N = tr_acts.shape[0]
+    if is0: print(f"[cond] {a.steps} steps x {a.batch} x {world} ranks = {a.steps*a.batch*world} draws over {N} pairs = {a.steps*a.batch*world/N:.2f} passes (single pass = no repetition)", flush=True)
+    perm = torch.randperm(N, generator=rng); cursor = 0
     for step in range(1, a.steps + 1):
-        idx = torch.randint(0, tr_acts.shape[0], (a.batch,), generator=rng)
-        x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk = enc_batch([tr_z[i] for i in idx.tolist()])
+        if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0; print(f"[cond] re-shuffle (pass {step*a.batch*world/N:.1f})", flush=True)
+        idx = perm[cursor:cursor + a.batch]; cursor += a.batch
+        x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch([tr_z[i] for i in idx.tolist()], grad=True)
         sched = min(1.0, step / a.warmup) * (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1)
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
         lr = a.lr * sched
@@ -246,6 +262,7 @@ def main():
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn)}, step=step)
         if step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours:
             ev = evaluate(step)
+            if mv_z is not None: ev.update(evaluate(step, mv_acts, mv_z, prefix="eval_onpolicy"))
             if use_wandb: wandb.log(ev, step=step)
             if a.unfreeze_prior:
                 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
