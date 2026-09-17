@@ -171,6 +171,8 @@ def main():
     model = Denoiser(a.d_input, a.d_model, a.d_mlp, a.n_layers).to(device)
     ema = Denoiser(a.d_input, a.d_model, a.d_mlp, a.n_layers).to(device); ema.load_state_dict(model.state_dict()); ema.requires_grad_(False)
     n_params = model.n_params()
+    if a.compile:   # compile each MLP block (before sharding): fuses LN + gated MLP; safe with FSDP2
+        for blk in model.layers: blk.compile()
     if a.fsdp:
         mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         for mod in (model, ema):
@@ -186,7 +188,6 @@ def main():
     if os.path.exists(os.path.join(latest, "meta.json" if a.fsdp else "state.pt")):
         step, samples = load_latest(latest, model, ema, opt, a.fsdp)
         if rank == 0: print(f"[train] resumed from step {step} ({samples/1e6:.0f}M samples)", flush=True)
-    if a.compile: fwd = torch.compile(fwd)
     if rank == 0:
         print(f"[train] denoiser {n_params/1e9:.2f}B params, world {world}, fsdp {a.fsdp}, global batch {global_batch}, total steps {total_steps}", flush=True)
         if not a.no_wandb:
