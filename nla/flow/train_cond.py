@@ -76,29 +76,48 @@ def main():
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=400000); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
-    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
-    a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
+    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
+    a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
+    import torch.distributed as dist
+    ddp = "RANK" in os.environ
+    if ddp: dist.init_process_group("nccl"); rank, world = dist.get_rank(), dist.get_world_size(); dev = torch.device("cuda", int(os.environ["LOCAL_RANK"])); torch.cuda.set_device(dev)
+    else: rank, world, dev = 0, 1, "cuda"
+    is0 = rank == 0
     norm = Normalizer.load(a.stats).to(dev)
     m = torch.load(os.path.join(a.prior, "model.pt"), map_location="cpu"); cfg = m["args"]
     sd = m.get("model") if a.prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(a.prior, "ema.pt"), map_location="cpu")["ema"]
     prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"]); prior.load_state_dict({k: v.float() for k, v in sd.items()})
-    prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
     encode, tok = load_encoder(a.base, a.enc_layer, dev)
     d_enc = cfg["d_input"]
-    model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank).to(dev)
-    for blk in model.blocks: blk.read.float(); blk.gate_mod.float()                     # adapter in fp32
-    n_ad = model.n_adapter_params(); print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}", flush=True)
+    if a.unfreeze_prior:
+        # co-train: prior fp32 master + adapters, FSDP2-sharded across ranks (13.7B fp32 + Adam does not fit one GPU); bf16 compute
+        from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+        prior = prior.to(dev).requires_grad_(True)
+        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank).to(dev)
+        mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+        for blk in model.blocks: fully_shard(blk, mp_policy=mp)
+        fully_shard(model, mp_policy=mp)
+    else:
+        prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
+        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank).to(dev)
+        for blk in model.blocks: blk.read.float(); blk.gate_mod.float()                     # adapter in fp32
+    n_ad = model.n_adapter_params()
+    if is0: print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}; unfreeze_prior={a.unfreeze_prior} world={world}", flush=True)
     tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train); va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)
     n_sft = len(tr_z)
     if a.mined_dir:
         m_acts, m_z = load_mined_pairs(a.mined_dir, a.mined_acts_parquet, a.max_mined)
         if len(m_z): tr_acts = torch.cat([tr_acts, m_acts]); tr_z = tr_z + m_z
         print(f"[cond] mined on-policy pairs: {len(m_z)}", flush=True)
-    print(f"[cond] {len(tr_z)} train pairs ({n_sft} SFT/Opus + {len(tr_z)-n_sft} on-policy), {len(va_z)} val pairs; d_enc {d_enc}", flush=True)
+    if is0: print(f"[cond] {len(tr_z)} train pairs ({n_sft} SFT/Opus + {len(tr_z)-n_sft} on-policy), {len(va_z)} val pairs; d_enc {d_enc}", flush=True)
     from nla.schema import compute_predict_mean_baselines, resolve_target_scale, normalize_activation
     msf = math.sqrt(cfg["d_input"]); _, base_mse = compute_predict_mean_baselines(va_acts[: a.eval_n], msf)
-    opt = torch.optim.AdamW(model.adapter_parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
-    use_wandb = bool(a.wandb)
+    adapter_ids = {id(p_) for p_ in model.adapter_parameters()}
+    groups = [{"params": list(model.adapter_parameters()), "lr": a.lr, "base_lr": a.lr}]
+    if a.unfreeze_prior: groups.append({"params": [p_ for p_ in model.parameters() if id(p_) not in adapter_ids], "lr": a.prior_lr, "base_lr": a.prior_lr})
+    opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.0)
+    trainable = [p_ for g_ in groups for p_ in g_["params"]]
+    use_wandb = bool(a.wandb) and is0
     if use_wandb:
         try: import wandb; wandb.init(project=a.wandb, name=a.tag, config=vars(a) | {"adapter_params": n_ad})
         except Exception as e: print("[cond] wandb off:", e, flush=True); use_wandb = False
@@ -151,24 +170,33 @@ def main():
         json.dump(out, open(os.path.join(a.out, f"eval_{step:06d}.json"), "w"), indent=1)
         return out
 
-    rng = torch.Generator().manual_seed(a.seed); t0 = time.time(); evaluate(0)
+    rng = torch.Generator().manual_seed(a.seed + rank); t0 = time.time(); evaluate(0)
     for step in range(1, a.steps + 1):
         idx = torch.randint(0, tr_acts.shape[0], (a.batch,), generator=rng)
         x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk = enc_batch([tr_z[i] for i in idx.tolist()])
-        lr = a.lr * min(1.0, step / a.warmup) * (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1)
-        for gp in opt.param_groups: gp["lr"] = lr
+        sched = min(1.0, step / a.warmup) * (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1)
+        for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
+        lr = a.lr * sched
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond)
-        opt.zero_grad(set_to_none=True); loss.backward(); gn = torch.nn.utils.clip_grad_norm_(model.adapter_parameters(), 1.0); opt.step()
-        if step % 50 == 0:
+        opt.zero_grad(set_to_none=True); loss.backward(); gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn; opt.step()
+        if step % 50 == 0 and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/step:.2f}s/step", flush=True)
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn)}, step=step)
         if step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours:
             ev = evaluate(step)
             if use_wandb: wandb.log(ev, step=step)
-            torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
+            if a.unfreeze_prior:
+                from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+                full = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+                if is0:
+                    torch.save({"adapter": {k: v for k, v in full.items() if ".read." in k or ".gate_mod." in k}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
+                    torch.save({"model": {k[len("prior."):]: v.to(torch.bfloat16) for k, v in full.items() if k.startswith("prior.")}, "args": cfg, "step": step, "cotrained_with": a.tag}, os.path.join(a.out, "prior_cotrained_latest.pt"))
+            elif is0:
+                torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
             if (time.time() - t0) / 3600 > a.max_hours: break
-    print("[cond] done", flush=True)
+    if is0: print("[cond] done", flush=True)
+    if ddp: dist.destroy_process_group()
 
 
 if __name__ == "__main__":
