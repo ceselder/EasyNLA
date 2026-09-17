@@ -64,21 +64,27 @@ def ema_update(ema, model, decay):
 
 
 @torch.no_grad()
-def evaluate(ema, norm, held, device, n, sample_steps, d):
-    """Held-out FM loss on a fixed t-grid with fixed noise + Frechet distance of EMA samples vs real (normalised space)."""
-    ema.eval()
-    x0 = norm.normalize(held[:n].to(device)); g = torch.Generator(device=device).manual_seed(0)
-    out = {}
-    tot = 0.0
+def _heldout_fm(model, x0, device, prefix):
+    g = torch.Generator(device=device).manual_seed(0); out = {}; tot = 0.0
     for t_val in (0.1, 0.3, 0.5, 0.7, 0.9):
         eps = torch.randn(x0.shape, device=device, generator=g); t = torch.full((x0.shape[0],), t_val, device=device)
         ls = []
         for i in range(0, x0.shape[0], 4096):
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                l, _ = fm_loss(ema, x0[i:i+4096], t[i:i+4096], eps[i:i+4096])
+                l, _ = fm_loss(model, x0[i:i+4096], t[i:i+4096], eps[i:i+4096])
             ls.append(l.item() * x0[i:i+4096].shape[0])
-        out[f"eval/fm_loss_t{t_val}"] = sum(ls) / x0.shape[0]; tot += out[f"eval/fm_loss_t{t_val}"]
-    out["eval/fm_loss"] = tot / 5
+        out[f"{prefix}_t{t_val}"] = sum(ls) / x0.shape[0]; tot += out[f"{prefix}_t{t_val}"]
+    out[prefix] = tot / 5
+    return out
+
+
+def evaluate(ema, norm, held, device, n, sample_steps, d, raw_model=None):
+    """Held-out FM loss (EMA and raw weights) on a fixed t-grid with fixed noise + Frechet distance of EMA samples vs real (normalised space)."""
+    ema.eval()
+    x0 = norm.normalize(held[:n].to(device)); g = torch.Generator(device=device).manual_seed(0)
+    out = _heldout_fm(ema, x0, device, "eval/fm_loss")
+    if raw_model is not None:
+        raw_model.eval(); out.update(_heldout_fm(raw_model, x0, device, "eval/fm_loss_raw")); raw_model.train()
     n_s = min(4096, n)
     noise = torch.randn((n_s, d), device=device, generator=g)
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -154,8 +160,8 @@ def main():
             if not a.no_wandb: import wandb; wandb.log(rec, step=step)
             loss_acc, n_acc = 0.0, 0
         if rank == 0 and held is not None and step % a.eval_every == 0:
-            ev = evaluate(ema, norm, held, device, a.eval_n, a.sample_steps, a.d_input)
-            print("[eval] " + " ".join(f"{k.split('/')[1]}={v:.4f}" for k, v in ev.items()), flush=True)
+            ev = evaluate(ema, norm, held, device, a.eval_n, a.sample_steps, a.d_input, raw_model=model)
+            print("[eval] " + " ".join(f"{k.split('/')[1]}={v:.4f}" for k, v in ev.items() if not k.endswith(("_t0.1","_t0.3","_t0.5","_t0.7","_t0.9"))), flush=True)
             if not a.no_wandb: import wandb; wandb.log(ev, step=step)
         if step % a.ckpt_every == 0:
             dist.barrier()
