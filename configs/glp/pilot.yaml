@@ -1,0 +1,8 @@
+# PILOT for critical-batch measurement: full-size model, FineWeb only, 200M samples (~1.5 h), snapshots at 100M/200M.
+data:
+  sources:
+    - {name: fineweb, kind: hf_text, dataset: HuggingFaceFW/fineweb, config: sample-10BT, weight: 1.0}
+train: {total_samples: 2.0e8}
+eval: {every: 1000}
+ckpt: {every: 5000, snapshot_every_samples: 1.0e8}
+max_hours: 3.0

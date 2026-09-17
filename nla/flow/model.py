@@ -66,8 +66,9 @@ class Denoiser(nn.Module):
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """x_t: [B, d_input] (normalised space), t: [B] in [0,1] (1 = noise). Returns predicted velocity eps - x0."""
-        emb = self.time_embed(timestep_embedding(t * 1000.0, self.d_model))
-        h = self.in_proj(x_t)
+        dt = self.in_proj.weight.dtype
+        emb = self.time_embed(timestep_embedding(t * 1000.0, self.d_model).to(dt))
+        h = self.in_proj(x_t.to(dt))
         for layer in self.layers:
             h = layer(h, emb)
         return self.out_proj(self.ln(h))
