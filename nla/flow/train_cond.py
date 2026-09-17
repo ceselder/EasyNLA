@@ -47,6 +47,27 @@ def load_pairs(parquet, n, skip=0):
     acts = torch.cat(acts)[:n]; return acts, zs[:n]
 
 
+def load_mined_pairs(mined_dir, acts_parquet, max_n):
+    """On-policy pairs from scripts/mine_av_rollouts.py shards (row_idx, explanation) joined to the activations of the parquet they were mined over."""
+    import glob
+    shards = sorted(glob.glob(os.path.join(mined_dir, "rollouts_*.parquet")))
+    if not shards: return torch.zeros(0), []
+    rows = pq.read_table(shards[0]).schema.names
+    tabs = [pq.read_table(s, columns=["row_idx", "explanation"]) for s in shards]
+    ri = np.concatenate([np.asarray(t.column("row_idx").to_pylist(), dtype=np.int64) for t in tabs]); ex = sum([t.column("explanation").to_pylist() for t in tabs], [])
+    keep = [i for i, e in enumerate(ex) if e]; ri, ex = ri[keep], [ex[i] for i in keep]
+    if len(ex) > max_n: sel = np.random.default_rng(0).choice(len(ex), max_n, replace=False); ri, ex = ri[sel], [ex[i] for i in sel]
+    need = sorted(set(ri.tolist())); pf = pq.ParquetFile(acts_parquet); acts = {}; seen = 0; need_set = set(need)
+    for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector"]):
+        idxs = [i for i in range(seen, seen + rb.num_rows) if i in need_set]
+        if idxs:
+            a = np.asarray(rb.column("activation_vector").flatten(), dtype=np.float32).reshape(rb.num_rows, -1)
+            for i in idxs: acts[i] = a[i - seen]
+        seen += rb.num_rows
+        if seen > max(need): break
+    A = torch.tensor(np.stack([acts[int(i)] for i in ri])); return A, ex
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"])
@@ -54,7 +75,7 @@ def main():
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
-    p.add_argument("--max-train", type=int, default=200000); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
+    p.add_argument("--max-train", type=int, default=200000); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=400000); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
     p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     norm = Normalizer.load(a.stats).to(dev)
@@ -68,7 +89,12 @@ def main():
     for blk in model.blocks: blk.read.float(); blk.gate_mod.float()                     # adapter in fp32
     n_ad = model.n_adapter_params(); print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}", flush=True)
     tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train); va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)
-    print(f"[cond] {len(tr_z)} train pairs, {len(va_z)} val pairs; d_enc {d_enc}", flush=True)
+    n_sft = len(tr_z)
+    if a.mined_dir:
+        m_acts, m_z = load_mined_pairs(a.mined_dir, a.mined_acts_parquet, a.max_mined)
+        if len(m_z): tr_acts = torch.cat([tr_acts, m_acts]); tr_z = tr_z + m_z
+        print(f"[cond] mined on-policy pairs: {len(m_z)}", flush=True)
+    print(f"[cond] {len(tr_z)} train pairs ({n_sft} SFT/Opus + {len(tr_z)-n_sft} on-policy), {len(va_z)} val pairs; d_enc {d_enc}", flush=True)
     from nla.schema import compute_predict_mean_baselines, resolve_target_scale, normalize_activation
     msf = math.sqrt(cfg["d_input"]); _, base_mse = compute_predict_mean_baselines(va_acts[: a.eval_n], msf)
     opt = torch.optim.AdamW(model.adapter_parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)

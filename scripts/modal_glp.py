@@ -134,7 +134,8 @@ def train_cond(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap
     base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
     out = f"/vol_glp/cond/{tag}"
     cmd = [sys.executable, "-m", "nla.flow.train_cond", "--prior", f"/vol_glp/{prior_tag}/ckpts/{prior_ckpt}", "--stats", f"/vol_glp/{prior_tag}/rep_statistics.pt",
-           "--base", base, "--train-parquet", "/vol_q36/data/sft/av_sft_train.parquet", "--val-parquet", "/vol_q36/data/sft/av_sft_val.parquet", "--out", out, "--tag", tag] + extra.split()
+           "--base", base, "--train-parquet", "/vol_q36/data/sft/av_sft_train.parquet", "--val-parquet", "/vol_q36/data/sft/av_sft_val.parquet", "--out", out, "--tag", tag,
+           "--mined-acts-parquet", "/vol_q36/data/rl/rl_shuf.parquet"] + extra.split()      # add --mined-dir /vol_glp/pairs/<tag> via extra to mix in on-policy pairs
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
