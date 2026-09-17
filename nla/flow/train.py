@@ -214,8 +214,8 @@ def main():
         lr = lr_at(step, total_steps, a.lr, a.warmup, a.min_lr_frac)
         for g in opt.param_groups: g["lr"] = lr
         opt.zero_grad(set_to_none=True); loss_sum = 0.0
-        for mi, x0 in enumerate(xs):   # gradient accumulation: skip the FSDP reduce-scatter on all but the last micro-step
-            if a.fsdp and a.grad_accum > 1: model.set_requires_gradient_sync(mi == len(xs) - 1)
+        for mi, x0 in enumerate(xs):   # gradient accumulation. NOTE: do not skip FSDP gradient sync between micro-steps: FSDP2 then keeps
+            # the full UNSHARDED fp32 gradient per rank (+~28 GB for 13.7B) and 2-way FSDP OOMs. Reduce-scatter every micro-step instead.
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, _ = fm_loss(fwd, x0)
             (loss / len(xs)).backward(); loss_sum += loss.item()
