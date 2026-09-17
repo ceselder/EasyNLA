@@ -1,0 +1,47 @@
+# DEFAULT RECIPE for the activation flow prior (GLP-style) on Qwen3.6-27B layer 42. Ablate against THIS file:
+#   modal run --detach scripts/modal_glp.py --task pretrain --tag <name> --set "train.lr=1e-4 model.n_layers=12"
+# Every run saves its resolved config to <out-dir>/config.yaml. Follows Luo et al. 2026 (GLP) unless noted.
+base_id: Qwen/Qwen3.6-27B
+layer: 42                      # activation = output of decoder block 42 (HF hidden_states[43]), same as the NLA AR/AV
+gpus:
+  producers: 5                 # GPUs streaming activations (LM truncated to 43 blocks)
+  consumers: 3                 # DDP trainer GPUs
+data:
+  dataset: HuggingFaceFW/fineweb
+  config: sample-10BT
+  max_len: 2048                # docs truncated to this many tokens
+  min_len: 16                  # shorter docs dropped
+  tokens_per_batch: 32768      # padded tokens per LM forward (length-bucketed, right padding)
+  buffer_docs: 512             # docs tokenised + sorted per bucket
+  seed: 0                      # stream shuffle seed
+  drop_pos0: true              # skip position 0 (attention-sink token), as GLP skips BOS
+  max_tokens_per_producer: inf # cap per producer (smoke tests)
+shards:
+  size: 16384                  # activations per shard file
+  max_ready: 48                # back-pressure: producers wait above this many unconsumed shards (~48 x 168 MB)
+stats:
+  n: 2000000                   # activations used for per-dim mean/var standardisation
+  heldout_n: 65536             # held-out activations (never trained on)
+  heldout_docs_full: 64        # held-out docs stored with token ids + all positions (for delta-LM-loss eval)
+model:                         # GLP TransformerMLPDenoiser; d_model = 2 x d_act, d_mlp = 2 x d_model
+  d_model: 10240
+  d_mlp: 20480
+  n_layers: 6                  # -> 5.35B params
+train:
+  batch: 4096                  # per GPU (GLP: 4096 total on one A100)
+  lr: 5.0e-5                   # GLP value; NOT scaled for the 3x larger global batch (ablate)
+  total_samples: 2.0e9         # single pass, no activation seen twice
+  warmup: 0.01
+  min_lr_frac: 0.1             # cosine floor
+  clip: 1.0
+  wd: 0.0
+  ema: 0.9999
+  compile: false
+eval:
+  every: 1000                  # steps
+  n: 16384                     # held-out activations scored
+  sample_steps: 50             # Euler steps for FD samples
+ckpt:
+  every: 2000                  # steps -> latest/ (resumable)
+  snapshot_every_samples: 1.28e8   # bf16 EMA snapshots (GLP: every 32M)
+max_hours: 22.3                # stop + save before Modal's 23 h limit; relaunch resumes from latest/

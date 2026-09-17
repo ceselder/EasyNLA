@@ -1,6 +1,7 @@
 """Modal app for pretraining the activation flow prior (GLP-style) on Qwen3.6-27B layer-42 activations.
-  modal run scripts/modal_glp.py --task smoke                      # B200:3, tiny model, ~20 min end-to-end check
-  modal run --detach scripts/modal_glp.py --task pretrain --tag glp27b_d6   # B200:8, 5 producers + 3 DDP consumers, 2B activations
+  modal run scripts/modal_glp.py --task smoke                                   # B200:3, tiny model, end-to-end check
+  modal run --detach scripts/modal_glp.py --task pretrain --tag glp27b_default     # B200:8, configs/glp/default_27b_l42.yaml
+  modal run --detach scripts/modal_glp.py --task pretrain --tag glp27b_lr1e4 --sets "train.lr=1e-4"   # one-flag ablation
 """
 import os, sys
 import modal
@@ -26,23 +27,25 @@ def _run(args):
 
 
 @app.function(gpu="B200:8", timeout=23 * 3600, **COMMON)
-def pretrain(tag: str, n_producers: int = 5, n_consumers: int = 3, total_samples: float = 2e9, extra: str = ""):
-    return _run(["--out-dir", f"/vol_glp/{tag}", "--n-producers", str(n_producers), "--n-consumers", str(n_consumers),
-                 "--total-samples", str(total_samples), "--wandb-name", tag] + extra.split())
+def pretrain(tag: str, config: str = "", sets: str = ""):
+    args = ["--out-dir", f"/vol_glp/{tag}", "--wandb-name", tag]
+    if config: args += ["--config", f"{REPO_REMOTE}/{config}"]
+    if sets.strip(): args += ["--set"] + sets.split()
+    return _run(args)
 
 
 @app.function(gpu="B200:3", timeout=2 * 3600, **COMMON)
-def smoke(tag: str = "smoke_glp", extra: str = ""):
-    return _run(["--out-dir", f"/vol_glp/{tag}", "--n-producers", "2", "--n-consumers", "1", "--d-model", "2048", "--d-mlp", "4096", "--n-layers", "3",
-                 "--batch", "2048", "--total-samples", "3e7", "--max-tokens-per-producer", "1.5e7", "--max-hours", "1.0", "--wandb-name", tag,
-                 "--producer-extra", "--stats-n 200000 --heldout-n 16384 --heldout-docs-full 16 --shard-size 8192",
-                 "--trainer-extra", "--ckpt-every 200 --eval-every 100 --eval-n 8192 --snapshot-every-samples 1e7 --stream-timeout 300"] + extra.split())
+def smoke(tag: str = "smoke_glp", sets: str = ""):
+    args = ["--out-dir", f"/vol_glp/{tag}", "--wandb-name", tag, "--config", f"{REPO_REMOTE}/configs/glp/smoke.yaml"]
+    if sets.strip(): args += ["--set"] + sets.split()
+    return _run(args)
 
 
 @app.local_entrypoint()
-def main(task: str = "smoke", tag: str = "", n_producers: int = 5, n_consumers: int = 3, total_samples: float = 2e9, extra: str = ""):
+def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = ""):
+    """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
     if task == "smoke":
-        print("rc", smoke.remote(tag or "smoke_glp", extra))
+        print("rc", smoke.remote(tag or "smoke_glp", sets))
     elif task == "pretrain":
         assert tag, "--tag required"
-        print("rc", pretrain.remote(tag, n_producers, n_consumers, total_samples, extra))
+        print("rc", pretrain.remote(tag, config, sets))

@@ -68,7 +68,7 @@ def main():
     p.add_argument("--seed", type=int, default=0); p.add_argument("--stats-n", type=int, default=2_000_000)
     p.add_argument("--heldout-n", type=int, default=65536); p.add_argument("--heldout-docs-full", type=int, default=64)
     p.add_argument("--max-tokens", type=float, default=float("inf"), help="stop after this many tokens (this producer)")
-    p.add_argument("--stop-file", default=None)
+    p.add_argument("--stop-file", default=None); p.add_argument("--keep-pos0", action="store_true")
     a = p.parse_args()
     device = "cuda"
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -124,10 +124,11 @@ def main():
                     pass
             h = cap.pop("h")                                    # [B, Lmax, d] bf16
             lens = am.sum(1)
-            keep = am.bool().clone(); keep[:, 0] = False           # drop position 0 (attention sink / BOS-like)
+            keep = am.bool().clone()
+            if not a.keep_pos0: keep[:, 0] = False           # drop position 0 (attention sink / BOS-like)
             acts = h[keep.to(device)].to(torch.bfloat16).cpu()  # [N, d] in row-major (b, pos) order
-            pos = torch.cat([torch.arange(1, int(l)) for l in lens]).to(torch.int32)
-            doc = torch.cat([torch.full((int(l) - 1,), prog["docs"] + b, dtype=torch.int32) for b, l in enumerate(lens)])
+            p0 = 0 if a.keep_pos0 else 1; pos = torch.cat([torch.arange(p0, int(l)) for l in lens]).to(torch.int32)
+            doc = torch.cat([torch.full((int(l) - p0,), prog["docs"] + b, dtype=torch.int32) for b, l in enumerate(lens)])
             if welford is not None and welford.n < a.stats_n:
                 welford.update(h[keep.to(device)])
                 if welford.n >= a.stats_n:
