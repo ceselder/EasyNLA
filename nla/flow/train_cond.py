@@ -110,7 +110,7 @@ def main():
     p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42)
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
-    p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
+    p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block")
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
     p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
@@ -136,7 +136,7 @@ def main():
         # co-train: prior fp32 master + adapters, FSDP2-sharded across ranks (13.7B fp32 + Adam does not fit one GPU); bf16 compute
         from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
         prior = prior.to(dev).requires_grad_(True)
-        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens).to(dev)
+        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens, d_c=a.d_c).to(dev)
         mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         # shard the prior block and the adapter modules SEPARATELY: prior.layers[i] is also referenced as blocks[i].base, and FSDP2 refuses to
         # re-shard a module it already reached through the other path (the root would otherwise meet DTensor params -> "value was None")
@@ -144,15 +144,16 @@ def main():
         # so sharding the prior block as a unit leaves its DTensor params un-gathered ("mixed torch.Tensor and DTensor" in layer_norm)
         for i, pblk in enumerate(prior.layers):
             for sub in (pblk.ln, pblk.up_proj, pblk.gate_proj, pblk.time_proj, pblk.down_proj): fully_shard(sub, mp_policy=mp)
-            if use_tokens: fully_shard(model.blocks[i].read, mp_policy=mp); fully_shard(model.blocks[i].gate_mod, mp_policy=mp)
+            for sub in model.blocks[i].read, model.blocks[i].cvec_out, model.blocks[i].gate_mod:
+                if sub is not None: fully_shard(sub, mp_policy=mp)
         for sub in (prior.in_proj, prior.time_embed, prior.ln, prior.out_proj): fully_shard(sub, mp_policy=mp)
+        if d_cvec:
+            for sub in (model.cvec_ln, model.cvec_in, model.cvec_x): fully_shard(sub, mp_policy=mp)
         fully_shard(model, mp_policy=mp)
     else:
         prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
-        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens).to(dev)
-        if use_tokens:
-            for blk in model.blocks: blk.read.float(); blk.gate_mod.float()                     # adapter in fp32
-        if d_cvec: model.cvec_ln.float(); model.cvec_proj.float()
+        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens, d_c=a.d_c).to(dev)
+        for m_ in model.adapter_modules(): m_.float()                                            # adapter in fp32
     n_ad = model.n_adapter_params()
     if is0: print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}; unfreeze_prior={a.unfreeze_prior} world={world}", flush=True)
     tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train); va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)
@@ -271,7 +272,7 @@ def main():
                     torch.save({"adapter": {k: v for k, v in full.items() if ".read." in k or ".gate_mod." in k}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
                     torch.save({"model": {k[len("prior."):]: v.to(torch.bfloat16) for k, v in full.items() if k.startswith("prior.")}, "args": cfg, "step": step, "cotrained_with": a.tag}, os.path.join(a.out, "prior_cotrained_latest.pt"))
             elif is0:
-                torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k or k.startswith("cvec_")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
+                torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
             if arvec is not None and is0:
                 torch.save({"lora": {k: v for k, v in arvec.crit.state_dict().items() if "lora_" in k}, "value_head": arvec.crit.value_head.state_dict(), "step": step}, os.path.join(a.out, "ar_encoder_latest.pt"))
             if (time.time() - t0) / 3600 > a.max_hours: break
