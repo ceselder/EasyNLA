@@ -34,6 +34,15 @@ def pretrain(tag: str, config: str = "", sets: str = ""):
     return _run(args)
 
 
+@app.function(gpu="B200:4", timeout=23 * 3600, **COMMON)
+def pretrain_g4(tag: str, config: str = "", sets: str = ""):
+    """Same as pretrain on a 4-GPU node (2 producers + 2 consumers) for when B200:8 capacity is scarce."""
+    args = ["--out-dir", f"/vol_glp/{tag}", "--wandb-name", tag, "--set", "gpus.producers=2", "gpus.consumers=2"]
+    if config: args[-3:-3] = ["--config", f"{REPO_REMOTE}/{config}"]
+    if sets.strip(): args += sets.split()
+    return _run(args)
+
+
 @app.function(gpu="B200:3", timeout=2 * 3600, **COMMON)
 def smoke(tag: str = "smoke_glp", sets: str = ""):
     args = ["--out-dir", f"/vol_glp/{tag}", "--wandb-name", tag, "--config", f"{REPO_REMOTE}/configs/glp/smoke.yaml"]
@@ -104,6 +113,9 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
     elif task == "pretrain":
         assert tag, "--tag required"
         print("rc", pretrain.remote(tag, config, sets))
+    elif task == "pretrain_g4":
+        assert tag, "--tag required"
+        print("rc", pretrain_g4.remote(tag, config, sets))
     elif task == "eval_lm":
         print("rc", eval_lm.remote(tag, ckpt, extra))
     elif task == "bench_producer":
