@@ -68,6 +68,37 @@ def load_mined_pairs(mined_dir, acts_parquet, max_n):
     A = torch.tensor(np.stack([acts[int(i)] for i in ri])); return A, ex
 
 
+class ARVecEncoder(torch.nn.Module):
+    """The existing NLA critic (AR: truncated LM trunk + affine value head), used as the conditioning encoder.
+    cvec = concat(normalise(value_head(last_hidden)) [= the MSE critic's E[h|z] estimate at init], normalise(last_hidden)). LoRA on the trunk
+    (r 64, alpha 16, rsLoRA) and the value head are trainable; trained by the flow-matching loss, not MSE."""
+    def __init__(self, ar_dir, tok, device, lora_r=64, lora_alpha=16, grad_ckpt=True):
+        super().__init__()
+        from nla.models import NLACriticModel
+        from peft import LoraConfig, get_peft_model
+        crit = NLACriticModel.from_pretrained(ar_dir, dtype=torch.bfloat16).to(device)
+        for p_ in crit.parameters(): p_.requires_grad_(False)
+        tm = r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))"
+        crit.backbone = get_peft_model(crit.backbone, LoraConfig(r=lora_r, lora_alpha=lora_alpha, use_rslora=True, target_modules=tm, lora_dropout=0.0, bias="none"))
+        if grad_ckpt:
+            try: crit.backbone.gradient_checkpointing_enable(); crit.backbone.enable_input_require_grads()
+            except Exception as e: print("[arvec] grad ckpt off:", e, flush=True)
+        crit.value_head.float().requires_grad_(True)
+        self.crit, self.tok, self.device = crit, tok, device
+        self.msf = math.sqrt(crit.value_head.weight.shape[0])
+        self.tmpl = "Summary of the following text: <text>{explanation}</text> <summary>"
+    def trainable_parameters(self):
+        return [p_ for p_ in self.crit.parameters() if p_.requires_grad]
+    def forward(self, texts):
+        from nla.schema import normalize_activation
+        enc = self.tok([self.tmpl.format(explanation=z) for z in texts], return_tensors="pt", padding=True, truncation=True, max_length=256, add_special_tokens=False)
+        ids, am = enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
+        out = self.crit(input_ids=ids, attention_mask=am).backbone_last_hidden
+        last = out[torch.arange(ids.shape[0], device=self.device), am.sum(1) - 1].float()      # right padding -> last real token
+        pred = self.crit.value_head(normalize_activation(last, self.msf).to(self.crit.value_head.weight.dtype)).float()
+        return torch.cat([normalize_activation(pred, self.msf), normalize_activation(last, self.msf)], -1)   # [B, 2*d]
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"])
@@ -76,7 +107,7 @@ def main():
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=400000); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
-    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
+    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
     ddp = "RANK" in os.environ
@@ -87,20 +118,29 @@ def main():
     m = torch.load(os.path.join(a.prior, "model.pt"), map_location="cpu"); cfg = m["args"]
     sd = m.get("model") if a.prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(a.prior, "ema.pt"), map_location="cpu")["ema"]
     prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"]); prior.load_state_dict({k: v.float() for k, v in sd.items()})
-    encode, tok = load_encoder(a.base, a.enc_layer, dev)
-    d_enc = cfg["d_input"]
+    d_enc = cfg["d_input"]; use_tokens = a.cond_mode in ("tokens", "both"); use_arvec = a.cond_mode in ("ar_vec", "both")
+    if use_tokens: encode, tok = load_encoder(a.base, a.enc_layer, dev)
+    else:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(a.base); tok.padding_side = "right"
+        if tok.pad_token_id is None: tok.pad_token = tok.eos_token
+        encode = None
+    arvec = ARVecEncoder(a.ar_ckpt, tok, dev) if use_arvec else None
+    d_cvec = 2 * d_enc if use_arvec else 0
     if a.unfreeze_prior:
         # co-train: prior fp32 master + adapters, FSDP2-sharded across ranks (13.7B fp32 + Adam does not fit one GPU); bf16 compute
         from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
         prior = prior.to(dev).requires_grad_(True)
-        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank).to(dev)
+        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens).to(dev)
         mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-        for blk in model.blocks: fully_shard(blk, mp_policy=mp)
+        for blk in (model.blocks if use_tokens else prior.layers): fully_shard(blk, mp_policy=mp)
         fully_shard(model, mp_policy=mp)
     else:
         prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
-        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank).to(dev)
-        for blk in model.blocks: blk.read.float(); blk.gate_mod.float()                     # adapter in fp32
+        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens).to(dev)
+        if use_tokens:
+            for blk in model.blocks: blk.read.float(); blk.gate_mod.float()                     # adapter in fp32
+        if d_cvec: model.cvec_ln.float(); model.cvec_proj.float()
     n_ad = model.n_adapter_params()
     if is0: print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}; unfreeze_prior={a.unfreeze_prior} world={world}", flush=True)
     tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train); va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)
@@ -115,6 +155,8 @@ def main():
     adapter_ids = {id(p_) for p_ in model.adapter_parameters()}
     groups = [{"params": list(model.adapter_parameters()), "lr": a.lr, "base_lr": a.lr}]
     if a.unfreeze_prior: groups.append({"params": [p_ for p_ in model.parameters() if id(p_) not in adapter_ids], "lr": a.prior_lr, "base_lr": a.prior_lr})
+    if arvec is not None: groups.append({"params": arvec.trainable_parameters(), "lr": a.ar_lr, "base_lr": a.ar_lr})
+    if is0 and arvec is not None: print(f"[cond] AR encoder trainable params: {sum(p_.numel() for p_ in arvec.trainable_parameters())/1e6:.1f}M (LoRA + value head)", flush=True)
     opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.0)
     trainable = [p_ for g_ in groups for p_ in g_["params"]]
     use_wandb = bool(a.wandb) and is0
@@ -122,8 +164,15 @@ def main():
         try: import wandb; wandb.init(project=a.wandb, name=a.tag, config=vars(a) | {"adapter_params": n_ad})
         except Exception as e: print("[cond] wandb off:", e, flush=True); use_wandb = False
 
-    def enc_batch(zs):
-        with torch.autocast("cuda", dtype=torch.bfloat16): return encode(zs)
+    def enc_batch(zs, grad=False):
+        """-> (token states or None, mask or None, cvec or None). cvec is computed WITH grad when grad=True (training), else without."""
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            e, mk = encode(zs) if encode is not None else (None, None)
+            if arvec is None: return e, mk, None
+            if grad: cv = arvec(zs)
+            else:
+                with torch.no_grad(): cv = arvec(zs)
+            return e, mk, cv
 
     @torch.no_grad()
     def evaluate(step):
@@ -147,8 +196,8 @@ def main():
         t_val = 0.9; eps = torch.randn(x0.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(7)); t = torch.full((a.eval_n,), t_val, device=dev)
         preds = []
         for i in range(0, a.eval_n, 128):
-            e, mk = enc_batch(zs[i:i+128]); x_t = (1 - t_val) * x0[i:i+128] + t_val * eps[i:i+128]
-            with torch.autocast("cuda", dtype=torch.bfloat16): v = model(x_t, t[i:i+128], e, mk).float()
+            e, mk, cv = enc_batch(zs[i:i+128]); x_t = (1 - t_val) * x0[i:i+128] + t_val * eps[i:i+128]
+            with torch.autocast("cuda", dtype=torch.bfloat16): v = model(x_t, t[i:i+128], e, mk, cv).float()
             preds.append(norm.denormalize(x_t - t_val * v))
         pred = normalize_activation(torch.cat(preds), msf); gold = normalize_activation(va_acts[: a.eval_n].to(dev), msf)
         mse = ((pred - gold) ** 2).mean().item(); out["eval/cond_fve_x0_t0.9"] = 100 * (1 - mse / base_mse); out["eval/cond_mse_x0_t0.9"] = mse
@@ -158,10 +207,10 @@ def main():
         for i in range(a.match_n):
             cands = [mz[i]] + [mz[j] for j in rng.choice([j for j in range(a.match_n) if j != i], K - 1, replace=False)]
             order = rng.permutation(K); cands = [cands[o] for o in order]; true_idx = int(np.where(order == 0)[0][0])   # shuffle: ties must not favour the true one
-            e, mk = enc_batch(cands); xi = norm.normalize(mh[i:i+1].to(dev)).expand(K, -1); score = torch.zeros(K, device=dev)
+            e, mk, cv = enc_batch(cands); xi = norm.normalize(mh[i:i+1].to(dev)).expand(K, -1); score = torch.zeros(K, device=dev)
             for r in range(8):
                 tt = torch.rand(1, device=dev, generator=gm).expand(K); ee = torch.randn(xi.shape[1:], device=dev, generator=gm)[None].expand(K, -1)
-                with torch.autocast("cuda", dtype=torch.bfloat16): v = model((1 - tt)[:, None] * xi + tt[:, None] * ee, tt, e, mk).float()
+                with torch.autocast("cuda", dtype=torch.bfloat16): v = model((1 - tt)[:, None] * xi + tt[:, None] * ee, tt, e, mk, cv).float()
                 score += ((v - (ee - xi)) ** 2).mean(-1)
             correct += int(score.argmin().item() == true_idx and (score < score[true_idx]).sum().item() == 0 and (score == score[true_idx]).sum().item() == 1)   # strict best
         out["eval/source_match_acc"] = correct / a.match_n; out["eval/source_match_chance"] = 1 / K
@@ -178,7 +227,7 @@ def main():
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
         lr = a.lr * sched
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond)
+            loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv)
         opt.zero_grad(set_to_none=True); loss.backward(); gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn; opt.step()
         if step % 50 == 0 and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/step:.2f}s/step", flush=True)
@@ -193,7 +242,9 @@ def main():
                     torch.save({"adapter": {k: v for k, v in full.items() if ".read." in k or ".gate_mod." in k}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
                     torch.save({"model": {k[len("prior."):]: v.to(torch.bfloat16) for k, v in full.items() if k.startswith("prior.")}, "args": cfg, "step": step, "cotrained_with": a.tag}, os.path.join(a.out, "prior_cotrained_latest.pt"))
             elif is0:
-                torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
+                torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k or k.startswith("cvec_")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
+            if arvec is not None and is0:
+                torch.save({"lora": {k: v for k, v in arvec.crit.state_dict().items() if "lora_" in k}, "value_head": arvec.crit.value_head.state_dict(), "step": step}, os.path.join(a.out, "ar_encoder_latest.pt"))
             if (time.time() - t0) / 3600 > a.max_hours: break
     if is0: print("[cond] done", flush=True)
     if ddp: dist.destroy_process_group()
