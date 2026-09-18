@@ -95,10 +95,34 @@ class ARVecEncoder(torch.nn.Module):
     """The existing NLA critic (AR: truncated LM trunk + affine value head), used as the conditioning encoder.
     cvec = concat(normalise(value_head(last_hidden)) [= the MSE critic's E[h|z] estimate at init], normalise(last_hidden)). LoRA on the trunk
     (r 64, alpha 16, rsLoRA) and the value head are trainable; trained by the flow-matching loss, not MSE."""
-    def __init__(self, ar_dir, tok, device, lora_r=64, lora_alpha=16, grad_ckpt=True, trainable=True):
+    TM = r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))"
+    def __init__(self, ar_dir, tok, device, lora_r=64, lora_alpha=16, grad_ckpt=True, trainable=True, enc_layer=42):
         super().__init__()
         from nla.models import NLACriticModel
         from peft import LoraConfig, inject_adapter_in_model
+        self.trainable = trainable; self.tok, self.device = tok, device
+        self.tmpl = "Summary of the following text: <text>{explanation}</text> <summary>"
+        if not os.path.exists(os.path.join(ar_dir, "value_head.safetensors")):
+            # RAW BASE trunk (HF id or snapshot dir), truncated to layers 0..enc_layer, final norm removed -> token states = residual after enc_layer.
+            # Never saw the MSE objective; LoRA-tuned by the flow loss when trainable. Only .tokens() is meaningful (no value head -> no pooled vector).
+            from transformers import AutoModelForCausalLM
+            lm = AutoModelForCausalLM.from_pretrained(ar_dir, dtype=torch.bfloat16, attn_implementation="sdpa").to(device)
+            inner = lm.model; owner = inner if hasattr(inner, "layers") else inner.language_model
+            del owner.layers[enc_layer + 1:]; owner.norm = torch.nn.Identity()
+            if hasattr(lm, "lm_head"): lm.lm_head = torch.nn.Identity()
+            for p_ in lm.parameters(): p_.requires_grad_(False)
+            if trainable:
+                inject_adapter_in_model(LoraConfig(r=lora_r, lora_alpha=lora_alpha, use_rslora=True, target_modules=self.TM, lora_dropout=0.0, bias="none"), owner)
+                for n_, p_ in owner.named_parameters(): p_.requires_grad_("lora_" in n_)
+                for m_ in owner.modules():
+                    if hasattr(m_, "lora_A"):
+                        for sub in list(m_.lora_A.values()) + list(m_.lora_B.values()): sub.float()
+                if grad_ckpt:
+                    try: owner.gradient_checkpointing_enable(); lm.enable_input_require_grads()
+                    except Exception as e: print("[arvec] grad ckpt off:", e, flush=True)
+            else: lm.eval()
+            self.crit = None; self.lm, self.owner = lm, owner; self.msf = math.sqrt(owner.config.hidden_size if hasattr(owner, "config") else 5120)
+            print(f"[arvec] BASE-trunk token encoder: layers 0..{enc_layer}, trainable={trainable}", flush=True); return
         crit = NLACriticModel.from_pretrained(ar_dir, dtype=torch.bfloat16).to(device)
         for p_ in crit.parameters(): p_.requires_grad_(False)
         self.trainable = trainable
@@ -120,8 +144,19 @@ class ARVecEncoder(torch.nn.Module):
         self.msf = math.sqrt(crit.value_head.weight.shape[0])
         self.tmpl = "Summary of the following text: <text>{explanation}</text> <summary>"
     def trainable_parameters(self):
-        return [p_ for p_ in self.crit.parameters() if p_.requires_grad]
+        mod = self.crit if self.crit is not None else self.lm
+        return [p_ for p_ in mod.parameters() if p_.requires_grad]
+    def state_for_save(self):
+        mod = self.crit if self.crit is not None else self.lm
+        d = {"lora": {k: v for k, v in mod.state_dict().items() if "lora_" in k}}
+        if self.crit is not None: d["value_head"] = self.crit.value_head.state_dict()
+        return d
+    def load_saved(self, st):
+        mod = self.crit if self.crit is not None else self.lm
+        mod.load_state_dict(st["lora"], strict=False)
+        if self.crit is not None and "value_head" in st: self.crit.value_head.load_state_dict(st["value_head"])
     def forward(self, texts):
+        assert self.crit is not None, "pooled AR vector needs the critic encoder (tokens_base has no value head)"
         from nla.schema import normalize_activation
         enc = self.tok([self.tmpl.format(explanation=z) for z in texts], return_tensors="pt", padding=True, truncation=True, max_length=256, add_special_tokens=False)
         ids, am = enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
@@ -135,7 +170,8 @@ class ARVecEncoder(torch.nn.Module):
         cross-attention conditioning (tokens_ar): every denoiser block reads these with its own learned heads; nothing is pooled."""
         enc = self.tok([self.tmpl.format(explanation=z) for z in texts], return_tensors="pt", padding=True, truncation=True, max_length=max_len, add_special_tokens=False)
         ids, am = enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
-        out = self.crit(input_ids=ids, attention_mask=am).backbone_last_hidden
+        if self.crit is not None: out = self.crit(input_ids=ids, attention_mask=am).backbone_last_hidden
+        else: out = self.owner(input_ids=ids, attention_mask=am, use_cache=False).last_hidden_state      # norm removed -> raw residual after enc_layer
         mask = am.bool().clone(); mask[:, 0] = False
         return out, mask
 
@@ -148,7 +184,7 @@ def main():
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024); p.add_argument("--chunk-queries", type=int, default=0, help="Flamingo-style per-slice queries: split the block hidden state into this many chunks, each attends over the explanation tokens (0 = pooled slots)")
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
-    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
+    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar", "tokens_base"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
     ddp = "RANK" in os.environ
@@ -163,17 +199,18 @@ def main():
     # ar_vec    = the NLA critic trunk (LoRA-tuned by the flow loss) pooled to one vector, injected additively
     # both      = tokens + ar_vec
     # tokens_ar = cross-reads into the critic trunk's layer-42 TOKEN states (LoRA-tuned by the flow loss; frozen with --ar-lr 0); NO pooled vector
-    d_enc = cfg["d_input"]; use_tokens = a.cond_mode in ("tokens", "both", "tokens_ar"); use_arvec = a.cond_mode in ("ar_vec", "both", "tokens_ar")
+    # tokens_base = like tokens_ar but the encoder is the RAW BASE trunk (never MSE-trained), LoRA-tuned by the flow loss: no mean-prediction anywhere
+    d_enc = cfg["d_input"]; use_tokens = a.cond_mode in ("tokens", "both", "tokens_ar", "tokens_base"); use_arvec = a.cond_mode in ("ar_vec", "both", "tokens_ar", "tokens_base")
     if a.cond_mode in ("tokens", "both"): encode, tok = load_encoder(a.base, a.enc_layer, dev)
     else:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(a.base); tok.padding_side = "right"
         if tok.pad_token_id is None: tok.pad_token = tok.eos_token
         encode = None
-    arvec = ARVecEncoder(a.ar_ckpt, tok, dev, trainable=a.ar_lr > 0) if use_arvec else None
+    arvec = ARVecEncoder(a.base if a.cond_mode == "tokens_base" else a.ar_ckpt, tok, dev, trainable=a.ar_lr > 0, enc_layer=a.enc_layer) if use_arvec else None
     if arvec is not None and a.resume_from and os.path.exists(os.path.join(a.resume_from, "ar_encoder_latest.pt")):
         st_ = torch.load(os.path.join(a.resume_from, "ar_encoder_latest.pt"), map_location="cpu")
-        arvec.crit.load_state_dict(st_["lora"], strict=False); arvec.crit.value_head.load_state_dict(st_["value_head"])
+        arvec.load_saved(st_)
         if is0: print(f"[cond] resumed AR encoder from step {st_.get('step')}", flush=True)
     def _load_adapter(model_):
         if not a.resume_from: return
@@ -246,7 +283,7 @@ def main():
         With --resid-shift the standardised AR prediction of the batch is left in enc_batch.shift (None otherwise)."""
         enc_batch.shift = None
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            if a.cond_mode == "tokens_ar":
+            if a.cond_mode in ("tokens_ar", "tokens_base"):
                 if grad and arvec.trainable: e, mk = arvec.tokens(zs)
                 else:
                     with torch.no_grad(): e, mk = arvec.tokens(zs)
@@ -351,7 +388,7 @@ def main():
             elif is0:
                 torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
             if arvec is not None and is0:
-                torch.save({"lora": {k: v for k, v in arvec.crit.state_dict().items() if "lora_" in k}, "value_head": arvec.crit.value_head.state_dict(), "step": step}, os.path.join(a.out, "ar_encoder_latest.pt"))
+                torch.save(dict(arvec.state_for_save(), step=step), os.path.join(a.out, "ar_encoder_latest.pt"))
             if (time.time() - t0) / 3600 > a.max_hours: break
     if is0: print("[cond] done", flush=True)
     if ddp: dist.destroy_process_group()
