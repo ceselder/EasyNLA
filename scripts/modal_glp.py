@@ -152,6 +152,16 @@ def mine_pairs(tag: str, av_merged: str, parquet: str = "/vol_q36/data/rl/rl_shu
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
+@app.function(gpu="B200", timeout=6 * 3600, **COMMON)
+def ultra_extract(explained_glob: str = "/vol_glp/data/ultra_explained_t1/chunk_*.parquet", out_dir: str = "/vol_glp/data/ultra_L42", shard: int = 0, nshards: int = 1, extra: str = ""):
+    """Layer-42 activations for Sonnet-5-explained UltraFineWeb prefixes -> extraction-schema shards (nla.flow.datagen_ultra extract)."""
+    import subprocess
+    from playground_app import resolve_base
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    cmd = [sys.executable, "-m", "nla.flow.datagen_ultra", "extract", "--explained-glob", explained_glob, "--out-dir", out_dir, "--base", base, "--shard", str(shard), "--nshards", str(nshards)] + extra.split()
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
+
+
 @app.function(timeout=2 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=200 * 1024, ephemeral_disk=600 * 1024)   # Modal minimum is 512 GiB
 def convert_wrapper(src: str, dst: str):
     """Text-only merged checkpoint -> vLLM wrapper layout (Qwen3_5ForConditionalGeneration)."""
@@ -211,6 +221,9 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", [c.get() for c in calls])
     elif task == "eval_cond":
         print("rc", eval_cond.remote(tag, prior_tag, ckpt, extra))
+    elif task == "ultra_extract":   # all shards in parallel, one B200 each; --tag = explained dir name, --sets = out dir
+        calls = [ultra_extract.spawn(f"/vol_glp/data/{tag or 'ultra_explained_t1'}/chunk_*.parquet", sets or "/vol_glp/data/ultra_L42", shard=i, nshards=nshards, extra=extra) for i in range(nshards)]
+        print("rc", [c.get() for c in calls])
     elif task == "train_cond_g4":
         print("rc", train_cond_g4.remote(tag or "cond_cotrain", prior_tag, ckpt, extra))
     elif task == "train_cond":
