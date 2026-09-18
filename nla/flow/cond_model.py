@@ -138,19 +138,23 @@ class CondDenoiser(nn.Module):
         return sum(p.numel() for p in self.adapter_parameters())
 
 
-def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=None):
+def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=None, shift=None):
     """Conditional flow-matching loss with PER-SAMPLE condition dropout: a dropped sample gets an all-False token mask and cvec_has=False,
-    so the adapter contributes exactly the prior for it (keeps the unconditional path alive for the shuffle / no-text controls)."""
+    so the adapter contributes exactly the prior for it (keeps the unconditional path alive for the shuffle / no-text controls).
+    shift [B, d] (optional, 'start from the prediction'): the flow models the RESIDUAL x0 - shift(z); dropped samples keep x0 (no shift)."""
     B = x0.shape[0]
     if t is None: t = torch.rand(B, device=x0.device)
     if eps is None: eps = torch.randn_like(x0)
-    x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
     if enc is None and cvec is None:
+        x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
         return F.mse_loss(model(x_t, t).float(), (eps - x0).float()), t, False
     cvec_has = None if cvec is None else torch.ones(B, dtype=torch.bool, device=x0.device)
+    keep = torch.ones(B, dtype=torch.bool, device=x0.device)
     if p_uncond > 0:
-        drop = torch.rand(B, device=x0.device) < p_uncond
+        drop = torch.rand(B, device=x0.device) < p_uncond; keep = ~drop
         if enc_mask is not None: enc_mask = enc_mask & ~drop[:, None]
         if cvec_has is not None: cvec_has = cvec_has & ~drop
+    if shift is not None: x0 = x0 - shift * keep[:, None].to(x0.dtype)
+    x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
     v = model(x_t, t, enc, enc_mask, cvec, cvec_has)
     return F.mse_loss(v.float(), (eps - x0).float()), t, True

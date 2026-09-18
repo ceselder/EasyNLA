@@ -78,6 +78,10 @@ def test_cond_vector():
     enc = torch.randn(8, 7, 24); mask = torch.ones(8, 7, dtype=torch.bool); mask[:, 5:] = False
     assert torch.allclose(prior(x, t), ce(x, t, enc, mask), atol=1e-5)
     l, _, _ = cond_fm_loss(ce, x, enc, mask, p_uncond=0.5); l.backward(); assert all(p.grad is not None for p in ce.token_encoder.parameters() if p.numel() > 0)
+    # residual shift: zero shift == no shift; nonzero shift changes the loss (same noise)
+    torch.manual_seed(3); tt = torch.rand(8); ee = torch.randn(8, 16)
+    l0, _, _ = cond_fm_loss(cm, x, None, None, t=tt, eps=ee, cvec=cv, shift=torch.zeros(8, 16)); l1, _, _ = cond_fm_loss(cm, x, None, None, t=tt, eps=ee, cvec=cv)
+    assert torch.allclose(l0, l1); l2, _, _ = cond_fm_loss(cm, x, None, None, t=tt, eps=ee, cvec=cv, shift=torch.randn(8, 16)); assert not torch.allclose(l2, l1)
     # both pathways together
     cb = CondDenoiser(prior, 24, n_slots=4, n_heads=2, d_head=8, gate_rank=4, d_cvec=12, use_tokens=True, d_c=8)
     enc = torch.randn(8, 7, 24); mask = torch.ones(8, 7, dtype=torch.bool)

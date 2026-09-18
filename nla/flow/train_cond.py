@@ -124,6 +124,7 @@ class ARVecEncoder(torch.nn.Module):
         out = self.crit(input_ids=ids, attention_mask=am).backbone_last_hidden
         last = out[torch.arange(ids.shape[0], device=self.device), am.sum(1) - 1].float()      # right padding -> last real token
         pred = self.crit.value_head(normalize_activation(last, self.msf).to(self.crit.value_head.weight.dtype)).float()
+        self.last_pred_raw = pred                                                                          # [B, d] activation units (the MSE critic's E[h|z])
         return torch.cat([normalize_activation(pred, self.msf), normalize_activation(last, self.msf)], -1)   # [B, 2*d]
 
 
@@ -135,7 +136,7 @@ def main():
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024)
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
-    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
+    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
     ddp = "RANK" in os.environ
@@ -223,14 +224,18 @@ def main():
         try: import wandb; wandb.init(project=a.wandb, name=a.tag, config=vars(a) | {"adapter_params": n_ad})
         except Exception as e: print("[cond] wandb off:", e, flush=True); use_wandb = False
 
+    if a.resid_shift: assert arvec is not None, "--resid-shift needs --cond-mode ar_vec or both"
     def enc_batch(zs, grad=False):
-        """-> (token states or None, mask or None, cvec or None). cvec is computed WITH grad when grad=True (training), else without."""
+        """-> (token states or None, mask or None, cvec or None). cvec is computed WITH grad when grad=True (training), else without.
+        With --resid-shift the standardised AR prediction of the batch is left in enc_batch.shift (None otherwise)."""
+        enc_batch.shift = None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             e, mk = encode(zs) if encode is not None else (None, None)
             if arvec is None: return e, mk, None
             if grad: cv = arvec(zs)
             else:
                 with torch.no_grad(): cv = arvec(zs)
+            if a.resid_shift: enc_batch.shift = norm.normalize(arvec.last_pred_raw).detach() if not grad else norm.normalize(arvec.last_pred_raw)
             return e, mk, cv
 
     @torch.no_grad()
@@ -247,9 +252,10 @@ def main():
                 ls = []
                 for i in range(0, n_ev, 128):
                     e, mk, cv = enc_batch(cond[i:i+128]) if cond is not None else (None, None, None)
+                    xs = x0[i:i+128] - enc_batch.shift if (cond is not None and enc_batch.shift is not None) else x0[i:i+128]   # residual parametrisation
                     with torch.autocast("cuda", dtype=torch.bfloat16):
-                        x_t = (1 - t_val) * x0[i:i+128] + t_val * eps[i:i+128]; v = model(x_t, t[i:i+128], e, mk, cv)
-                    ls.append(F.mse_loss(v.float(), (eps[i:i+128] - x0[i:i+128]).float(), reduction="sum").item() / x0.shape[1])
+                        x_t = (1 - t_val) * xs + t_val * eps[i:i+128]; v = model(x_t, t[i:i+128], e, mk, cv)
+                    ls.append(F.mse_loss(v.float(), (eps[i:i+128] - xs).float(), reduction="sum").item() / x0.shape[1])
                 out[f"eval/fm_{name}_t{t_val}"] = sum(ls) / n_ev
         for name in ("uncond", "cond", "shuf"): out[f"eval/fm_{name}"] = sum(out[f"eval/fm_{name}_t{t}"] for t in (0.1, 0.3, 0.5, 0.7, 0.9)) / 5
         out["eval/gain_bits_per_dim"] = (out["eval/fm_uncond"] - out["eval/fm_cond"]) / (2 * math.log(2))   # ELBO-flavoured: 0.5*Δmse per dim in nats -> bits (uniform-t weighting)
@@ -257,9 +263,10 @@ def main():
         t_val = 0.9; eps = torch.randn(x0.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(7)); t = torch.full((n_ev,), t_val, device=dev)
         preds = []
         for i in range(0, n_ev, 128):
-            e, mk, cv = enc_batch(zs[i:i+128]); x_t = (1 - t_val) * x0[i:i+128] + t_val * eps[i:i+128]
+            e, mk, cv = enc_batch(zs[i:i+128]); sh = enc_batch.shift if enc_batch.shift is not None else 0.0
+            xs = x0[i:i+128] - sh; x_t = (1 - t_val) * xs + t_val * eps[i:i+128]
             with torch.autocast("cuda", dtype=torch.bfloat16): v = model(x_t, t[i:i+128], e, mk, cv).float()
-            preds.append(norm.denormalize(x_t - t_val * v))
+            preds.append(norm.denormalize(x_t - t_val * v + sh))
         pred = normalize_activation(torch.cat(preds), msf); gold = normalize_activation(ev_acts[: n_ev].to(dev), msf)
         mse = ((pred - gold) ** 2).mean().item(); out["eval/cond_fve_x0_t0.9"] = 100 * (1 - mse / base_mse); out["eval/cond_mse_x0_t0.9"] = mse
         # source match: for each of match_n held-out pairs, rank the true explanation against 7 distractors by mean denoising loss over 8 (t, eps)
@@ -271,6 +278,7 @@ def main():
             cands = [mz[i]] + [mz[j] for j in rng.choice([j for j in range(a.match_n) if j != i], K - 1, replace=False)]
             order = rng.permutation(K); cands = [cands[o] for o in order]; true_idx = int(np.where(order == 0)[0][0])   # shuffle: ties must not favour the true one
             e, mk, cv = enc_batch(cands); xi = norm.normalize(mh[i:i+1].to(dev)).expand(K, -1); score = torch.zeros(K, device=dev)
+            if enc_batch.shift is not None: xi = xi - enc_batch.shift
             for r in range(8):
                 tt = torch.rand(1, device=dev, generator=gm).expand(K); ee = torch.randn(xi.shape[1:], device=dev, generator=gm)[None].expand(K, -1)
                 with torch.autocast("cuda", dtype=torch.bfloat16): v = model((1 - tt)[:, None] * xi + tt[:, None] * ee, tt, e, mk, cv).float()
@@ -304,7 +312,7 @@ def main():
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
         lr = a.lr * sched
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv)
+            loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift)
         opt.zero_grad(set_to_none=True); loss.backward(); gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn; opt.step()
         if step % 50 == 0 and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step", flush=True)
