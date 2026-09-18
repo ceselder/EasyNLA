@@ -202,8 +202,8 @@ def main():
     import torch.distributed as dist
     ddp = "RANK" in os.environ
     if ddp: dist.init_process_group("nccl"); rank, world = dist.get_rank(), dist.get_world_size(); dev = torch.device("cuda", int(os.environ["LOCAL_RANK"])); torch.cuda.set_device(dev)
-    assert not ddp or a.unfreeze_prior, "multi-rank train_cond without --unfreeze-prior has no gradient sync (adapters/encoder would drift per rank)"
     else: rank, world, dev = 0, 1, "cuda"
+    assert not ddp or a.unfreeze_prior, "multi-rank train_cond without --unfreeze-prior has no gradient sync (adapters/encoder would drift per rank)"
     is0 = rank == 0
     norm = Normalizer.load(a.stats).to(dev)
     m = torch.load(os.path.join(a.prior, "model.pt"), map_location="cpu"); cfg = m["args"]
