@@ -35,7 +35,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dumps-dir", required=True, help="dir or glob of dirs holding step_*_r*.pt"); p.add_argument("--out", required=True)
     p.add_argument("--critic", default=None); p.add_argument("--sidecar", default="/vol_q36/data/rl/rl_shuf.parquet"); p.add_argument("--batch", type=int, default=32)
-    p.add_argument("--flow-prior", default=None); p.add_argument("--flow-adapter", default=None); p.add_argument("--flow-stats", default=None); p.add_argument("--base", default=None)
+    p.add_argument("--flow-prior", default=None); p.add_argument("--flow-adapter", default=None); p.add_argument("--flow-stats", default=None); p.add_argument("--base", default=None); p.add_argument("--flow-prior-override", default=None)
     p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--ode-steps", type=int, default=40); p.add_argument("--probes", type=int, default=2); p.add_argument("--K", type=int, default=8)
     p.add_argument("--max-rows", type=int, default=1024, help="cap on rows per step for the flow scorer (ODE cost)"); p.add_argument("--flow-batch", type=int, default=128)
     p.add_argument("--force", action="store_true", help="recompute steps already in --out"); p.add_argument("--save-rows", action="store_true", help="store per-row scores (dump order) for offline pairwise analyses")
@@ -51,10 +51,10 @@ def main():
         cfg = load_nla_config(a.sidecar, tok); template = cfg.critic_prompt_template; msf = resolve_target_scale(cfg.mse_scale, cfg.d_model)
         critic = NLACriticModel.from_pretrained(a.critic, torch_dtype=torch.bfloat16).to(dev).eval(); critic.requires_grad_(False); pad = tok.eos_token_id
     if use_flow:
-        from nla.flow.train_cond import load_encoder
         from nla.flow.eval_cond import exact_logp, denoise_gain
-        model, norm, d = load_flow(a.flow_prior, a.flow_adapter, a.flow_stats, dev)
-        encode, _ = load_encoder(a.base, a.enc_layer, dev)
+        from nla.flow.scoring import FlowBundle
+        fb = FlowBundle(a.flow_prior, a.flow_adapter, a.flow_stats, dev, base=a.base, enc_layer=a.enc_layer, prior_override=a.flow_prior_override)
+        model, norm, d = fb.model, fb.norm, fb.d
         lpu_cache = {}
     prev = json.load(open(a.out)) if os.path.exists(a.out) else {}
     files = sorted(glob.glob(os.path.join(a.dumps_dir, "step_*_r*.pt")))
@@ -107,10 +107,10 @@ def main():
             sel = valid[: a.max_rows]; x0 = norm.normalize(acts[sel].to(dev)); lpu = uncond_logp(x0)
             lpc, gains = [], []
             for cs in range(0, len(sel), a.flow_batch):
-                ch = sel[cs: cs + a.flow_batch]; enc, mk = encode([expls[i] for i in ch]); xb = x0[cs: cs + a.flow_batch]
+                ch = sel[cs: cs + a.flow_batch]; enc, mk, cv = fb.cond([expls[i] for i in ch]); xb = x0[cs: cs + a.flow_batch]
                 gen = torch.Generator(device=dev).manual_seed(1234 + cs)                        # same probes as the unconditional pass -> paired
-                lpc.append(exact_logp(model, xb, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=gen))
-                gen2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, xb, enc, mk, a.K, gen2); gains.append((lu - lc) / 2 * d)
+                lpc.append(exact_logp(model, xb, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=gen, cvec=cv))
+                gen2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, xb, enc, mk, a.K, gen2, cvec=cv); gains.append((lu - lc) / 2 * d)
             lpc = torch.cat(lpc); pmi = (lpc - lpu) / math.log(2); gb = torch.cat(gains) / math.log(2)
             if rows_out is not None:
                 for j, i in enumerate(sel): rows_out[i].update({"pmi_bits": float(pmi[j]), "gain_bits": float(gb[j])})

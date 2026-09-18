@@ -50,7 +50,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True); p.add_argument("--n", type=int, default=512); p.add_argument("--skip", type=int, default=0)
     p.add_argument("--flow-prior", required=True); p.add_argument("--flow-adapter", required=True); p.add_argument("--flow-stats", required=True); p.add_argument("--base", required=True)
-    p.add_argument("--critic", required=True); p.add_argument("--sidecar", default="/vol_q36/data/rl/rl_shuf.parquet"); p.add_argument("--enc-layer", type=int, default=42)
+    p.add_argument("--critic", required=True); p.add_argument("--sidecar", default="/vol_q36/data/rl/rl_shuf.parquet"); p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--flow-prior-override", default=None)
     p.add_argument("--ode-steps", type=int, default=40); p.add_argument("--probes", type=int, default=2); p.add_argument("--K", type=int, default=16); p.add_argument("--rows-per-batch", type=int, default=3)
     a = p.parse_args(); dev = "cuda"; rng = random.Random(0)
     import pyarrow.parquet as pq
@@ -59,8 +59,6 @@ def main():
     from nla.models import NLACriticModel
     from nla.utils import critic_predict
     from nla.config import load_nla_config
-    from nla.flow.score_dumps import load_flow
-    from nla.flow.train_cond import load_encoder
     from nla.flow.eval_cond import exact_logp, denoise_gain
     t = pq.read_table(a.val_parquet, columns=["detokenized_text_truncated", "response", "activation_vector"])
     srcs = t.column(0).to_pylist(); golds = t.column(1).to_pylist(); N = t.num_rows
@@ -84,7 +82,8 @@ def main():
     # ---- models
     tok = AutoTokenizer.from_pretrained(a.critic); cfg = load_nla_config(a.sidecar, tok); template = cfg.critic_prompt_template; msf = resolve_target_scale(cfg.mse_scale, cfg.d_model); pad = tok.eos_token_id
     critic = NLACriticModel.from_pretrained(a.critic, torch_dtype=torch.bfloat16).to(dev).eval(); critic.requires_grad_(False)
-    model, norm, d = load_flow(a.flow_prior, a.flow_adapter, a.flow_stats, dev); encode, _ = load_encoder(a.base, a.enc_layer, dev)
+    from nla.flow.scoring import FlowBundle
+    fb = FlowBundle(a.flow_prior, a.flow_adapter, a.flow_stats, dev, base=a.base, enc_layer=a.enc_layer, prior_override=a.flow_prior_override); model, norm, d = fb.model, fb.norm, fb.d
     names = ["orig"] + MODES
     # ---- MSE critic (batched)
     flat = [(ii, k) for ii, it in enumerate(items) for k in names]
@@ -102,10 +101,10 @@ def main():
     for cs in range(0, len(items), R):
         ch = items[cs: cs + R]; texts = [it["variants"][k]["text"] for it in ch for k in names]
         x0 = norm.normalize(torch.tensor(np.stack([acts[it["row"]] for it in ch for _ in names]), device=dev))
-        enc, mk = encode(texts)
-        g1 = torch.Generator(device=dev).manual_seed(1234 + cs); lpc = exact_logp(model, x0, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=g1)
+        enc, mk, cv = fb.cond(texts)
+        g1 = torch.Generator(device=dev).manual_seed(1234 + cs); lpc = exact_logp(model, x0, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=g1, cvec=cv)
         g0 = torch.Generator(device=dev).manual_seed(1234 + cs); lpu = exact_logp(model, x0, None, None, n_steps=a.ode_steps, probes=a.probes, gen=g0)
-        g2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, x0, enc, mk, a.K, g2)
+        g2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, x0, enc, mk, a.K, g2, cvec=cv)
         pmi = (lpc - lpu) / math.log(2); gain = (lu - lc) / 2 * d / math.log(2)
         for j, (it, k) in enumerate([(it, k) for it in ch for k in names]): it["variants"][k].update({"pmi_bits": float(pmi[j]), "gain_bits": float(gain[j]), "logp_cond_nats": float(lpc[j])})
         if (cs // R) % 20 == 0:

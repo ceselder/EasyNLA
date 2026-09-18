@@ -29,19 +29,19 @@ def build_variants(z, pool, rng):
 
 
 @torch.no_grad()
-def denoise_gain(model, x0, enc, mk, K, gen):
+def denoise_gain(model, x0, enc, mk, K, gen, cvec=None):
     """Per-sample mean denoising loss over K fixed (t, eps) for cond and uncond."""
     B = x0.shape[0]; lc = torch.zeros(B, device=x0.device); lu = torch.zeros(B, device=x0.device)
     for k in range(K):
         t = torch.rand(1, device=x0.device, generator=gen).expand(B); eps = torch.randn(x0.shape, device=x0.device, generator=gen)
         x_t = (1 - t)[:, None] * x0 + t[:, None] * eps; tgt = eps - x0
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            vc = model(x_t, t, enc, mk).float(); vu = model(x_t, t).float()
+            vc = model(x_t, t, enc, mk, cvec).float(); vu = model(x_t, t).float()
         lc += ((vc - tgt) ** 2).mean(-1) / K; lu += ((vu - tgt) ** 2).mean(-1) / K
     return lc, lu
 
 
-def exact_logp(model, x0, enc, mk, n_steps=40, probes=1, gen=None):
+def exact_logp(model, x0, enc, mk, n_steps=40, probes=1, gen=None, cvec=None):
     """log p(x0) under the flow ODE dx/dt = v(x,t): integrate x from t=0 (data) to t=1 (noise) with Heun, accumulating -div(v) dt via
     Hutchinson (Rademacher). log p_0(x0) = log N(x1; 0, I) + int_0^1 div v dt  (density transport for dx/dt = v)."""
     B, d = x0.shape; x = x0.clone(); logdet = torch.zeros(B, device=x0.device)
@@ -50,7 +50,7 @@ def exact_logp(model, x0, enc, mk, n_steps=40, probes=1, gen=None):
         x = x.detach().requires_grad_(True); tt = torch.full((B,), float(t), device=x.device)
         with torch.enable_grad():
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                v = model(x, tt, enc, mk) if enc is not None else model(x, tt)
+                v = model(x, tt, enc, mk, cvec) if (enc is not None or cvec is not None) else model(x, tt)
             v = v.float(); div = torch.zeros(B, device=x.device)
             for _ in range(probes):
                 e = (torch.randint(0, 2, (1, x.shape[1]), device=x.device, generator=gen).float() * 2 - 1).expand_as(x)   # same probe for every row -> paired across variants
