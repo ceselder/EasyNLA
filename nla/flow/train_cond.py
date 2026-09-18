@@ -33,6 +33,25 @@ def load_encoder(base, layer, device):
     return encode, tok
 
 
+def load_shards(glob_pat, n, skip_val=True):
+    """All (activation, Opus explanation) rows of the raw extraction shards (cols activation_vector / explanation / is_val), val rows excluded."""
+    import glob as _glob, pyarrow.parquet as pq
+    acts, zs = [], []
+    for f in sorted(_glob.glob(glob_pat)):
+        pf = pq.ParquetFile(f)
+        for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "explanation", "is_val"]):
+            keep = [i for i, v in enumerate(rb.column("is_val").to_pylist()) if not (skip_val and v)]
+            if not keep: continue
+            import numpy as _np
+            a = torch.tensor(_np.stack(rb.column("activation_vector").to_numpy(zero_copy_only=False)), dtype=torch.float16)[keep]
+            z = [(rb.column("explanation")[i].as_py() or "").strip() for i in keep]
+            acts.append(a); zs += z
+            if sum(x.shape[0] for x in acts) >= n: break
+        if sum(x.shape[0] for x in acts) >= n: break
+    acts = torch.cat(acts)[:n]; zs = zs[:n]
+    return acts, zs
+
+
 def load_pairs(parquet, n, skip=0):
     """Row-batched read (a single 500k x 5120 list array overflows pyarrow's int32 offsets)."""
     from nla.schema import extract_explanation
@@ -111,7 +130,7 @@ def main():
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block")
-    p.add_argument("--max-train", type=int, default=200000); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
+    p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
     p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
@@ -156,7 +175,12 @@ def main():
         for m_ in model.adapter_modules(): m_.float()                                            # adapter in fp32
     n_ad = model.n_adapter_params()
     if is0: print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}; unfreeze_prior={a.unfreeze_prior} world={world}", flush=True)
-    tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train); va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)
+    if a.train_shards_glob:
+        tr_acts, tr_z = load_shards(a.train_shards_glob, a.max_train)
+        if is0: print(f"[cond] loaded {len(tr_z)} Opus pairs from shards {a.train_shards_glob}", flush=True)
+    else:
+        tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train)
+    va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)
     n_sft = len(tr_z)
     mv_acts, mv_z = None, None
     if a.mined_dir:
