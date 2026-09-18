@@ -192,7 +192,7 @@ class ARVecEncoder(torch.nn.Module):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"])
-    p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--enc-model", default=None, help="tokens_base: HF id of an arbitrary token encoder (e.g. Qwen/Qwen3-Embedding-8B) instead of the base trunk"); p.add_argument("--enc-keep-norm", action="store_true")
+    p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--exact-n", type=int, default=128, help="rows for the EXACT log p(h|z)-log p(h) eval (probability-flow ODE); 0 = off"); p.add_argument("--exact-every", type=int, default=1000); p.add_argument("--exact-steps", type=int, default=24); p.add_argument("--enc-model", default=None, help="tokens_base: HF id of an arbitrary token encoder (e.g. Qwen/Qwen3-Embedding-8B) instead of the base trunk"); p.add_argument("--enc-keep-norm", action="store_true")
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024); p.add_argument("--chunk-queries", type=int, default=0, help="Flamingo-style per-slice queries: split the block hidden state into this many chunks, each attends over the explanation tokens (0 = pooled slots)")
@@ -363,6 +363,22 @@ def main():
         model.train()
         if arvec is not None: arvec.train()
         P = prefix
+        # ---- EXACT information gain (bits): log p(h|z) - log p(h) via the probability-flow ODE, same Hutchinson probes/steps for all three
+        # variants (uncond / gold z / shuffled z). This is the real quantity; eval/gain_bits_per_dim above is only the FM-loss proxy.
+        if a.exact_n > 0 and not a.unfreeze_prior and (step % a.exact_every == 0 or step == a.steps):
+            from nla.flow.eval_cond import exact_logp
+            n_x = min(a.exact_n, n_ev); xx = x0[:n_x]; zz = list(ev_z[:n_x]); d_ = xx.shape[1]
+            perm = torch.randperm(n_x, generator=torch.Generator().manual_seed(1)).tolist()
+            e_, m_, c_ = enc_batch(zz); es, ms, cs = enc_batch([zz[i] for i in perm])
+            lp = {}
+            for name, (ee, mm, cc) in (("uncond", (None, None, None)), ("cond", (e_, m_, c_)), ("shuf", (es, ms, cs))):
+                gx = torch.Generator(device=dev).manual_seed(11)
+                lp[name] = exact_logp(model, xx, ee, mm, n_steps=a.exact_steps, probes=1, gen=gx, cvec=cc)
+            pmi = (lp["cond"] - lp["uncond"]) / math.log(2); pms = (lp["shuf"] - lp["uncond"]) / math.log(2)
+            out.update({f"{prefix}/exact_pmi_bits": pmi.mean().item(), f"{prefix}/exact_pmi_median_bits": pmi.median().item(), f"{prefix}/exact_pmi_sem_bits": (pmi.std() / math.sqrt(n_x)).item(),
+                        f"{prefix}/exact_pmi_shuf_bits": pms.mean().item(), f"{prefix}/exact_frac_positive": (pmi > 0).float().mean().item(),
+                        f"{prefix}/exact_bits_per_dim_uncond": (-lp["uncond"].mean() / (d_ * math.log(2))).item(), f"{prefix}/exact_bits_per_dim_cond": (-lp["cond"].mean() / (d_ * math.log(2))).item()})
+            if is0: print(f"  [exact@{step}] PMI {pmi.mean().item():.1f} bits (median {pmi.median().item():.1f}, sem {pmi.std().item() / math.sqrt(n_x):.1f}, {100 * (pmi > 0).float().mean().item():.0f}% positive) | shuffled z {pms.mean().item():.1f} bits | n {n_x}, {a.exact_steps} Heun steps", flush=True)
         if not is0: return out
         print(f"[{P}@{step}] fm uncond {out[P+'/fm_uncond']:.4f} cond {out[P+'/fm_cond']:.4f} shuf {out[P+'/fm_shuf']:.4f} | gain {out[P+'/gain_bits_per_dim']*x0.shape[1]:.1f} bits/activation | cond FVE(x0@0.9) {out[P+'/cond_fve_x0_t0.9']:.1f}% | source-match {100*out[P+'/source_match_acc']:.1f}% (chance 12.5%)", flush=True)
         json.dump(out, open(os.path.join(a.out, f"{P}_{step:06d}.json"), "w"), indent=1)
