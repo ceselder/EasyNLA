@@ -302,9 +302,11 @@ def extract_qwen3_8b(shard: int = 0, nshards: int = 1, limit: int = 0,
 
 # ------------------------------------------------------------ stage 3: build SFT data
 @app.function(volumes=VOLS, timeout=3 * 60 * 60, cpu=8.0, memory=131072, secrets=SECRETS)
-def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024):
+def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024, actdir_override: str = "", out_dir: str = "", max_train_expl_tokens: int = 0, api_model: str = ""):
     """AV/AR SFT parquets + sidecars from the extracted shards, 99/1 doc-level split
-    (nla.val_split.is_val_doc(doc_id, 10) — the same rule as the HF dataset)."""
+    (nla.val_split.is_val_doc(doc_id, 10) — the same rule as the HF dataset).
+    actdir_override / out_dir: build from another extraction (e.g. the Sonnet-5 UltraFineWeb shards) into its own dir;
+    max_train_expl_tokens: stop adding train rows once the explanations' token total reaches this (token-matched comparisons)."""
     import glob
     import json
     import random
@@ -330,9 +332,10 @@ def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024):
         # August extraction (nla-qwen36-ema volume): 30 shards, all 742k rows, cols
         # doc_id/text/explanation/is_val/n_raw_tokens/activation_layer/activation_vector
         base, layer, d = "Qwen/Qwen3.6-27B", 42, 5120
-        actdir = "/vol_q36/data/acts_qwen36_L42"
-        assert os.path.exists(f"{actdir}/_COMPLETE"), f"{actdir} incomplete"
+        actdir = actdir_override or "/vol_q36/data/acts_qwen36_L42"
+        assert actdir_override or os.path.exists(f"{actdir}/_COMPLETE"), f"{actdir} incomplete"
         shards = sorted(glob.glob(f"{actdir}/shard_*.parquet"))
+        assert shards, f"no shards under {actdir}"
     else:
         raise SystemExit(model_tag)
 
@@ -368,9 +371,24 @@ def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024):
     print(f"rows={tbl.num_rows} train={len(tr_idx)} test={len(te_idx)} "
           f"docs train={len({dids[i] for i in tr_idx})} test={len({dids[i] for i in te_idx})}", flush=True)
     assert not ({dids[i] for i in tr_idx} & {dids[i] for i in te_idx})
+    # explanation token accounting (token-matched data comparisons): count in the shuffled train order, cut at the budget
+    _expl = tbl.column("explanation").to_pylist(); _ntok = [0] * len(_expl)
+    for s0 in range(0, len(tr_idx), 4096):
+        ids_ = [tr_idx[j] for j in range(s0, min(s0 + 4096, len(tr_idx)))]
+        for i, enc in zip(ids_, tok([_expl[i] or "" for i in ids_], add_special_tokens=False)["input_ids"]): _ntok[i] = len(enc)
+    total_tokens = sum(_ntok[i] for i in tr_idx)
+    if max_train_expl_tokens > 0:
+        acc, cut = 0, len(tr_idx)
+        for j, i in enumerate(tr_idx):
+            acc += _ntok[i]
+            if acc >= max_train_expl_tokens: cut = j + 1; break
+        tr_idx = tr_idx[:cut]; print(f"token cap {max_train_expl_tokens}: keeping {cut} train rows ({acc} explanation tokens)", flush=True)
+    train_tokens = sum(_ntok[i] for i in tr_idx)
+    print(f"train explanation tokens: {train_tokens} over {len(tr_idx)} rows (mean {train_tokens/max(len(tr_idx),1):.0f}); full pool {total_tokens}", flush=True)
 
-    out = f"{DATA}/{model_tag}"
+    out = out_dir or f"{DATA}/{model_tag}"
     os.makedirs(out, exist_ok=True)
+    json.dump({"train_rows": len(tr_idx), "train_expl_tokens": train_tokens, "pool_expl_tokens": total_tokens, "test_rows": len(te_idx), "actdir": actdir, "api_model": api_model or "claude-opus-5"}, open(f"{out}/counts.json", "w"), indent=1)
 
     def emit(idx, stage, split):
         sub = tbl.take(pa.array(idx))
@@ -403,9 +421,8 @@ def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024):
                            "positions_per_doc": 10, "test_doc_permille": TEST_PERMILLE},
             "kind": "nla_dataset", "schema_version": 1, "keep_debug_metadata": True,
             "tokens": toks, "prompt_templates": {"actor": ACTOR, "critic": CRITIC},
-            "api_summaries": {"model": "claude-opus-5",
-                              "note": f"explanations from {OPUS5}; activations re-extracted "
-                                      f"on {base} layer {layer} (last token, left-truncated 4096)"},
+            "api_summaries": {"model": api_model or "claude-opus-5",
+                              "note": (f"explanations from {actdir}" if actdir_override else f"explanations from {OPUS5}") + f"; activations on {base} layer {layer} (last token)"},
         }
         yaml.safe_dump(meta, open(f"{path}.nla_meta.yaml", "w"), sort_keys=False, allow_unicode=True)
         print(f"  wrote {path} rows={n} {os.path.getsize(path)/1e9:.2f} GB", flush=True)
@@ -743,6 +760,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
                  for s in range(nshards)]
         for c in calls:
             print(c.get())
+    elif task == "build_variant":   # --data-dir = actdir, --out = out dir, --limit = max train explanation tokens (0 = all), --base = api model note
+        print(build_datasets.remote(model_tag, actdir_override=data_dir, out_dir=out, max_train_expl_tokens=limit, api_model=base))
     elif task == "build":
         print(build_datasets.remote(model_tag=model_tag))
     elif task == "sft":
