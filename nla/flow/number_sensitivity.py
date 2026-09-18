@@ -37,6 +37,9 @@ def main():
         rows.append({"row": it["row"], "number": num, "alt": alt, "src": src, "src2": src2, "z": it["variants"]["orig"]["text"], "tokens_after": None})
     print(f"[sens] {len(rows)} rows with the number located in the source", flush=True)
     fb = FlowBundle(a.flow_prior, a.flow_adapter, a.flow_stats, dev, base=a.base, enc_layer=a.enc_layer, prior_override=a.flow_prior_override)
+    if fb.encode is None:                       # AR-vector-only adapters carry no token encoder; we still need the base to re-extract activations
+        from nla.flow.train_cond import load_encoder
+        fb.encode, _ = load_encoder(a.base, a.enc_layer, dev)
     tok = AutoTokenizer.from_pretrained(a.critic); cfg = load_nla_config(a.sidecar, tok); template = cfg.critic_prompt_template; msf = resolve_target_scale(cfg.mse_scale, cfg.d_model); pad = tok.eos_token_id
     critic = NLACriticModel.from_pretrained(a.critic, torch_dtype=torch.bfloat16).to(dev).eval(); critic.requires_grad_(False)
     # ---- re-extract h (original source, sanity) and h' (perturbed source) at the final token, in length-sorted batches
