@@ -135,7 +135,7 @@ def main():
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024)
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
-    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0)
+    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
     ddp = "RANK" in os.environ
@@ -154,12 +154,25 @@ def main():
         if tok.pad_token_id is None: tok.pad_token = tok.eos_token
         encode = None
     arvec = ARVecEncoder(a.ar_ckpt, tok, dev) if use_arvec else None
+    if arvec is not None and a.resume_from and os.path.exists(os.path.join(a.resume_from, "ar_encoder_latest.pt")):
+        st_ = torch.load(os.path.join(a.resume_from, "ar_encoder_latest.pt"), map_location="cpu")
+        arvec.crit.load_state_dict(st_["lora"], strict=False); arvec.crit.value_head.load_state_dict(st_["value_head"])
+        if is0: print(f"[cond] resumed AR encoder from step {st_.get('step')}", flush=True)
+    def _load_adapter(model_):
+        if not a.resume_from: return
+        ad_ = torch.load(os.path.join(a.resume_from, "adapter_latest.pt"), map_location="cpu"); res_ = model_.load_state_dict(ad_["adapter"], strict=False)
+        assert not res_.unexpected_keys, res_.unexpected_keys[:5]
+        if is0: print(f"[cond] resumed adapter from step {ad_.get('step')} ({len(ad_['adapter'])} tensors)", flush=True)
     d_cvec = 2 * d_enc if use_arvec else 0
     if a.unfreeze_prior:
         # co-train: prior fp32 master + adapters, FSDP2-sharded across ranks (13.7B fp32 + Adam does not fit one GPU); bf16 compute
         from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+        if a.resume_from and os.path.exists(os.path.join(a.resume_from, "prior_cotrained_latest.pt")):
+            pc_ = torch.load(os.path.join(a.resume_from, "prior_cotrained_latest.pt"), map_location="cpu"); prior.load_state_dict({k: v.float() for k, v in pc_["model"].items()})
+            if is0: print(f"[cond] resumed co-trained prior from step {pc_.get('step')}", flush=True)
         prior = prior.to(dev).requires_grad_(True)
         model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens, d_c=a.d_c, enc_self_layers=a.enc_self_layers, enc_self_dim=a.enc_self_dim).to(dev)
+        _load_adapter(model)                       # before sharding: plain tensors
         mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         # shard the prior block and the adapter modules SEPARATELY: prior.layers[i] is also referenced as blocks[i].base, and FSDP2 refuses to
         # re-shard a module it already reached through the other path (the root would otherwise meet DTensor params -> "value was None")
@@ -177,6 +190,7 @@ def main():
     else:
         prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
         model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens, d_c=a.d_c, enc_self_layers=a.enc_self_layers, enc_self_dim=a.enc_self_dim).to(dev)
+        _load_adapter(model)
         for m_ in model.adapter_modules(): m_.float()                                            # adapter in fp32
     n_ad = model.n_adapter_params()
     if is0: print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}; unfreeze_prior={a.unfreeze_prior} world={world}", flush=True)
@@ -277,7 +291,12 @@ def main():
     N = tr_acts.shape[0]
     if is0: print(f"[cond] {a.steps} steps x {a.batch} x {world} ranks = {a.steps*a.batch*world} draws over {N} pairs = {a.steps*a.batch*world/N:.2f} passes (single pass = no repetition)", flush=True)
     perm = torch.randperm(N, generator=rng); cursor = 0
-    for step in range(1, a.steps + 1):
+    if a.start_step:   # replay the sampler: full passes re-draw the permutation, the remainder advances the cursor (same data order as an uninterrupted run)
+        bpp = max(1, N // a.batch)
+        for _ in range(a.start_step // bpp): perm = torch.randperm(N, generator=rng)
+        cursor = (a.start_step % bpp) * a.batch
+        if is0: print(f"[cond] resuming at step {a.start_step} (cursor {cursor}/{N})", flush=True)
+    for step in range(a.start_step + 1, a.steps + 1):
         if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0; print(f"[cond] re-shuffle (pass {step*a.batch*world/N:.1f})", flush=True)
         idx = perm[cursor:cursor + a.batch]; cursor += a.batch
         x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch([tr_z[i] for i in idx.tolist()], grad=True)
@@ -288,7 +307,7 @@ def main():
             loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv)
         opt.zero_grad(set_to_none=True); loss.backward(); gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn; opt.step()
         if step % 50 == 0 and is0:
-            print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/step:.2f}s/step", flush=True)
+            print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step", flush=True)
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn)}, step=step)
         if step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours:
             ev = evaluate(step)
@@ -298,7 +317,7 @@ def main():
                 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
                 full = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
                 if is0:
-                    torch.save({"adapter": {k: v for k, v in full.items() if ".read." in k or ".gate_mod." in k}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
+                    torch.save({"adapter": {k: v for k, v in full.items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
                     torch.save({"model": {k[len("prior."):]: v.to(torch.bfloat16) for k, v in full.items() if k.startswith("prior.")}, "args": cfg, "step": step, "cotrained_with": a.tag}, os.path.join(a.out, "prior_cotrained_latest.pt"))
             elif is0:
                 torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
