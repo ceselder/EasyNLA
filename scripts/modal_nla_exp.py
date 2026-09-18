@@ -716,6 +716,19 @@ def extract_ar_delta(out: str = "/vol/ckpts/qwen36_27b/ar_sft_delta_lora", merge
     vol.commit()
     return "ok"
 
+@app.function(gpu="B200", volumes=VOLS, timeout=4 * 60 * 60, secrets=SECRETS)
+def number_sensitivity(pairs_json: str = "/vol_glp/cond/halluc_classify_numbers.json", out: str = "/vol_glp/cond/number_sensitivity.json",
+                       flow_adapter: str = "/vol_glp/cond/sw_arvec_resid/adapter_latest.pt", flow_prior: str = "/vol_glp/glp27b_main/ckpts/snap_000655M", critic: str = "ar_sft_merged", model_tag: str = "qwen36_27b", n: int = 512):
+    """Change the grounded number in the SOURCE, re-extract the activation, measure displacement and scorer response."""
+    import sys
+    from huggingface_hub import snapshot_download
+    _prep(patch_lens=False)
+    snap = snapshot_download("Qwen/Qwen3.6-27B", token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap", allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
+    _run([sys.executable, "-m", "nla.flow.number_sensitivity", "--val-parquet", "/vol_q36/data/sft/av_sft_val.parquet", "--pairs-json", pairs_json, "--out", out, "--n", str(n),
+          "--flow-prior", flow_prior, "--flow-adapter", flow_adapter, "--flow-stats", f"{os.path.dirname(os.path.dirname(flow_prior))}/rep_statistics.pt", "--base", snap, "--critic", f"{CKPT}/{model_tag}/{critic}"])
+    vol_glp.commit()
+    return "ok"
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -772,6 +785,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         print(score_dumps.remote(tag=tag, model_tag=model_tag, dumps_glob=glob, out=out, extra=extra))
     elif task == "extract_ar_delta":
         print(extract_ar_delta.remote())
+    elif task == "number_sensitivity":
+        print(number_sensitivity.remote(**({"flow_adapter": tag} if tag else {})))
     elif task == "halluc_classify":   # --tag = flow adapter path (default all-pairs), --out = output json, --limit = n rows
         kw = {"n": limit or 512}
         if tag: kw["flow_adapter"] = tag
