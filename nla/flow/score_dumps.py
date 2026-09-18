@@ -108,9 +108,10 @@ def main():
             lpc, gains = [], []
             for cs in range(0, len(sel), a.flow_batch):
                 ch = sel[cs: cs + a.flow_batch]; enc, mk, cv = fb.cond([expls[i] for i in ch]); xb = x0[cs: cs + a.flow_batch]
+                xc = xb - fb.last_shift if fb.last_shift is not None else xb                    # residual parametrisation: conditional model sees x0 - shift
                 gen = torch.Generator(device=dev).manual_seed(1234 + cs)                        # same probes as the unconditional pass -> paired
-                lpc.append(exact_logp(model, xb, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=gen, cvec=cv))
-                gen2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, xb, enc, mk, a.K, gen2, cvec=cv); gains.append((lu - lc) / 2 * d)
+                lpc.append(exact_logp(model, xc, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=gen, cvec=cv))
+                gen2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, xc, enc, mk, a.K, gen2, cvec=cv); gains.append((lu - lc) / 2 * d)
             lpc = torch.cat(lpc); pmi = (lpc - lpu) / math.log(2); gb = torch.cat(gains) / math.log(2)
             if rows_out is not None:
                 for j, i in enumerate(sel): rows_out[i].update({"pmi_bits": float(pmi[j]), "gain_bits": float(gb[j])})

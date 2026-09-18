@@ -101,10 +101,10 @@ def main():
     for cs in range(0, len(items), R):
         ch = items[cs: cs + R]; texts = [it["variants"][k]["text"] for it in ch for k in names]
         x0 = norm.normalize(torch.tensor(np.stack([acts[it["row"]] for it in ch for _ in names]), device=dev))
-        enc, mk, cv = fb.cond(texts)
-        g1 = torch.Generator(device=dev).manual_seed(1234 + cs); lpc = exact_logp(model, x0, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=g1, cvec=cv)
+        enc, mk, cv = fb.cond(texts); xc = x0 - fb.last_shift if fb.last_shift is not None else x0
+        g1 = torch.Generator(device=dev).manual_seed(1234 + cs); lpc = exact_logp(model, xc, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=g1, cvec=cv)
         g0 = torch.Generator(device=dev).manual_seed(1234 + cs); lpu = exact_logp(model, x0, None, None, n_steps=a.ode_steps, probes=a.probes, gen=g0)
-        g2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, x0, enc, mk, a.K, g2, cvec=cv)
+        g2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, xc, enc, mk, a.K, g2, cvec=cv)
         pmi = (lpc - lpu) / math.log(2); gain = (lu - lc) / 2 * d / math.log(2)
         for j, (it, k) in enumerate([(it, k) for it in ch for k in names]): it["variants"][k].update({"pmi_bits": float(pmi[j]), "gain_bits": float(gain[j]), "logp_cond_nats": float(lpc[j])})
         if (cs // R) % 20 == 0:

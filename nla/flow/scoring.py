@@ -43,8 +43,12 @@ class FlowBundle:
 
     @torch.no_grad()
     def cond(self, texts):
-        enc = mk = cvec = None
+        """-> (enc, mask, cvec); with a --resid-shift adapter the standardised AR prediction is left in self.last_shift (else None):
+        score x0 - shift under the conditional model, x0 under the prior (unit Jacobian, so log p(h|z) - log p(h) is unchanged in form)."""
+        enc = mk = cvec = None; self.last_shift = None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if self.encode is not None: enc, mk = self.encode(texts)
-            if self.arvec is not None: cvec = self.arvec(texts).float()
+            if self.arvec is not None:
+                cvec = self.arvec(texts).float()
+                if self.aa.get("resid_shift"): self.last_shift = self.norm.normalize(self.arvec.last_pred_raw).float()
         return enc, mk, cvec
