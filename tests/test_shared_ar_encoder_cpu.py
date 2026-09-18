@@ -66,7 +66,7 @@ def test():
     class _FC:  # minimal stand-in for FlowCritic.save's use
         pass
     from nla.flow.rl_critic import FlowCritic
-    fc = FlowCritic.__new__(FlowCritic); fc.arvec = enc; fc.actor = actor; fc.model = torch.nn.Module(); fc.adapter_args = {}; fc.cfg = {}
+    fc = FlowCritic.__new__(FlowCritic); fc.arvec = enc; fc.actor = actor; fc.model = torch.nn.Module(); fc.adapter_args = {}; fc.cfg = {}; fc.shared_trunk = True
     FlowCritic.save(fc, f"{tmp}/flow_latest", 9); st = torch.load(f"{tmp}/flow_latest/ar_encoder_latest.pt")
     assert set(st["lora"]) == set(lora), (sorted(st["lora"])[:2], sorted(lora)[:2])
     print("shared AR encoder CPU test OK")

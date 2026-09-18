@@ -101,10 +101,15 @@ class FlowCritic:
     def __init__(self, prior_dir: str, adapter_path: str, stats_path: str, actor, tokenizer, device, *, enc_layer: int = 42,
                  lr: float = 1e-4, p_uncond: float = 0.1, t_grid=(0.2, 0.4, 0.6, 0.8), fve_t: float = 0.9, micro_batch: int = 16,
                  max_len: int = 192, prior_weights: str = "raw", train_adapter: bool = True, eps_per_t: int = 1, prior_override: str | None = None,
-                 grounded_shards: str | None = None, grounded_n: int = 0, grounded_skip: int = 0, ar_sft_lora_dir: str = "/vol/ckpts/qwen36_27b/ar_sft_delta_lora"):
+                 grounded_shards: str | None = None, grounded_n: int = 0, grounded_skip: int = 0, ar_sft_lora_dir: str = "/vol/ckpts/qwen36_27b/ar_sft_delta_lora",
+                 actor_device=None, shared_trunk: bool = False, ar_ckpt: str = "/vol/ckpts/qwen36_27b/ar_sft_merged"):
+        """device = where the flow (prior + adapter) and, for AR-vector conditioners, the AR trunk live; actor_device = where the actor
+        (token-state encoder) lives. With a second GPU per rank (--flow-device cuda:1) the real 31 GB AR trunk fits next to the flow."""
         self.actor, self.tok, self.device, self.enc_layer = actor, tokenizer, device, enc_layer
+        self.actor_device = actor_device if actor_device is not None else device; self.shared_trunk = shared_trunk
         self.eps_per_t = max(1, int(eps_per_t))
         self.dev_type = torch.device(device).type
+        if self.dev_type == "cuda" and torch.device(device).index is not None: torch.cuda.set_device(device)   # allocate on the critic GPU
         self.p_uncond, self.t_grid, self.fve_t, self.micro_batch, self.max_len = p_uncond, tuple(float(t) for t in t_grid), fve_t, micro_batch, max_len
         self.norm = Normalizer.load(stats_path).to(device)
         # build the 13.7B prior on the meta device and stream the checkpoint in with mmap: no 55 GB fp32 CPU copy per rank
@@ -126,7 +131,17 @@ class FlowCritic:
                                   enc_self_layers=aa.get("enc_self_layers", 0), enc_self_dim=aa.get("enc_self_dim", 1024), chunk_queries=aa.get("chunk_queries", 0)).to(device)
         self.arvec = None
         if use_arvec:
-            self.arvec = SharedARVecEncoder(actor, tokenizer, device, os.path.join(os.path.dirname(adapter_path), "ar_encoder_latest.pt"), ar_sft_lora_dir, cfg["d_input"], enc_layer=enc_layer)
+            enc_path = os.path.join(os.path.dirname(adapter_path), "ar_encoder_latest.pt")
+            if shared_trunk:
+                self.arvec = SharedARVecEncoder(actor, tokenizer, device, enc_path, ar_sft_lora_dir, cfg["d_input"], enc_layer=enc_layer)
+            else:   # the real SFT reconstructor trunk (its merged delta is full-rank; it cannot share the actor's weights) + the stage-2 LoRA / head
+                from transformers import AutoTokenizer
+                from nla.flow.train_cond import ARVecEncoder
+                ar_dir = aa.get("ar_ckpt", ar_ckpt); atok = AutoTokenizer.from_pretrained(ar_dir); atok.padding_side = "right"
+                if atok.pad_token_id is None: atok.pad_token = atok.eos_token
+                self.arvec = ARVecEncoder(ar_dir, atok, device); st = torch.load(enc_path, map_location="cpu")
+                self.arvec.crit.load_state_dict(st["lora"], strict=False); self.arvec.crit.value_head.load_state_dict(st["value_head"])
+                print(f"[flow] AR-vector encoder: real trunk {ar_dir} on {device} + stage-2 LoRA/head from {enc_path} (step {st.get('step')})", flush=True)
         res = self.model.load_state_dict(ad["adapter"], strict=False)
         assert not res.unexpected_keys, res.unexpected_keys[:5]
         for mod in self.model.adapter_modules(): mod.float()
@@ -167,9 +182,9 @@ class FlowCritic:
         """explanation strings -> (token states at enc_layer [B, T, d] bf16, key mask [B, T] bool; position 0 masked)."""
         ids_l = [self.tok.encode(z, add_special_tokens=False)[: self.max_len] for z in texts]
         T = max(1, max(len(x) for x in ids_l)); pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
-        ids = torch.full((len(texts), T), pad, dtype=torch.long, device=self.device); am = torch.zeros((len(texts), T), dtype=torch.long, device=self.device)
+        ids = torch.full((len(texts), T), pad, dtype=torch.long, device=self.actor_device); am = torch.zeros((len(texts), T), dtype=torch.long, device=self.actor_device)
         for r, x in enumerate(ids_l):
-            ids[r, : len(x)] = torch.tensor(x, dtype=torch.long, device=self.device); am[r, : len(x)] = 1
+            ids[r, : len(x)] = torch.tensor(x, dtype=torch.long, device=self.actor_device); am[r, : len(x)] = 1
         layers, inner = self._layers(); cap = {}
         def hook(_m, _i, out): cap["h"] = out[0] if isinstance(out, tuple) else out; raise _Stop()
         hnd = layers[self.enc_layer].register_forward_hook(hook)
@@ -181,6 +196,7 @@ class FlowCritic:
         finally:
             hnd.remove(); self.actor.train(was_training)
         h = cap.pop("h").to(torch.bfloat16); mask = am.bool(); mask[:, 0] = False
+        if str(self.device) != str(self.actor_device): h, mask = h.to(self.device), mask.to(self.device)
         return h, mask
 
     def _cond(self, texts, grad: bool = False):
@@ -189,7 +205,11 @@ class FlowCritic:
         enc = mask = cvec = shift = None
         if self.use_tokens: enc, mask = self.encode(texts)
         if self.arvec is not None:
-            cvec = self.arvec(texts, grad=grad)
+            if self.shared_trunk: cvec = self.arvec(texts, grad=grad)
+            else:
+                with (torch.enable_grad() if grad else torch.no_grad()), torch.autocast(device_type=self.dev_type, dtype=torch.bfloat16):
+                    cvec = self.arvec(texts)
+            cvec = cvec.to(self.device)
             if not grad: cvec = cvec.detach()
             if self.resid_shift: shift = self.norm.normalize(self.arvec.last_pred_raw); shift = shift if grad else shift.detach()
         return enc, mask, cvec, shift
@@ -265,9 +285,11 @@ class FlowCritic:
 
     def save(self, out_dir: str, step: int):
         os.makedirs(out_dir, exist_ok=True); tmp = os.path.join(out_dir, "adapter_latest.pt.tmp")
-        if self.arvec is not None:
+        if self.arvec is not None and self.shared_trunk:
             lora = {f"backbone.model.layers.{n.split('.layers.')[1].replace('.ar_critic', '.default')}": p_.detach().cpu() for n, p_ in self.actor.named_parameters() if ".ar_critic." in n}
             torch.save({"lora": lora, "value_head": self.arvec.value_head.state_dict(), "step": step}, os.path.join(out_dir, "ar_encoder_latest.pt"))
+        elif self.arvec is not None:
+            torch.save({"lora": {k: v.detach().cpu() for k, v in self.arvec.crit.state_dict().items() if "lora_" in k}, "value_head": self.arvec.crit.value_head.state_dict(), "step": step}, os.path.join(out_dir, "ar_encoder_latest.pt"))
         torch.save({"adapter": {k: v for k, v in self.model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_")},
                     "args": self.adapter_args, "prior_cfg": self.cfg, "step": step, "rl_step": step}, tmp)
         os.replace(tmp, os.path.join(out_dir, "adapter_latest.pt"))

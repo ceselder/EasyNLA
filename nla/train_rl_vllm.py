@@ -1820,7 +1820,9 @@ def main():
     p.add_argument("--flow-cotrain", choices=["rollouts", "grounded", "mix"], default="rollouts", help="what the flow critic co-trains on each step")
     p.add_argument("--flow-grounded-shards", default=None, help="extraction shards (activation_vector/explanation/is_val) for grounded co-training; comma-separated globs ok")
     p.add_argument("--flow-grounded-n", type=int, default=100000, help="grounded pairs held per rank (rank-disjoint slices)")
-    p.add_argument("--flow-ar-sft-lora", default="/vol/ckpts/qwen36_27b/ar_sft_delta_lora", help="PEFT adapter of the SFT reconstructor's merged LoRA (AR-vector conditioners share the actor's trunk)")
+    p.add_argument("--flow-ar-sft-lora", default="/vol/ckpts/qwen36_27b/ar_sft_delta_lora", help="PEFT adapter of the SFT reconstructor's merged LoRA (only with --flow-shared-trunk)")
+    p.add_argument("--flow-device", default="", help="device for the flow critic (prior, adapter, AR trunk), e.g. cuda:1 when each rank owns 2 GPUs; default = the actor's device")
+    p.add_argument("--flow-shared-trunk", action="store_true", help="AR-vector conditioner reads through the actor's weights + LoRA adapters instead of the real reconstructor trunk (approximate)")
     p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl", "flow"],
                    default="vector_mse",
                    help="Critic (AR) TRAINING loss. vector_mse (DEFAULT) = classic "
@@ -2152,7 +2154,8 @@ def main():
         if args.reward_mode != "flow":
             print(f"[flow] NOTE: --ar-loss flow with --reward-mode {args.reward_mode}: the actor is rewarded by the flow's x0-prediction MSE", flush=True)
         critic = None
-        flow = FlowCritic(args.flow_prior, args.flow_adapter, args.flow_stats, actor, tokenizer, device, enc_layer=args.flow_enc_layer,
+        _flow_dev = torch.device(args.flow_device) if args.flow_device else device
+        flow = FlowCritic(args.flow_prior, args.flow_adapter, args.flow_stats, actor, tokenizer, _flow_dev, enc_layer=args.flow_enc_layer, actor_device=device, shared_trunk=args.flow_shared_trunk,
                           lr=args.flow_lr, p_uncond=args.flow_p_uncond, t_grid=[float(x) for x in args.flow_t_grid.split(",")],
                           micro_batch=args.flow_micro_batch, train_adapter=args.train_critic, eps_per_t=args.flow_eps_per_t, prior_override=args.flow_prior_override,
                           grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
