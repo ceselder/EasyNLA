@@ -78,6 +78,12 @@ def test_cond_vector():
     enc = torch.randn(8, 7, 24); mask = torch.ones(8, 7, dtype=torch.bool); mask[:, 5:] = False
     assert torch.allclose(prior(x, t), ce(x, t, enc, mask), atol=1e-5)
     l, _, _ = cond_fm_loss(ce, x, enc, mask, p_uncond=0.5); l.backward(); assert all(p.grad is not None for p in ce.token_encoder.parameters() if p.numel() > 0)
+    # chunked (per-slice) queries: identity at init, trains, dropout rows == prior
+    cq = CondDenoiser(prior, 24, n_heads=2, d_head=8, gate_rank=4, chunk_queries=4)
+    enc = torch.randn(8, 7, 24); mask = torch.ones(8, 7, dtype=torch.bool)
+    assert torch.allclose(prior(x, t), cq(x, t, enc, mask), atol=1e-5)
+    l, _, _ = cond_fm_loss(cq, x, enc, mask, p_uncond=0.5); l.backward(); assert all(p.grad is not None for p in cq.adapter_parameters() if p.numel() > 0)
+    m2 = mask.clone(); m2[:4] = False; assert torch.allclose(cq(x, t, enc, m2)[:4], prior(x, t)[:4], atol=1e-5)
     # residual shift: zero shift == no shift; nonzero shift changes the loss (same noise)
     torch.manual_seed(3); tt = torch.rand(8); ee = torch.randn(8, 16)
     l0, _, _ = cond_fm_loss(cm, x, None, None, t=tt, eps=ee, cvec=cv, shift=torch.zeros(8, 16)); l1, _, _ = cond_fm_loss(cm, x, None, None, t=tt, eps=ee, cvec=cv)

@@ -20,7 +20,7 @@ class FlowBundle:
         ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]; self.aa = aa; self.d = cfg["d_input"]
         self.cond_mode = aa.get("cond_mode", "tokens"); use_tokens = self.cond_mode in ("tokens", "both"); use_arvec = self.cond_mode in ("ar_vec", "both")
         self.model = CondDenoiser(prior, cfg["d_input"], aa["n_slots"], aa["n_heads"], aa["d_head"], aa.get("gate_rank", 128), d_cvec=(2 * cfg["d_input"] if use_arvec else 0),
-                                  use_tokens=use_tokens, d_c=aa.get("d_c", 4096), enc_self_layers=aa.get("enc_self_layers", 0), enc_self_dim=aa.get("enc_self_dim", 1024)).to(dev)
+                                  use_tokens=use_tokens, d_c=aa.get("d_c", 4096), enc_self_layers=aa.get("enc_self_layers", 0), enc_self_dim=aa.get("enc_self_dim", 1024), chunk_queries=aa.get("chunk_queries", 0)).to(dev)
         res = self.model.load_state_dict(ad["adapter"], strict=False); assert not res.unexpected_keys, res.unexpected_keys[:5]
         for mod in self.model.adapter_modules(): mod.float()
         self.model.eval(); self.model.requires_grad_(False)

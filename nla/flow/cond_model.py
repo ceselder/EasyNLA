@@ -35,14 +35,37 @@ class CrossRead(nn.Module):
         return self.out(att.transpose(1, 2).reshape(B, -1)) * has[:, None].to(h.dtype)
 
 
+class ChunkCrossRead(nn.Module):
+    """Flamingo-style per-position queries: the block hidden state is split into n_chunks slices, every slice queries the encoder tokens
+    (n_heads x d_head) and its attention output is written back into its own slice (zero-init out). Rows with an all-False mask -> 0."""
+    def __init__(self, d_model: int, d_enc: int, n_chunks: int = 40, n_heads: int = 4, d_head: int = 64):
+        super().__init__()
+        assert d_model % n_chunks == 0; self.n_chunks, self.n_heads, self.d_head, self.d_slice = n_chunks, n_heads, d_head, d_model // n_chunks
+        d_attn = n_heads * d_head
+        self.q = nn.Linear(self.d_slice, d_attn); self.k = nn.Linear(d_enc, d_attn); self.v = nn.Linear(d_enc, d_attn)
+        self.pos = nn.Parameter(torch.zeros(n_chunks, d_attn)); nn.init.normal_(self.pos, std=0.02)   # which slice is asking
+        self.enc_ln = nn.LayerNorm(d_enc)
+        self.out = nn.Linear(d_attn, self.d_slice); nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)
+
+    def forward(self, h, enc, enc_mask):
+        B, T, _ = enc.shape; C = self.n_chunks
+        has = enc_mask.any(-1); safe_mask = enc_mask | (~has)[:, None]
+        e = self.enc_ln(enc)
+        q = (self.q(h.view(B, C, self.d_slice)) + self.pos[None]).view(B, C, self.n_heads, self.d_head).transpose(1, 2)   # [B, H, C, dh]
+        k = self.k(e).view(B, T, self.n_heads, self.d_head).transpose(1, 2); v = self.v(e).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        att = F.scaled_dot_product_attention(q, k, v, attn_mask=safe_mask[:, None, None, :])                                  # [B, H, C, dh]
+        out = self.out(att.transpose(1, 2).reshape(B, C, self.n_heads * self.d_head)).reshape(B, C * self.d_slice)          # back into each slice
+        return out * has[:, None].to(h.dtype)
+
+
 class CondMLPBlock(nn.Module):
     """base MLP block + zero-init conditioning: token cross-read (optional) and/or an additive projection of the shared AR-vector features
     (optional). Both land in the same 'read' vector r, which is added to the residual stream and modulates the gate."""
-    def __init__(self, base: MLPBlock, d_enc: int, n_slots: int, n_heads: int, d_head: int, gate_rank: int = 128, use_read: bool = True, d_c: int = 0):
+    def __init__(self, base: MLPBlock, d_enc: int, n_slots: int, n_heads: int, d_head: int, gate_rank: int = 128, use_read: bool = True, d_c: int = 0, chunk_queries: int = 0):
         super().__init__()
         self.base = base
         d_model = base.ln.normalized_shape[0]
-        self.read = CrossRead(d_model, d_enc, n_slots, n_heads, d_head) if use_read else None
+        self.read = (ChunkCrossRead(d_model, d_enc, chunk_queries, n_heads, d_head) if chunk_queries else CrossRead(d_model, d_enc, n_slots, n_heads, d_head)) if use_read else None
         self.cvec_out = None
         if d_c:
             self.cvec_out = nn.Linear(d_c, d_model); nn.init.zeros_(self.cvec_out.weight); nn.init.zeros_(self.cvec_out.bias)
@@ -87,12 +110,12 @@ class CondDenoiser(nn.Module):
        + its last hidden state). cvec -> LayerNorm -> shared features c = [W1 c_ln ; silu(W2 c_ln)] (d_c) -> zero-init linear into the
        input projection and into the residual stream of every block (same additive channel the token reads use). Both None -> exactly
        the prior; cvec_has [B] bool marks samples whose vector is live (condition dropout)."""
-    def __init__(self, prior: Denoiser, d_enc: int, n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, d_cvec: int = 0, use_tokens: bool = True, d_c: int = 4096, enc_self_layers: int = 0, enc_self_dim: int = 1024):
+    def __init__(self, prior: Denoiser, d_enc: int, n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, d_cvec: int = 0, use_tokens: bool = True, d_c: int = 4096, enc_self_layers: int = 0, enc_self_dim: int = 1024, chunk_queries: int = 0):
         super().__init__()
         self.prior = prior; self.use_tokens = use_tokens
         self.token_encoder = TokenEncoder(d_enc, enc_self_dim, enc_self_layers) if (use_tokens and enc_self_layers > 0) else None
         self.d_enc = d_enc; self.d_cvec = d_cvec; self.d_c = d_c if d_cvec else 0
-        self.blocks = nn.ModuleList([CondMLPBlock(blk, d_enc, n_slots, n_heads, d_head, gate_rank, use_read=use_tokens, d_c=self.d_c) for blk in prior.layers])
+        self.blocks = nn.ModuleList([CondMLPBlock(blk, d_enc, n_slots, n_heads, d_head, gate_rank, use_read=use_tokens, d_c=self.d_c, chunk_queries=chunk_queries) for blk in prior.layers])
         if d_cvec:
             self.cvec_ln = nn.LayerNorm(d_cvec)
             self.cvec_in = nn.Linear(d_cvec, d_c)                                              # first half linear, second half SiLU features
