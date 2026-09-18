@@ -764,6 +764,7 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         if tag: kw["flow_adapter"] = tag
         if out: kw["out"] = out
         if extra: kw["prior_override"] = extra          # --extra = prior override file (co-trained prior)
+        if base: kw["flow_prior"] = base                # --base = prior snapshot dir (default 655M)
         print(halluc_classify.remote(**kw))
     elif task == "probe_tok":
         print(probe_tokenizer.remote())
