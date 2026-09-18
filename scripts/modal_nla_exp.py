@@ -669,14 +669,23 @@ def pyrun(cmd: str):
     _run(["bash", "-lc", cmd])
     return "ok"
 
-@app.function(gpu="B200", volumes=VOLS, timeout=4 * 60 * 60, secrets=SECRETS)
-def score_dumps(tag: str, critic: str = "ar_sft_merged", model_tag: str = "qwen36_27b"):
-    """Frozen SFT-critic FVE on the eval rollouts a run dumped every eval (train_rl_vllm save_dir/eval_rollouts) -> frozen_scores.json."""
+@app.function(gpu="B200", volumes=VOLS, timeout=6 * 60 * 60, secrets=SECRETS)
+def score_dumps(tag: str, critic: str = "ar_sft_merged", model_tag: str = "qwen36_27b", dumps_glob: str = "", out: str = "",
+                flow_adapter: str = "/vol_glp/cond/cond_655M_all/adapter_latest.pt", flow_prior: str = "/vol_glp/glp27b_main/ckpts/snap_000655M", max_rows: int = 1024):
+    """Fixed-scorer evaluation of dumped eval rollouts: frozen SFT MSE critic FVE + frozen stage-2 flow exact log p(h|z) (PMI bits).
+    dumps_glob may span several runs (checkpoint eval chain); default = the run's own eval_rollouts."""
     import sys
+    from huggingface_hub import snapshot_download
     _prep(patch_lens=False)
     d = f"{CKPT}/{model_tag}/{tag}"
-    _run([sys.executable, "-m", "nla.flow.score_dumps", "--dumps-dir", f"{d}/eval_rollouts", "--critic", f"{CKPT}/{model_tag}/{critic}",
-          "--sidecar", "/vol_q36/data/rl/rl_shuf.parquet", "--out", f"{d}/frozen_scores.json"])
+    dumps = dumps_glob or f"{d}/eval_rollouts"; out = out or f"{d}/frozen_scores.json"
+    cmd = [sys.executable, "-m", "nla.flow.score_dumps", "--dumps-dir", dumps, "--out", out, "--sidecar", "/vol_q36/data/rl/rl_shuf.parquet", "--max-rows", str(max_rows)]
+    if critic: cmd += ["--critic", f"{CKPT}/{model_tag}/{critic}"]
+    if flow_adapter:
+        snap = snapshot_download("Qwen/Qwen3.6-27B", token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap",
+                                 allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
+        cmd += ["--flow-prior", flow_prior, "--flow-adapter", flow_adapter, "--flow-stats", f"{os.path.dirname(os.path.dirname(flow_prior))}/rep_statistics.pt", "--base", snap]
+    _run(cmd)
     vol.commit()
     return "ok"
 
@@ -733,7 +742,7 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "pyrun":
         print(pyrun.remote(cmd=cmd))
     elif task == "score_dumps":
-        print(score_dumps.remote(tag=tag, model_tag=model_tag))
+        print(score_dumps.remote(tag=tag, model_tag=model_tag, dumps_glob=glob, out=out))
     elif task == "probe_tok":
         print(probe_tokenizer.remote())
     elif task == "shells":
