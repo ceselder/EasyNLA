@@ -1460,7 +1460,7 @@ def grpo_update_microbatched(
         sample_losses_log.append(chunk_loss.item() * denom / len(chunk_losses) / loss_scale)
         del new_hidden
     if do_step:
-        _trainable = [p for p in actor.parameters() if p.requires_grad]
+        _trainable = [p for n, p in actor.named_parameters() if p.requires_grad and ".ar_critic." not in n and ".ar_sft." not in n]
         # DP: average grads across ranks BEFORE clip+step so every rank clips the
         # same grad and takes an identical step (keeps the actor copies in sync).
         actor_sync_wait_s, actor_allreduce_s = _allreduce_grads_(
@@ -1820,6 +1820,7 @@ def main():
     p.add_argument("--flow-cotrain", choices=["rollouts", "grounded", "mix"], default="rollouts", help="what the flow critic co-trains on each step")
     p.add_argument("--flow-grounded-shards", default=None, help="extraction shards (activation_vector/explanation/is_val) for grounded co-training; comma-separated globs ok")
     p.add_argument("--flow-grounded-n", type=int, default=100000, help="grounded pairs held per rank (rank-disjoint slices)")
+    p.add_argument("--flow-ar-sft-lora", default="/vol/ckpts/qwen36_27b/ar_sft_delta_lora", help="PEFT adapter of the SFT reconstructor's merged LoRA (AR-vector conditioners share the actor's trunk)")
     p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl", "flow"],
                    default="vector_mse",
                    help="Critic (AR) TRAINING loss. vector_mse (DEFAULT) = classic "
@@ -2155,7 +2156,7 @@ def main():
                           lr=args.flow_lr, p_uncond=args.flow_p_uncond, t_grid=[float(x) for x in args.flow_t_grid.split(",")],
                           micro_batch=args.flow_micro_batch, train_adapter=args.train_critic, eps_per_t=args.flow_eps_per_t, prior_override=args.flow_prior_override,
                           grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
-                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)))
+                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora)
         if args.flow_cotrain != "rollouts": assert flow.pool is not None, "--flow-cotrain grounded/mix needs --flow-grounded-shards"
         _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
         if args.resume_from_lora is not None and _flow_latest.exists():
@@ -2409,7 +2410,10 @@ def main():
     except ImportError:
         _adam_cls = torch.optim.AdamW
         print(f"[optim] bitsandbytes unavailable, falling back to torch AdamW (fp32 m,v)")
-    trainable = [p for p in actor.parameters() if p.requires_grad]
+    # the flow critic may hang extra LoRA adapters on the actor (shared-trunk AR encoder: 'ar_sft' frozen, 'ar_critic' trained by the FLOW
+    # optimizer) -- they must never enter the policy optimizer or its grad clipping
+    _not_policy = lambda n: (".ar_critic." in n) or (".ar_sft." in n)
+    trainable = [p for n, p in actor.named_parameters() if p.requires_grad and not _not_policy(n)]
     optim = _adam_cls(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
 
     # Resume: restore Adam moments (saved latest-only alongside checkpoints).

@@ -5,7 +5,7 @@ import argparse, json, os, re, torch
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 
-TM = re.compile(r"^model\.layers\.(\d+)\.(self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))\.weight$")
+TM = re.compile(r"^model\.(?:language_model\.)?layers\.(\d+)\.(self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))\.weight$")
 
 
 def shard_map(d):
@@ -21,7 +21,7 @@ def main():
     mb, mm = shard_map(a.base), shard_map(a.merged)
     # the merged (text-only, 43-layer) checkpoint uses model.layers.N...; the base may be the multimodal wrapper (model.language_model.layers.N...)
     def base_key(k):
-        for cand in (k, k.replace("model.layers.", "model.language_model.layers.")):
+        for cand in (k, k.replace("model.layers.", "model.language_model.layers."), k.replace("model.language_model.layers.", "model.layers.")):
             if cand in mb: return cand
         raise KeyError(k)
     out, errs = {}, []
@@ -43,8 +43,8 @@ def main():
         if len(errs) % 50 == 0: print(f"[delta] {len(errs)} modules; last {k}: rel err {rel:.2e}, energy beyond rank {r}: {tail:.2e}", flush=True)
     os.makedirs(a.out, exist_ok=True); save_file(out, os.path.join(a.out, "adapter_model.safetensors"))
     cfg = {"peft_type": "LORA", "r": a.r, "lora_alpha": a.r ** 0.5, "use_rslora": True, "lora_dropout": 0.0, "bias": "none", "task_type": "CAUSAL_LM",
-           "target_modules": r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))",
-           "layers_to_transform": list(range(a.layers)), "inference_mode": False, "init_lora_weights": True}
+           "target_modules": r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.(?:" + "|".join(str(i) for i in range(a.layers)) + r")\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))",
+           "inference_mode": False, "init_lora_weights": True}
     json.dump(cfg, open(os.path.join(a.out, "adapter_config.json"), "w"), indent=1)
     worst = sorted(errs, key=lambda e: -e[1])[:3]
     json.dump({"n_modules": len(errs), "max_rel_err": max(e[1] for e in errs), "median_rel_err": sorted(e[1] for e in errs)[len(errs) // 2], "worst": worst}, open(os.path.join(a.out, "extraction_report.json"), "w"), indent=1)

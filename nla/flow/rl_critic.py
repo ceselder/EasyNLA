@@ -24,11 +24,84 @@ class _Stop(Exception):
     pass
 
 
+class SharedARVecEncoder(torch.nn.Module):
+    """The AR-vector conditioner's encoder WITHOUT a second 27B trunk: the actor's own base weights + two extra LoRA adapters on layers
+    0..enc_layer ("ar_sft" = the SFT reconstructor's merged LoRA recovered by SVD, frozen; "ar_critic" = the stage-2 LoRA, trained), run
+    through the first enc_layer+1 layers only with the final norm bypassed (the reconstructor stripped it), then the affine value head.
+    cvec = [normalise(value_head(last)); normalise(last)]; last_pred_raw kept for the residual-shift parametrisation.
+    Every call activates the two adapters for its forward and restores the policy adapter ("default") in a finally block, so GRPO,
+    the KL reference and the vLLM weight sync (which sums ACTIVE adapters) never see them."""
+    def __init__(self, actor, tok, device, ar_encoder_path: str, ar_sft_lora_dir: str, d: int, enc_layer: int = 42, lora_r: int = 64, lora_alpha: int = 16):
+        super().__init__()
+        import math as _m, re as _re
+        from peft import LoraConfig
+        self.actor, self.tok, self.device, self.enc_layer = actor, tok, device, enc_layer
+        self.msf = _m.sqrt(d); self.tmpl = "Summary of the following text: <text>{explanation}</text> <summary>"
+        st = torch.load(ar_encoder_path, map_location="cpu")
+        lm = self._lm(); n_layers = len(lm.layers)
+        layers_alt = "|".join(str(i) for i in range(enc_layer + 1))       # PEFT forbids layers_to_transform with a regex target -> bake the range in
+        tm = r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.(?:" + layers_alt + r")\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))"
+        if "ar_sft" not in getattr(actor, "peft_config", {}):
+            actor.load_adapter(ar_sft_lora_dir, adapter_name="ar_sft")                                       # frozen merged-SFT delta
+        if "ar_critic" not in actor.peft_config:
+            actor.add_adapter("ar_critic", LoraConfig(r=lora_r, lora_alpha=lora_alpha, use_rslora=True, target_modules=tm, lora_dropout=0.0, bias="none"))
+        # copy the stage-2 LoRA (critic-style keys backbone.model.layers.N.<mod>.lora_{A,B}.default.weight) into adapter "ar_critic"
+        mods = dict(lm.layers.named_modules()); n_copied = 0
+        for k, v in st["lora"].items():
+            m = _re.match(r"backbone\.model\.layers\.(\d+)\.(.+)\.lora_(A|B)\.default\.weight$", k)
+            if not m or int(m.group(1)) > enc_layer: continue
+            mod = mods[f"{m.group(1)}.{m.group(2)}"]; tgt = getattr(mod, "lora_" + m.group(3))["ar_critic"].weight
+            with torch.no_grad(): tgt.copy_(v.to(tgt.dtype)); n_copied += 1
+        self.value_head = torch.nn.Linear(d, d, bias="bias" in st["value_head"]).to(device).float(); self.value_head.load_state_dict(st["value_head"])
+        self.ar_params = [p_ for n_, p_ in actor.named_parameters() if ".ar_critic." in n_]
+        for p_ in self.ar_params: p_.data = p_.data.float()
+        self._restore()
+        print(f"[flow] shared AR encoder: copied {n_copied} stage-2 LoRA tensors into adapter 'ar_critic' ({sum(p_.numel() for p_ in self.ar_params)/1e6:.0f}M trainable), 'ar_sft' from {ar_sft_lora_dir}, "
+              f"{n_layers}-layer trunk truncated to {enc_layer + 1} for the read", flush=True)
+
+    def _lm(self):
+        base = self.actor.get_base_model() if hasattr(self.actor, "get_base_model") else self.actor
+        inner = base.model
+        return inner if hasattr(inner, "layers") else inner.language_model
+
+    def _restore(self):
+        """policy adapter active; ar_sft frozen; ar_critic KEEPS requires_grad (PEFT's set_adapter would clear it, and a leaf whose flag is
+        cleared before backward receives no gradient). Its grads live in the flow optimizer, which zeroes them after every step, so the
+        actor's own clipping / all-reduce (which skip None grads) never see them."""
+        self.actor.base_model.set_adapter("default"); self.actor.set_adapter("default")
+        for n_, p_ in self.actor.named_parameters():
+            if ".ar_sft." in n_: p_.requires_grad_(False)
+        for p_ in self.ar_params: p_.requires_grad_(True)
+
+    def trainable_parameters(self):
+        return self.ar_params + list(self.value_head.parameters())
+
+    def forward(self, texts, grad: bool = True):
+        from nla.schema import normalize_activation
+        enc = self.tok([self.tmpl.format(explanation=z) for z in texts], return_tensors="pt", padding=True, truncation=True, max_length=256, add_special_tokens=False)
+        ids, am = enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
+        lm = self._lm(); full_layers, full_norm = lm.layers, lm.norm
+        try:
+            self.actor.base_model.set_adapter(["ar_sft", "ar_critic"])
+            for n_, p_ in self.actor.named_parameters():
+                if ".ar_sft." in n_: p_.requires_grad_(False)
+            lm.layers = torch.nn.ModuleList(list(full_layers)[: self.enc_layer + 1]); lm.norm = torch.nn.Identity()
+            ctx = torch.enable_grad() if grad else torch.no_grad()
+            with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
+                out = lm(input_ids=ids, attention_mask=am, use_cache=False)
+                h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        finally:
+            lm.layers = full_layers; lm.norm = full_norm; self._restore()
+        last = h[torch.arange(ids.shape[0], device=self.device), am.sum(1) - 1].float()
+        pred = self.value_head(normalize_activation(last, self.msf)).float(); self.last_pred_raw = pred
+        return torch.cat([normalize_activation(pred, self.msf), normalize_activation(last, self.msf)], -1)
+
+
 class FlowCritic:
     def __init__(self, prior_dir: str, adapter_path: str, stats_path: str, actor, tokenizer, device, *, enc_layer: int = 42,
                  lr: float = 1e-4, p_uncond: float = 0.1, t_grid=(0.2, 0.4, 0.6, 0.8), fve_t: float = 0.9, micro_batch: int = 16,
                  max_len: int = 192, prior_weights: str = "raw", train_adapter: bool = True, eps_per_t: int = 1, prior_override: str | None = None,
-                 grounded_shards: str | None = None, grounded_n: int = 0, grounded_skip: int = 0):
+                 grounded_shards: str | None = None, grounded_n: int = 0, grounded_skip: int = 0, ar_sft_lora_dir: str = "/vol/ckpts/qwen36_27b/ar_sft_delta_lora"):
         self.actor, self.tok, self.device, self.enc_layer = actor, tokenizer, device, enc_layer
         self.eps_per_t = max(1, int(eps_per_t))
         self.dev_type = torch.device(device).type
@@ -46,8 +119,14 @@ class FlowCritic:
         prior.load_state_dict(sd, strict=True)                    # copies with dtype conversion, tensor by tensor
         prior.requires_grad_(False); del sd, m
         ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]
+        self.cond_mode = aa.get("cond_mode", "tokens"); self.use_tokens = self.cond_mode in ("tokens", "both"); use_arvec = self.cond_mode in ("ar_vec", "both")
+        self.resid_shift = bool(aa.get("resid_shift", False))
         self.model = CondDenoiser(prior, cfg["d_input"], aa["n_slots"], aa["n_heads"], aa["d_head"], aa.get("gate_rank", 128),
-                                  d_cvec=0, use_tokens=True).to(device)
+                                  d_cvec=(2 * cfg["d_input"] if use_arvec else 0), use_tokens=self.use_tokens, d_c=aa.get("d_c", 4096),
+                                  enc_self_layers=aa.get("enc_self_layers", 0), enc_self_dim=aa.get("enc_self_dim", 1024), chunk_queries=aa.get("chunk_queries", 0)).to(device)
+        self.arvec = None
+        if use_arvec:
+            self.arvec = SharedARVecEncoder(actor, tokenizer, device, os.path.join(os.path.dirname(adapter_path), "ar_encoder_latest.pt"), ar_sft_lora_dir, cfg["d_input"], enc_layer=enc_layer)
         res = self.model.load_state_dict(ad["adapter"], strict=False)
         assert not res.unexpected_keys, res.unexpected_keys[:5]
         for mod in self.model.adapter_modules(): mod.float()
@@ -55,7 +134,7 @@ class FlowCritic:
         self.trainable = []
         if train_adapter:
             for p_ in self.model.adapter_parameters(): p_.requires_grad_(True)
-            self.trainable = list(self.model.adapter_parameters())
+            self.trainable = list(self.model.adapter_parameters()) + (self.arvec.trainable_parameters() if self.arvec is not None else [])
         self.optim = None
         if self.trainable:
             try:   # 8-bit Adam (same choice as the LoRA MSE critic): 777M adapter params -> ~1.6 GB of optimizer state instead of 6.2 GB
@@ -104,6 +183,17 @@ class FlowCritic:
         h = cap.pop("h").to(torch.bfloat16); mask = am.bool(); mask[:, 0] = False
         return h, mask
 
+    def _cond(self, texts, grad: bool = False):
+        """-> (enc, mask, cvec, shift): token states (adapters off) and/or the AR vector; shift = standardised AR prediction if the adapter
+        was trained with --resid-shift (the flow then models x0 - shift), else None."""
+        enc = mask = cvec = shift = None
+        if self.use_tokens: enc, mask = self.encode(texts)
+        if self.arvec is not None:
+            cvec = self.arvec(texts, grad=grad)
+            if not grad: cvec = cvec.detach()
+            if self.resid_shift: shift = self.norm.normalize(self.arvec.last_pred_raw); shift = shift if grad else shift.detach()
+        return enc, mask, cvec, shift
+
     # ------------------------------------------------------------------ reward
     @torch.no_grad()
     def score(self, explanations, activations, groups, seed: int = 0):
@@ -122,26 +212,28 @@ class FlowCritic:
         from nla.schema import normalize_activation
         for cs in range(0, len(valid), self.micro_batch):
             chunk = valid[cs: cs + self.micro_batch]; B = len(chunk)
-            enc, mask = self.encode([explanations[i] for i in chunk])
+            enc, mask, cvec, shift = self._cond([explanations[i] for i in chunk], grad=False)
             gold = torch.stack([activations[i].to(self.device).float() for i in chunk])
             x0 = self.norm.normalize(gold); eps = torch.stack([eps_for(groups[i], 0) for i in chunk])
+            x0_full = x0
+            if shift is not None: x0 = x0 - shift                                             # residual parametrisation
             tot = torch.zeros(B, device=self.device)
             with self._ac():
                 for k in range(self.eps_per_t):
                     eps_k = eps if k == 0 else torch.stack([eps_for(groups[i], k) for i in chunk])
                     for tv in self.t_grid:
                         t = torch.full((B,), tv, device=self.device); x_t = (1 - tv) * x0 + tv * eps_k
-                        v = self.model(x_t, t, enc, mask).float()
+                        v = self.model(x_t, t, enc, mask, cvec).float()
                         tot += ((v - (eps_k - x0)) ** 2).mean(1)
                 t = torch.full((B,), self.fve_t, device=self.device); x_t = (1 - self.fve_t) * x0 + self.fve_t * eps
-                v = self.model(x_t, t, enc, mask).float(); x0_hat = self.norm.denormalize(x_t - self.fve_t * v)
+                v = self.model(x_t, t, enc, mask, cvec).float(); x0_hat = self.norm.denormalize(x_t - self.fve_t * v + (shift if shift is not None else 0.0))
             fl = tot / (len(self.t_grid) * self.eps_per_t)
             mse = ((normalize_activation(x0_hat, self.msf) - normalize_activation(gold, self.msf)) ** 2).mean(1)
             for r, i in enumerate(chunk):
                 a, b = fl[r].item(), mse[r].item()
                 if math.isfinite(a) and math.isfinite(b):
                     fr[i] = -a; vr[i] = -b; preds[i] = x0_hat[r].detach().float().cpu()
-        del enc, mask, gold, x0, eps, tot, v, x_t, x0_hat
+        del enc, mask, gold, x0, x0_full, eps, tot, v, x_t, x0_hat
         if self.dev_type == "cuda": torch.cuda.empty_cache()
         return fr, vr, preds
 
@@ -154,10 +246,10 @@ class FlowCritic:
         self.model.train(); n = len(pairs); total = 0.0
         for cs in range(0, n, self.micro_batch):
             ch = pairs[cs: cs + self.micro_batch]; B = len(ch)
-            enc, mask = self.encode([z for z, _ in ch])
+            enc, mask, cvec, shift = self._cond([z for z, _ in ch], grad=True)
             x0 = self.norm.normalize(torch.stack([a.to(self.device).float() for _, a in ch]))
             with self._ac():
-                loss, _, _ = cond_fm_loss(self.model, x0, enc, mask, p_uncond=self.p_uncond)
+                loss, _, _ = cond_fm_loss(self.model, x0, enc, mask, p_uncond=self.p_uncond, cvec=cvec, shift=shift)
             if not torch.isfinite(loss): return float("nan")
             (loss * (B / n) / accum).backward(); total += loss.item() * B / n
             del enc, mask, x0, loss
@@ -173,6 +265,9 @@ class FlowCritic:
 
     def save(self, out_dir: str, step: int):
         os.makedirs(out_dir, exist_ok=True); tmp = os.path.join(out_dir, "adapter_latest.pt.tmp")
+        if self.arvec is not None:
+            lora = {f"backbone.model.layers.{n.split('.layers.')[1].replace('.ar_critic', '.default')}": p_.detach().cpu() for n, p_ in self.actor.named_parameters() if ".ar_critic." in n}
+            torch.save({"lora": lora, "value_head": self.arvec.value_head.state_dict(), "step": step}, os.path.join(out_dir, "ar_encoder_latest.pt"))
         torch.save({"adapter": {k: v for k, v in self.model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_")},
                     "args": self.adapter_args, "prior_cfg": self.cfg, "step": step, "rl_step": step}, tmp)
         os.replace(tmp, os.path.join(out_dir, "adapter_latest.pt"))
