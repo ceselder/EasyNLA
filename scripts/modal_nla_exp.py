@@ -125,6 +125,31 @@ def _prep(patch_lens: bool = True):
     os.environ["VLLM_DEEP_GEMM_WARMUP"] = "skip"
 
 
+def _local_base_snap(model_tag: str) -> str:
+    """Download the raw base to the container's LOCAL disk and verify every shard. Two multi-rank runs reading the
+    volume-backed HF cache saw a stale/partial snapshot ("does not appear to have a file named model-0000X-of-00015")
+    and every rank died — this happened to the RL arms (Sep 17) and to the token-matched AR SFT relaunch (Sep 18)."""
+    from huggingface_hub import snapshot_download
+    import json as _json
+    base_id = "Qwen/Qwen3.6-27B" if model_tag == "qwen36_27b" else BASE_8B
+    snap = snapshot_download(base_id, token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap",
+                             allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
+    idx = os.path.join(snap, "model.safetensors.index.json")
+    if os.path.exists(idx):
+        shards = sorted(set(_json.load(open(idx))["weight_map"].values()))
+        missing = [f for f in shards if not os.path.exists(os.path.join(snap, f))]
+        for _try in range(3):
+            if not missing:
+                break
+            print(f"[snap] base snapshot missing {len(missing)} shard(s) -> re-download (try {_try+1})", flush=True)
+            snapshot_download(base_id, token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap", force_download=True,
+                              allow_patterns=missing)
+            missing = [f for f in shards if not os.path.exists(os.path.join(snap, f))]
+        assert not missing, f"base snapshot incomplete after retries: {missing}"
+        print(f"[snap] base snapshot verified: {len(shards)} shards -> {snap}", flush=True)
+    return snap
+
+
 def _run(cmd, env_extra=None, cwd=REPO_REMOTE):
     import subprocess
     print("CMD:", " ".join(shlex.quote(c) for c in cmd), flush=True)
@@ -462,6 +487,9 @@ def train_sft(mode: str, tag: str, nproc: int = 4, model_tag: str = "qwen3_8b",
     base = BASE_8B if model_tag == "qwen3_8b" else "Qwen/Qwen3.6-27B"
     layer = LAYER_8B if model_tag == "qwen3_8b" else 42
     ddir = data_dir or f"{DATA}/{model_tag}"
+    if "$BASE_SNAP" in extra:   # local verified snapshot instead of the volume HF cache (see _local_base_snap)
+        base = _local_base_snap(model_tag)
+        extra = extra.replace("$BASE_SNAP", base)
     save_dir = f"{CKPT}/{model_tag}/{tag}"
     os.makedirs(save_dir, exist_ok=True)
     data = f"{ddir}/{mode}_sft_train{data_suffix}.parquet"
@@ -525,29 +553,7 @@ def train_rl(tag: str, nproc: int = 4, model_tag: str = "qwen3_8b", extra: str =
     _prep(patch_lens=True)
     save_dir = f"{CKPT}/{model_tag}/{tag}"
     if "$BASE_SNAP" in extra:
-        # Qwen3.6-27B path: vLLM loads the RAW base snapshot (--av-ckpt/--vllm-model) and the trainer
-        # force-syncs the LoRA-merged actor weights at step 0 (see train_rl_vllm: vllm_model != av_ckpt).
-        from huggingface_hub import snapshot_download
-        import json as _json
-        base_id = "Qwen/Qwen3.6-27B" if model_tag == "qwen36_27b" else BASE_8B
-        # Download the base to the container's LOCAL disk, not the shared volume cache: two 6-rank runs reading a
-        # volume-backed HF cache saw a stale/partial snapshot ("does not appear to have a file named model-0000X-of-00015")
-        # and every rank died. Local disk is private to this container and verified below.
-        snap = snapshot_download(base_id, token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap",
-                                 allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
-        idx = os.path.join(snap, "model.safetensors.index.json")
-        if os.path.exists(idx):
-            shards = sorted(set(_json.load(open(idx))["weight_map"].values()))
-            missing = [f for f in shards if not os.path.exists(os.path.join(snap, f))]
-            for _try in range(3):
-                if not missing:
-                    break
-                print(f"[rl] base snapshot missing {len(missing)} shard(s) -> re-download (try {_try+1})", flush=True)
-                snapshot_download(base_id, token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap", force_download=True,
-                                  allow_patterns=missing)
-                missing = [f for f in shards if not os.path.exists(os.path.join(snap, f))]
-            assert not missing, f"base snapshot incomplete after retries: {missing}"
-            print(f"[rl] base snapshot verified: {len(shards)} shards", flush=True)
+        snap = _local_base_snap(model_tag)
         print(f"[rl] $BASE_SNAP -> {snap}", flush=True)
         extra = extra.replace("$BASE_SNAP", snap)
         # HF actor/critic base too: load from the verified local dir instead of resolving the repo id via the volume cache
