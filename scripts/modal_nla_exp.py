@@ -74,7 +74,7 @@ image = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REP
 app = modal.App(APP_NAME, image=image)
 vol = modal.Volume.from_name(VOL, create_if_missing=True)
 vol_q36 = modal.Volume.from_name(VOL_Q36)
-SECRETS = [modal.Secret.from_name("nla-exp-secrets")]
+SECRETS = [modal.Secret.from_name("nla-exp-secrets"), modal.Secret.from_name("anthropic-judge")]   # judge key for --evals text_judges/halluc (refreshed from the local store)
 vol_glp = modal.Volume.from_name("nla-glp", create_if_missing=True)   # flow prior + stage-2 adapters (flow critic for RL)
 VOLS = {"/vol": vol, "/vol_q36": vol_q36, "/vol_glp": vol_glp}
 
