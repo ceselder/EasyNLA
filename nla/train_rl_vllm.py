@@ -1274,9 +1274,13 @@ def _allreduce_grads_(params, world_size, measure=False):
         torch.cuda.synchronize()
         wait_s = _time.time() - _t
         _t = _time.time()
+    _pg_dev = torch.device("cuda", 0)          # the NCCL group is pinned to this rank's first GPU; critic grads may live on a second GPU
     for p in plist:
-        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        p.grad /= world_size
+        if p.grad.device != _pg_dev:
+            g = p.grad.to(_pg_dev); dist.all_reduce(g, op=dist.ReduceOp.SUM); p.grad.copy_(g / world_size); del g
+        else:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad /= world_size
     if measure:
         torch.cuda.synchronize()
         comm_s = _time.time() - _t
