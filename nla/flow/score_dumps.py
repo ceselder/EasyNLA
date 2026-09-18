@@ -38,6 +38,7 @@ def main():
     p.add_argument("--flow-prior", default=None); p.add_argument("--flow-adapter", default=None); p.add_argument("--flow-stats", default=None); p.add_argument("--base", default=None)
     p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--ode-steps", type=int, default=40); p.add_argument("--probes", type=int, default=2); p.add_argument("--K", type=int, default=8)
     p.add_argument("--max-rows", type=int, default=1024, help="cap on rows per step for the flow scorer (ODE cost)"); p.add_argument("--flow-batch", type=int, default=128)
+    p.add_argument("--force", action="store_true", help="recompute steps already in --out"); p.add_argument("--save-rows", action="store_true", help="store per-row scores (dump order) for offline pairwise analyses")
     a = p.parse_args(); dev = "cuda"
     use_critic = a.critic is not None; use_flow = a.flow_adapter is not None
     assert use_critic or use_flow
@@ -76,8 +77,8 @@ def main():
 
     for step in sorted(by_step):
         e = out.get(str(step), {})
-        need_c = use_critic and ("fve_frozen_sft_critic" not in e or e.get("n_files") != len(by_step[step]))
-        need_f = use_flow and ("pmi_bits_mean" not in e or e.get("n_files") != len(by_step[step]))
+        need_c = use_critic and (a.force or "fve_frozen_sft_critic" not in e or e.get("n_files") != len(by_step[step]))
+        need_f = use_flow and (a.force or "pmi_bits_mean" not in e or e.get("n_files") != len(by_step[step]))
         if not (need_c or need_f): continue
         expls, acts, live, flow = [], [], [], []
         for f in by_step[step]:
@@ -86,6 +87,7 @@ def main():
         acts = torch.cat(acts); n_rows = len(expls); valid = [i for i, z in enumerate(expls) if z is not None]
         rec = dict(e); rec.update({"step": step, "n_rows": n_rows, "n_valid": len(valid), "n_files": len(by_step[step]),
                                    "flow_reward_mean_live": (sum(flow) / len(flow)) if flow else None})
+        rows_out = [dict(pos=i) for i in range(n_rows)] if a.save_rows else None
         if need_c:
             if baseline is None: _, baseline = compute_predict_mean_baselines(acts, msf)
             mses = []
@@ -97,6 +99,8 @@ def main():
                 with torch.no_grad(): pred = critic_predict(critic, bx, am, msf)
                 mse = ((normalize_activation(pred.float(), msf) - normalize_activation(acts[ch].to(dev), msf)) ** 2).mean(1)
                 mses += [v for v in mse.tolist() if math.isfinite(v)]
+                if rows_out is not None:
+                    for r, i in enumerate(ch): rows_out[i]["critic_mse"] = float(mse[r])
             rec["fve_frozen_sft_critic"] = 100 * (1 - sum(mses) / len(mses) / baseline) if mses else float("nan"); rec["baseline_mse"] = baseline
             rec["live_vector_fve"] = (100 * (1 + sum(live) / len(live) / baseline)) if live else None
         if need_f:
@@ -108,10 +112,13 @@ def main():
                 lpc.append(exact_logp(model, xb, enc, mk, n_steps=a.ode_steps, probes=a.probes, gen=gen))
                 gen2 = torch.Generator(device=dev).manual_seed(99 + cs); lc, lu = denoise_gain(model, xb, enc, mk, a.K, gen2); gains.append((lu - lc) / 2 * d)
             lpc = torch.cat(lpc); pmi = (lpc - lpu) / math.log(2); gb = torch.cat(gains) / math.log(2)
+            if rows_out is not None:
+                for j, i in enumerate(sel): rows_out[i].update({"pmi_bits": float(pmi[j]), "gain_bits": float(gb[j])})
             rec.update({"pmi_bits_mean": float(pmi.mean()), "pmi_bits_median": float(pmi.median()), "pmi_bits_p10": float(pmi.quantile(0.1)), "pmi_bits_p90": float(pmi.quantile(0.9)),
                         "pmi_frac_positive": float((pmi > 0).float().mean()), "pmi_sem_bits": float(pmi.std() / math.sqrt(len(pmi))), "gain_bits_mean": float(gb.mean()),
                         "bits_per_dim_cond": float(-lpc.mean() / (d * math.log(2))), "bits_per_dim_uncond": float(-lpu.mean() / (d * math.log(2))), "n_flow_rows": len(sel),
                         "frac_extracted": len(valid) / max(n_rows, 1)})
+        if rows_out is not None: rec["rows"] = rows_out
         out[str(step)] = rec
         print(f"[score_dumps] step {step}: " + (f"frozen-critic FVE {rec['fve_frozen_sft_critic']:.1f}% | " if need_c else "") +
               (f"frozen-flow PMI {rec['pmi_bits_mean']:.1f} bits (median {rec['pmi_bits_median']:.1f}, {100*rec['pmi_frac_positive']:.0f}% pos, sem {rec['pmi_sem_bits']:.1f}) gain {rec['gain_bits_mean']:.0f} | " if need_f else "") +

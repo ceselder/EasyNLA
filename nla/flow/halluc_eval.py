@@ -71,7 +71,7 @@ def main():
     p.add_argument("--dumps", nargs="+", required=True, help="label=glob (e.g. flow=~/dumps/rlQ36_flow/eval_rollouts/step_*_r*.pt)")
     p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--judge", action="store_true"); p.add_argument("--judge-n", type=int, default=64); p.add_argument("--judge-model", default="claude-sonnet-5"); p.add_argument("--judge-workers", type=int, default=8)
-    p.add_argument("--match-rows-to", default=None, help="label whose evaluated rows define the matched subset for the other arms (default: the arm with the fewest rows)")
+    p.add_argument("--force-judge", action="store_true"); p.add_argument("--match-rows-to", default=None, help="label whose evaluated rows define the matched subset for the other arms (default: the arm with the fewest rows)")
     a = p.parse_args()
     t = pq.read_table(a.val_parquet, columns=["detokenized_text_truncated", "response", "activation_vector"])
     n = t.num_rows; ref = torch.tensor(np.asarray(t.column("activation_vector").combine_chunks().flatten(), dtype=np.float32).reshape(n, -1)); ref_norm2 = (ref * ref).sum(1)
@@ -86,8 +86,8 @@ def main():
             d = torch.load(f, map_location="cpu"); idx, dist = match_rows(d["activations"], ref, ref_norm2)
             if float(dist.max()) > 1.0: print(f"[halluc] WARN {f}: max match distance {float(dist.max()):.3f}", flush=True)
             rows = arms.setdefault(label, {}).setdefault(step, [])
-            for z, i in zip(d["explanations"], idx.tolist()):
-                rows.append({"row": i, "expl": z, "src": srcs[i] or "", "gold": golds[i] or ""})
+            for pos, (z, i) in enumerate(zip(d["explanations"], idx.tolist())):
+                rows.append({"row": i, "pos": len(rows), "expl": z, "src": srcs[i] or "", "gold": golds[i] or ""})
     ref_label = a.match_rows_to or min(arms, key=lambda L: min(len(v) for v in arms[L].values()))
     matched = set(r["row"] for rows in arms[ref_label].values() for r in rows)
     print(f"[halluc] arms {list(arms)}; matched-row subset from {ref_label}: {len(matched)} rows", flush=True)
@@ -114,7 +114,7 @@ def main():
             sub = [r for r in valid if r["row"] in matched]
             if len(sub) < len(valid): rec.update(agg(sub, "matched_"))
             rec["examples_unsupported_numbers"] = [{"row": r["row"], "nums": r["g"]["numbers_unsupported"], "expl": r["expl"][:300]} for r in valid if r["g"]["n_numbers_unsupported"]][:6]
-            if a.judge and "judge_n" not in rec:
+            if a.judge and (a.force_judge or "judge_n" not in rec):
                 rng = random.Random(0); pool = sorted(sub if len(sub) >= a.judge_n else valid, key=lambda r: r["row"]); rng.shuffle(pool); pool = pool[: a.judge_n]
                 from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(a.judge_workers) as ex: js = list(ex.map(lambda r: judge_one(client, a.judge_model, r["src"], r["expl"], hdr), pool))
@@ -123,7 +123,9 @@ def main():
                     rec.update({"judge_n": len(ok), "judge_model": a.judge_model, "judge_mean_unsupported_claims": float(np.mean([j["unsupported_claims"] or 0 for j in ok])),
                                 "judge_mean_unsupported_numbers": float(np.mean([j["unsupported_numbers"] or 0 for j in ok])), "judge_mean_severity": float(np.mean([j["severity"] for j in ok])),
                                 "judge_frac_severity_ge2": float(np.mean([j["severity"] >= 2 for j in ok])), "judge_frac_grounded": float(np.mean([j["severity"] == 0 for j in ok])),
-                                "judge_examples": [{"row": r["row"], "severity": j["severity"], "examples": j.get("examples", [])[:3], "expl": r["expl"][:240]} for r, j in zip(pool, js) if j and (j.get("severity") or 0) >= 2][:6]})
+                                "judge_examples": [{"row": r["row"], "severity": j["severity"], "examples": j.get("examples", [])[:3], "expl": r["expl"][:240]} for r, j in zip(pool, js) if j and (j.get("severity") or 0) >= 2][:6],
+                                "judge_rows": [{"pos": r["pos"], "row": r["row"], "claims": j.get("unsupported_claims"), "numbers": j.get("unsupported_numbers"), "contradictions": j.get("contradictions"), "severity": j.get("severity"),
+                                                "n_numbers_unsupported_auto": r["g"]["n_numbers_unsupported"], "n_words": r["g"]["n_words"]} for r, j in zip(pool, js) if j]})
             out[key] = rec
             print(f"[halluc] {label} step {step}: {len(valid)} expl | unsupported-number rate {rec.get('frac_with_unsupported_number', float('nan')):.2f} (numbers/expl {rec.get('numbers_per_expl', 0):.2f}) | "
                   f"unsupported-quote rate {rec.get('frac_with_unsupported_quote', float('nan')):.2f} | names/expl {rec.get('unsupported_names_per_expl', 0):.2f} | words {rec.get('words_per_expl', 0):.0f}"
