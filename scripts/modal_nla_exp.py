@@ -759,8 +759,11 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         print(pyrun.remote(cmd=cmd))
     elif task == "score_dumps":
         print(score_dumps.remote(tag=tag, model_tag=model_tag, dumps_glob=glob, out=out, extra=extra))
-    elif task == "halluc_classify":
-        print(halluc_classify.remote(n=limit or 512))
+    elif task == "halluc_classify":   # --tag = flow adapter path (default all-pairs), --out = output json, --limit = n rows
+        kw = {"n": limit or 512}
+        if tag: kw["flow_adapter"] = tag
+        if out: kw["out"] = out
+        print(halluc_classify.remote(**kw))
     elif task == "probe_tok":
         print(probe_tokenizer.remote())
     elif task == "shells":
