@@ -671,7 +671,7 @@ def pyrun(cmd: str):
 
 @app.function(gpu="B200", volumes=VOLS, timeout=6 * 60 * 60, secrets=SECRETS)
 def score_dumps(tag: str, critic: str = "ar_sft_merged", model_tag: str = "qwen36_27b", dumps_glob: str = "", out: str = "",
-                flow_adapter: str = "/vol_glp/cond/cond_655M_all/adapter_latest.pt", flow_prior: str = "/vol_glp/glp27b_main/ckpts/snap_000655M", max_rows: int = 1024):
+                flow_adapter: str = "/vol_glp/cond/cond_655M_all/adapter_latest.pt", flow_prior: str = "/vol_glp/glp27b_main/ckpts/snap_000655M", max_rows: int = 1024, extra: str = ""):
     """Fixed-scorer evaluation of dumped eval rollouts: frozen SFT MSE critic FVE + frozen stage-2 flow exact log p(h|z) (PMI bits).
     dumps_glob may span several runs (checkpoint eval chain); default = the run's own eval_rollouts."""
     import sys
@@ -685,6 +685,7 @@ def score_dumps(tag: str, critic: str = "ar_sft_merged", model_tag: str = "qwen3
         snap = snapshot_download("Qwen/Qwen3.6-27B", token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap",
                                  allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
         cmd += ["--flow-prior", flow_prior, "--flow-adapter", flow_adapter, "--flow-stats", f"{os.path.dirname(os.path.dirname(flow_prior))}/rep_statistics.pt", "--base", snap]
+    cmd += shlex.split(extra)
     _run(cmd)
     vol.commit()
     return "ok"
@@ -757,7 +758,7 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
     elif task == "pyrun":
         print(pyrun.remote(cmd=cmd))
     elif task == "score_dumps":
-        print(score_dumps.remote(tag=tag, model_tag=model_tag, dumps_glob=glob, out=out))
+        print(score_dumps.remote(tag=tag, model_tag=model_tag, dumps_glob=glob, out=out, extra=extra))
     elif task == "halluc_classify":
         print(halluc_classify.remote(n=limit or 512))
     elif task == "probe_tok":
