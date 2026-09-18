@@ -388,7 +388,11 @@ def build_datasets(model_tag: str = "qwen3_8b", n_eval_fixed: int = 1024, actdir
     tbl = pa.concat_tables(tables)
     del tables
     dids = tbl.column("doc_id").to_pylist()
+    shard_is_val = tbl.column("is_val").to_pylist() if "is_val" in tbl.column_names else None
     is_test = [is_val_doc(x, TEST_PERMILLE) for x in dids]
+    # ALSO honour the extraction shards' own is_val flag (they hold out ~2 % of docs = crc bucket < 20, while TEST_PERMILLE = 10 holds out
+    # only bucket < 10): otherwise bucket [10, 20) — half of av_sft_val, the shared eval set — lands in TRAIN (found Sep 18: opustm/qwen36_27b builds).
+    if shard_is_val is not None: is_test = [a_ or bool(b_) for a_, b_ in zip(is_test, shard_is_val)]
     tr_idx = [i for i, t in enumerate(is_test) if not t]
     te_idx = [i for i, t in enumerate(is_test) if t]
     random.Random(0).shuffle(tr_idx)
