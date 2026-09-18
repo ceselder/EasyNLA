@@ -96,20 +96,30 @@ class ARVecEncoder(torch.nn.Module):
     cvec = concat(normalise(value_head(last_hidden)) [= the MSE critic's E[h|z] estimate at init], normalise(last_hidden)). LoRA on the trunk
     (r 64, alpha 16, rsLoRA) and the value head are trainable; trained by the flow-matching loss, not MSE."""
     TM = r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))"
-    def __init__(self, ar_dir, tok, device, lora_r=64, lora_alpha=16, grad_ckpt=True, trainable=True, enc_layer=42):
+    def __init__(self, ar_dir, tok, device, lora_r=64, lora_alpha=16, grad_ckpt=True, trainable=True, enc_layer=42, enc_model=None, keep_norm=False):
         super().__init__()
         from nla.models import NLACriticModel
         from peft import LoraConfig, inject_adapter_in_model
         self.trainable = trainable; self.tok, self.device = tok, device
         self.tmpl = "Summary of the following text: <text>{explanation}</text> <summary>"
-        if not os.path.exists(os.path.join(ar_dir, "value_head.safetensors")):
+        if enc_model is not None or not os.path.exists(os.path.join(ar_dir, "value_head.safetensors")):
             # RAW BASE trunk (HF id or snapshot dir), truncated to layers 0..enc_layer, final norm removed -> token states = residual after enc_layer.
             # Never saw the MSE objective; LoRA-tuned by the flow loss when trainable. Only .tokens() is meaningful (no value head -> no pooled vector).
-            from transformers import AutoModelForCausalLM
-            lm = AutoModelForCausalLM.from_pretrained(ar_dir, dtype=torch.bfloat16, attn_implementation="sdpa").to(device)
-            inner = lm.model; owner = inner if hasattr(inner, "layers") else inner.language_model
-            del owner.layers[enc_layer + 1:]; owner.norm = torch.nn.Identity()
-            if hasattr(lm, "lm_head"): lm.lm_head = torch.nn.Identity()
+            from transformers import AutoModelForCausalLM, AutoModel, AutoTokenizer
+            if enc_model is not None:
+                # any HF text model as the token encoder (e.g. Qwen/Qwen3-Embedding-8B): bare transformer, its own tokenizer, raw explanation text,
+                # all layers unless --enc-layer cuts earlier, final norm kept with --enc-keep-norm (embedding models pool AFTER the norm)
+                lm = AutoModel.from_pretrained(enc_model, dtype=torch.bfloat16, attn_implementation="sdpa").to(device)
+                owner = lm.language_model if hasattr(lm, "language_model") else lm
+                self.tok = AutoTokenizer.from_pretrained(enc_model); self.tok.padding_side = "right"
+                if self.tok.pad_token_id is None: self.tok.pad_token = self.tok.eos_token
+                self.tmpl = "{explanation}"
+            else:
+                lm = AutoModelForCausalLM.from_pretrained(ar_dir, dtype=torch.bfloat16, attn_implementation="sdpa").to(device)
+                inner = lm.model; owner = inner if hasattr(inner, "layers") else inner.language_model
+                if hasattr(lm, "lm_head"): lm.lm_head = torch.nn.Identity()
+            if enc_layer + 1 < len(owner.layers): del owner.layers[enc_layer + 1:]
+            if not keep_norm: owner.norm = torch.nn.Identity()
             for p_ in lm.parameters(): p_.requires_grad_(False)
             if trainable:
                 inject_adapter_in_model(LoraConfig(r=lora_r, lora_alpha=lora_alpha, use_rslora=True, target_modules=self.TM, lora_dropout=0.0, bias="none"), owner)
@@ -122,7 +132,7 @@ class ARVecEncoder(torch.nn.Module):
                     except Exception as e: print("[arvec] grad ckpt off:", e, flush=True)
             else: lm.eval()
             self.crit = None; self.lm, self.owner = lm, owner; self.msf = math.sqrt(owner.config.hidden_size if hasattr(owner, "config") else 5120)
-            print(f"[arvec] BASE-trunk token encoder: layers 0..{enc_layer}, trainable={trainable}", flush=True); return
+            print(f"[arvec] token encoder {enc_model or ar_dir}: {len(owner.layers)} layers, d {owner.config.hidden_size}, keep_norm={keep_norm}, trainable={trainable}", flush=True); return
         crit = NLACriticModel.from_pretrained(ar_dir, dtype=torch.bfloat16).to(device)
         for p_ in crit.parameters(): p_.requires_grad_(False)
         self.trainable = trainable
@@ -179,7 +189,7 @@ class ARVecEncoder(torch.nn.Module):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"])
-    p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42)
+    p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--enc-model", default=None, help="tokens_base: HF id of an arbitrary token encoder (e.g. Qwen/Qwen3-Embedding-8B) instead of the base trunk"); p.add_argument("--enc-keep-norm", action="store_true")
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024); p.add_argument("--chunk-queries", type=int, default=0, help="Flamingo-style per-slice queries: split the block hidden state into this many chunks, each attends over the explanation tokens (0 = pooled slots)")
@@ -207,7 +217,9 @@ def main():
         tok = AutoTokenizer.from_pretrained(a.base); tok.padding_side = "right"
         if tok.pad_token_id is None: tok.pad_token = tok.eos_token
         encode = None
-    arvec = ARVecEncoder(a.base if a.cond_mode == "tokens_base" else a.ar_ckpt, tok, dev, trainable=a.ar_lr > 0, enc_layer=a.enc_layer) if use_arvec else None
+    arvec = ARVecEncoder(a.base if a.cond_mode == "tokens_base" else a.ar_ckpt, tok, dev, trainable=a.ar_lr > 0, enc_layer=a.enc_layer,
+                         enc_model=a.enc_model if a.cond_mode == "tokens_base" else None, keep_norm=a.enc_keep_norm) if use_arvec else None
+    if arvec is not None and arvec.crit is None: d_enc = arvec.owner.config.hidden_size      # cross-read K/V width follows the encoder (4096 for Qwen3-Embedding-8B)
     if arvec is not None and a.resume_from and os.path.exists(os.path.join(a.resume_from, "ar_encoder_latest.pt")):
         st_ = torch.load(os.path.join(a.resume_from, "ar_encoder_latest.pt"), map_location="cpu")
         arvec.load_saved(st_)
