@@ -689,6 +689,21 @@ def score_dumps(tag: str, critic: str = "ar_sft_merged", model_tag: str = "qwen3
     vol.commit()
     return "ok"
 
+@app.function(gpu="B200", volumes=VOLS, timeout=6 * 60 * 60, secrets=SECRETS)
+def halluc_classify(n: int = 512, out: str = "/vol_glp/cond/halluc_classify_numbers.json", flow_adapter: str = "/vol_glp/cond/cond_655M_all/adapter_latest.pt",
+                    flow_prior: str = "/vol_glp/glp27b_main/ckpts/snap_000655M", critic: str = "ar_sft_merged", model_tag: str = "qwen36_27b"):
+    """Controlled number-perturbation detector test: frozen flow (exact log p) vs frozen SFT MSE critic on gold explanations with grounded numbers."""
+    import sys
+    from huggingface_hub import snapshot_download
+    _prep(patch_lens=False)
+    snap = snapshot_download("Qwen/Qwen3.6-27B", token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap",
+                             allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
+    _run([sys.executable, "-m", "nla.flow.halluc_classify", "--val-parquet", "/vol_q36/data/sft/av_sft_val.parquet", "--out", out, "--n", str(n),
+          "--flow-prior", flow_prior, "--flow-adapter", flow_adapter, "--flow-stats", f"{os.path.dirname(os.path.dirname(flow_prior))}/rep_statistics.pt",
+          "--base", snap, "--critic", f"{CKPT}/{model_tag}/{critic}"])
+    vol_glp.commit()
+    return "ok"
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -743,6 +758,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         print(pyrun.remote(cmd=cmd))
     elif task == "score_dumps":
         print(score_dumps.remote(tag=tag, model_tag=model_tag, dumps_glob=glob, out=out))
+    elif task == "halluc_classify":
+        print(halluc_classify.remote(n=limit or 512))
     elif task == "probe_tok":
         print(probe_tokenizer.remote())
     elif task == "shells":
