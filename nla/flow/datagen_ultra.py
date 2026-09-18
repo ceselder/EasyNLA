@@ -94,6 +94,53 @@ def cmd_explain(a):
     asyncio.run(main_async())
 
 
+def cmd_explain_batch(a):
+    """Same prompt via the Message Batches API (50 % price): one batch per chunk of rows, all submitted up-front, polled until done,
+    each finished batch written as chunk_XXXX.parquet (resumable: existing chunk files are skipped, pending batch ids are persisted)."""
+    import anthropic
+    from nla.datagen.stage2_api_explain import _DEFAULT_INSTRUCTION, _DEFAULT_RESPONSE_PATTERN, _extract_and_clean
+    instr_prefix, text_part = _DEFAULT_INSTRUCTION.split("Text to analyze:")
+    system = [{"type": "text", "text": instr_prefix.strip()}]
+    hdr = {"anthropic-workspace-id": os.environ["ANTHROPIC_WORKSPACE_ID"]} if os.environ.get("ANTHROPIC_WORKSPACE_ID") else {}
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"], default_headers=hdr, max_retries=8)
+    t = pq.read_table(a.rows); n = t.num_rows
+    if a.limit: t = t.slice(0, a.limit); n = t.num_rows
+    os.makedirs(a.out_dir, exist_ok=True); state_p = f"{a.out_dir}/batches.json"
+    state = json.load(open(state_p)) if os.path.exists(state_p) else {}
+    done = {int(re.search(r"chunk_(\d+)", f).group(1)) for f in glob.glob(f"{a.out_dir}/chunk_*.parquet")}
+    # submit
+    for ci, cs in enumerate(range(0, n, a.chunk)):
+        if ci in done or str(ci) in state: continue
+        texts = t.slice(cs, min(a.chunk, n - cs)).column("text").to_pylist()
+        reqs = [{"custom_id": f"c{ci}_{i}", "params": {"model": a.model, "max_tokens": a.max_tokens, "system": system,
+                 "messages": [{"role": "user", "content": "Text to analyze:" + text_part.replace("{text}", x)}]}} for i, x in enumerate(texts)]
+        b = client.messages.batches.create(requests=reqs); state[str(ci)] = {"id": b.id, "n": len(texts), "submitted": time.time()}
+        json.dump(state, open(state_p, "w"), indent=1); print(f"[batch] submitted chunk {ci} ({len(texts)} req) as {b.id}", flush=True)
+    # poll + collect
+    usage = {"in": 0, "out": 0, "ok": 0, "dropped": 0, "fail": 0}; t0 = time.time()
+    while True:
+        pending = [ci for ci in state if int(ci) not in done]
+        if not pending: break
+        for ci in pending:
+            b = client.messages.batches.retrieve(state[ci]["id"])
+            if b.processing_status != "ended": continue
+            cs = int(ci) * a.chunk; tbl = t.slice(cs, min(a.chunk, n - cs)); m = tbl.num_rows; ex = [None] * m
+            for r in client.messages.batches.results(state[ci]["id"]):
+                i = int(r.custom_id.split("_")[1])
+                if r.result.type != "succeeded": usage["fail"] += 1; continue
+                msg = r.result.message; usage["in"] += msg.usage.input_tokens; usage["out"] += msg.usage.output_tokens
+                raw = "".join(bl.text for bl in msg.content if getattr(bl, "type", None) == "text"); e = _extract_and_clean(raw, _DEFAULT_RESPONSE_PATTERN)
+                if e is None or e.count("\n\n") < 1: usage["dropped"] += 1; continue
+                ex[i] = e; usage["ok"] += 1
+            keep = [i for i in range(m) if ex[i]]; out = tbl.take(keep).append_column("explanation", pa.array([ex[i] for i in keep]))
+            tmp = f"{a.out_dir}/chunk_{int(ci):04d}.parquet.tmp"; pq.write_table(out, tmp, compression="zstd"); os.replace(tmp, f"{a.out_dir}/chunk_{int(ci):04d}.parquet"); done.add(int(ci))
+            cost = usage["in"] * a.price_in / 2e6 + usage["out"] * a.price_out / 2e6
+            print(f"[batch] chunk {ci} ended: {len(keep)}/{m} kept | total ok {usage['ok']} dropped {usage['dropped']} fail {usage['fail']} | tokens in {usage['in']/1e6:.1f}M out {usage['out']/1e6:.2f}M | est cost (batch price) ${cost:.0f} | {(time.time()-t0)/60:.0f} min", flush=True)
+            json.dump(usage | {"elapsed_s": time.time() - t0, "est_cost_usd_batch": cost, "model": a.model}, open(f"{a.out_dir}/usage.json", "w"), indent=1)
+        time.sleep(a.poll_s)
+    print(f"[batch] all {len(done)} chunks done", flush=True)
+
+
 def cmd_extract(a):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -136,9 +183,11 @@ def main():
     r.add_argument("--positions-per-doc", type=int, default=4); r.add_argument("--min-tokens", type=int, default=30); r.add_argument("--max-tokens", type=int, default=1024); r.add_argument("--max-chars", type=int, default=12000); r.add_argument("--seed", type=int, default=0); r.add_argument("--base", default=BASE)
     e = sub.add_parser("explain"); e.add_argument("--rows", required=True); e.add_argument("--out-dir", required=True); e.add_argument("--model", default="claude-sonnet-5"); e.add_argument("--max-tokens", type=int, default=400); e.add_argument("--debug-drops", action="store_true")
     e.add_argument("--concurrency", type=int, default=64); e.add_argument("--chunk", type=int, default=2000); e.add_argument("--limit", type=int, default=0); e.add_argument("--price-in", type=float, default=3.0); e.add_argument("--price-out", type=float, default=15.0)
+    eb = sub.add_parser("explain-batch"); eb.add_argument("--rows", required=True); eb.add_argument("--out-dir", required=True); eb.add_argument("--model", default="claude-sonnet-5"); eb.add_argument("--max-tokens", type=int, default=600)
+    eb.add_argument("--chunk", type=int, default=10000); eb.add_argument("--limit", type=int, default=0); eb.add_argument("--poll-s", type=int, default=120); eb.add_argument("--price-in", type=float, default=3.0); eb.add_argument("--price-out", type=float, default=15.0)
     x = sub.add_parser("extract"); x.add_argument("--explained-glob", required=True); x.add_argument("--out-dir", required=True); x.add_argument("--base", default=BASE); x.add_argument("--layer", type=int, default=42)
     x.add_argument("--batch", type=int, default=32); x.add_argument("--max-len", type=int, default=1100); x.add_argument("--shard", type=int, default=0); x.add_argument("--nshards", type=int, default=1)
-    a = p.parse_args(); {"rows": cmd_rows, "explain": cmd_explain, "extract": cmd_extract}[a.cmd](a)
+    a = p.parse_args(); {"rows": cmd_rows, "explain": cmd_explain, "explain-batch": cmd_explain_batch, "extract": cmd_extract}[a.cmd](a)
 
 
 if __name__ == "__main__":
