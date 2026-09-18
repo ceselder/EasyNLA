@@ -7,8 +7,8 @@ from transformers import AutoTokenizer
 from nla.models import NLACriticModel
 from nla.utils.critic import critic_predict
 from nla.schema import normalize_activation, extract_explanation
-import nla.flow.score_dumps as SD
-compute_predict_mean_baselines, load_nla_config, resolve_target_scale = SD.compute_predict_mean_baselines, SD.load_nla_config, SD.resolve_target_scale
+from nla.config import load_nla_config
+from nla.schema import resolve_target_scale, compute_predict_mean_baselines
 dev = "cuda"; C = "/vol/ckpts/qwen36_27b"; B = 32
 critics = sys.argv[1:] or ["ar_sft_merged", "sft_ar_sonnet_merged", "sft_ar_opustm_merged"]
 dumps = sorted(glob.glob(f"{C}/evalTM_*/eval_rollouts/step_*_r*.pt"))
