@@ -1815,6 +1815,11 @@ def main():
     p.add_argument("--flow-t-grid", default="0.2,0.4,0.6,0.8", help="noise levels for the reward estimate (shared eps per group)")
     p.add_argument("--flow-enc-layer", type=int, default=42, help="layer of the frozen base (actor with adapters off) read as the explanation encoder")
     p.add_argument("--flow-micro-batch", type=int, default=16)
+    p.add_argument("--flow-eps-per-t", type=int, default=1, help="noise draws per t level in the reward estimate (all shared per group)")
+    p.add_argument("--flow-prior-override", default=None, help="prior weights file (e.g. a stage-2 prior_cotrained_latest.pt) instead of <flow-prior>/model.pt")
+    p.add_argument("--flow-cotrain", choices=["rollouts", "grounded", "mix"], default="rollouts", help="what the flow critic co-trains on each step")
+    p.add_argument("--flow-grounded-shards", default=None, help="extraction shards (activation_vector/explanation/is_val) for grounded co-training; comma-separated globs ok")
+    p.add_argument("--flow-grounded-n", type=int, default=100000, help="grounded pairs held per rank (rank-disjoint slices)")
     p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl", "flow"],
                    default="vector_mse",
                    help="Critic (AR) TRAINING loss. vector_mse (DEFAULT) = classic "
@@ -2148,7 +2153,10 @@ def main():
         critic = None
         flow = FlowCritic(args.flow_prior, args.flow_adapter, args.flow_stats, actor, tokenizer, device, enc_layer=args.flow_enc_layer,
                           lr=args.flow_lr, p_uncond=args.flow_p_uncond, t_grid=[float(x) for x in args.flow_t_grid.split(",")],
-                          micro_batch=args.flow_micro_batch, train_adapter=args.train_critic)
+                          micro_batch=args.flow_micro_batch, train_adapter=args.train_critic, eps_per_t=args.flow_eps_per_t, prior_override=args.flow_prior_override,
+                          grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
+                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)))
+        if args.flow_cotrain != "rollouts": assert flow.pool is not None, "--flow-cotrain grounded/mix needs --flow-grounded-shards"
         _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
         if args.resume_from_lora is not None and _flow_latest.exists():
             print(f"[flow] RESUMING co-trained flow adapter from {_flow_latest} (rl step {flow.load(str(_flow_latest))})", flush=True)
@@ -3113,8 +3121,16 @@ def main():
                 cmb = max(1, args.critic_micro_batch)
                 _use_kl_ar = (args.ar_loss == "downstream_kl" and kl_gold_cache)
                 if flow is not None:
-                    # flow critic: conditional FM loss on the kept rollouts (per-sample condition dropout); grads on the adapter
-                    accumulated = flow.train_backward(crit_texts, crit_golds, accum)
+                    # flow critic: conditional FM loss (per-sample condition dropout); grads on the adapter. Data per --flow-cotrain:
+                    # the kept rollouts (classic co-training), grounded gold pairs (never the policy's own text), or half/half.
+                    if args.flow_cotrain == "rollouts":
+                        accumulated = flow.train_backward(crit_texts, crit_golds, accum)
+                    elif args.flow_cotrain == "grounded":
+                        accumulated = flow.train_backward_grounded(max(len(crit_texts), 64), accum, seed=step * 7919 + int(os.environ.get("RANK", 0)))
+                    else:
+                        h = max(len(crit_texts) // 2, 32)
+                        a1 = flow.train_backward(crit_texts[:h], crit_golds[:h], accum * 2); a2 = flow.train_backward_grounded(h, accum * 2, seed=step * 7919 + int(os.environ.get("RANK", 0)))
+                        accumulated = (a1 + a2) / 2
                     finite = math.isfinite(accumulated)
                     if not finite:
                         print(f"step {step}: flow critic loss non-finite, skipping", flush=True)

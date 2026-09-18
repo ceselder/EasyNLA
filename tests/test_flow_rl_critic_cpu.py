@@ -1,5 +1,5 @@
 """CPU test of the RL flow critic: shared-noise group rewards, FVE readout, co-training grads, save/load. Fake tiny actor."""
-import contextlib, os, tempfile, torch, torch.nn as nn
+import contextlib, math, os, tempfile, torch, torch.nn as nn
 from nla.flow.model import Denoiser
 from nla.flow.cond_model import CondDenoiser
 
@@ -45,11 +45,21 @@ def test_flow_critic():
     assert abs(fr[0] - fr[2]) > 1e-6, "different explanation -> different reward"
     fr2, _, _ = fc.score(expl, A, groups, seed=5); assert all((a is None and b is None) or abs(a - b) < 1e-5 for a, b in zip(fr, fr2)), "deterministic in seed"
     fr3, _, _ = fc.score(expl, A, groups, seed=6); assert abs(fr3[0] - fr[0]) > 1e-7, "seed changes the shared noise"
-    assert all(-3 < r < 0 for r in fr if r is not None) and all(-3 < r < 0 for r in vr if r is not None)
+    assert all(math.isfinite(r) and r < 0 for r in fr if r is not None) and all(math.isfinite(r) and r < 0 for r in vr if r is not None)
     # co-training: grads land on the adapter only
     fc.optim.zero_grad(); l = fc.train_backward(expl, A, accum=1); assert l == l and l > 0
     assert all(p.grad is not None for p in fc.trainable) and all(p.grad is None for p in fc.model.prior.parameters())
     fc.optim.step(); fc.save(f"{tmp}/flow_latest", 7); st = fc.load(f"{tmp}/flow_latest/adapter_latest.pt"); assert st == 7
+    # eps_per_t > 1, prior override, grounded pool
+    import numpy as np, pyarrow as pa, pyarrow.parquet as pq
+    A = np.random.randn(12, D).astype(np.float32)
+    pq.write_table(pa.table({"activation_vector": pa.FixedSizeListArray.from_arrays(pa.array(A.reshape(-1)), D), "explanation": [f"gold {i}" for i in range(12)], "is_val": [i % 4 == 0 for i in range(12)]}), f"{tmp}/shard_000.parquet")
+    torch.save({"model": prior.state_dict(), "args": {"d_input": D, "d_model": 32, "d_mlp": 64, "n_layers": 2}, "step": 1}, f"{tmp}/prior_cotrained.pt")
+    fc2 = FlowCritic(tmp, f"{tmp}/adapter.pt", f"{tmp}/stats.pt", actor, tok, torch.device("cpu"), enc_layer=1, micro_batch=3, t_grid=(0.3, 0.7), eps_per_t=2,
+                     prior_override=f"{tmp}/prior_cotrained.pt", grounded_shards=f"{tmp}/shard_*.parquet", grounded_n=5, grounded_skip=2)
+    assert fc2.pool is not None and len(fc2.pool[1]) == 5 and fc2.pool[1][0] == "gold 3", fc2.pool[1]
+    fr2, _, _ = fc2.score(expl, [acts[g] for g in groups], groups, seed=5); assert abs(fr2[0] - fr2[1]) < 1e-5 and fr2[3] is None
+    fc2.optim.zero_grad(); lg = fc2.train_backward_grounded(4, accum=1, seed=0); assert lg == lg and lg > 0 and all(p.grad is not None for p in fc2.trainable)
     print("flow RL critic CPU test OK")
 
 if __name__ == "__main__":

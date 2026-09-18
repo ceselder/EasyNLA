@@ -33,15 +33,18 @@ def load_encoder(base, layer, device):
     return encode, tok
 
 
-def load_shards(glob_pat, n, skip_val=True):
-    """All (activation, Opus explanation) rows of the raw extraction shards (cols activation_vector / explanation / is_val), val rows excluded."""
+def load_shards(glob_pat, n, skip_val=True, skip=0):
+    """All (activation, Opus explanation) rows of the raw extraction shards (cols activation_vector / explanation / is_val), val rows excluded;
+    `skip` non-val rows are passed over first (rank-disjoint subsets). Comma-separated globs are allowed."""
     import glob as _glob, pyarrow.parquet as pq
-    acts, zs = [], []
-    glob_pat = glob_pat.strip("\x27\"")
-    for f in sorted(_glob.glob(glob_pat)):
+    acts, zs = [], []; to_skip = skip
+    files = sorted(f for g in glob_pat.strip("\x27\"").split(",") for f in _glob.glob(g.strip()))
+    for f in files:
         pf = pq.ParquetFile(f)
         for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "explanation", "is_val"]):
             keep = [i for i, v in enumerate(rb.column("is_val").to_pylist()) if not (skip_val and v)]
+            if to_skip >= len(keep): to_skip -= len(keep); continue
+            if to_skip: keep = keep[to_skip:]; to_skip = 0
             if not keep: continue
             import numpy as _np
             a = torch.tensor(_np.stack(rb.column("activation_vector").to_numpy(zero_copy_only=False)), dtype=torch.float16)[keep]

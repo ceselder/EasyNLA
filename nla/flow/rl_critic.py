@@ -27,14 +27,19 @@ class _Stop(Exception):
 class FlowCritic:
     def __init__(self, prior_dir: str, adapter_path: str, stats_path: str, actor, tokenizer, device, *, enc_layer: int = 42,
                  lr: float = 1e-4, p_uncond: float = 0.1, t_grid=(0.2, 0.4, 0.6, 0.8), fve_t: float = 0.9, micro_batch: int = 16,
-                 max_len: int = 192, prior_weights: str = "raw", train_adapter: bool = True):
+                 max_len: int = 192, prior_weights: str = "raw", train_adapter: bool = True, eps_per_t: int = 1, prior_override: str | None = None,
+                 grounded_shards: str | None = None, grounded_n: int = 0, grounded_skip: int = 0):
         self.actor, self.tok, self.device, self.enc_layer = actor, tokenizer, device, enc_layer
+        self.eps_per_t = max(1, int(eps_per_t))
         self.dev_type = torch.device(device).type
         self.p_uncond, self.t_grid, self.fve_t, self.micro_batch, self.max_len = p_uncond, tuple(float(t) for t in t_grid), fve_t, micro_batch, max_len
         self.norm = Normalizer.load(stats_path).to(device)
         # build the 13.7B prior on the meta device and stream the checkpoint in with mmap: no 55 GB fp32 CPU copy per rank
-        m = torch.load(os.path.join(prior_dir, "model.pt"), map_location="cpu", mmap=True); cfg = m["args"]
-        sd = m.get("model") if prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(prior_dir, "ema.pt"), map_location="cpu", mmap=True)["ema"]
+        if prior_override:      # e.g. a stage-2 co-trained prior (prior_cotrained_latest.pt: {"model": prior state dict, "args": cfg})
+            m = torch.load(prior_override, map_location="cpu", mmap=True); cfg = m["args"]; sd = m["model"]
+        else:
+            m = torch.load(os.path.join(prior_dir, "model.pt"), map_location="cpu", mmap=True); cfg = m["args"]
+            sd = m.get("model") if prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(prior_dir, "ema.pt"), map_location="cpu", mmap=True)["ema"]
         with torch.device("meta"):
             prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"])
         prior = prior.to_empty(device=device).to(torch.bfloat16)
@@ -61,7 +66,12 @@ class FlowCritic:
         else: opt_name = "none"
         self.d = cfg["d_input"]; self.msf = math.sqrt(self.d); self.adapter_step = int(ad.get("step", 0))
         self.cfg, self.adapter_args = cfg, aa
-        print(f"[flow] prior {cfg['n_layers']} blocks ({prior_weights} weights, {prior_dir}); adapter step {self.adapter_step} from {adapter_path}; "
+        self.pool = None
+        if grounded_shards and grounded_n > 0:     # grounded (activation, gold explanation) pairs for critic co-training instead of the policy's own rollouts
+            from nla.flow.train_cond import load_shards
+            acts, zs = load_shards(grounded_shards, grounded_n, skip=grounded_skip); self.pool = (acts, zs)
+            print(f"[flow] grounded co-training pool: {len(zs)} pairs from {grounded_shards} (skip {grounded_skip})", flush=True)
+        print(f"[flow] prior {cfg['n_layers']} blocks ({'OVERRIDE ' + prior_override if prior_override else prior_weights + ' weights, ' + prior_dir}); adapter step {self.adapter_step} from {adapter_path}; eps/t {self.eps_per_t}; "
               f"trainable {sum(p.numel() for p in self.trainable)/1e6:.0f}M ({opt_name}); t grid {self.t_grid}; encoder = actor (adapters off) @ layer {enc_layer}", flush=True)
 
     def _ac(self):
@@ -103,27 +113,29 @@ class FlowCritic:
         valid = [i for i in range(n) if explanations[i] is not None and len(explanations[i].strip()) > 0]
         if not valid: return fr, vr, preds
         gens = {}
-        def eps_for(g):
-            if g not in gens:
-                gen = torch.Generator(device=self.device).manual_seed(int(seed) * 1_000_003 + int(g))
-                gens[g] = torch.randn(self.d, generator=gen, device=self.device)
-            return gens[g]
+        def eps_for(g, k=0):
+            if (g, k) not in gens:
+                gen = torch.Generator(device=self.device).manual_seed(int(seed) * 1_000_003 + int(g) * 31 + int(k))
+                gens[(g, k)] = torch.randn(self.d, generator=gen, device=self.device)
+            return gens[(g, k)]
         self.model.eval()
         from nla.schema import normalize_activation
         for cs in range(0, len(valid), self.micro_batch):
             chunk = valid[cs: cs + self.micro_batch]; B = len(chunk)
             enc, mask = self.encode([explanations[i] for i in chunk])
             gold = torch.stack([activations[i].to(self.device).float() for i in chunk])
-            x0 = self.norm.normalize(gold); eps = torch.stack([eps_for(groups[i]) for i in chunk])
+            x0 = self.norm.normalize(gold); eps = torch.stack([eps_for(groups[i], 0) for i in chunk])
             tot = torch.zeros(B, device=self.device)
             with self._ac():
-                for tv in self.t_grid:
-                    t = torch.full((B,), tv, device=self.device); x_t = (1 - tv) * x0 + tv * eps
-                    v = self.model(x_t, t, enc, mask).float()
-                    tot += ((v - (eps - x0)) ** 2).mean(1)
+                for k in range(self.eps_per_t):
+                    eps_k = eps if k == 0 else torch.stack([eps_for(groups[i], k) for i in chunk])
+                    for tv in self.t_grid:
+                        t = torch.full((B,), tv, device=self.device); x_t = (1 - tv) * x0 + tv * eps_k
+                        v = self.model(x_t, t, enc, mask).float()
+                        tot += ((v - (eps_k - x0)) ** 2).mean(1)
                 t = torch.full((B,), self.fve_t, device=self.device); x_t = (1 - self.fve_t) * x0 + self.fve_t * eps
                 v = self.model(x_t, t, enc, mask).float(); x0_hat = self.norm.denormalize(x_t - self.fve_t * v)
-            fl = tot / len(self.t_grid)
+            fl = tot / (len(self.t_grid) * self.eps_per_t)
             mse = ((normalize_activation(x0_hat, self.msf) - normalize_activation(gold, self.msf)) ** 2).mean(1)
             for r, i in enumerate(chunk):
                 a, b = fl[r].item(), mse[r].item()
@@ -151,6 +163,13 @@ class FlowCritic:
             del enc, mask, x0, loss
         if self.dev_type == "cuda": torch.cuda.empty_cache()
         return total
+
+    def train_backward_grounded(self, n: int, accum: int = 1, seed: int | None = None):
+        """conditional FM step on n random GROUNDED pairs from the pool (gold explanations of held-in activations) instead of rollouts."""
+        if self.pool is None or self.optim is None: return float("nan")
+        acts, zs = self.pool; g = torch.Generator().manual_seed(seed) if seed is not None else None
+        idx = torch.randint(0, len(zs), (min(n, len(zs)),), generator=g).tolist()
+        return self.train_backward([zs[i] for i in idx], [acts[i] for i in idx], accum)
 
     def save(self, out_dir: str, step: int):
         os.makedirs(out_dir, exist_ok=True); tmp = os.path.join(out_dir, "adapter_latest.pt.tmp")
