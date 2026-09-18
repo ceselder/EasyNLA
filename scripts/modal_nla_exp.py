@@ -669,6 +669,17 @@ def pyrun(cmd: str):
     _run(["bash", "-lc", cmd])
     return "ok"
 
+@app.function(gpu="B200", volumes=VOLS, timeout=4 * 60 * 60, secrets=SECRETS)
+def score_dumps(tag: str, critic: str = "ar_sft_merged", model_tag: str = "qwen36_27b"):
+    """Frozen SFT-critic FVE on the eval rollouts a run dumped every eval (train_rl_vllm save_dir/eval_rollouts) -> frozen_scores.json."""
+    import sys
+    _prep(patch_lens=False)
+    d = f"{CKPT}/{model_tag}/{tag}"
+    _run([sys.executable, "-m", "nla.flow.score_dumps", "--dumps-dir", f"{d}/eval_rollouts", "--critic", f"{CKPT}/{model_tag}/{critic}",
+          "--sidecar", "/vol_q36/data/rl/rl_shuf.parquet", "--out", f"{d}/frozen_scores.json"])
+    vol.commit()
+    return "ok"
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -721,6 +732,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         print(split_sft_rl.remote(model_tag=model_tag, n_sft=limit or 500_000))
     elif task == "pyrun":
         print(pyrun.remote(cmd=cmd))
+    elif task == "score_dumps":
+        print(score_dumps.remote(tag=tag, model_tag=model_tag))
     elif task == "probe_tok":
         print(probe_tokenizer.remote())
     elif task == "shells":
