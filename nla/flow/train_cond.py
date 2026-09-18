@@ -163,7 +163,10 @@ class ARVecEncoder(torch.nn.Module):
         return d
     def load_saved(self, st):
         mod = self.crit if self.crit is not None else self.lm
-        mod.load_state_dict(st["lora"], strict=False)
+        have = {k for k in mod.state_dict() if "lora_" in k}; want = set(st["lora"])
+        assert want <= have, f"saved encoder LoRA keys not in this encoder ({len(want - have)} extra, e.g. {sorted(want - have)[:2]}) — different --enc-model / --ar-lr 0 / mode?"
+        assert have <= want or not have, f"encoder has {len(have - want)} LoRA tensors the checkpoint lacks — resuming would leave them random"
+        mod.load_state_dict(st["lora"], strict=False); print(f"[arvec] loaded {len(want)} encoder LoRA tensors", flush=True)
         if self.crit is not None and "value_head" in st: self.crit.value_head.load_state_dict(st["value_head"])
     def forward(self, texts):
         assert self.crit is not None, "pooled AR vector needs the critic encoder (tokens_base has no value head)"
@@ -199,6 +202,7 @@ def main():
     import torch.distributed as dist
     ddp = "RANK" in os.environ
     if ddp: dist.init_process_group("nccl"); rank, world = dist.get_rank(), dist.get_world_size(); dev = torch.device("cuda", int(os.environ["LOCAL_RANK"])); torch.cuda.set_device(dev)
+    assert not ddp or a.unfreeze_prior, "multi-rank train_cond without --unfreeze-prior has no gradient sync (adapters/encoder would drift per rank)"
     else: rank, world, dev = 0, 1, "cuda"
     is0 = rank == 0
     norm = Normalizer.load(a.stats).to(dev)

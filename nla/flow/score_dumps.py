@@ -23,6 +23,7 @@ def load_flow(prior_dir, adapter_path, stats_path, dev):
         prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"])
     prior = prior.to_empty(device=dev).to(torch.bfloat16); prior.load_state_dict(sd, strict=True); prior.requires_grad_(False)
     ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]
+    assert aa.get("cond_mode", "tokens") == "tokens", f"this loader only supports tokens-mode adapters (frozen base-trunk encoder); adapter is cond_mode={aa.get('cond_mode')} -> use nla.flow.scoring.FlowBundle"
     model = CondDenoiser(prior, cfg["d_input"], aa["n_slots"], aa["n_heads"], aa["d_head"], aa.get("gate_rank", 128)).to(dev)
     res = model.load_state_dict(ad["adapter"], strict=False); assert not res.unexpected_keys
     for mod in model.adapter_modules(): mod.float()
