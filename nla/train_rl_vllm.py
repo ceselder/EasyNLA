@@ -1979,9 +1979,10 @@ def main():
         # communicator to this rank's masked GPU (no "Guessing device ID" heuristic).
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=2),
                                 device_id=torch.device("cuda:0"))
-        assert torch.cuda.device_count() == args.vllm_tp, (
-            f"[dp] rank sees {torch.cuda.device_count()} GPUs but --vllm-tp={args.vllm_tp}; "
-            f"need total_gpus == world_size * vllm_tp.")
+        _extra_gpus = 1 if (args.flow_device and args.flow_device not in ("cuda", "cuda:0")) else 0   # a critic GPU per rank (--flow-device cuda:1)
+        assert torch.cuda.device_count() == args.vllm_tp + _extra_gpus, (
+            f"[dp] rank sees {torch.cuda.device_count()} GPUs but --vllm-tp={args.vllm_tp} (+{_extra_gpus} critic GPU); "
+            f"need total_gpus == world_size * (vllm_tp + critic_gpus).")
         assert args.batch_prompts % world_size == 0, (
             f"--batch-prompts ({args.batch_prompts}) must be divisible by world_size {world_size}.")
         print(f"[dp] world_size={world_size} rank={rank} vllm_tp={args.vllm_tp} "
