@@ -73,6 +73,11 @@ def test_cond_vector():
         opt.zero_grad(); l.backward(); opt.step(); l0 = l.item() if l0 is None else l0
     has = torch.tensor([False] * 4 + [True] * 4); out = cm(x, t, cvec=cv, cvec_has=has); ref = prior(x, t)
     assert torch.allclose(out[:4], ref[:4], atol=1e-5) and (out[4:] - ref[4:]).abs().mean() > 1e-4 and torch.isfinite(out).all()
+    # learnt token encoder: identity at init, trains
+    ce = CondDenoiser(prior, 24, n_slots=4, n_heads=2, d_head=8, gate_rank=4, enc_self_layers=1, enc_self_dim=16)
+    enc = torch.randn(8, 7, 24); mask = torch.ones(8, 7, dtype=torch.bool); mask[:, 5:] = False
+    assert torch.allclose(prior(x, t), ce(x, t, enc, mask), atol=1e-5)
+    l, _, _ = cond_fm_loss(ce, x, enc, mask, p_uncond=0.5); l.backward(); assert all(p.grad is not None for p in ce.token_encoder.parameters() if p.numel() > 0)
     # both pathways together
     cb = CondDenoiser(prior, 24, n_slots=4, n_heads=2, d_head=8, gate_rank=4, d_cvec=12, use_tokens=True, d_c=8)
     enc = torch.randn(8, 7, 24); mask = torch.ones(8, 7, dtype=torch.bool)

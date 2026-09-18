@@ -66,15 +66,31 @@ class CondMLPBlock(nn.Module):
         return x + b.down_proj(F.silu(g) * b.up_proj(h)) + r
 
 
+class TokenEncoder(nn.Module):
+    """Learnt attention over the frozen LM's token states before the cross-reads: enc' = enc + out(Transformer(in(enc))), out zero-init
+    (identity at init). d_inner-dim, n_layers post-norm encoder layers, key padding from the mask."""
+    def __init__(self, d_enc: int, d_inner: int = 1024, n_layers: int = 2, n_heads: int = 8):
+        super().__init__()
+        self.inp = nn.Linear(d_enc, d_inner); self.ln = nn.LayerNorm(d_enc)
+        layer = nn.TransformerEncoderLayer(d_inner, n_heads, dim_feedforward=4 * d_inner, dropout=0.0, batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, n_layers)
+        self.out = nn.Linear(d_inner, d_enc); nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)
+
+    def forward(self, enc, mask):
+        h = self.enc(self.inp(self.ln(enc.float())), src_key_padding_mask=~mask)
+        return enc + self.out(h).to(enc.dtype)
+
+
 class CondDenoiser(nn.Module):
     """Wraps a pretrained Denoiser. forward(x_t, t, enc=None, enc_mask=None, cvec=None, cvec_has=None):
        enc/enc_mask = token states for the cross-attention reads; cvec [B, d_cvec] = an AR summary vector (the AR's affine prediction of h
        + its last hidden state). cvec -> LayerNorm -> shared features c = [W1 c_ln ; silu(W2 c_ln)] (d_c) -> zero-init linear into the
        input projection and into the residual stream of every block (same additive channel the token reads use). Both None -> exactly
        the prior; cvec_has [B] bool marks samples whose vector is live (condition dropout)."""
-    def __init__(self, prior: Denoiser, d_enc: int, n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, d_cvec: int = 0, use_tokens: bool = True, d_c: int = 4096):
+    def __init__(self, prior: Denoiser, d_enc: int, n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, d_cvec: int = 0, use_tokens: bool = True, d_c: int = 4096, enc_self_layers: int = 0, enc_self_dim: int = 1024):
         super().__init__()
         self.prior = prior; self.use_tokens = use_tokens
+        self.token_encoder = TokenEncoder(d_enc, enc_self_dim, enc_self_layers) if (use_tokens and enc_self_layers > 0) else None
         self.d_enc = d_enc; self.d_cvec = d_cvec; self.d_c = d_c if d_cvec else 0
         self.blocks = nn.ModuleList([CondMLPBlock(blk, d_enc, n_slots, n_heads, d_head, gate_rank, use_read=use_tokens, d_c=self.d_c) for blk in prior.layers])
         if d_cvec:
@@ -99,11 +115,15 @@ class CondDenoiser(nn.Module):
         if enc is not None:
             enc = enc.to(dt)
             if enc_mask is None: enc_mask = torch.ones(enc.shape[:2], dtype=torch.bool, device=enc.device)
+            if self.token_encoder is not None:
+                safe = enc_mask | (~enc_mask.any(-1))[:, None]                     # all-False rows (condition dropout) must not be all-padding
+                enc = self.token_encoder(enc, safe)
         for blk in self.blocks: h = blk(h, emb, enc, enc_mask, c, cvec_has)
         return p.out_proj(p.ln(h))
 
     def adapter_modules(self):
         """the trainable conditioning modules (everything that is not the prior)"""
+        if self.token_encoder is not None: yield self.token_encoder
         for blk in self.blocks:
             if blk.read is not None: yield blk.read
             if blk.cvec_out is not None: yield blk.cvec_out
