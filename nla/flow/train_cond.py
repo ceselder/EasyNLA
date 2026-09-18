@@ -37,6 +37,7 @@ def load_shards(glob_pat, n, skip_val=True):
     """All (activation, Opus explanation) rows of the raw extraction shards (cols activation_vector / explanation / is_val), val rows excluded."""
     import glob as _glob, pyarrow.parquet as pq
     acts, zs = [], []
+    glob_pat = glob_pat.strip("\x27\"")
     for f in sorted(_glob.glob(glob_pat)):
         pf = pq.ParquetFile(f)
         for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "explanation", "is_val"]):
