@@ -705,6 +705,17 @@ def halluc_classify(n: int = 512, out: str = "/vol_glp/cond/halluc_classify_numb
     vol_glp.commit()
     return "ok"
 
+@app.function(gpu="H100", volumes=VOLS, secrets=SECRETS, timeout=3 * 60 * 60, memory=131072, ephemeral_disk=600 * 1024)
+def extract_ar_delta(out: str = "/vol/ckpts/qwen36_27b/ar_sft_delta_lora", merged: str = "/vol/ckpts/qwen36_27b/ar_sft_merged"):
+    """SFT reconstructor merged LoRA -> PEFT adapter (rank-64 SVD of merged - base), for sharing the actor's trunk as the AR encoder."""
+    import sys
+    from huggingface_hub import snapshot_download
+    _prep(patch_lens=False)
+    snap = snapshot_download("Qwen/Qwen3.6-27B", token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap", allow_patterns=["*.json", "*.safetensors"])
+    _run([sys.executable, f"{REPO_REMOTE}/scripts/extract_ar_delta_lora.py", "--base", snap, "--merged", merged, "--out", out])
+    vol.commit()
+    return "ok"
+
 # ------------------------------------------------------------------------ entrypoint
 @app.local_entrypoint()
 def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: int = 1,
@@ -759,6 +770,8 @@ def main(task: str, mode: str = "av", tag: str = "", nproc: int = 4, nshards: in
         print(pyrun.remote(cmd=cmd))
     elif task == "score_dumps":
         print(score_dumps.remote(tag=tag, model_tag=model_tag, dumps_glob=glob, out=out, extra=extra))
+    elif task == "extract_ar_delta":
+        print(extract_ar_delta.remote())
     elif task == "halluc_classify":   # --tag = flow adapter path (default all-pairs), --out = output json, --limit = n rows
         kw = {"n": limit or 512}
         if tag: kw["flow_adapter"] = tag
