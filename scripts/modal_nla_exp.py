@@ -553,7 +553,7 @@ def train_rl(tag: str, nproc: int = 4, model_tag: str = "qwen3_8b", extra: str =
     _prep(patch_lens=True)
     save_dir = f"{CKPT}/{model_tag}/{tag}"
     if "$BASE_SNAP" in extra:
-        snap = _local_base_snap(model_tag)
+        snap = _local_base_snap(model_tag); base_id = "Qwen/Qwen3.6-27B" if model_tag == "qwen36_27b" else BASE_8B
         print(f"[rl] $BASE_SNAP -> {snap}", flush=True)
         extra = extra.replace("$BASE_SNAP", snap)
         # HF actor/critic base too: load from the verified local dir instead of resolving the repo id via the volume cache
