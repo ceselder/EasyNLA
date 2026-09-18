@@ -109,7 +109,6 @@ class FlowCritic:
         self.actor_device = actor_device if actor_device is not None else device; self.shared_trunk = shared_trunk
         self.eps_per_t = max(1, int(eps_per_t))
         self.dev_type = torch.device(device).type
-        if self.dev_type == "cuda" and torch.device(device).index is not None: torch.cuda.set_device(device)   # allocate on the critic GPU
         self.p_uncond, self.t_grid, self.fve_t, self.micro_batch, self.max_len = p_uncond, tuple(float(t) for t in t_grid), fve_t, micro_batch, max_len
         self.norm = Normalizer.load(stats_path).to(device)
         # build the 13.7B prior on the meta device and stream the checkpoint in with mmap: no 55 GB fp32 CPU copy per rank
