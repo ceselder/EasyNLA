@@ -58,7 +58,9 @@ def main():
         h = out[0] if isinstance(out, tuple) else out
         if h.shape[1] > 1:                                        # prefill
             if st["cap"] is not None: st["cap"].append(h[:, st["pos"]].detach().float().clone())
-            if st["vec"] is not None: h[:, st["pos"]] = st["vec"].to(h.dtype)
+            if st["vec"] is not None:
+                v = st["vec"]; v = v if v.shape[0] == h.shape[0] else v[:1].expand(h.shape[0], -1)   # KL forward runs batch 1, generation runs batch = samples
+                h[:, st["pos"]] = v.to(h.dtype)
         elif st["decode_fn"] is not None:                          # one new token per sequence
             h[:, 0] = st["decode_fn"](h[:, 0].float()).to(h.dtype)
         return out
