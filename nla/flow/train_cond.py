@@ -412,7 +412,14 @@ def main():
         if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
             for p_ in arvec.trainable_parameters():
                 if p_.grad is not None: dist.all_reduce(p_.grad, op=dist.ReduceOp.AVG)
-        gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn; opt.step()
+        # clip FSDP-sharded (DTensor) params and plain-tensor params (encoder LoRA outside FSDP) separately: torch cannot norm a mixed list
+        from torch.distributed.tensor import DTensor as _DT
+        _sh = [p_ for p_ in trainable if isinstance(p_, _DT)]; _pl = [p_ for p_ in trainable if not isinstance(p_, _DT)]
+        gn2 = 0.0
+        for grp in (_sh, _pl):
+            if grp:
+                g_ = torch.nn.utils.clip_grad_norm_(grp, 1.0); g_ = g_.full_tensor() if hasattr(g_, "full_tensor") else g_; gn2 += float(g_) ** 2
+        gn = torch.tensor(gn2 ** 0.5); opt.step()
         if step % 50 == 0 and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step", flush=True)
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn)}, step=step)
