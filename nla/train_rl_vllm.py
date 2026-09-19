@@ -1662,6 +1662,7 @@ def main():
     p.add_argument("--vllm-gpu-mem", type=float, default=0.5,
                    help="vLLM gpu_memory_utilization; trimmed to leave room for "
                         "HF actor+LoRA + critic + Adam states + activations.")
+    p.add_argument("--vllm-max-num-seqs", type=int, default=None, help="cap vLLM decode concurrency (Qwen3.6 hybrid layers: CUDA graphs need max_num_seqs <= Mamba cache blocks)")
     p.add_argument("--vllm-max-len", type=int, default=1024)
     p.add_argument("--vllm-tp", type=int, default=1,
                    help="vLLM tensor_parallel_size. Set to 4 for 4-GPU runs to "
@@ -2329,6 +2330,7 @@ def main():
         dtype="bfloat16",
         gpu_memory_utilization=args.vllm_gpu_mem,
         max_model_len=args.vllm_max_len,
+        **({"max_num_seqs": args.vllm_max_num_seqs} if args.vllm_max_num_seqs else {}),   # hybrid (Mamba/DeltaNet) models: CUDA-graph capture needs one Mamba cache block per decode seq
         tensor_parallel_size=args.vllm_tp,
         # eager unless NLA_VLLM_EAGER=0 (vllm-metamodel: decode CUDA graphs, prompt-only steering)
         enforce_eager=(os.environ.get("NLA_VLLM_EAGER", "1") == "1"),
