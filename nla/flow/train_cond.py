@@ -191,7 +191,7 @@ class ARVecEncoder(torch.nn.Module):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"]); p.add_argument("--prior-init", default="pretrained", choices=["pretrained", "random"], help="random = ignore the snapshot weights (architecture only): train the conditional flow from scratch")
+    p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"]); p.add_argument("--prior-init", default="pretrained", choices=["pretrained", "random"], help="random = ignore the snapshot weights (architecture only): train the conditional flow from scratch"); p.add_argument("--prior-arch", default="", help="d_model,d_mlp,n_layers for a random-init denoiser (default: the snapshot's)")
     p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--exact-n", type=int, default=128, help="rows for the EXACT log p(h|z)-log p(h) eval (probability-flow ODE); 0 = off"); p.add_argument("--exact-every", type=int, default=1000); p.add_argument("--exact-steps", type=int, default=24); p.add_argument("--enc-model", default=None, help="tokens_base: HF id of an arbitrary token encoder (e.g. Qwen/Qwen3-Embedding-8B) instead of the base trunk"); p.add_argument("--enc-keep-norm", action="store_true")
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
@@ -208,6 +208,9 @@ def main():
     norm = Normalizer.load(a.stats).to(dev)
     m = torch.load(os.path.join(a.prior, "model.pt"), map_location="cpu"); cfg = m["args"]
     sd = m.get("model") if a.prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(a.prior, "ema.pt"), map_location="cpu")["ema"]
+    if a.prior_arch:   # random-init only: override the denoiser shape (d_model,d_mlp,n_layers); cfg is mutated so the saved co-trained prior carries the right args
+        assert a.prior_init == "random", "--prior-arch needs --prior-init random"
+        cfg["d_model"], cfg["d_mlp"], cfg["n_layers"] = [int(x) for x in a.prior_arch.split(",")]
     prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"])
     if a.prior_init == "pretrained": prior.load_state_dict({k: v.float() for k, v in sd.items()})
     else:
