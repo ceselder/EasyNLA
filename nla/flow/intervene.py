@@ -32,7 +32,8 @@ def main():
     p.add_argument("--alphas", default="0.5,1,2"); p.add_argument("--closed-loop", type=int, default=24, help="items to also run the every-position variants on (0 = off)")
     p.add_argument("--cl-alphas", default="1", help="α for the every-position variants (ar Δ and bridge Δ, re-scaled per position)"); p.add_argument("--skip-base", action="store_true", help="only none + the α grids")
     p.add_argument("--critic", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--layer", type=int, default=42)
-    a = p.parse_args(); alphas = [float(x) for x in a.alphas.split(",")]
+    p.add_argument("--sdedit-taus", default="", help="SDEdit-style stochastic edits: noise h to level τ, denoise under z′ (τ=1 = fresh sample from p(h|z′)); comma list")
+    a = p.parse_args(); alphas = [float(x) for x in a.alphas.split(",") if x]; taus = [float(x) for x in a.sdedit_taus.split(",") if x]; cl_alphas = [float(x) for x in a.cl_alphas.split(",") if x]
     from huggingface_hub import snapshot_download
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from nla.models import NLACriticModel
@@ -91,11 +92,22 @@ def main():
         if k < a.closed_loop:
             def bridge_of(hn):
                 xn = fb.norm.normalize(hn.to(d1)); e_ = ode(fb, xn, c_o, 0.0, 1.0, a.ode_steps); return fb.norm.denormalize(ode(fb, e_, c_e, 1.0, 0.0, a.ode_steps)).to(d0)
-            for al in [float(x) for x in a.cl_alphas.split(",")]:
+            for al in cl_alphas:
                 conds[f"ar_delta_a{al:g}_all"] = (resc(h0, d_ar, al), lambda hn, d=d_ar, al=al: resc(hn, d[None].expand_as(hn), al))
                 conds[f"flow_bridge_delta_a{al:g}_all"] = (resc(h0, d_bridge, al), lambda hn, al=al: resc(hn, bridge_of(hn) - hn, al))   # per-position bridge direction, α-scaled
                 conds[f"random_delta_a{al:g}_all"] = (resc(h0, rnd, al), lambda hn, r=rnd, al=al: resc(hn, r[None].expand_as(hn), al))
             if not a.skip_base: conds["flow_bridge_all"] = (h_bridge, bridge_of)
+        # ---- SDEdit-style stochastic edits: x_τ = (1−τ)·x0 + τ·ε, denoise from τ to 0 under z′ (edit) or under z (noise-only control)
+        gs = torch.Generator(device=d1).manual_seed(2000 + it["row"])
+        def sdedit(xn, tau, cond, gen=None):
+            e_ = torch.randn(xn.shape, device=d1, generator=gen) if gen is not None else torch.randn_like(xn)
+            return fb.norm.denormalize(ode(fb, (1 - tau) * xn + tau * e_, cond, tau, 0.0, max(4, int(a.ode_steps * tau))))
+        for tau in taus:
+            eps_s = torch.randn(x0.shape, device=d1, generator=gs)
+            conds[f"sdedit_t{tau:g}"] = (fb.norm.denormalize(ode(fb, (1 - tau) * x0 + tau * eps_s, c_e, tau, 0.0, max(4, int(a.ode_steps * tau))))[0].to(d0), None)
+            conds[f"sdedit_t{tau:g}_orig"] = (fb.norm.denormalize(ode(fb, (1 - tau) * x0 + tau * eps_s, c_o, tau, 0.0, max(4, int(a.ode_steps * tau))))[0].to(d0), None)   # same noise, ORIGINAL z: cost of the noise alone
+            if k < a.closed_loop and tau in (0.5, 0.9):
+                conds[f"sdedit_t{tau:g}_all"] = (conds[f"sdedit_t{tau:g}"][0], lambda hn, tau=tau: sdedit(fb.norm.normalize(hn.to(d1)), tau, c_e).to(d0))
         rec = dict(row=it["row"], doc_id=it["doc_id"], prefix_tail=it["text"][-400:], z=it["z"], z_edit=it["z_edit"], orig_prop=it["orig_prop"], target_prop=it["target_prop"], edit_type=it.get("edit_type"),
                    norms=dict(h=h0.norm().item(), d_ar=d_ar.norm().item(), d_bridge=d_bridge.norm().item(), d_samp=d_samp.norm().item(), bridge_recon_rel_err=((h_recon - h0).norm() / h0.norm()).item(),
                               cos_ar_bridge=torch.nn.functional.cosine_similarity(d_ar, d_bridge, dim=0).item(), cos_ar_samp=torch.nn.functional.cosine_similarity(d_ar, d_samp, dim=0).item(),
