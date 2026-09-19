@@ -109,13 +109,13 @@ class ARVecEncoder(torch.nn.Module):
             if enc_model is not None:
                 # any HF text model as the token encoder (e.g. Qwen/Qwen3-Embedding-8B): bare transformer, its own tokenizer, raw explanation text,
                 # all layers unless --enc-layer cuts earlier, final norm kept with --enc-keep-norm (embedding models pool AFTER the norm)
-                lm = AutoModel.from_pretrained(enc_model, dtype=torch.bfloat16, attn_implementation="sdpa").to(device)
+                lm = AutoModel.from_pretrained(enc_model, dtype=torch.bfloat16, attn_implementation="sdpa", low_cpu_mem_usage=True, device_map={"": device})
                 owner = lm.language_model if hasattr(lm, "language_model") else lm
                 self.tok = AutoTokenizer.from_pretrained(enc_model); self.tok.padding_side = "right"
                 if self.tok.pad_token_id is None: self.tok.pad_token = self.tok.eos_token
                 self.tmpl = "{explanation}"
             else:
-                lm = AutoModelForCausalLM.from_pretrained(ar_dir, dtype=torch.bfloat16, attn_implementation="sdpa").to(device)
+                lm = AutoModelForCausalLM.from_pretrained(ar_dir, dtype=torch.bfloat16, attn_implementation="sdpa", low_cpu_mem_usage=True, device_map={"": device})   # no host copy
                 inner = lm.model; owner = inner if hasattr(inner, "layers") else inner.language_model
                 if hasattr(lm, "lm_head"): lm.lm_head = torch.nn.Identity()
             if enc_layer + 1 < len(owner.layers): del owner.layers[enc_layer + 1:]
