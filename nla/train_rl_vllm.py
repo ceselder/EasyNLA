@@ -2164,7 +2164,7 @@ def main():
                           lr=args.flow_lr, p_uncond=args.flow_p_uncond, t_grid=[float(x) for x in args.flow_t_grid.split(",")],
                           micro_batch=args.flow_micro_batch, train_adapter=args.train_critic, eps_per_t=args.flow_eps_per_t, prior_override=args.flow_prior_override,
                           grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
-                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora)
+                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora, base_path=args.av_ckpt)
         if args.flow_cotrain != "rollouts": assert flow.pool is not None, "--flow-cotrain grounded/mix needs --flow-grounded-shards"
         _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
         if args.resume_from_lora is not None and _flow_latest.exists():

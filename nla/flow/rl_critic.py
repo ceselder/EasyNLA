@@ -98,7 +98,7 @@ class SharedARVecEncoder(torch.nn.Module):
 
 
 class FlowCritic:
-    def __init__(self, prior_dir: str, adapter_path: str, stats_path: str, actor, tokenizer, device, *, enc_layer: int = 42,
+    def __init__(self, prior_dir: str, adapter_path: str, stats_path: str, actor, tokenizer, device, *, enc_layer: int = 42, base_path: str | None = None,
                  lr: float = 1e-4, p_uncond: float = 0.1, t_grid=(0.2, 0.4, 0.6, 0.8), fve_t: float = 0.9, micro_batch: int = 16,
                  max_len: int = 192, prior_weights: str = "raw", train_adapter: bool = True, eps_per_t: int = 1, prior_override: str | None = None,
                  grounded_shards: str | None = None, grounded_n: int = 0, grounded_skip: int = 0, ar_sft_lora_dir: str = "/vol/ckpts/qwen36_27b/ar_sft_delta_lora",
@@ -123,12 +123,29 @@ class FlowCritic:
         prior.load_state_dict(sd, strict=True)                    # copies with dtype conversion, tensor by tensor
         prior.requires_grad_(False); del sd, m
         ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]
-        self.cond_mode = aa.get("cond_mode", "tokens"); self.use_tokens = self.cond_mode in ("tokens", "both"); use_arvec = self.cond_mode in ("ar_vec", "both")
+        self.cond_mode = aa.get("cond_mode", "tokens")
+        self.use_tokens = self.cond_mode in ("tokens", "both")                       # cross-reads into the FROZEN BASE trunk (= the actor with adapters off)
+        use_arvec = self.cond_mode in ("ar_vec", "both")                             # pooled AR vector from the critic trunk (+LoRA)
+        self.use_enc = self.cond_mode in ("tokens_ar", "tokens_base")                # cross-reads into an ARVecEncoder trunk's token states (LoRA-tuned by the flow loss)
         self.resid_shift = bool(aa.get("resid_shift", False))
-        self.model = CondDenoiser(prior, cfg["d_input"], aa["n_slots"], aa["n_heads"], aa["d_head"], aa.get("gate_rank", 128),
-                                  d_cvec=(2 * cfg["d_input"] if use_arvec else 0), use_tokens=self.use_tokens, d_c=aa.get("d_c", 4096),
+        d_enc = cfg["d_input"]
+        if self.use_enc:
+            from transformers import AutoTokenizer
+            from nla.flow.train_cond import ARVecEncoder
+            enc_path = os.path.join(os.path.dirname(adapter_path), "ar_encoder_latest.pt"); st = torch.load(enc_path, map_location="cpu") if os.path.exists(enc_path) else {"lora": {}}
+            if self.cond_mode == "tokens_base":
+                src = aa.get("base") if aa.get("base") and os.path.exists(str(aa.get("base"))) else (base_path or "Qwen/Qwen3.6-27B"); enc_model = aa.get("enc_model")
+            else: src = aa.get("ar_ckpt", ar_ckpt); enc_model = None
+            etok = AutoTokenizer.from_pretrained(enc_model or src); etok.padding_side = "right"
+            if etok.pad_token_id is None: etok.pad_token = etok.eos_token
+            self.arvec = ARVecEncoder(src, etok, device, trainable=bool(st["lora"]) or train_adapter, enc_layer=aa.get("enc_layer", enc_layer), enc_model=enc_model, keep_norm=aa.get("enc_keep_norm", False))
+            if st["lora"]: self.arvec.load_saved(st)
+            if self.arvec.crit is None: d_enc = self.arvec.owner.config.hidden_size
+            print(f"[flow] {self.cond_mode} token encoder {enc_model or src}: LoRA tensors {len(st['lora'])}, d_enc {d_enc}, trainable={self.arvec.trainable}", flush=True)
+        self.model = CondDenoiser(prior, d_enc, aa["n_slots"], aa["n_heads"], aa["d_head"], aa.get("gate_rank", 128),
+                                  d_cvec=(2 * cfg["d_input"] if use_arvec else 0), use_tokens=(self.use_tokens or self.use_enc), d_c=aa.get("d_c", 4096),
                                   enc_self_layers=aa.get("enc_self_layers", 0), enc_self_dim=aa.get("enc_self_dim", 1024), chunk_queries=aa.get("chunk_queries", 0)).to(device)
-        self.arvec = None
+        if not self.use_enc: self.arvec = None
         if use_arvec:
             enc_path = os.path.join(os.path.dirname(adapter_path), "ar_encoder_latest.pt")
             if shared_trunk:
@@ -203,6 +220,11 @@ class FlowCritic:
         was trained with --resid-shift (the flow then models x0 - shift), else None."""
         enc = mask = cvec = shift = None
         if self.use_tokens: enc, mask = self.encode(texts)
+        if self.use_enc:
+            with (torch.enable_grad() if (grad and self.arvec.trainable) else torch.no_grad()), torch.autocast(device_type=self.dev_type, dtype=torch.bfloat16):
+                enc, mask = self.arvec.tokens(texts)
+            if not grad: enc = enc.detach()
+            return enc, mask, None, None
         if self.arvec is not None:
             if self.shared_trunk: cvec = self.arvec(texts, grad=grad)
             else:
@@ -288,7 +310,7 @@ class FlowCritic:
             lora = {f"backbone.model.layers.{n.split('.layers.')[1].replace('.ar_critic', '.default')}": p_.detach().cpu() for n, p_ in self.actor.named_parameters() if ".ar_critic." in n}
             torch.save({"lora": lora, "value_head": self.arvec.value_head.state_dict(), "step": step}, os.path.join(out_dir, "ar_encoder_latest.pt"))
         elif self.arvec is not None:
-            torch.save({"lora": {k: v.detach().cpu() for k, v in self.arvec.crit.state_dict().items() if "lora_" in k}, "value_head": self.arvec.crit.value_head.state_dict(), "step": step}, os.path.join(out_dir, "ar_encoder_latest.pt"))
+            torch.save(dict({k: ({kk: vv.detach().cpu() for kk, vv in v.items()} if isinstance(v, dict) else v) for k, v in self.arvec.state_for_save().items()}, step=step), os.path.join(out_dir, "ar_encoder_latest.pt"))
         torch.save({"adapter": {k: v for k, v in self.model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_")},
                     "args": self.adapter_args, "prior_cfg": self.cfg, "step": step, "rl_step": step}, tmp)
         os.replace(tmp, os.path.join(out_dir, "adapter_latest.pt"))
