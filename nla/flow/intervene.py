@@ -30,6 +30,7 @@ def main():
     p.add_argument("--edits", default="/vol_glp/cond/intervene_edits.json"); p.add_argument("--adapter", default="sw_both"); p.add_argument("--out", required=True)
     p.add_argument("--n", type=int, default=64); p.add_argument("--gen-tokens", type=int, default=48); p.add_argument("--samples", type=int, default=4); p.add_argument("--ode-steps", type=int, default=40)
     p.add_argument("--alphas", default="0.5,1,2"); p.add_argument("--closed-loop", type=int, default=24, help="items to also run the every-position variants on (0 = off)")
+    p.add_argument("--cl-alphas", default="1", help="α for the every-position variants (ar Δ and bridge Δ, re-scaled per position)"); p.add_argument("--skip-base", action="store_true", help="only none + the α grids")
     p.add_argument("--critic", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--layer", type=int, default=42)
     a = p.parse_args(); alphas = [float(x) for x in a.alphas.split(",")]
     from huggingface_hub import snapshot_download
@@ -81,15 +82,20 @@ def main():
         g = torch.Generator(device=d1).manual_seed(1000 + it["row"]); eps = torch.randn(1, x0.shape[1], device=d1, generator=g)
         s_o = fb.norm.denormalize(ode(fb, eps, c_o, 1.0, 0.0, a.ode_steps))[0].to(d0); s_e = fb.norm.denormalize(ode(fb, eps, c_e, 1.0, 0.0, a.ode_steps))[0].to(d0)
         d_bridge, d_samp = h_bridge - h0, s_e - s_o; rnd = torch.randn_like(h0)
-        conds = {"none": (h0, None), "ar_replace": (ar_e * h0.norm() / ar_e.norm(), None), "flow_bridge": (h_bridge, None)}
+        conds = {"none": (h0, None)}
+        if not a.skip_base: conds.update({"ar_replace": (ar_e * h0.norm() / ar_e.norm(), None), "flow_bridge": (h_bridge, None)})
         for al in alphas:
             conds[f"ar_delta_a{al:g}"] = (resc(h0, d_ar, al), None); conds[f"flow_bridge_delta_a{al:g}"] = (resc(h0, d_bridge, al), None)
-            conds[f"flow_sample_delta_a{al:g}"] = (resc(h0, d_samp, al), None); conds[f"random_delta_a{al:g}"] = (resc(h0, rnd, al), None)
+            if not a.skip_base: conds[f"flow_sample_delta_a{al:g}"] = (resc(h0, d_samp, al), None)
+            conds[f"random_delta_a{al:g}"] = (resc(h0, rnd, al), None)
         if k < a.closed_loop:
-            conds["ar_delta_a1_all"] = (resc(h0, d_ar, 1.0), lambda hn, d=d_ar: resc(hn, d[None].expand_as(hn), 1.0))
-            def bridge_fn(hn):
+            def bridge_of(hn):
                 xn = fb.norm.normalize(hn.to(d1)); e_ = ode(fb, xn, c_o, 0.0, 1.0, a.ode_steps); return fb.norm.denormalize(ode(fb, e_, c_e, 1.0, 0.0, a.ode_steps)).to(d0)
-            conds["flow_bridge_all"] = (h_bridge, bridge_fn)
+            for al in [float(x) for x in a.cl_alphas.split(",")]:
+                conds[f"ar_delta_a{al:g}_all"] = (resc(h0, d_ar, al), lambda hn, d=d_ar, al=al: resc(hn, d[None].expand_as(hn), al))
+                conds[f"flow_bridge_delta_a{al:g}_all"] = (resc(h0, d_bridge, al), lambda hn, al=al: resc(hn, bridge_of(hn) - hn, al))   # per-position bridge direction, α-scaled
+                conds[f"random_delta_a{al:g}_all"] = (resc(h0, rnd, al), lambda hn, r=rnd, al=al: resc(hn, r[None].expand_as(hn), al))
+            if not a.skip_base: conds["flow_bridge_all"] = (h_bridge, bridge_of)
         rec = dict(row=it["row"], doc_id=it["doc_id"], prefix_tail=it["text"][-400:], z=it["z"], z_edit=it["z_edit"], orig_prop=it["orig_prop"], target_prop=it["target_prop"], edit_type=it.get("edit_type"),
                    norms=dict(h=h0.norm().item(), d_ar=d_ar.norm().item(), d_bridge=d_bridge.norm().item(), d_samp=d_samp.norm().item(), bridge_recon_rel_err=((h_recon - h0).norm() / h0.norm()).item(),
                               cos_ar_bridge=torch.nn.functional.cosine_similarity(d_ar, d_bridge, dim=0).item(), cos_ar_samp=torch.nn.functional.cosine_similarity(d_ar, d_samp, dim=0).item(),
@@ -110,6 +116,6 @@ def main():
             rec["conds"][name] = dict(texts=texts, kl_at_T=kl, nll_unpatched=nll_mean)
         results.append(rec); json.dump({"adapter": a.adapter, "layer": a.layer, "ode_steps": a.ode_steps, "samples": a.samples, "gen_tokens": a.gen_tokens, "items": results}, open(a.out, "w"))
         print(f"[intervene] {k + 1}/{len(E)} row {it['row']} ({time.time() - t0:.0f}s) recon_err {rec['norms']['bridge_recon_rel_err']:.3f} cos(ar,bridge) {rec['norms']['cos_ar_bridge']:.2f} KL none/ar1/bridge: "
-              f"{rec['conds']['none']['kl_at_T']:.3f}/{rec['conds']['ar_delta_a1']['kl_at_T']:.3f}/{rec['conds']['flow_bridge']['kl_at_T']:.3f}", flush=True)
+              f"{rec['conds']['none']['kl_at_T']:.3f}/{rec['conds'].get('ar_delta_a1', rec['conds'][list(rec['conds'])[1]])['kl_at_T']:.3f}/{rec['conds'].get('flow_bridge', {'kl_at_T': float('nan')})['kl_at_T']:.3f}", flush=True)
     print("[intervene] done", a.out)
 if __name__ == "__main__": main()
