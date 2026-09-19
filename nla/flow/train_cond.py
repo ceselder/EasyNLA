@@ -408,7 +408,11 @@ def main():
         lr = a.lr * sched
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift)
-        opt.zero_grad(set_to_none=True); loss.backward(); gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn; opt.step()
+        opt.zero_grad(set_to_none=True); loss.backward()
+        if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
+            for p_ in arvec.trainable_parameters():
+                if p_.grad is not None: dist.all_reduce(p_.grad, op=dist.ReduceOp.AVG)
+        gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn; opt.step()
         if step % 50 == 0 and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step", flush=True)
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn)}, step=step)
