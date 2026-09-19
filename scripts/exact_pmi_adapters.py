@@ -18,7 +18,8 @@ for tag in tags:
     if not os.path.exists(ap): print("skip", tag, "(no adapter)"); continue
     try:
         aa = torch.load(ap, map_location="cpu")["args"]
-        fb = FlowBundle(aa["prior"], ap, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"))
+        pco = os.path.join(os.path.dirname(ap), "prior_cotrained_latest.pt")   # co-trained / from-scratch runs: the prior weights live here, not in the snapshot
+        fb = FlowBundle(aa["prior"], ap, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"), prior_override=pco if os.path.exists(pco) else None)
         x0 = fb.norm.normalize(acts.to(dev)); lp = {"uncond": [], "cond": [], "shuf": []}
         for i in range(0, N, B):
             xx = x0[i:i + B]

@@ -191,7 +191,7 @@ class ARVecEncoder(torch.nn.Module):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"])
+    p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"]); p.add_argument("--prior-init", default="pretrained", choices=["pretrained", "random"], help="random = ignore the snapshot weights (architecture only): train the conditional flow from scratch")
     p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--exact-n", type=int, default=128, help="rows for the EXACT log p(h|z)-log p(h) eval (probability-flow ODE); 0 = off"); p.add_argument("--exact-every", type=int, default=1000); p.add_argument("--exact-steps", type=int, default=24); p.add_argument("--enc-model", default=None, help="tokens_base: HF id of an arbitrary token encoder (e.g. Qwen/Qwen3-Embedding-8B) instead of the base trunk"); p.add_argument("--enc-keep-norm", action="store_true")
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
@@ -208,7 +208,12 @@ def main():
     norm = Normalizer.load(a.stats).to(dev)
     m = torch.load(os.path.join(a.prior, "model.pt"), map_location="cpu"); cfg = m["args"]
     sd = m.get("model") if a.prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(a.prior, "ema.pt"), map_location="cpu")["ema"]
-    prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"]); prior.load_state_dict({k: v.float() for k, v in sd.items()})
+    prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"])
+    if a.prior_init == "pretrained": prior.load_state_dict({k: v.float() for k, v in sd.items()})
+    else:
+        assert a.unfreeze_prior, "--prior-init random only makes sense with --unfreeze-prior (train the whole conditional flow from scratch on the supervised pairs)"
+        if is0: print(f"[cond] prior RANDOMLY initialised ({sum(p_.numel() for p_ in prior.parameters())/1e9:.1f}B params): supervised-only training, no unsupervised pretraining", flush=True)
+    del sd
     # tokens    = cross-reads into the FROZEN BASE trunk's layer-42 token states (no template)
     # ar_vec    = the NLA critic trunk (LoRA-tuned by the flow loss) pooled to one vector, injected additively
     # both      = tokens + ar_vec
