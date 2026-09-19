@@ -196,7 +196,10 @@ def train_cond_g4(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "s
            "--stats", f"/vol_glp/{prior_tag}/rep_statistics.pt", "--base", base, "--train-parquet", "/vol_q36/data/sft/av_sft_train.parquet", "--val-parquet", "/vol_q36/data/sft/av_sft_val.parquet",
            "--out", out, "--tag", tag, "--mined-acts-parquet", "/vol_q36/data/rl/rl_shuf.parquet", "--unfreeze-prior"] + extra.split()
     env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
-    rc = subprocess.call(cmd, cwd=REPO_REMOTE, env=env); vol_glp.commit(); return rc
+    os.makedirs(out, exist_ok=True); logf = open(os.path.join(out, "train.log"), "ab")            # durable log on the volume (detached runs lose their stdout)
+    proc = subprocess.Popen(cmd, cwd=REPO_REMOTE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in proc.stdout: sys.stdout.buffer.write(line); sys.stdout.flush(); logf.write(line); logf.flush()
+    rc = proc.wait(); logf.close(); vol_glp.commit(); return rc
 
 
 @app.local_entrypoint()
