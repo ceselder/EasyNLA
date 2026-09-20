@@ -35,15 +35,15 @@ def load_encoder(base, layer, device):
     return encode, tok
 
 
-def load_shards(glob_pat, n, skip_val=True, skip=0):
+def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False):
     """All (activation, Opus explanation) rows of the raw extraction shards (cols activation_vector / explanation / is_val), val rows excluded;
     `skip` non-val rows are passed over first (rank-disjoint subsets). Comma-separated globs are allowed."""
     import glob as _glob, pyarrow.parquet as pq
-    acts, zs = [], []; to_skip = skip
+    acts, zs, docs = [], [], []; to_skip = skip
     files = sorted(f for g in glob_pat.strip("\x27\"").split(",") for f in _glob.glob(g.strip()))
     for f in files:
         pf = pq.ParquetFile(f)
-        for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "explanation", "is_val"]):
+        for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "explanation", "is_val"] + (["doc_id"] if with_doc else [])):
             keep = [i for i, v in enumerate(rb.column("is_val").to_pylist()) if not (skip_val and v)]
             if to_skip >= len(keep): to_skip -= len(keep); continue
             if to_skip: keep = keep[to_skip:]; to_skip = 0
@@ -52,24 +52,28 @@ def load_shards(glob_pat, n, skip_val=True, skip=0):
             a = torch.tensor(_np.stack(rb.column("activation_vector").to_numpy(zero_copy_only=False)), dtype=torch.float16)[keep]
             z = [(rb.column("explanation")[i].as_py() or "").strip() for i in keep]
             acts.append(a); zs += z
+            if with_doc: docs += [rb.column("doc_id")[i].as_py() for i in keep]
             if sum(x.shape[0] for x in acts) >= n: break
         if sum(x.shape[0] for x in acts) >= n: break
     acts = torch.cat(acts)[:n]; zs = zs[:n]
-    return acts, zs
+    return (acts, zs, docs[:n]) if with_doc else (acts, zs)
 
 
-def load_pairs(parquet, n, skip=0):
+def load_pairs(parquet, n, skip=0, with_doc=False):
     """Row-batched read (a single 500k x 5120 list array overflows pyarrow's int32 offsets)."""
     from nla.schema import extract_explanation
-    pf = pq.ParquetFile(parquet); acts, zs, seen = [], [], 0
-    for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "response"]):
+    pf = pq.ParquetFile(parquet); acts, zs, docs, seen = [], [], [], 0
+    for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "response"] + (["doc_id"] if with_doc else [])):
         if seen + rb.num_rows <= skip: seen += rb.num_rows; continue
         a = np.asarray(rb.column("activation_vector").flatten(), dtype=np.float32).reshape(rb.num_rows, -1)
         z = [(extract_explanation(r) or r or "").strip() for r in rb.column("response").to_pylist()]
+        d_ = rb.column("doc_id").to_pylist() if with_doc else None
         lo = max(0, skip - seen); a, z = a[lo:], z[lo:]; seen += rb.num_rows
+        if with_doc: d_ = d_[lo:]
         keep = [i for i, zz in enumerate(z) if zz]; acts.append(torch.tensor(a[keep])); zs += [z[i] for i in keep]
+        if with_doc: docs += [d_[i] for i in keep]
         if len(zs) >= n: break
-    acts = torch.cat(acts)[:n]; return acts, zs[:n]
+    acts = torch.cat(acts)[:n]; return (acts, zs[:n], docs[:n]) if with_doc else (acts, zs[:n])
 
 
 def load_mined_pairs(mined_dir, acts_parquet, max_n):
@@ -201,6 +205,9 @@ def main():
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
     p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar", "tokens_base"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
     p.add_argument("--neg-frac", type=float, default=0.0, help="contrastive hard negatives: fraction of the batch that also gets a same-text-one-specific-changed negative (number perturbed / entity swapped); hinge on the paired FM-loss gap")
+    p.add_argument("--group-contrast", type=int, default=0, help="same-document InfoNCE: number of document groups per step (0 = off); the G activations of one document are each other's hard negatives")
+    p.add_argument("--group-size", type=int, default=8); p.add_argument("--group-tau", type=float, default=0.02, help="temperature on the per-dim FM loss: logits = -loss / tau"); p.add_argument("--group-lambda", type=float, default=1.0)
+    p.add_argument("--eval-samedoc", action="store_true", help="also report same-document discrimination accuracy in eval (on by default when --group-contrast > 0)")
     p.add_argument("--neg-margin", type=float, default=0.02, help="per-dim FM-loss gap (neg - pos) the hinge asks for"); p.add_argument("--neg-lambda", type=float, default=2.0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
@@ -276,12 +283,19 @@ def main():
         for m_ in model.adapter_modules(): m_.float()                                            # adapter in fp32
     n_ad = model.n_adapter_params()
     if is0: print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}; unfreeze_prior={a.unfreeze_prior} world={world}", flush=True)
+    want_doc = a.group_contrast > 0 or a.eval_samedoc; tr_doc = va_doc = None
     if a.train_shards_glob:
-        tr_acts, tr_z = load_shards(a.train_shards_glob, a.max_train)
+        out_ = load_shards(a.train_shards_glob, a.max_train, with_doc=want_doc); tr_acts, tr_z = out_[0], out_[1]; tr_doc = out_[2] if want_doc else None
         if is0: print(f"[cond] loaded {len(tr_z)} Opus pairs from shards {a.train_shards_glob}", flush=True)
     else:
-        tr_acts, tr_z = load_pairs(a.train_parquet, a.max_train)
-    va_acts, va_z = load_pairs(a.val_parquet, a.eval_n + a.match_n)
+        out_ = load_pairs(a.train_parquet, a.max_train, with_doc=want_doc); tr_acts, tr_z = out_[0], out_[1]; tr_doc = out_[2] if want_doc else None
+    out_ = load_pairs(a.val_parquet, a.eval_n + a.match_n, with_doc=want_doc); va_acts, va_z = out_[0], out_[1]; va_doc = out_[2] if want_doc else None
+    def doc_groups(docs, G):
+        by = {}
+        for i, d_ in enumerate(docs): by.setdefault(d_, []).append(i)
+        return [v for v in by.values() if len(v) >= G]
+    tr_groups = doc_groups(tr_doc, a.group_size) if tr_doc else []; va_groups = doc_groups(va_doc, a.group_size) if va_doc else []
+    if want_doc and is0: print(f"[cond] same-document groups (>= {a.group_size} cuts): train {len(tr_groups)} docs, val {len(va_groups)} docs", flush=True)
     n_sft = len(tr_z)
     mv_acts, mv_z = None, None
     if a.mined_dir:
@@ -361,6 +375,19 @@ def main():
                     for r_, w_ in zip(rr, (g_ > 0).tolist()): kw.setdefault(negs[r_][1], [0, 0]); kw[negs[r_][1]][0] += int(w_); kw[negs[r_][1]][1] += 1
             out["eval/neg_detect_acc"] = wins / tot; out["eval/neg_gap"] = gsum / tot; out["eval/neg_n"] = len(rows_)
             for k_, (w_, n_) in kw.items(): out[f"eval/neg_detect_acc_{k_}"] = w_ / n_; out[f"eval/neg_n_{k_}"] = n_ // 3
+        if va_groups and (a.group_contrast > 0 or a.eval_samedoc):   # same-document discrimination: G cuts of one document, which explanation belongs to which activation
+            G = a.group_size; gs_ = va_groups[:48]; ok_r = ok_c = tot_ = 0; gge = torch.Generator(device=dev).manual_seed(11)
+            for g_ in gs_:
+                idx_ = sorted(g_)[:G]; xg = norm.normalize(ev_acts[idx_].to(dev)) if max(idx_) < len(ev_acts) else None
+                if xg is None: continue
+                e_, m_, c_ = enc_batch([ev_z[i] for i in idx_])
+                for t_val in (0.3, 0.5, 0.7):
+                    ee = torch.randn(xg.shape, device=dev, generator=gge); x_t = (1 - t_val) * xg + t_val * ee; tt = torch.full((G * G,), t_val, device=dev)
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        v = model(x_t.repeat_interleave(G, 0), tt, e_.repeat(G, 1, 1) if e_ is not None else None, m_.repeat(G, 1) if m_ is not None else None, c_.repeat(G, 1) if c_ is not None else None)
+                    Lm = ((v.float() - (ee - xg).float().repeat_interleave(G, 0)) ** 2).mean(-1).view(G, G); ar_ = torch.arange(G, device=dev)
+                    ok_r += (Lm.argmin(1) == ar_).sum().item(); ok_c += (Lm.argmin(0) == ar_).sum().item(); tot_ += G
+            if tot_: out["eval/samedoc_acc_row"] = ok_r / tot_; out["eval/samedoc_acc_col"] = ok_c / tot_; out["eval/samedoc_groups"] = len(gs_)
         out["eval/gain_bits_per_dim"] = (out["eval/fm_uncond"] - out["eval/fm_cond"]) / (2 * math.log(2))   # ELBO-flavoured: 0.5*Δmse per dim in nats -> bits (uniform-t weighting)
         # conditional FVE: x0-prediction at high noise, x0_hat = x_t - t*v ; NLA convention: unit-L2 to sqrt(d), MSE, predict-mean baseline
         t_val = 0.9; eps = torch.randn(x0.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(7)); t = torch.full((n_ev,), t_val, device=dev)
@@ -409,6 +436,7 @@ def main():
                         f"{prefix}/exact_bits_per_dim_uncond": (-lp["uncond"].mean() / (d_ * math.log(2))).item(), f"{prefix}/exact_bits_per_dim_cond": (-lp["cond"].mean() / (d_ * math.log(2))).item()})
             if is0: print(f"  [exact@{step}] PMI {pmi.mean().item():.1f} bits (median {pmi.median().item():.1f}, sem {pmi.std().item() / math.sqrt(n_x):.1f}, {100 * (pmi > 0).float().mean().item():.0f}% positive) | shuffled z {pms.mean().item():.1f} bits | n {n_x}, {a.exact_steps} Heun steps", flush=True)
         if not is0: return out
+        if P + "/samedoc_acc_row" in out and is0: print(f"  [{P}@{step}] same-document discrimination: activation->explanation {100*out[P+'/samedoc_acc_row']:.1f}%, explanation->activation {100*out[P+'/samedoc_acc_col']:.1f}% (chance {100/a.group_size:.1f}%, {out[P+'/samedoc_groups']} docs x {a.group_size} cuts)", flush=True)
         if P + "/neg_detect_acc" in out and is0: print(f"  [{P}@{step}] hard-negative detection {100*out[P+'/neg_detect_acc']:.1f}% (gap {out[P+'/neg_gap']:.4f}, n {out[P+'/neg_n']}) | " + " ".join(f"{k}: {100*out[P+'/neg_detect_acc_'+k]:.0f}% (n {out[P+'/neg_n_'+k]})" for k in ("number", "quote", "name") if P+"/neg_detect_acc_"+k in out), flush=True)
         print(f"[{P}@{step}] fm uncond {out[P+'/fm_uncond']:.4f} cond {out[P+'/fm_cond']:.4f} shuf {out[P+'/fm_shuf']:.4f} | gain {out[P+'/gain_bits_per_dim']*x0.shape[1]:.1f} bits/activation | cond FVE(x0@0.9) {out[P+'/cond_fve_x0_t0.9']:.1f}% | source-match {100*out[P+'/source_match_acc']:.1f}% (chance 12.5%)", flush=True)
         json.dump(out, open(os.path.join(a.out, f"{P}_{step:06d}.json"), "w"), indent=1)
@@ -452,6 +480,23 @@ def main():
         if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
             for p_ in arvec.trainable_parameters():
                 if p_.grad is not None: dist.all_reduce(p_.grad, op=dist.ReduceOp.AVG)
+        gstats = {}
+        if a.group_contrast > 0 and tr_groups:   # same-document InfoNCE: G cuts of one document; each activation must pick ITS explanation (and vice versa)
+            G = a.group_size; gi = [tr_groups[neg_rng.randrange(len(tr_groups))] for _ in range(a.group_contrast)]
+            sel = [neg_rng.sample(g_, G) for g_ in gi]; flat = [i for g_ in sel for i in g_]
+            eg, mkg, cvg = enc_batch([tr_z[i] for i in flat], grad=True); xg_all = norm.normalize(tr_acts[flat].to(dev))
+            ce_sum = 0.0; acc_r = acc_c = 0
+            for k_ in range(a.group_contrast):
+                sl = slice(k_ * G, (k_ + 1) * G); xg = xg_all[sl]; e_ = eg[sl] if eg is not None else None; m_ = mkg[sl] if mkg is not None else None; c_ = cvg[sl] if cvg is not None else None
+                tt = torch.rand(G, device=dev); ee = torch.randn_like(xg); x_t = (1 - tt)[:, None] * xg + tt[:, None] * ee; tgt = (ee - xg).float()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    v = model(x_t.repeat_interleave(G, 0), tt.repeat_interleave(G), e_.repeat(G, 1, 1) if e_ is not None else None, m_.repeat(G, 1) if m_ is not None else None, c_.repeat(G, 1) if c_ is not None else None)
+                Lm = ((v.float() - tgt.repeat_interleave(G, 0)) ** 2).mean(-1).view(G, G)        # [activation i, explanation j]
+                logits = -Lm / a.group_tau; tgt_idx = torch.arange(G, device=dev)
+                ce = 0.5 * (F.cross_entropy(logits, tgt_idx) + F.cross_entropy(logits.t(), tgt_idx))
+                (a.group_lambda * ce / a.group_contrast).backward(retain_graph=(k_ < a.group_contrast - 1))
+                ce_sum += ce.item(); acc_r += (logits.argmax(1) == tgt_idx).float().mean().item(); acc_c += (logits.argmax(0) == tgt_idx).float().mean().item()
+            gstats = {"train/samedoc_ce": ce_sum / a.group_contrast, "train/samedoc_acc_row": acc_r / a.group_contrast, "train/samedoc_acc_col": acc_c / a.group_contrast}
         # clip FSDP-sharded (DTensor) params and plain-tensor params (encoder LoRA outside FSDP) separately: torch cannot norm a mixed list
         from torch.distributed.tensor import DTensor as _DT
         _sh = [p_ for p_ in trainable if isinstance(p_, _DT)]; _pl = [p_ for p_ in trainable if not isinstance(p_, _DT)]
@@ -462,7 +507,8 @@ def main():
         gn = torch.tensor(gn2 ** 0.5); opt.step()
         if step % 50 == 0 and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step", flush=True)
-            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats}, step=step)
+            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats}, step=step)
+            if gstats and is0: print(f"  [samedoc] ce {gstats['train/samedoc_ce']:.3f} acc row {100*gstats['train/samedoc_acc_row']:.0f}% col {100*gstats['train/samedoc_acc_col']:.0f}% (chance {100/a.group_size:.0f}%)", flush=True)
             if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
         if step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours:
             ev = evaluate(step)
