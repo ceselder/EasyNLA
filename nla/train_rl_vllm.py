@@ -2679,18 +2679,21 @@ def main():
         tok_bg = copy.deepcopy(tokenizer)   # the generation thread gets its own tokenizer (HF fast tokenizers are not thread-safe)
         # Triton's Autotuner keeps per-call state on the kernel object (self.nargs) and is NOT thread-safe: the encoder/critic forward in the
         # background thread and the policy forward in the main thread share the same fla / conv kernels -> "'NoneType' object is not a mapping".
-        # Serialize each autotuned kernel's Python-side launch with a per-kernel lock (launches are asynchronous, so the GPUs still overlap).
+        # Make `nargs` THREAD-LOCAL per kernel (no launch serialization: a lock here made both threads idle each other's GPU, GRPO 474 -> 641 s)
+        # and only serialize the rare benchmarking path so two threads never time configs against each other.
         try:
             import triton.runtime.autotuner as _ta
-            if not getattr(_ta.Autotuner, "_nla_locked", False):
-                _orig_run = _ta.Autotuner.run
-                def _locked_run(self, *a, **k):
-                    lk = self.__dict__.get("_nla_lock")
-                    if lk is None: lk = self.__dict__["_nla_lock"] = threading.RLock()
-                    with lk: return _orig_run(self, *a, **k)
-                _ta.Autotuner.run = _locked_run; _ta.Autotuner._nla_locked = True
-                print("[async-gen] Triton Autotuner.run made thread-safe (per-kernel lock)", flush=True)
-        except Exception as _e: print(f"[async-gen] WARNING: could not lock Triton autotuner: {_e}", flush=True)
+            if not getattr(_ta.Autotuner, "_nla_threadlocal", False):
+                _tls = threading.local(); _bench_lock = threading.Lock()
+                def _nargs_get(self): return getattr(_tls, f"n{id(self)}", None)
+                def _nargs_set(self, v): setattr(_tls, f"n{id(self)}", v)
+                _ta.Autotuner.nargs = property(_nargs_get, _nargs_set)
+                _orig_bench = _ta.Autotuner._bench
+                def _locked_bench(self, *a, **k):
+                    with _bench_lock: return _orig_bench(self, *a, **k)
+                _ta.Autotuner._bench = _locked_bench; _ta.Autotuner._nla_threadlocal = True
+                print("[async-gen] Triton Autotuner: thread-local nargs + serialized benchmarking (no launch lock)", flush=True)
+        except Exception as _e: print(f"[async-gen] WARNING: could not patch Triton autotuner: {_e}", flush=True)
 
         class _BgJob:
             def __init__(self, fn):
