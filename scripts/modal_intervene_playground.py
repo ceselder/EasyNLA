@@ -17,6 +17,7 @@ app = modal.App("nla-intervene-playground", image=image)
 def web():
     import gradio as gr
     from fastapi import FastAPI
-    from intervene_playground_app import build_ui
+    from intervene_playground_app import build_ui, _load, _critic, _flow, FLOWS, CRITICS
+    _load(); _critic(list(CRITICS)[0]); _flow(list(FLOWS)[0])   # preload at container start (~10 min) so the first click is not a 10-minute wait
     demo = build_ui(); api = FastAPI()
     return gr.mount_gradio_app(api, demo, path="/", auth=("celeste", os.environ.get("NLA_PG_PASSWORD", "claube")))
