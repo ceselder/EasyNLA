@@ -28,6 +28,7 @@ def ode(fb, x, cond, t0, t1, steps):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--edits", default="/vol_glp/cond/intervene_edits.json"); p.add_argument("--adapter", default="sw_both"); p.add_argument("--out", required=True)
+    p.add_argument("--adapter-path", default=None, help="explicit adapter_latest.pt (e.g. an RL arm's co-trained flow critic: <save_dir>/flow_latest/adapter_latest.pt); --adapter is then only a label")
     p.add_argument("--n", type=int, default=64); p.add_argument("--gen-tokens", type=int, default=48); p.add_argument("--samples", type=int, default=4); p.add_argument("--ode-steps", type=int, default=40)
     p.add_argument("--alphas", default="0.5,1,2"); p.add_argument("--closed-loop", type=int, default=24, help="items to also run the every-position variants on (0 = off)")
     p.add_argument("--cl-alphas", default="1", help="α for the every-position variants (ar Δ and bridge Δ, re-scaled per position)"); p.add_argument("--skip-base", action="store_true", help="only none + the α grids")
@@ -51,7 +52,7 @@ def main():
     def ar_pred(z):
         enc = ctok([tmpl.format(explanation=z)], return_tensors="pt", add_special_tokens=False); ids, am = enc["input_ids"].to(d0), enc["attention_mask"].to(d0)
         with torch.no_grad(): return critic_predict(critic, ids, am, msf).float()[0]
-    ap = f"/vol_glp/cond/{a.adapter}/adapter_latest.pt"; aa = torch.load(ap, map_location="cpu")["args"]
+    ap = a.adapter_path or f"/vol_glp/cond/{a.adapter}/adapter_latest.pt"; aa = torch.load(ap, map_location="cpu")["args"]
     pco = os.path.join(os.path.dirname(ap), "prior_cotrained_latest.pt")   # co-trained / from-scratch conditioners keep their denoiser weights here
     fb = FlowBundle(aa["prior"], ap, aa["stats"], d1, base=snap, enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", a.critic), prior_override=pco if os.path.exists(pco) else None)
     E = json.load(open(a.edits))["items"][: a.n]; print(f"[intervene] {len(E)} edits, adapter {a.adapter} (step {torch.load(ap, map_location='cpu').get('step')}), layer {a.layer}", flush=True)
