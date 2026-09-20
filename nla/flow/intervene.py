@@ -47,7 +47,9 @@ def main():
     d0, d1 = "cuda:0", "cuda:1"
     tok = AutoTokenizer.from_pretrained(snap); lm = AutoModelForCausalLM.from_pretrained(snap, dtype=torch.bfloat16, attn_implementation="sdpa").to(d0).eval(); lm.requires_grad_(False)
     layer = resolve_decoder_layers(lm)[a.layer]
-    ctok = AutoTokenizer.from_pretrained(a.critic); cfg = load_nla_config("/vol_q36/data/rl/rl_shuf.parquet", ctok); tmpl = cfg.critic_prompt_template; msf = resolve_target_scale(cfg.mse_scale, cfg.d_model)
+    try: ctok = AutoTokenizer.from_pretrained(a.critic)
+    except Exception: ctok = AutoTokenizer.from_pretrained("/vol/ckpts/qwen36_27b/ar_sft_merged")   # RL critic_latest dirs are saved without tokenizer files; same tokenizer family
+    cfg = load_nla_config("/vol_q36/data/rl/rl_shuf.parquet", ctok); tmpl = cfg.critic_prompt_template; msf = resolve_target_scale(cfg.mse_scale, cfg.d_model)
     critic = NLACriticModel.from_pretrained(a.critic, torch_dtype=torch.bfloat16).to(d0).eval(); critic.requires_grad_(False)
     def ar_pred(z):
         enc = ctok([tmpl.format(explanation=z)], return_tensors="pt", add_special_tokens=False); ids, am = enc["input_ids"].to(d0), enc["attention_mask"].to(d0)
