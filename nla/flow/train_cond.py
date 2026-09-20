@@ -7,6 +7,8 @@ import argparse, json, math, os, time
 import numpy as np, pyarrow.parquet as pq, torch, torch.nn.functional as F
 from nla.flow.model import Denoiser, Normalizer
 from nla.flow.cond_model import CondDenoiser, cond_fm_loss
+from nla.flow.negatives import make_negative
+import random as _random
 
 
 class _Stop(Exception): pass
@@ -198,6 +200,8 @@ def main():
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024); p.add_argument("--chunk-queries", type=int, default=0, help="Flamingo-style per-slice queries: split the block hidden state into this many chunks, each attends over the explanation tokens (0 = pooled slots)")
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
     p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar", "tokens_base"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
+    p.add_argument("--neg-frac", type=float, default=0.0, help="contrastive hard negatives: fraction of the batch that also gets a same-text-one-specific-changed negative (number perturbed / entity swapped); hinge on the paired FM-loss gap")
+    p.add_argument("--neg-margin", type=float, default=0.02, help="per-dim FM-loss gap (neg - pos) the hinge asks for"); p.add_argument("--neg-lambda", type=float, default=2.0)
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
     ddp = "RANK" in os.environ
@@ -340,6 +344,21 @@ def main():
                     ls.append(F.mse_loss(v.float(), (eps[i:i+128] - xs).float(), reduction="sum").item() / x0.shape[1])
                 out[f"eval/fm_{name}_t{t_val}"] = sum(ls) / n_ev
         for name in ("uncond", "cond", "shuf"): out[f"eval/fm_{name}"] = sum(out[f"eval/fm_{name}_t{t}"] for t in (0.1, 0.3, 0.5, 0.7, 0.9)) / 5
+        # hard-negative detection: same text with one specific changed; paired (same t, eps) per-row loss; P(neg loss > true loss)
+        nrng = _random.Random(2); negs = [make_negative(z, nrng, zs) for z in zs]; rows_ = [i for i, (zn, _) in enumerate(negs) if zn is not None]
+        if rows_:
+            wins = 0; tot = 0; gsum = 0.0; gn_ = torch.Generator(device=dev).manual_seed(3)
+            for t_val in (0.3, 0.5, 0.7):
+                eps = torch.randn(x0.shape, device=dev, generator=gn_); t = torch.full((n_ev,), t_val, device=dev)
+                for i in range(0, len(rows_), 64):
+                    rr = rows_[i:i+64]; lo = []
+                    for texts in ([zs[r] for r in rr], [negs[r][0] for r in rr]):
+                        e, mk, cv = enc_batch(texts); xs = x0[rr]
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            v = model((1 - t_val) * xs + t_val * eps[rr], t[rr], e, mk, cv)
+                        lo.append(((v.float() - (eps[rr] - xs).float()) ** 2).mean(-1))
+                    g_ = lo[1] - lo[0]; wins += (g_ > 0).sum().item(); tot += len(rr); gsum += g_.sum().item()
+            out["eval/neg_detect_acc"] = wins / tot; out["eval/neg_gap"] = gsum / tot; out["eval/neg_n"] = len(rows_)
         out["eval/gain_bits_per_dim"] = (out["eval/fm_uncond"] - out["eval/fm_cond"]) / (2 * math.log(2))   # ELBO-flavoured: 0.5*Δmse per dim in nats -> bits (uniform-t weighting)
         # conditional FVE: x0-prediction at high noise, x0_hat = x_t - t*v ; NLA convention: unit-L2 to sqrt(d), MSE, predict-mean baseline
         t_val = 0.9; eps = torch.randn(x0.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(7)); t = torch.full((n_ev,), t_val, device=dev)
@@ -388,6 +407,7 @@ def main():
                         f"{prefix}/exact_bits_per_dim_uncond": (-lp["uncond"].mean() / (d_ * math.log(2))).item(), f"{prefix}/exact_bits_per_dim_cond": (-lp["cond"].mean() / (d_ * math.log(2))).item()})
             if is0: print(f"  [exact@{step}] PMI {pmi.mean().item():.1f} bits (median {pmi.median().item():.1f}, sem {pmi.std().item() / math.sqrt(n_x):.1f}, {100 * (pmi > 0).float().mean().item():.0f}% positive) | shuffled z {pms.mean().item():.1f} bits | n {n_x}, {a.exact_steps} Heun steps", flush=True)
         if not is0: return out
+        if P + "/neg_detect_acc" in out and is0: print(f"  [{P}@{step}] hard-negative detection {100*out[P+'/neg_detect_acc']:.1f}% (gap {out[P+'/neg_gap']:.4f}, n {out[P+'/neg_n']})", flush=True)
         print(f"[{P}@{step}] fm uncond {out[P+'/fm_uncond']:.4f} cond {out[P+'/fm_cond']:.4f} shuf {out[P+'/fm_shuf']:.4f} | gain {out[P+'/gain_bits_per_dim']*x0.shape[1]:.1f} bits/activation | cond FVE(x0@0.9) {out[P+'/cond_fve_x0_t0.9']:.1f}% | source-match {100*out[P+'/source_match_acc']:.1f}% (chance 12.5%)", flush=True)
         json.dump(out, open(os.path.join(a.out, f"{P}_{step:06d}.json"), "w"), indent=1)
         return out
@@ -402,6 +422,7 @@ def main():
         for _ in range(a.start_step // bpp): perm = torch.randperm(N, generator=rng)
         cursor = (a.start_step % bpp) * a.batch
         if is0: print(f"[cond] resuming at step {a.start_step} (cursor {cursor}/{N})", flush=True)
+    neg_rng = _random.Random(a.seed + 17 + int(os.environ.get('RANK', 0)))
     for step in range(a.start_step + 1, a.steps + 1):
         if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0; print(f"[cond] re-shuffle (pass {step*a.batch*world/N:.1f})", flush=True)
         idx = perm[cursor:cursor + a.batch]; cursor += a.batch
@@ -412,6 +433,20 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift)
         opt.zero_grad(set_to_none=True); loss.backward()
+        closs = None; neg_stats = {}
+        if a.neg_frac > 0:   # contrastive hard negatives: same activation, same (t, eps); the negative text must score WORSE by a margin
+            nb = max(1, int(round(a.neg_frac * a.batch))); sel = idx[:nb].tolist(); zs_pos = [tr_z[i] for i in sel]
+            negs = [make_negative(z, neg_rng, tr_z) for z in zs_pos]; keep_i = [k for k, (zn, _) in enumerate(negs) if zn is not None]
+            if keep_i:
+                zp = [zs_pos[k] for k in keep_i]; zn = [negs[k][0] for k in keep_i]; xn = x0[keep_i].detach(); n2 = len(keep_i)
+                e2, mk2, cv2 = enc_batch(zp + zn, grad=True); tt = torch.rand(n2, device=dev); ee = torch.randn_like(xn)
+                x_t = (1 - tt)[:, None] * xn + tt[:, None] * ee; tgt = (ee - xn).float()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    v2 = model(torch.cat([x_t, x_t]), torch.cat([tt, tt]), e2, mk2, cv2)
+                lrow = ((v2.float() - torch.cat([tgt, tgt])) ** 2).mean(-1); gap = lrow[n2:] - lrow[:n2]
+                closs = a.neg_lambda * F.relu(a.neg_margin - gap).mean(); closs.backward()
+                neg_stats = {"train/contrast_loss": closs.item(), "train/neg_gap": gap.mean().item(), "train/neg_win": (gap > 0).float().mean().item(), "train/neg_n": n2,
+                             "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2}
         if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
             for p_ in arvec.trainable_parameters():
                 if p_.grad is not None: dist.all_reduce(p_.grad, op=dist.ReduceOp.AVG)
@@ -425,7 +460,8 @@ def main():
         gn = torch.tensor(gn2 ** 0.5); opt.step()
         if step % 50 == 0 and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step", flush=True)
-            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn)}, step=step)
+            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats}, step=step)
+            if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
         if step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours:
             ev = evaluate(step)
             if mv_z is not None: ev.update(evaluate(step, mv_acts, mv_z, prefix="eval_onpolicy"))
