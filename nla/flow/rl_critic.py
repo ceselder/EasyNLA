@@ -102,11 +102,12 @@ class FlowCritic:
                  lr: float = 1e-4, p_uncond: float = 0.1, t_grid=(0.2, 0.4, 0.6, 0.8), fve_t: float = 0.9, micro_batch: int = 16,
                  max_len: int = 192, prior_weights: str = "raw", train_adapter: bool = True, eps_per_t: int = 1, prior_override: str | None = None,
                  grounded_shards: str | None = None, grounded_n: int = 0, grounded_skip: int = 0, ar_sft_lora_dir: str = "/vol/ckpts/qwen36_27b/ar_sft_delta_lora",
-                 actor_device=None, shared_trunk: bool = False, ar_ckpt: str = "/vol/ckpts/qwen36_27b/ar_sft_merged"):
+                 actor_device=None, shared_trunk: bool = False, ar_ckpt: str = "/vol/ckpts/qwen36_27b/ar_sft_merged", enc_device=None):
         """device = where the flow (prior + adapter) and, for AR-vector conditioners, the AR trunk live; actor_device = where the actor
         (token-state encoder) lives. With a second GPU per rank (--flow-device cuda:1) the real 31 GB AR trunk fits next to the flow."""
         self.actor, self.tok, self.device, self.enc_layer = actor, tokenizer, device, enc_layer
         self.actor_device = actor_device if actor_device is not None else device; self.shared_trunk = shared_trunk
+        self.enc_device = enc_device if enc_device is not None else device   # the 27B token encoder can live on another GPU than the denoiser (async layout: encoder + vLLM on the critic GPU, denoiser on the policy GPU)
         self.eps_per_t = max(1, int(eps_per_t))
         self.dev_type = torch.device(device).type
         self.p_uncond, self.t_grid, self.fve_t, self.micro_batch, self.max_len = p_uncond, tuple(float(t) for t in t_grid), fve_t, micro_batch, max_len
@@ -138,7 +139,7 @@ class FlowCritic:
             else: src = aa.get("ar_ckpt", ar_ckpt); enc_model = None
             etok = AutoTokenizer.from_pretrained(enc_model or src); etok.padding_side = "right"
             if etok.pad_token_id is None: etok.pad_token = etok.eos_token
-            self.arvec = ARVecEncoder(src, etok, device, trainable=bool(st["lora"]) or train_adapter, enc_layer=aa.get("enc_layer", enc_layer), enc_model=enc_model, keep_norm=aa.get("enc_keep_norm", False))
+            self.arvec = ARVecEncoder(src, etok, self.enc_device, trainable=bool(st["lora"]) or train_adapter, enc_layer=aa.get("enc_layer", enc_layer), enc_model=enc_model, keep_norm=aa.get("enc_keep_norm", False))
             if st["lora"]: self.arvec.load_saved(st)
             if self.arvec.crit is None: d_enc = self.arvec.owner.config.hidden_size
             print(f"[flow] {self.cond_mode} token encoder {enc_model or src}: LoRA tensors {len(st['lora'])}, d_enc {d_enc}, trainable={self.arvec.trainable}", flush=True)
@@ -155,7 +156,7 @@ class FlowCritic:
                 from nla.flow.train_cond import ARVecEncoder
                 ar_dir = aa.get("ar_ckpt", ar_ckpt); atok = AutoTokenizer.from_pretrained(ar_dir); atok.padding_side = "right"
                 if atok.pad_token_id is None: atok.pad_token = atok.eos_token
-                self.arvec = ARVecEncoder(ar_dir, atok, device); st = torch.load(enc_path, map_location="cpu")
+                self.arvec = ARVecEncoder(ar_dir, atok, self.enc_device); st = torch.load(enc_path, map_location="cpu")
                 self.arvec.crit.load_state_dict(st["lora"], strict=False); self.arvec.crit.value_head.load_state_dict(st["value_head"])
                 print(f"[flow] AR-vector encoder: real trunk {ar_dir} on {device} + stage-2 LoRA/head from {enc_path} (step {st.get('step')})", flush=True)
         res = self.model.load_state_dict(ad["adapter"], strict=False)
@@ -223,6 +224,7 @@ class FlowCritic:
         if self.use_enc:
             with (torch.enable_grad() if (grad and self.arvec.trainable) else torch.no_grad()), torch.autocast(device_type=self.dev_type, dtype=torch.bfloat16):
                 enc, mask = self.arvec.tokens(texts)
+            if str(self.enc_device) != str(self.device): enc, mask = enc.to(self.device), mask.to(self.device)   # cross-device: autograd carries the encoder LoRA grads back
             if not grad: enc = enc.detach()
             return enc, mask, None, None
         if self.arvec is not None:

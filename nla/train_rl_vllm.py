@@ -1796,7 +1796,9 @@ def main():
     p.add_argument("--cispo-eps-max", type=float, default=5.0, help="CISPO IS-weight truncation (maemm bundle: 5)")
     p.add_argument("--ppo-clip", type=float, default=0.2, help="--loss ppo: clipped-ratio surrogate vs the vLLM sampler logprobs (needed when rollouts are one step stale)")
     p.add_argument("--async-gen", action="store_true", help="generate + score + critic-backward the NEXT step's rollouts in a background thread on the critic GPU while GRPO runs (one-step-off-policy; forces --loss ppo unless cispo, --sampler-mismatch-thresh 0, implies --vllm-on-flow-gpu)")
-    p.add_argument("--vllm-on-flow-gpu", action="store_true", help="place the vLLM engine on the critic GPU (--flow-device cuda:1) instead of the policy GPU")
+    p.add_argument("--vllm-on-flow-gpu", action="store_true", help="place the vLLM engine on the critic GPU (--flow-device cuda:1) instead of the policy GPU (= --vllm-gpu-index 1)")
+    p.add_argument("--vllm-gpu-index", type=int, default=None, help="which GPU of the rank's slice hosts the vLLM engine (default 0 = the policy GPU)")
+    p.add_argument("--flow-enc-device", default="", help="device for the flow critic's 27B token ENCODER (default = --flow-device). Async layout: --flow-device cuda:0 --flow-enc-device cuda:1 --vllm-gpu-index 1 puts the 13.7B denoiser next to the policy and the encoder next to the engine")
     p.add_argument("--no-sort-microbatches", action="store_true", help="keep the original (unsorted) GRPO micro-batch order; default sorts rollouts by length to cut padding")
     p.add_argument("--adv-mode", choices=["group", "none", "batch"], default=None,
                    help="group (DEFAULT) = GRPO per-group mean/std; none = Dr.GRPO centring only (== --dr-grpo); "
@@ -1898,8 +1900,8 @@ def main():
     if args.async_gen:
         args.sampler_mismatch_thresh = 0.0
         if args.loss == 'reinforce': args.loss = 'cispo'   # off-policy by one step -> the ScaleRL / maemm rl_disagg recipe: truncated-IS REINFORCE (CISPO), not PPO
-        if args.flow_device and args.flow_device not in ('cuda', 'cuda:0'): args.vllm_on_flow_gpu = True
-        print(f'[async-gen] ON: loss={args.loss} (cispo eps_max {args.cispo_eps_max} / ppo clip {args.ppo_clip}), adv-mode {args.adv_mode}, loss-agg {args.loss_agg}, zero-var-filter {args.zero_var_filter}, sampler-mismatch masking off, vllm_on_flow_gpu={args.vllm_on_flow_gpu}', flush=True)
+        if args.vllm_gpu_index is None: args.vllm_gpu_index = 1 if any(d and d not in ('cuda', 'cuda:0') for d in (args.flow_device, args.flow_enc_device)) else 0
+        print(f'[async-gen] ON: loss={args.loss} (cispo eps_max {args.cispo_eps_max} / ppo clip {args.ppo_clip}), adv-mode {args.adv_mode}, loss-agg {args.loss_agg}, zero-var-filter {args.zero_var_filter}, sampler-mismatch masking off, vllm_gpu_index={args.vllm_gpu_index}, flow_device={args.flow_device or "cuda:0"}, flow_enc_device={args.flow_enc_device or args.flow_device or "cuda:0"}', flush=True)
     # ---- fail-fast checks (BEFORE any model/engine loading) ----
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -2001,7 +2003,7 @@ def main():
         # communicator to this rank's masked GPU (no "Guessing device ID" heuristic).
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=2),
                                 device_id=torch.device("cuda:0"))
-        _extra_gpus = 1 if (args.flow_device and args.flow_device not in ("cuda", "cuda:0")) else 0   # a critic GPU per rank (--flow-device cuda:1)
+        _extra_gpus = 1 if any(d and d not in ("cuda", "cuda:0") for d in (args.flow_device, args.flow_enc_device)) else 0   # a critic GPU per rank (--flow-device / --flow-enc-device cuda:1)
         assert torch.cuda.device_count() == args.vllm_tp + _extra_gpus, (
             f"[dp] rank sees {torch.cuda.device_count()} GPUs but --vllm-tp={args.vllm_tp} (+{_extra_gpus} critic GPU); "
             f"need total_gpus == world_size * (vllm_tp + critic_gpus).")
@@ -2182,7 +2184,7 @@ def main():
                           lr=args.flow_lr, p_uncond=args.flow_p_uncond, t_grid=[float(x) for x in args.flow_t_grid.split(",")],
                           micro_batch=args.flow_micro_batch, train_adapter=args.train_critic, eps_per_t=args.flow_eps_per_t, prior_override=args.flow_prior_override,
                           grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
-                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora, base_path=args.av_ckpt)
+                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora, base_path=args.av_ckpt, enc_device=(torch.device(args.flow_enc_device) if args.flow_enc_device else None))
         if args.flow_cotrain != "rollouts": assert flow.pool is not None, "--flow-cotrain grounded/mix needs --flow-grounded-shards"
         _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
         if args.resume_from_lora is not None and _flow_latest.exists():
@@ -2341,11 +2343,12 @@ def main():
         from vllm.config.attention import AttentionConfig
         _vllm_extra["attention_config"] = AttentionConfig(backend=args.vllm_attn_backend)
     _cvd_saved = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if args.vllm_on_flow_gpu:
+    _vgi = (1 if args.vllm_on_flow_gpu else 0) if args.vllm_gpu_index is None else args.vllm_gpu_index
+    if _vgi:
         _devs = _cvd_saved.split(",") if _cvd_saved else [str(i) for i in range(torch.cuda.device_count())]
-        assert len(_devs) >= 2 and args.flow_device not in ("", "cuda", "cuda:0"), "--vllm-on-flow-gpu needs 2 GPUs per rank and --flow-device cuda:1"
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([_devs[1], _devs[0]] + _devs[2:])   # the engine worker sees the critic GPU as cuda:0; the policy GPU stays visible for CUDA-IPC weight sync (peer-mapped)
-        print(f"[vllm] engine placed on the critic GPU (physical {_devs[1]}); worker CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}", flush=True)
+        assert len(_devs) > _vgi, f"--vllm-gpu-index {_vgi} but the rank sees {len(_devs)} GPUs"
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([_devs[_vgi]] + [d for i, d in enumerate(_devs) if i != _vgi])   # the engine worker sees its GPU as cuda:0; the others stay visible for CUDA-IPC weight sync (peer-mapped)
+        print(f"[vllm] engine placed on GPU index {_vgi} of the rank (physical {_devs[_vgi]}); worker CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}", flush=True)
     llm = VLLM(
         **_vllm_extra,
         model=args.vllm_model or args.av_ckpt,
@@ -2366,7 +2369,7 @@ def main():
         enable_prefix_caching=False,
     )
     print(f"[vllm] ready", flush=True)
-    if args.vllm_on_flow_gpu:
+    if _vgi:
         if _cvd_saved is None: os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else: os.environ["CUDA_VISIBLE_DEVICES"] = _cvd_saved
     # Initial weight sync: push the (fresh) LoRA-merged actor into vLLM.
