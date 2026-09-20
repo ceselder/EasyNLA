@@ -2399,13 +2399,14 @@ def main():
     # this is a true no-op (~180s wasted). OFF by default; --initial-sync-warmup
     # re-enables it purely to smoke-test the sync path early.
     _name_map = _VLLM_NAME_MAPS[args.vllm_name_map]
-    if args.vllm_model and args.vllm_model != args.av_ckpt and not args.resume_from_lora:
+    if ((args.vllm_model and args.vllm_model != args.av_ckpt) or getattr(args, "av_adapter", None)) and not args.resume_from_lora:
         # vLLM loaded the RAW --vllm-model (e.g. the base wrapper), NOT the AV
         # warm-start — the initial sync is a CORRECTNESS requirement here, not a
         # warm-up: without it step-0 rollouts come from the base policy. (Safe
         # under only_adapted: AV-SFT touched only the adapted modules, so the
         # frozen weights vLLM has from the base wrapper already match av_merged.)
-        print("[vllm] --vllm-model != --av-ckpt: forcing initial weight sync", flush=True)
+        # Same when the AV warm start is a LoRA on top of --av-ckpt (--av-adapter): vLLM has the base, the actor has base+LoRA.
+        print("[vllm] engine holds the base without the AV warm start (--vllm-model != --av-ckpt or --av-adapter): forcing initial weight sync", flush=True)
         args.initial_sync_warmup = True
     if args.initial_sync_warmup or args.resume_from_lora is not None:
         # MANDATORY on resume: the HF actor holds the resumed RL LoRA but vLLM
