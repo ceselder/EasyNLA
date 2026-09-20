@@ -3241,6 +3241,8 @@ def main():
                 print(f"step {step}: GRPO OOM -> micro-batch halved to {args.logp_micro_batch}", flush=True)
             if _attempt == 2: raise
         t_grpo_end = time.time()  # [timing] end of GRPO forward+backward+step
+        if (_async or _prefix_cache is not None) and grpo_metrics.get('sampler_logp_absdiff_mean') is not None:
+            print(f"  [sampler-vs-hf@{step}] mean|Δlogp| {grpo_metrics['sampler_logp_absdiff_mean']:.4f} max {grpo_metrics.get('sampler_logp_absdiff_max', float('nan')):.3f} (noise floor ~0.02; one-step policy lag adds a little; a wrong suffix path would be ≫)", flush=True)
         # Build a scalar-tensor stand-in for the existing logging path that
         # expects a `loss` tensor with .item().
         loss = torch.tensor(mean_loss_val, device=device)
