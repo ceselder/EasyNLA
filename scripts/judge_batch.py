@@ -6,8 +6,9 @@ the batch endpoint (50 % cheaper, thousands of requests per submit). It is an EV
 
 Usage
   submit:  python scripts/judge_batch.py submit --dumps label=glob [label=glob ...] --val-parquet P --out data/judge_batch.json
-  collect: python scripts/judge_batch.py collect --out data/judge_batch.json      # polls until every batch ended, aggregates
-Pending batch ids + custom-id map live in <out>.pending.json. Already-judged (label, step) keys are skipped on re-submit.
+           add --retry-failed to re-queue only the rows whose earlier response failed (truncated / refused / unparseable)
+  collect: python scripts/judge_batch.py collect --out data/judge_batch.json [--wait]   # merges per-row results, re-aggregates
+Pending batch ids + custom-id map live in <out>.pending.json. Per-row claims are kept in <out> so later batches merge.
 """
 from __future__ import annotations
 import argparse, glob, json, os, re, sys, time
@@ -30,8 +31,8 @@ Step 3. Two overall integer ratings, 1-10:
   hallucination_1_10: 1-2 fully grounded (every specific claim traces to the passage); 3-4 minor unsupported detail; 5-6 mixed, at least one confident specific (entity/number/relation/event) the passage does not contain; 7-8 substantially fabricated, several invented specifics or a confident claim about subject matter the passage never raises; 9-10 describes text that is essentially not this passage.
   informativeness_1_10: how much ACCURATE, specific information about THIS passage the explanation conveys; 1 generic, 5 some real specifics amid generic content, 10 richly specific and accurate. Fabricated specifics earn nothing.
 
-Answer with ONE JSON object and nothing else:
-{"claims": [{"claim": "<short paraphrase>", "type": "name|number|date|quote|title|place|event|topic|other", "verdict": "supported|unsupported|contradicted"}], "hallucination_1_10": <int>, "informativeness_1_10": <int>}"""
+Output rules (strict): ONE compact JSON object on a single line, no markdown, no commentary. At most 14 claims; each "claim" at most 10 words; if the explanation has more than 14 specific claims, keep the 14 most concrete. Format:
+{"claims":[{"claim":"<≤10 words>","type":"name|number|date|quote|title|place|event|topic|other","verdict":"supported|unsupported|contradicted"}],"hallucination_1_10":<int>,"informativeness_1_10":<int>}"""
 
 
 def user_msg(src: str, z: str, src_chars: int) -> str:
@@ -64,7 +65,7 @@ def load_rows(dumps, val_parquet):
 def parse(txt: str):
     try:
         j = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
-        cl = [c for c in j.get("claims", []) if isinstance(c, dict) and c.get("verdict") in ("supported", "unsupported", "contradicted")]
+        cl = [{"claim": str(c.get("claim", ""))[:120], "type": str(c.get("type", "other")), "verdict": c["verdict"]} for c in j.get("claims", []) if isinstance(c, dict) and c.get("verdict") in ("supported", "unsupported", "contradicted")]
         return {"claims": cl, "h": j.get("hallucination_1_10"), "inf": j.get("informativeness_1_10")}
     except Exception:
         return None
@@ -87,27 +88,33 @@ def aggregate(recs: list[dict]) -> dict:
             "frac_any_contradicted": sum(c > 0 for c in con) / n, "claim_precision": (sum(sup) / tot) if tot else None,
             "number_claims_per_expl": sum(num_all) / n, "number_precision": (1 - sum(num_bad) / sum(num_all)) if sum(num_all) else None,
             "hallucination_1_10": float(np.mean(h)) if h else None, "informativeness_1_10": float(np.mean(inf)) if inf else None,
-            "hallucination_1_10_sem": float(np.std(h) / np.sqrt(len(h))) if h else None, "bad_per_expl_sem": float(np.std(bad) / np.sqrt(n))}
+            "hallucination_1_10_sem": float(np.std(h) / np.sqrt(len(h))) if h else None, "bad_per_expl_sem": float(np.std(bad) / np.sqrt(n)),
+            "supported_per_expl_sem": float(np.std(sup) / np.sqrt(n))}
 
 
 def submit(a):
     out = json.load(open(a.out)) if os.path.exists(a.out) else {}
     pend_path = a.out + ".pending.json"; pend = json.load(open(pend_path)) if os.path.exists(pend_path) else {"batches": [], "map": {}}
     items, srcs = load_rows(a.dumps, a.val_parquet)
-    reqs = []; cid = 0
-    pending_keys = set(v["key"] for v in pend["map"].values())
+    reqs = []; cid = int(time.time()) % 100000 * 1000
+    pending_rows = {}
+    for v in pend["map"].values(): pending_rows.setdefault(v["key"], set()).add(v["row"])
     for (label, step), rows in sorted(items.items()):
-        key = f"{label}:{step}"
-        if key in out and out[key].get("n", 0) >= min(a.n_rows, len(rows)) and not a.force: continue
-        if key in pending_keys and not a.force: continue
-        rows = sorted(rows)[: a.n_rows]
+        key = f"{label}:{step}"; rows = sorted(rows)[: a.n_rows]
+        if a.retry_failed:
+            if key not in out: continue
+            failed = set(out[key].get("failed_rows", [])); rows = [(i, z) for i, z in rows if i in failed and i not in pending_rows.get(key, set())]
+        else:
+            done = set(int(r) for r in out.get(key, {}).get("per_row", {})) | pending_rows.get(key, set())
+            if not a.force: rows = [(i, z) for i, z in rows if i not in done]
+        if not rows: continue
         for i, z in rows:
             c = f"r{cid}"; cid += 1
             pend["map"][c] = {"key": key, "row": i}
             reqs.append({"custom_id": c, "params": {"model": MODEL, "max_tokens": a.max_tokens,
                                                     "system": [{"type": "text", "text": SYS, "cache_control": {"type": "ephemeral"}}],
                                                     "messages": [{"role": "user", "content": user_msg(srcs[i], z, a.src_chars)}]}})
-        print(f"[judge-batch] {key}: {len(rows)} rows queued", flush=True)
+        print(f"[judge-batch] {key}: {len(rows)} rows queued{' (retry)' if a.retry_failed else ''}", flush=True)
     if not reqs: print("[judge-batch] nothing to submit"); return
     if a.dry_run: print(f"[judge-batch] DRY RUN: {len(reqs)} requests, ~{sum(len(json.dumps(r)) for r in reqs)/1e6:.1f} MB"); return
     cl = client()
@@ -123,44 +130,51 @@ def collect(a):
     pend_path = a.out + ".pending.json"
     if not os.path.exists(pend_path): print("[judge-batch] no pending batches"); return
     pend = json.load(open(pend_path)); cl = client()
-    per_key: dict[str, dict[int, dict]] = {}
-    remaining = []
+    new_rows: dict[str, dict[int, dict]] = {}; failed: dict[str, set] = {}; touched = set(); done_ids = set()
     for b in pend["batches"]:
         while True:
             mb = cl.messages.batches.retrieve(b["id"])
             if mb.processing_status == "ended": break
             c = mb.request_counts; print(f"[judge-batch] {b['id']}: {mb.processing_status} succeeded {c.succeeded} errored {c.errored} processing {c.processing}", flush=True)
-            if not a.wait: remaining.append(b); break
+            if not a.wait: break
             time.sleep(a.poll)
         if mb.processing_status != "ended": continue
-        n_ok = n_fail = 0
+        done_ids.add(b["id"]); n_ok = n_fail = 0; stops = {}
         for res in cl.messages.batches.results(b["id"]):
             m = pend["map"].get(res.custom_id)
             if m is None: continue
+            touched.add(m["key"])
             if res.result.type == "succeeded":
-                txt = "".join(bl.text for bl in res.result.message.content if getattr(bl, "type", None) == "text"); p = parse(txt)
-                if p: per_key.setdefault(m["key"], {})[m["row"]] = p; n_ok += 1
-                else: n_fail += 1
-            else: n_fail += 1
-        print(f"[judge-batch] {b['id']} ended: parsed {n_ok}, failed {n_fail}", flush=True)
-    for key, rows in per_key.items():
-        recs = list(rows.values()); agg = aggregate(recs); agg.update({"model": MODEL, "judged_at": time.strftime("%Y-%m-%d %H:%M")})
-        agg["examples"] = [{"row": r, "claims": [c for c in rows[r]["claims"] if c["verdict"] != "supported"][:4]} for r in sorted(rows)[:12] if any(c["verdict"] != "supported" for c in rows[r]["claims"])][:6]
-        agg["per_row"] = {str(r): {"bad": sum(c["verdict"] != "supported" for c in rows[r]["claims"]), "sup": sum(c["verdict"] == "supported" for c in rows[r]["claims"]), "h": rows[r]["h"], "inf": rows[r]["inf"]} for r in rows}
+                msg = res.result.message; stops[msg.stop_reason] = stops.get(msg.stop_reason, 0) + 1
+                txt = "".join(bl.text for bl in msg.content if getattr(bl, "type", None) == "text"); p = parse(txt) if msg.stop_reason != "max_tokens" else None
+                if p: new_rows.setdefault(m["key"], {})[m["row"]] = p; n_ok += 1
+                else: failed.setdefault(m["key"], set()).add(m["row"]); n_fail += 1
+            else: failed.setdefault(m["key"], set()).add(m["row"]); n_fail += 1; stops["ERR:" + res.result.type] = stops.get("ERR:" + res.result.type, 0) + 1
+        print(f"[judge-batch] {b['id']} ended: parsed {n_ok}, failed {n_fail}, stop reasons {stops}", flush=True)
+    for key in touched:
+        rec = out.get(key, {}); per_row = {int(r): v for r, v in rec.get("per_row", {}).items() if v.get("claims") is not None}
+        per_row.update(new_rows.get(key, {}))
+        still_failed = sorted((set(rec.get("failed_rows", [])) | failed.get(key, set())) - set(per_row))
+        agg = aggregate(list(per_row.values())); agg.update({"model": MODEL, "judged_at": time.strftime("%Y-%m-%d %H:%M"), "failed_rows": still_failed,
+                                                             "per_row": {str(r): v for r, v in sorted(per_row.items())}})
+        agg["examples"] = [{"row": r, "claims": [c for c in per_row[r]["claims"] if c["verdict"] != "supported"][:4]} for r in sorted(per_row)[:12] if any(c["verdict"] != "supported" for c in per_row[r]["claims"])][:6]
         out[key] = agg
-        print(f"[judge-batch] {key}: n {agg['n']} | bad/expl {agg['bad_per_expl']:.2f} (unsup {agg['unsupported_per_expl']:.2f}, contra {agg['contradicted_per_expl']:.2f}) | any-bad {100*agg['frac_any_bad']:.0f}% | supported/expl {agg['supported_per_expl']:.2f} | precision {agg['claim_precision']:.2f} | H {agg['hallucination_1_10']:.2f} I {agg['informativeness_1_10']:.2f}", flush=True)
+        if agg["n"]: print(f"[judge-batch] {key}: n {agg['n']} (+{len(still_failed)} failed) | bad/expl {agg['bad_per_expl']:.2f} (unsup {agg['unsupported_per_expl']:.2f}, contra {agg['contradicted_per_expl']:.2f}) | any-bad {100*agg['frac_any_bad']:.0f}% | supported/expl {agg['supported_per_expl']:.2f} | precision {agg['claim_precision']:.2f} | H {agg['hallucination_1_10']:.2f} I {agg['informativeness_1_10']:.2f}", flush=True)
     json.dump(out, open(a.out, "w"), indent=1)
-    done_ids = set(b["id"] for b in pend["batches"]) - set(b["id"] for b in remaining)
-    pend["batches"] = remaining; pend["map"] = {c: m for c, m in pend["map"].items() if m["key"] not in per_key} if remaining else {}
+    pend["batches"] = [b for b in pend["batches"] if b["id"] not in done_ids]
+    remaining_ids = set(b["id"] for b in pend["batches"])
+    if remaining_ids:   # keep map entries only if some batch is still pending (we cannot tell which batch a custom id belongs to, so keep all)
+        pass
+    else: pend["map"] = {}
     json.dump(pend, open(pend_path, "w"))
-    print(f"[judge-batch] wrote {a.out}; {len(remaining)} batches still pending", flush=True)
+    print(f"[judge-batch] wrote {a.out}; {len(pend['batches'])} batches still pending; failed rows to retry: {sum(len(v.get('failed_rows', [])) for v in out.values())}", flush=True)
 
 
 def main():
     p = argparse.ArgumentParser(); sp = p.add_subparsers(dest="cmd", required=True)
     s = sp.add_parser("submit"); s.add_argument("--dumps", nargs="+", required=True); s.add_argument("--val-parquet", required=True); s.add_argument("--out", required=True)
-    s.add_argument("--n-rows", type=int, default=10 ** 6); s.add_argument("--src-chars", type=int, default=3500); s.add_argument("--max-tokens", type=int, default=900)
-    s.add_argument("--chunk", type=int, default=10000); s.add_argument("--force", action="store_true"); s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--n-rows", type=int, default=10 ** 6); s.add_argument("--src-chars", type=int, default=8000); s.add_argument("--max-tokens", type=int, default=2500)
+    s.add_argument("--chunk", type=int, default=10000); s.add_argument("--force", action="store_true"); s.add_argument("--dry-run", action="store_true"); s.add_argument("--retry-failed", action="store_true")
     c = sp.add_parser("collect"); c.add_argument("--out", required=True); c.add_argument("--wait", action="store_true"); c.add_argument("--poll", type=int, default=120)
     a = p.parse_args(); submit(a) if a.cmd == "submit" else collect(a)
 
