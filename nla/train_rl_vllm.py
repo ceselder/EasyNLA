@@ -1357,7 +1357,7 @@ def grpo_update_microbatched(
     _pc_pol = _pc_ref = None
     if prefix is not None:   # --prefix-cache: the shared prompt prefix ONCE per step — policy with grad (graph retained across micro-batches), reference without
         vectors_ref[0] = None
-        _pc_pol = prefix.run_prefix(actor, reference=False); _pc_ref = prefix.run_prefix(actor, reference=True)
+        _pc_pol = prefix.run_prefix(actor, reference=False); _pc_ref = prefix.run_prefix(actor, reference=True) if kl_beta > 0 else None
     sample_losses_log = []
     sample_kls_log = []
     sample_entropy_log = []   # mean per-token policy entropy over response tokens (nats)
@@ -1405,13 +1405,14 @@ def grpo_update_microbatched(
         # k3-only: 'dist' needs the full logits for its top-k, so it's rejected below.
         _base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
         lm_w = _base.lm_head.weight                                            # [V, d], frozen
+        _need_ref = kl_beta > 0   # kl_beta 0: the reference forward is a third of the update's compute and its result is unused
         if prefix is None:
             new_hidden = _base.model(input_ids=batch_ids, attention_mask=attn).last_hidden_state  # [B,L,d]
             with torch.no_grad():
-                ref_hidden = _reference_hidden(actor, batch_ids, attn)             # [B,L,d]
+                ref_hidden = _reference_hidden(actor, batch_ids, attn) if _need_ref else None   # [B,L,d]
         else:
             new_hidden = prefix.suffix_hidden(actor, _pc_pol, batch_ids, attn, reference=False)   # [B,L_suffix,d]
-            ref_hidden = prefix.suffix_hidden(actor, _pc_ref, batch_ids, attn, reference=True)
+            ref_hidden = prefix.suffix_hidden(actor, _pc_ref, batch_ids, attn, reference=True) if _need_ref else None
         if kl_estimator == "dist":
             raise NotImplementedError(
                 "kl_estimator='dist' needs full-vocab logits (truncated_dist_kl); the "
@@ -1431,10 +1432,13 @@ def grpo_update_microbatched(
             new_lp, lse, ent_mean = chunked_response_logp(resp_hidden, lm_w, target_ids)
             sample_entropy_log.append(float(ent_mean))
             # reference: chunked logp at response tokens (frozen SFT, detached, no grad)
-            with torch.no_grad():
-                ref_resp_hidden = ref_hidden[row].index_select(0, pred_idx)
-                ref_lp, _, _ = chunked_response_logp(ref_resp_hidden, lm_w, target_ids)
-                ref_lp = ref_lp.detach()
+            if ref_hidden is None:
+                ref_lp = new_lp.detach()                                       # kl_beta 0 -> KL term identically 0
+            else:
+                with torch.no_grad():
+                    ref_resp_hidden = ref_hidden[row].index_select(0, pred_idx)
+                    ref_lp, _, _ = chunked_response_logp(ref_resp_hidden, lm_w, target_ids)
+                    ref_lp = ref_lp.detach()
             # on-policy: no ratio, single GPU0 pass = new_lp
             if new_lp.numel() == 0:
                 continue
