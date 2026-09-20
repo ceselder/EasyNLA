@@ -203,7 +203,8 @@ def main():
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024); p.add_argument("--chunk-queries", type=int, default=0, help="Flamingo-style per-slice queries: split the block hidden state into this many chunks, each attends over the explanation tokens (0 = pooled slots)")
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
-    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar", "tokens_base"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
+    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar", "tokens_base", "trunk"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
+    p.add_argument("--trunk-dir", default=None, help="trunk mode: LM dir whose layers 0..--enc-layer become the denoiser (default: --ar-ckpt, the AR-SFT-merged trunk)"); p.add_argument("--trunk-act-tokens", type=int, default=4); p.add_argument("--trunk-fresh-every", type=int, default=4, help="trunk mode: a fresh bidirectional attention block after every N-th trunk layer (+ the last)"); p.add_argument("--trunk-fresh-heads", type=int, default=8); p.add_argument("--trunk-fresh-dhead", type=int, default=128)
     p.add_argument("--neg-frac", type=float, default=0.0, help="contrastive hard negatives: fraction of the batch that also gets a same-text-one-specific-changed negative (number perturbed / entity swapped); hinge on the paired FM-loss gap")
     p.add_argument("--group-contrast", type=int, default=0, help="same-document InfoNCE: number of document groups per step (0 = off); the G activations of one document are each other's hard negatives")
     p.add_argument("--group-size", type=int, default=8); p.add_argument("--group-tau", type=float, default=0.02, help="temperature on the per-dim FM loss: logits = -loss / tau"); p.add_argument("--group-lambda", type=float, default=1.0)
@@ -215,6 +216,8 @@ def main():
     if ddp: dist.init_process_group("nccl"); rank, world = dist.get_rank(), dist.get_world_size(); dev = torch.device("cuda", int(os.environ["LOCAL_RANK"])); torch.cuda.set_device(dev)
     else: rank, world, dev = 0, 1, "cuda"
     assert not ddp or a.unfreeze_prior, "multi-rank train_cond without --unfreeze-prior has no gradient sync (adapters/encoder would drift per rank)"
+    assert not (ddp and a.cond_mode == "trunk"), "--cond-mode trunk is single-GPU (the 27B trunk is the denoiser; no gradient sync implemented)"
+    assert not (a.unfreeze_prior and a.cond_mode == "trunk"), "--cond-mode trunk keeps the prior frozen (its velocity is the residual base)"
     is0 = rank == 0
     norm = Normalizer.load(a.stats).to(dev)
     m = torch.load(os.path.join(a.prior, "model.pt"), map_location="cpu"); cfg = m["args"]
@@ -249,7 +252,13 @@ def main():
         if is0: print(f"[cond] resumed AR encoder from step {st_.get('step')}", flush=True)
     def _load_adapter(model_):
         if not a.resume_from: return
-        ad_ = torch.load(os.path.join(a.resume_from, "adapter_latest.pt"), map_location="cpu"); res_ = model_.load_state_dict(ad_["adapter"], strict=False)
+        ad_ = torch.load(os.path.join(a.resume_from, "adapter_latest.pt"), map_location="cpu")
+        if a.cond_mode == "trunk":
+            n_ = model_.load_adapter_state_dict(ad_["adapter"]); lp_ = os.path.join(a.resume_from, "ar_encoder_latest.pt")
+            if os.path.exists(lp_): st_ = torch.load(lp_, map_location="cpu"); model_.load_lora_state_dict(st_["lora"])
+            if is0: print(f"[cond] resumed trunk adapter from step {ad_.get('step')} ({n_} tensors; trunk LoRA {'loaded' if os.path.exists(lp_) else 'MISSING'})", flush=True)
+            return
+        res_ = model_.load_state_dict(ad_["adapter"], strict=False)
         assert not res_.unexpected_keys, res_.unexpected_keys[:5]
         if is0: print(f"[cond] resumed adapter from step {ad_.get('step')} ({len(ad_['adapter'])} tensors)", flush=True)
     d_cvec = 2 * d_enc if a.cond_mode in ("ar_vec", "both") else 0
@@ -278,7 +287,13 @@ def main():
         fully_shard(model, mp_policy=mp)
     else:
         prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)                       # frozen prior in bf16
-        model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens, d_c=a.d_c, enc_self_layers=a.enc_self_layers, enc_self_dim=a.enc_self_dim, chunk_queries=a.chunk_queries).to(dev)
+        if a.cond_mode == "trunk":
+            # the LM trunk itself is the conditional denoiser (LoRA + fresh bidirectional blocks + activation tokens); v = prior + zero-init readout
+            from nla.flow.trunk_denoiser import TrunkDenoiser
+            model = TrunkDenoiser(prior, a.trunk_dir or a.ar_ckpt, tok, dev, enc_layer=a.enc_layer, n_act_tokens=a.trunk_act_tokens, fresh_every=a.trunk_fresh_every,
+                                  fresh_heads=a.trunk_fresh_heads, fresh_dhead=a.trunk_fresh_dhead, grad_ckpt=True)
+        else:
+            model = CondDenoiser(prior, d_enc, a.n_slots, a.n_heads, a.d_head, a.gate_rank, d_cvec=d_cvec, use_tokens=use_tokens, d_c=a.d_c, enc_self_layers=a.enc_self_layers, enc_self_dim=a.enc_self_dim, chunk_queries=a.chunk_queries).to(dev)
         _load_adapter(model)
         for m_ in model.adapter_modules(): m_.float()                                            # adapter in fp32
     n_ad = model.n_adapter_params()
@@ -311,6 +326,11 @@ def main():
     groups = [{"params": list(model.adapter_parameters()), "lr": a.lr, "base_lr": a.lr}]
     if a.unfreeze_prior: groups.append({"params": [p_ for p_ in model.parameters() if id(p_) not in adapter_ids], "lr": a.prior_lr, "base_lr": a.prior_lr})
     if arvec is not None and arvec.trainable_parameters(): groups.append({"params": arvec.trainable_parameters(), "lr": a.ar_lr, "base_lr": a.ar_lr})
+    if a.cond_mode == "trunk":
+        if a.ar_lr > 0: groups.append({"params": model.lora_parameters(), "lr": a.ar_lr, "base_lr": a.ar_lr})
+        else:
+            for p_ in model.lora_parameters(): p_.requires_grad_(False)
+        if is0: print(f"[cond] trunk LoRA params: {sum(p_.numel() for p_ in model.lora_parameters())/1e6:.1f}M at lr {a.ar_lr}", flush=True)
     if is0 and arvec is not None: print(f"[cond] AR encoder trainable params: {sum(p_.numel() for p_ in arvec.trainable_parameters())/1e6:.1f}M (LoRA + value head)", flush=True)
     opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.0)
     trainable = [p_ for g_ in groups for p_ in g_["params"]]
@@ -324,6 +344,8 @@ def main():
         """-> (token states or None, mask or None, cvec or None). cvec is computed WITH grad when grad=True (training), else without.
         With --resid-shift the standardised AR prediction of the batch is left in enc_batch.shift (None otherwise)."""
         enc_batch.shift = None
+        if a.cond_mode == "trunk":
+            ids_, mk_ = model.tokenize(zs); return ids_, mk_, None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if a.cond_mode in ("tokens_ar", "tokens_base"):
                 if grad and arvec.trainable: e, mk = arvec.tokens(zs)
@@ -506,7 +528,7 @@ def main():
                 g_ = torch.nn.utils.clip_grad_norm_(grp, 1.0); g_ = g_.full_tensor() if hasattr(g_, "full_tensor") else g_; gn2 += float(g_) ** 2
         gn = torch.tensor(gn2 ** 0.5); opt.step()
         if step % 50 == 0 and is0:
-            print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step", flush=True)
+            print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step | peak mem {torch.cuda.max_memory_allocated()/2**30:.0f} GiB", flush=True)
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats}, step=step)
             if gstats and is0: print(f"  [samedoc] ce {gstats['train/samedoc_ce']:.3f} acc row {100*gstats['train/samedoc_acc_row']:.0f}% col {100*gstats['train/samedoc_acc_col']:.0f}% (chance {100/a.group_size:.0f}%)", flush=True)
             if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
@@ -520,6 +542,9 @@ def main():
                 if is0:
                     torch.save({"adapter": {k: v for k, v in full.items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
                     torch.save({"model": {k[len("prior."):]: v.to(torch.bfloat16) for k, v in full.items() if k.startswith("prior.")}, "args": cfg, "step": step, "cotrained_with": a.tag}, os.path.join(a.out, "prior_cotrained_latest.pt"))
+            elif is0 and a.cond_mode == "trunk":
+                torch.save({"adapter": model.adapter_state_dict(), "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
+                torch.save({"lora": model.lora_state_dict(), "step": step}, os.path.join(a.out, "ar_encoder_latest.pt"))
             elif is0:
                 torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
             if arvec is not None and is0:

@@ -19,6 +19,21 @@ class FlowBundle:
         prior = prior.to_empty(device=dev).to(torch.bfloat16); prior.load_state_dict(sd, strict=True); prior.requires_grad_(False)
         ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]; self.aa = aa; self.d = cfg["d_input"]
         self.cond_mode = aa.get("cond_mode", "tokens")
+        if self.cond_mode == "trunk":
+            # whole-trunk denoiser: the LM trunk (LoRA + fresh bidirectional blocks) IS the conditional velocity field; adapter + trunk LoRA from the run dir
+            from transformers import AutoTokenizer
+            from nla.flow.trunk_denoiser import TrunkDenoiser
+            src = aa.get("trunk_dir") or aa.get("ar_ckpt", ar_ckpt)
+            tok = AutoTokenizer.from_pretrained(src); tok.padding_side = "right"
+            if tok.pad_token_id is None: tok.pad_token = tok.eos_token
+            self.model = TrunkDenoiser(prior, src, tok, dev, enc_layer=aa.get("enc_layer", enc_layer), n_act_tokens=aa.get("trunk_act_tokens", 4), fresh_every=aa.get("trunk_fresh_every", 4),
+                                       fresh_heads=aa.get("trunk_fresh_heads", 8), fresh_dhead=aa.get("trunk_fresh_dhead", 128), grad_ckpt=True)   # ckpt on: exact log p backprops through the trunk
+            n_ad = self.model.load_adapter_state_dict(ad["adapter"])
+            st_path = os.path.join(os.path.dirname(adapter_path), "ar_encoder_latest.pt"); n_lora = 0
+            if os.path.exists(st_path): n_lora = self.model.load_lora_state_dict(torch.load(st_path, map_location="cpu")["lora"])
+            self.model.eval(); self.model.requires_grad_(False)
+            self.encode = None; self.arvec = None; self.use_enc = self.use_vec = False
+            print(f"[scoring] frozen whole-trunk flow: adapter step {ad.get('step')} ({n_ad} adapter tensors, {n_lora} LoRA tensors) from {adapter_path}", flush=True); return
         use_tokens = self.cond_mode in ("tokens", "both", "tokens_ar", "tokens_base")     # cross-reads present in the adapter
         use_vec = self.cond_mode in ("ar_vec", "both")                                    # pooled AR vector present
         use_enc = self.cond_mode in ("tokens_ar", "tokens_base")                          # token states come from an ARVecEncoder trunk (LoRA-tuned or frozen)
@@ -60,6 +75,8 @@ class FlowBundle:
         """-> (enc, mask, cvec); with a --resid-shift adapter the standardised AR prediction is left in self.last_shift (else None):
         score x0 - shift under the conditional model, x0 under the prior (unit Jacobian, so log p(h|z) - log p(h) is unchanged in form)."""
         enc = mk = cvec = None; self.last_shift = None
+        if self.cond_mode == "trunk":
+            enc, mk = self.model.tokenize(texts); return enc, mk, None                        # token ids + mask; the trunk runs inside the model
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if self.encode is not None: enc, mk = self.encode(texts)
             if self.use_enc: enc, mk = self.arvec.tokens(texts)
