@@ -1332,7 +1332,7 @@ def grpo_update_microbatched(
     dp_world_size=1, kl_estimator="k3", kl_topk=64, n_total=None,
     length_normalizer=None,
     old_logps_list=None, sampler_mismatch_thresh=0.0,
-    sample_normalizers=None, loss_mode="reinforce", cispo_eps_max=5.0, ppo_clip=0.2, sort_by_length=True,
+    sample_normalizers=None, loss_mode="reinforce", cispo_eps_max=5.0, ppo_clip=0.2, sort_by_length=True, prefix=None,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
 
@@ -1354,6 +1354,10 @@ def grpo_update_microbatched(
     if zero_grad_first:
         optim.zero_grad()
     n = len(full_ids_list)
+    _pc_pol = _pc_ref = None
+    if prefix is not None:   # --prefix-cache: the shared prompt prefix ONCE per step — policy with grad (graph retained across micro-batches), reference without
+        vectors_ref[0] = None
+        _pc_pol = prefix.run_prefix(actor, reference=False); _pc_ref = prefix.run_prefix(actor, reference=True)
     sample_losses_log = []
     sample_kls_log = []
     sample_entropy_log = []   # mean per-token policy entropy over response tokens (nats)
@@ -1370,14 +1374,19 @@ def grpo_update_microbatched(
     for cs in range(0, n, micro_batch):
         idxs = _order[cs: cs + micro_batch]
         bs = len(idxs)
-        max_len = max(full_ids_list[i].numel() for i in idxs)
-        pad_id = tokenizer.eos_token_id
-        batch_ids = torch.full((bs, max_len), pad_id, dtype=torch.long, device=device)
-        attn = torch.zeros((bs, max_len), dtype=torch.long, device=device)
-        for row, i in enumerate(idxs):
-            L = full_ids_list[i].numel()
-            batch_ids[row, :L] = full_ids_list[i].to(device)
-            attn[row, :L] = 1
+        off = prefix.P if prefix is not None else 0   # prefix-cache: batch_ids hold the SUFFIX (left neighbour + marker + tail + response)
+        if prefix is not None:
+            for i in idxs: assert prefix.matches(full_ids_list[i]), f"rollout {i}: prompt prefix differs from the cached prefix"
+            batch_ids, attn, max_len = prefix.pad_suffixes([full_ids_list[i][off:] for i in idxs])
+        else:
+            max_len = max(full_ids_list[i].numel() for i in idxs)
+            pad_id = tokenizer.eos_token_id
+            batch_ids = torch.full((bs, max_len), pad_id, dtype=torch.long, device=device)
+            attn = torch.zeros((bs, max_len), dtype=torch.long, device=device)
+            for row, i in enumerate(idxs):
+                L = full_ids_list[i].numel()
+                batch_ids[row, :L] = full_ids_list[i].to(device)
+                attn[row, :L] = 1
         v_batch = torch.stack(
             [activations[i].to(device).float() for i in idxs], dim=0,
         )
@@ -1396,9 +1405,13 @@ def grpo_update_microbatched(
         # k3-only: 'dist' needs the full logits for its top-k, so it's rejected below.
         _base = actor.get_base_model() if hasattr(actor, "get_base_model") else actor
         lm_w = _base.lm_head.weight                                            # [V, d], frozen
-        new_hidden = _base.model(input_ids=batch_ids, attention_mask=attn).last_hidden_state  # [B,L,d]
-        with torch.no_grad():
-            ref_hidden = _reference_hidden(actor, batch_ids, attn)             # [B,L,d]
+        if prefix is None:
+            new_hidden = _base.model(input_ids=batch_ids, attention_mask=attn).last_hidden_state  # [B,L,d]
+            with torch.no_grad():
+                ref_hidden = _reference_hidden(actor, batch_ids, attn)             # [B,L,d]
+        else:
+            new_hidden = prefix.suffix_hidden(actor, _pc_pol, batch_ids, attn, reference=False)   # [B,L_suffix,d]
+            ref_hidden = prefix.suffix_hidden(actor, _pc_ref, batch_ids, attn, reference=True)
         if kl_estimator == "dist":
             raise NotImplementedError(
                 "kl_estimator='dist' needs full-vocab logits (truncated_dist_kl); the "
@@ -1411,8 +1424,8 @@ def grpo_update_microbatched(
             p_len = prompt_lens[i]
             if L <= p_len:
                 continue
-            target_ids = batch_ids[row, p_len:L]
-            pred_idx = torch.arange(p_len - 1, L - 1, device=device)
+            target_ids = batch_ids[row, p_len - off:L - off]
+            pred_idx = torch.arange(p_len - off - 1, L - off - 1, device=device)
             # policy: chunked logp at response tokens (grad -> hidden -> LoRA) + entropy (no grad)
             resp_hidden = new_hidden[row].index_select(0, pred_idx)            # [n_resp, d]
             new_lp, lse, ent_mean = chunked_response_logp(resp_hidden, lm_w, target_ids)
@@ -1467,10 +1480,12 @@ def grpo_update_microbatched(
         # weights failure-heavy ranks' samples more).
         denom = n_total if n_total is not None else n
         chunk_loss = torch.stack(chunk_losses).sum() / denom * loss_scale
-        chunk_loss.backward()
+        chunk_loss.backward(retain_graph=(prefix is not None and cs + micro_batch < n))   # prefix graph is shared by every micro-batch of the step
         vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
         sample_losses_log.append(chunk_loss.item() * denom / len(chunk_losses) / loss_scale)
         del new_hidden
+    if prefix is not None:
+        del _pc_pol, _pc_ref
     if do_step:
         _trainable = [p for n, p in actor.named_parameters() if p.requires_grad and ".ar_critic." not in n and ".ar_sft." not in n]
         # DP: average grads across ranks BEFORE clip+step so every rank clips the
@@ -1799,6 +1814,7 @@ def main():
     p.add_argument("--vllm-on-flow-gpu", action="store_true", help="place the vLLM engine on the critic GPU (--flow-device cuda:1) instead of the policy GPU (= --vllm-gpu-index 1)")
     p.add_argument("--vllm-gpu-index", type=int, default=None, help="which GPU of the rank's slice hosts the vLLM engine (default 0 = the policy GPU)")
     p.add_argument("--flow-enc-device", default="", help="device for the flow critic's 27B token ENCODER (default = --flow-device). Async layout: --flow-device cuda:0 --flow-enc-device cuda:1 --vllm-gpu-index 1 puts the 13.7B denoiser next to the policy and the encoder next to the engine")
+    p.add_argument("--prefix-cache", action="store_true", help="run the shared AV prompt prefix once per step and only [left neighbour, marker, tail, response] per rollout (MAEMM prefix cache; needs the ceselder/transformers@maemm-prefix-cache fork and --no-gradient-checkpointing)")
     p.add_argument("--no-gradient-checkpointing", action="store_true", help="override a config's gradient_checkpointing: true (the policy GPU has room once vLLM moved off it); on OOM the GRPO update falls back to checkpointing for the rest of the run")
     p.add_argument("--no-sort-microbatches", action="store_true", help="keep the original (unsorted) GRPO micro-batch order; default sorts rollouts by length to cut padding")
     p.add_argument("--adv-mode", choices=["group", "none", "batch"], default=None,
@@ -2671,6 +2687,17 @@ def main():
         print(f"[data] fast-forwarded cursor through {args.start_step} steps "
               f"(cursor={cursor})", flush=True)
 
+    _prefix_cache = None
+    if args.prefix_cache:
+        from nla.rl_prefix import GRPOPrefixCache
+        from nla.utils.vllm_steer import find_marker_pos as _fmp
+        assert not args.gradient_checkpointing, "--prefix-cache needs --no-gradient-checkpointing (HF drops the cache under checkpointing)"
+        _ptxt0 = build_prompt_text(rows[0]["prompt"], inject_char, tokenizer); _pids = tokenizer.encode(_ptxt0, add_special_tokens=False)
+        _mp = _fmp(_pids, inj_id, left_id, right_id); _P = _mp - 1
+        _stride = max(1, len(rows) // 300)
+        assert all(build_prompt_text(rows[i]["prompt"], inject_char, tokenizer) == _ptxt0 for i in range(0, len(rows), _stride)), "--prefix-cache: the prompt is not identical across rows"
+        _prefix_cache = GRPOPrefixCache(_pids[:_P], tokenizer.eos_token_id, device)
+        print(f"[prefix-cache] shared prefix = {_P} of {len(_pids)} prompt tokens (marker at {_mp}); per rollout only left neighbour + marker + tail + response is processed", flush=True)
     prev_preemptions = 0  # cumulative vLLM preemptions seen at last step (KV thrash tracker)
     _async = bool(args.async_gen); pending = None; bg_wait_s = 0.0
     if _async:
@@ -3192,13 +3219,15 @@ def main():
             old_logps_list=upd_old_logps,
             sampler_mismatch_thresh=args.sampler_mismatch_thresh,
             sample_normalizers=([_sample_norm[i] for i in keep] if _sample_norm is not None else None),
-            loss_mode=args.loss, cispo_eps_max=args.cispo_eps_max, ppo_clip=args.ppo_clip, sort_by_length=not args.no_sort_microbatches,
+            loss_mode=args.loss, cispo_eps_max=args.cispo_eps_max, ppo_clip=args.ppo_clip, sort_by_length=not args.no_sort_microbatches, prefix=_prefix_cache,
             )
             break
           except torch.OutOfMemoryError:
             # fallback ladder: (1) turn gradient checkpointing on, (2) halve the micro-batch; grads from the failed attempt are discarded
             vectors_ref[0] = None; optim.zero_grad(set_to_none=True); torch.cuda.empty_cache()
-            if not args.gradient_checkpointing:
+            if _prefix_cache is not None:
+                _prefix_cache = None; print(f"step {step}: GRPO OOM -> prefix cache OFF for the rest of the run", flush=True)
+            elif not args.gradient_checkpointing:
                 args.gradient_checkpointing = True; actor.gradient_checkpointing_enable()
                 _inner = actor.base_model.model if hasattr(actor, "base_model") else actor
                 if hasattr(_inner, "gradient_checkpointing_enable"): _inner.gradient_checkpointing_enable()

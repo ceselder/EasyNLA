@@ -46,7 +46,7 @@ image = (
     # B200 for Qwen3.6-27B in July; Qwen3-8B uses the same stack.
     .run_commands(
         "uv pip install --system --python $(which python) "
-        "'vllm==0.21.0' " + LENS_PKG + " 'transformers==5.5.4' "
+        "'vllm==0.21.0' " + LENS_PKG + " " + ("'transformers @ git+https://github.com/ceselder/transformers@maemm-prefix-cache'" if os.environ.get("NLA_PREFIX_CACHE") == "1" else "'transformers==5.5.4'") + " "
         "peft bitsandbytes wandb accelerate datasets pyarrow pandas numpy "
         "anthropic openai 'huggingface_hub[hf_xet]' safetensors sentencepiece "
         "protobuf pyyaml orjson httpx tqdm flash-linear-attention scipy"
