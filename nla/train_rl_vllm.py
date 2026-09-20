@@ -2677,6 +2677,20 @@ def main():
         assert args.grad_accum <= 1, "--async-gen assumes no gradient accumulation"
         assert args.flow_cotrain == "grounded", "--async-gen: critic co-training must be --flow-cotrain grounded (independent of the rollouts)"
         tok_bg = copy.deepcopy(tokenizer)   # the generation thread gets its own tokenizer (HF fast tokenizers are not thread-safe)
+        # Triton's Autotuner keeps per-call state on the kernel object (self.nargs) and is NOT thread-safe: the encoder/critic forward in the
+        # background thread and the policy forward in the main thread share the same fla / conv kernels -> "'NoneType' object is not a mapping".
+        # Serialize each autotuned kernel's Python-side launch with a per-kernel lock (launches are asynchronous, so the GPUs still overlap).
+        try:
+            import triton.runtime.autotuner as _ta
+            if not getattr(_ta.Autotuner, "_nla_locked", False):
+                _orig_run = _ta.Autotuner.run
+                def _locked_run(self, *a, **k):
+                    lk = self.__dict__.get("_nla_lock")
+                    if lk is None: lk = self.__dict__["_nla_lock"] = threading.RLock()
+                    with lk: return _orig_run(self, *a, **k)
+                _ta.Autotuner.run = _locked_run; _ta.Autotuner._nla_locked = True
+                print("[async-gen] Triton Autotuner.run made thread-safe (per-kernel lock)", flush=True)
+        except Exception as _e: print(f"[async-gen] WARNING: could not lock Triton autotuner: {_e}", flush=True)
 
         class _BgJob:
             def __init__(self, fn):
