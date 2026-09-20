@@ -33,7 +33,7 @@ HF_CACHE = "/vol/hf_cache"
 # NLA_LENS=metamodel -> ceselder/vllm-metamodel (vllm-lens fork: indexed hook, CUDA graphs
 # after prefill, 3-40x faster rollouts); default = upstream vllm-lens 1.1.0 + repo patch.
 LENS = os.environ.get("NLA_LENS", "metamodel")   # default since 2026-09-03 11:00 (validated)
-LENS_PKG = ("'vllm-lens @ git+https://github.com/ceselder/vllm-metamodel'" if LENS == "metamodel"
+LENS_PKG = ("'vllm-lens @ git+https://github.com/ceselder/vllm-metamodel@bd6a5b8f66f48add68ae37af46ee840eba82d389'" if LENS == "metamodel"
             else "'vllm-lens==1.1.0'")
 
 image = (
