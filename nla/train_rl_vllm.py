@@ -1799,6 +1799,7 @@ def main():
     p.add_argument("--vllm-on-flow-gpu", action="store_true", help="place the vLLM engine on the critic GPU (--flow-device cuda:1) instead of the policy GPU (= --vllm-gpu-index 1)")
     p.add_argument("--vllm-gpu-index", type=int, default=None, help="which GPU of the rank's slice hosts the vLLM engine (default 0 = the policy GPU)")
     p.add_argument("--flow-enc-device", default="", help="device for the flow critic's 27B token ENCODER (default = --flow-device). Async layout: --flow-device cuda:0 --flow-enc-device cuda:1 --vllm-gpu-index 1 puts the 13.7B denoiser next to the policy and the encoder next to the engine")
+    p.add_argument("--no-gradient-checkpointing", action="store_true", help="override a config's gradient_checkpointing: true (the policy GPU has room once vLLM moved off it); on OOM the GRPO update falls back to checkpointing for the rest of the run")
     p.add_argument("--no-sort-microbatches", action="store_true", help="keep the original (unsorted) GRPO micro-batch order; default sorts rollouts by length to cut padding")
     p.add_argument("--adv-mode", choices=["group", "none", "batch"], default=None,
                    help="group (DEFAULT) = GRPO per-group mean/std; none = Dr.GRPO centring only (== --dr-grpo); "
@@ -1897,6 +1898,7 @@ def main():
     apply_config_defaults(p)   # YAML (--config) -> argparse defaults; CLI still overrides
     args = p.parse_args()
 
+    if args.no_gradient_checkpointing: args.gradient_checkpointing = False
     if args.async_gen:
         args.sampler_mismatch_thresh = 0.0
         if args.loss == 'reinforce': args.loss = 'cispo'   # off-policy by one step -> the ScaleRL / maemm rl_disagg recipe: truncated-IS REINFORCE (CISPO), not PPO
@@ -3172,7 +3174,10 @@ def main():
         upd_old_logps = [all_old_logps[i] for i in keep]
         upd_adv = adv.index_select(0, torch.tensor(keep, device=device))
         actor.train()
-        mean_loss_val, grad_norm_val, grpo_metrics = grpo_update_microbatched(
+        _grpo_kwargs_common = None
+        for _attempt in range(3):
+          try:
+            mean_loss_val, grad_norm_val, grpo_metrics = grpo_update_microbatched(
             actor, optim, tokenizer,
             upd_full_ids, upd_prompt_lens, upd_activations,
             upd_adv, vectors_ref, device,
@@ -3188,7 +3193,20 @@ def main():
             sampler_mismatch_thresh=args.sampler_mismatch_thresh,
             sample_normalizers=([_sample_norm[i] for i in keep] if _sample_norm is not None else None),
             loss_mode=args.loss, cispo_eps_max=args.cispo_eps_max, ppo_clip=args.ppo_clip, sort_by_length=not args.no_sort_microbatches,
-        )
+            )
+            break
+          except torch.OutOfMemoryError:
+            # fallback ladder: (1) turn gradient checkpointing on, (2) halve the micro-batch; grads from the failed attempt are discarded
+            vectors_ref[0] = None; optim.zero_grad(set_to_none=True); torch.cuda.empty_cache()
+            if not args.gradient_checkpointing:
+                args.gradient_checkpointing = True; actor.gradient_checkpointing_enable()
+                _inner = actor.base_model.model if hasattr(actor, "base_model") else actor
+                if hasattr(_inner, "gradient_checkpointing_enable"): _inner.gradient_checkpointing_enable()
+                print(f"step {step}: GRPO OOM -> gradient checkpointing ON for the rest of the run (micro-batch {args.logp_micro_batch})", flush=True)
+            else:
+                args.logp_micro_batch = max(1, args.logp_micro_batch // 2)
+                print(f"step {step}: GRPO OOM -> micro-batch halved to {args.logp_micro_batch}", flush=True)
+            if _attempt == 2: raise
         t_grpo_end = time.time()  # [timing] end of GRPO forward+backward+step
         # Build a scalar-tensor stand-in for the existing logging path that
         # expects a `loss` tensor with .item().
