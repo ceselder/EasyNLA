@@ -570,12 +570,25 @@ def train_rl(tag: str, nproc: int = 4, model_tag: str = "qwen3_8b", extra: str =
     # IPC weight sync needs the legacy allocator (no expandable_segments).
     env = dict(os.environ)
     env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-    import subprocess
+    import subprocess, collections, re, time
     print("CMD:", " ".join(shlex.quote(c) for c in cmd), flush=True)
-    p = subprocess.run(cmd, cwd=REPO_REMOTE, env=env)
+    # Persist the trainer's own output on the volume (/vol/logs/rl/<tag>.log, progress bars stripped) — Modal only buffers the last
+    # ~100 log lines, so a traceback from a call that died an hour ago is otherwise unrecoverable; the failure message carries the tail.
+    log_dir = "/vol/logs/rl"; os.makedirs(log_dir, exist_ok=True); log_path = f"{log_dir}/{tag}.log"
+    bar = re.compile(r"Processed prompts|\d+%\|"); nccl_noise = re.compile(r"frame #\d|TCPStore|sendBytes|c10::|Exception raised from")
+    tail = collections.deque(maxlen=80)
+    with open(log_path, "a", buffering=1) as lf:
+        lf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} nproc={nproc} CMD: {' '.join(shlex.quote(c) for c in cmd)}\n")
+        proc = subprocess.Popen(cmd, cwd=REPO_REMOTE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1)
+        for line in proc.stdout:
+            sys.stdout.write(line); sys.stdout.flush()
+            if bar.search(line): continue
+            lf.write(line)
+            if not nccl_noise.search(line) and line.strip(): tail.append(line.rstrip("\n")[:300])
+        rc = proc.wait()
     vol.commit()
-    if p.returncode != 0:
-        raise SystemExit(f"rl exited {p.returncode}")
+    if rc != 0:
+        raise SystemExit(f"rl exited {rc}; full log {log_path}; tail:\n" + "\n".join(tail))
     return save_dir
 
 
