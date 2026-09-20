@@ -1897,9 +1897,9 @@ def main():
 
     if args.async_gen:
         args.sampler_mismatch_thresh = 0.0
-        if args.loss == 'reinforce': args.loss = 'ppo'
+        if args.loss == 'reinforce': args.loss = 'cispo'   # off-policy by one step -> the ScaleRL / maemm rl_disagg recipe: truncated-IS REINFORCE (CISPO), not PPO
         if args.flow_device and args.flow_device not in ('cuda', 'cuda:0'): args.vllm_on_flow_gpu = True
-        print(f'[async-gen] ON: loss={args.loss} (clip {args.ppo_clip}), sampler-mismatch masking off, vllm_on_flow_gpu={args.vllm_on_flow_gpu}', flush=True)
+        print(f'[async-gen] ON: loss={args.loss} (cispo eps_max {args.cispo_eps_max} / ppo clip {args.ppo_clip}), adv-mode {args.adv_mode}, loss-agg {args.loss_agg}, zero-var-filter {args.zero_var_filter}, sampler-mismatch masking off, vllm_on_flow_gpu={args.vllm_on_flow_gpu}', flush=True)
     # ---- fail-fast checks (BEFORE any model/engine loading) ----
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
