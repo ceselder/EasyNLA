@@ -347,7 +347,7 @@ def main():
         # hard-negative detection: same text with one specific changed; paired (same t, eps) per-row loss; P(neg loss > true loss)
         nrng = _random.Random(2); negs = [make_negative(z, nrng, zs) for z in zs]; rows_ = [i for i, (zn, _) in enumerate(negs) if zn is not None]
         if rows_:
-            wins = 0; tot = 0; gsum = 0.0; gn_ = torch.Generator(device=dev).manual_seed(3)
+            wins = 0; tot = 0; gsum = 0.0; kw = {}; gn_ = torch.Generator(device=dev).manual_seed(3)
             for t_val in (0.3, 0.5, 0.7):
                 eps = torch.randn(x0.shape, device=dev, generator=gn_); t = torch.full((n_ev,), t_val, device=dev)
                 for i in range(0, len(rows_), 64):
@@ -358,7 +358,9 @@ def main():
                             v = model((1 - t_val) * xs + t_val * eps[rr], t[rr], e, mk, cv)
                         lo.append(((v.float() - (eps[rr] - xs).float()) ** 2).mean(-1))
                     g_ = lo[1] - lo[0]; wins += (g_ > 0).sum().item(); tot += len(rr); gsum += g_.sum().item()
+                    for r_, w_ in zip(rr, (g_ > 0).tolist()): kw.setdefault(negs[r_][1], [0, 0]); kw[negs[r_][1]][0] += int(w_); kw[negs[r_][1]][1] += 1
             out["eval/neg_detect_acc"] = wins / tot; out["eval/neg_gap"] = gsum / tot; out["eval/neg_n"] = len(rows_)
+            for k_, (w_, n_) in kw.items(): out[f"eval/neg_detect_acc_{k_}"] = w_ / n_; out[f"eval/neg_n_{k_}"] = n_ // 3
         out["eval/gain_bits_per_dim"] = (out["eval/fm_uncond"] - out["eval/fm_cond"]) / (2 * math.log(2))   # ELBO-flavoured: 0.5*Δmse per dim in nats -> bits (uniform-t weighting)
         # conditional FVE: x0-prediction at high noise, x0_hat = x_t - t*v ; NLA convention: unit-L2 to sqrt(d), MSE, predict-mean baseline
         t_val = 0.9; eps = torch.randn(x0.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(7)); t = torch.full((n_ev,), t_val, device=dev)
@@ -407,7 +409,7 @@ def main():
                         f"{prefix}/exact_bits_per_dim_uncond": (-lp["uncond"].mean() / (d_ * math.log(2))).item(), f"{prefix}/exact_bits_per_dim_cond": (-lp["cond"].mean() / (d_ * math.log(2))).item()})
             if is0: print(f"  [exact@{step}] PMI {pmi.mean().item():.1f} bits (median {pmi.median().item():.1f}, sem {pmi.std().item() / math.sqrt(n_x):.1f}, {100 * (pmi > 0).float().mean().item():.0f}% positive) | shuffled z {pms.mean().item():.1f} bits | n {n_x}, {a.exact_steps} Heun steps", flush=True)
         if not is0: return out
-        if P + "/neg_detect_acc" in out and is0: print(f"  [{P}@{step}] hard-negative detection {100*out[P+'/neg_detect_acc']:.1f}% (gap {out[P+'/neg_gap']:.4f}, n {out[P+'/neg_n']})", flush=True)
+        if P + "/neg_detect_acc" in out and is0: print(f"  [{P}@{step}] hard-negative detection {100*out[P+'/neg_detect_acc']:.1f}% (gap {out[P+'/neg_gap']:.4f}, n {out[P+'/neg_n']}) | " + " ".join(f"{k}: {100*out[P+'/neg_detect_acc_'+k]:.0f}% (n {out[P+'/neg_n_'+k]})" for k in ("number", "quote", "name") if P+"/neg_detect_acc_"+k in out), flush=True)
         print(f"[{P}@{step}] fm uncond {out[P+'/fm_uncond']:.4f} cond {out[P+'/fm_cond']:.4f} shuf {out[P+'/fm_shuf']:.4f} | gain {out[P+'/gain_bits_per_dim']*x0.shape[1]:.1f} bits/activation | cond FVE(x0@0.9) {out[P+'/cond_fve_x0_t0.9']:.1f}% | source-match {100*out[P+'/source_match_acc']:.1f}% (chance 12.5%)", flush=True)
         json.dump(out, open(os.path.join(a.out, f"{P}_{step:06d}.json"), "w"), indent=1)
         return out
@@ -446,7 +448,7 @@ def main():
                 lrow = ((v2.float() - torch.cat([tgt, tgt])) ** 2).mean(-1); gap = lrow[n2:] - lrow[:n2]
                 closs = a.neg_lambda * F.relu(a.neg_margin - gap).mean(); closs.backward()
                 neg_stats = {"train/contrast_loss": closs.item(), "train/neg_gap": gap.mean().item(), "train/neg_win": (gap > 0).float().mean().item(), "train/neg_n": n2,
-                             "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2}
+                             "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2, "train/neg_frac_quote": sum(1 for k in keep_i if negs[k][1] == "quote") / n2}
         if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
             for p_ in arvec.trainable_parameters():
                 if p_.grad is not None: dist.all_reduce(p_.grad, op=dist.ReduceOp.AVG)
