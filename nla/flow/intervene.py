@@ -7,6 +7,11 @@ asserts one different property. Build an intervened activation and generate cont
                     edit that changes only what the explanation change implies; h ← bridge(h)
   flow_bridge_delta_a / flow_sample_delta_a : the bridge's (or paired-noise samples') difference used as a direction with the paper's α-rescaling
   random_delta_a  : random direction control
+  flow_inv_t{τ}   : DETERMINISTIC inversion edit (UniSteer-style; SDEdit is its noisy version): run the probability-flow ODE forward from the
+                    real h under the SOURCE condition z (data→noise) only up to an intermediate τ, then integrate back to data under the TARGET
+                    z′. x_τ still carries most of h (coarse content survives), the part the condition controls is rewritten, τ = strength knob.
+  flow_inv_unc_t{τ} : the same with the UNCONDITIONAL prior as the source condition for the forward leg (no gold z needed — usable live)
+  flow_inv_t{τ}_orig : forward under z, back under z (round-trip reconstruction control at this τ)
   *_all           : closed loop — the same intervention re-applied to EVERY newly generated position (bridge recomputed per position)
 Metrics saved per condition: continuations, next-token KL at the intervened position, NLL of the continuation under the unpatched model.
 Judged offline (Sonnet-5): reflects target proposition? still reflects the original? coherence."""
@@ -34,7 +39,10 @@ def main():
     p.add_argument("--cl-alphas", default="1", help="α for the every-position variants (ar Δ and bridge Δ, re-scaled per position)"); p.add_argument("--skip-base", action="store_true", help="only none + the α grids")
     p.add_argument("--critic", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--layer", type=int, default=42)
     p.add_argument("--sdedit-taus", default="", help="SDEdit-style stochastic edits: noise h to level τ, denoise under z′ (τ=1 = fresh sample from p(h|z′)); comma list")
+    p.add_argument("--inv-taus", default="", help="deterministic inversion edits: ODE h→x_τ under z (or ∅), back to data under z′; comma list of τ (strength)")
+    p.add_argument("--inv-all-taus", default="0.5,0.9", help="τ values that also get the every-position (_all) inversion variants on the closed-loop items")
     a = p.parse_args(); alphas = [float(x) for x in a.alphas.split(",") if x]; taus = [float(x) for x in a.sdedit_taus.split(",") if x]; cl_alphas = [float(x) for x in a.cl_alphas.split(",") if x]
+    inv_taus = [float(x) for x in a.inv_taus.split(",") if x]; inv_all_taus = {float(x) for x in a.inv_all_taus.split(",") if x}
     from huggingface_hub import snapshot_download
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from nla.models import NLACriticModel
@@ -112,10 +120,22 @@ def main():
             conds[f"sdedit_t{tau:g}_orig"] = (fb.norm.denormalize(ode(fb, (1 - tau) * x0 + tau * eps_s, c_o, tau, 0.0, max(4, int(a.ode_steps * tau))))[0].to(d0), None)   # same noise, ORIGINAL z: cost of the noise alone
             if k < a.closed_loop and tau in (0.5, 0.9):
                 conds[f"sdedit_t{tau:g}_all"] = (conds[f"sdedit_t{tau:g}"][0], lambda hn, tau=tau: sdedit(fb.norm.normalize(hn.to(d1)), tau, c_e).to(d0))
+        # ---- deterministic inversion edits: x_τ = ODE(x0, source cond, 0→τ); h_edit = ODE(x_τ, z′, τ→0). Source = z (gold) or ∅ (unconditional prior).
+        def inv(xn, tau, src, tgt):
+            n_ = max(4, int(a.ode_steps * tau)); return fb.norm.denormalize(ode(fb, ode(fb, xn, src, 0.0, tau, n_), tgt, tau, 0.0, n_))
+        inv_norms = {}
+        for tau in inv_taus:
+            h_inv = inv(x0, tau, c_o, c_e)[0].to(d0); h_inv_u = inv(x0, tau, None, c_e)[0].to(d0); h_inv_o = inv(x0, tau, c_o, c_o)[0].to(d0)
+            conds[f"flow_inv_t{tau:g}"] = (h_inv, None); conds[f"flow_inv_unc_t{tau:g}"] = (h_inv_u, None); conds[f"flow_inv_t{tau:g}_orig"] = (h_inv_o, None)
+            inv_norms[f"inv_recon_rel_err_t{tau:g}"] = ((h_inv_o - h0).norm() / h0.norm()).item(); inv_norms[f"inv_delta_rel_t{tau:g}"] = ((h_inv - h0).norm() / h0.norm()).item()
+            inv_norms[f"inv_unc_delta_rel_t{tau:g}"] = ((h_inv_u - h0).norm() / h0.norm()).item(); inv_norms[f"cos_ar_inv_t{tau:g}"] = torch.nn.functional.cosine_similarity(d_ar, h_inv - h0, dim=0).item()
+            if k < a.closed_loop and tau in inv_all_taus:
+                conds[f"flow_inv_t{tau:g}_all"] = (h_inv, lambda hn, tau=tau: inv(fb.norm.normalize(hn.to(d1)), tau, c_o, c_e).to(d0))
+                conds[f"flow_inv_unc_t{tau:g}_all"] = (h_inv_u, lambda hn, tau=tau: inv(fb.norm.normalize(hn.to(d1)), tau, None, c_e).to(d0))
         rec = dict(row=it["row"], doc_id=it["doc_id"], prefix_tail=it["text"][-400:], z=it["z"], z_edit=it["z_edit"], orig_prop=it["orig_prop"], target_prop=it["target_prop"], edit_type=it.get("edit_type"),
                    norms=dict(h=h0.norm().item(), d_ar=d_ar.norm().item(), d_bridge=d_bridge.norm().item(), d_samp=d_samp.norm().item(), bridge_recon_rel_err=((h_recon - h0).norm() / h0.norm()).item(),
                               cos_ar_bridge=torch.nn.functional.cosine_similarity(d_ar, d_bridge, dim=0).item(), cos_ar_samp=torch.nn.functional.cosine_similarity(d_ar, d_samp, dim=0).item(),
-                              cos_bridge_samp=torch.nn.functional.cosine_similarity(d_bridge, d_samp, dim=0).item()), conds={})
+                              cos_bridge_samp=torch.nn.functional.cosine_similarity(d_bridge, d_samp, dim=0).item(), **inv_norms), conds={})
         for name, (vec, dfn) in conds.items():
             st.update(vec=vec[None].expand(a.samples, -1).contiguous(), decode_fn=None, pos=T)
             with torch.no_grad(): lg = lm(input_ids=ids).logits[0, T].float()
