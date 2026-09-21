@@ -200,7 +200,7 @@ def main():
     p.add_argument("--prior", required=True, help="snapshot dir with model.pt (raw weights) or ema.pt"); p.add_argument("--prior-weights", default="raw", choices=["raw", "ema"]); p.add_argument("--prior-init", default="pretrained", choices=["pretrained", "random"], help="random = ignore the snapshot weights (architecture only): train the conditional flow from scratch"); p.add_argument("--prior-arch", default="", help="d_model,d_mlp,n_layers for a random-init denoiser (default: the snapshot's)")
     p.add_argument("--stats", required=True); p.add_argument("--base", required=True); p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--exact-n", type=int, default=128, help="rows for the EXACT log p(h|z)-log p(h) eval (probability-flow ODE); 0 = off"); p.add_argument("--exact-every", type=int, default=1000); p.add_argument("--exact-steps", type=int, default=24); p.add_argument("--enc-model", default=None, help="tokens_base: HF id of an arbitrary token encoder (e.g. Qwen/Qwen3-Embedding-8B) instead of the base trunk"); p.add_argument("--enc-keep-norm", action="store_true")
     p.add_argument("--train-parquet", required=True); p.add_argument("--val-parquet", required=True); p.add_argument("--out", required=True)
-    p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
+    p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--grad-accum", type=int, default=1, help="micro-batches of --batch accumulated per optimizer step (effective batch = batch x grad_accum)"); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024); p.add_argument("--chunk-queries", type=int, default=0, help="Flamingo-style per-slice queries: split the block hidden state into this many chunks, each attends over the explanation tokens (0 = pooled slots)")
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
     p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar", "tokens_base", "trunk"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
@@ -467,7 +467,7 @@ def main():
     rng = torch.Generator().manual_seed(a.seed + rank); t0 = time.time(); evaluate(0)
     if mv_z is not None: evaluate(0, mv_acts, mv_z, prefix="eval_onpolicy")
     N = tr_acts.shape[0]
-    if is0: print(f"[cond] {a.steps} steps x {a.batch} x {world} ranks = {a.steps*a.batch*world} draws over {N} pairs = {a.steps*a.batch*world/N:.2f} passes (single pass = no repetition)", flush=True)
+    if is0: print(f"[cond] {a.steps} steps x {a.batch} x {a.grad_accum} accum x {world} ranks = {a.steps*a.batch*a.grad_accum*world} draws over {N} pairs = {a.steps*a.batch*a.grad_accum*world/N:.2f} passes (single pass = no repetition)", flush=True)
     perm = torch.randperm(N, generator=rng); cursor = 0
     if a.start_step:   # replay the sampler: full passes re-draw the permutation, the remainder advances the cursor (same data order as an uninterrupted run)
         bpp = max(1, N // a.batch)
@@ -476,15 +476,18 @@ def main():
         if is0: print(f"[cond] resuming at step {a.start_step} (cursor {cursor}/{N})", flush=True)
     neg_rng = _random.Random(a.seed + 17 + int(os.environ.get('RANK', 0)))
     for step in range(a.start_step + 1, a.steps + 1):
-        if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0; print(f"[cond] re-shuffle (pass {step*a.batch*world/N:.1f})", flush=True)
-        idx = perm[cursor:cursor + a.batch]; cursor += a.batch
-        x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch([tr_z[i] for i in idx.tolist()], grad=True)
         sched = min(1.0, step / a.warmup) * (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1)
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
         lr = a.lr * sched
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift)
-        opt.zero_grad(set_to_none=True); loss.backward()
+        opt.zero_grad(set_to_none=True); loss_acc = 0.0
+        for _acc in range(a.grad_accum):   # gradient accumulation: --grad-accum micro-batches of --batch pairs per optimizer step
+            if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0; print(f"[cond] re-shuffle (pass {step*a.batch*a.grad_accum*world/N:.1f})", flush=True)
+            idx = perm[cursor:cursor + a.batch]; cursor += a.batch
+            x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch([tr_z[i] for i in idx.tolist()], grad=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift)
+            (loss / a.grad_accum).backward(); loss_acc += loss.item() / a.grad_accum
+        loss = torch.tensor(loss_acc)
         closs = None; neg_stats = {}
         if a.neg_frac > 0:   # contrastive hard negatives: same activation, same (t, eps); the negative text must score WORSE by a margin
             nb = max(1, int(round(a.neg_frac * a.batch))); sel = idx[:nb].tolist(); zs_pos = [tr_z[i] for i in sel]
