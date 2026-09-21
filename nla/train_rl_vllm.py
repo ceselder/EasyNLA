@@ -1624,6 +1624,7 @@ def main():
     p.add_argument("--max-new-tokens", type=int, default=150)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr-warmup-steps", type=int, default=0, help="linear warm-up of the policy lr from 0 to --lr over this many optimizer steps (0 = off; recommended after a divergence)")
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--lora-r", type=int, default=128)
     p.add_argument("--lora-alpha", type=int, default=16)
@@ -3210,6 +3211,9 @@ def main():
         _grpo_kwargs_common = None
         for _attempt in range(3):
           try:
+            if getattr(args, "lr_warmup_steps", 0) > 0:   # linear lr warm-up (user: 'if it diverged do a warmup and/or lower the lr')
+                _lr_scale = min(1.0, (step + 1) / args.lr_warmup_steps)
+                for _g in optim.param_groups: _g["lr"] = args.lr * _lr_scale
             mean_loss_val, grad_norm_val, grpo_metrics = grpo_update_microbatched(
             actor, optim, tokenizer,
             upd_full_ids, upd_prompt_lens, upd_activations,
@@ -3521,6 +3525,7 @@ def main():
         log["time/grpo_s"] = t_grpo_end - t_score_end           # actor fwd+bwd+step (+grad all-reduce)
         log["time/critic_s"] = max(0.0, (t_critic_end - t_grpo_end) - vllm_sync_secs)  # AR co-train
         log["time/step_s"] = log["wall_s"]                       # headline: total wall per step
+        log["train/lr"] = float(optim.param_groups[0]["lr"])
         log["time/rollouts_per_s"] = _n_rollouts / max(1e-6, log["wall_s"])  # throughput
         # ---- DP grad-sync straggler wait: time this rank idled at the ACTOR grad all-reduce
         # barrier waiting for the SLOWEST rank to finish its backward (the load-imbalance tax).
