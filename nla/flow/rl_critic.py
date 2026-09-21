@@ -102,13 +102,17 @@ class FlowCritic:
                  lr: float = 1e-4, p_uncond: float = 0.1, t_grid=(0.2, 0.4, 0.6, 0.8), fve_t: float = 0.9, micro_batch: int = 16,
                  max_len: int = 192, prior_weights: str = "raw", train_adapter: bool = True, eps_per_t: int = 1, prior_override: str | None = None,
                  grounded_shards: str | None = None, grounded_n: int = 0, grounded_skip: int = 0, ar_sft_lora_dir: str = "/vol/ckpts/qwen36_27b/ar_sft_delta_lora",
-                 actor_device=None, shared_trunk: bool = False, ar_ckpt: str = "/vol/ckpts/qwen36_27b/ar_sft_merged", enc_device=None):
+                 actor_device=None, shared_trunk: bool = False, ar_ckpt: str = "/vol/ckpts/qwen36_27b/ar_sft_merged", enc_device=None, cotrain_max_pairs: int = 0):
         """device = where the flow (prior + adapter) and, for AR-vector conditioners, the AR trunk live; actor_device = where the actor
         (token-state encoder) lives. With a second GPU per rank (--flow-device cuda:1) the real 31 GB AR trunk fits next to the flow."""
+        ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]
+        self.cond_mode = aa.get("cond_mode", "tokens"); self.use_trunk = self.cond_mode == "trunk"
+        if self.use_trunk and enc_device is not None:
+            device = enc_device            # whole-trunk denoiser: the 27B trunk IS the denoiser -> everything (prior, trunk, optimizer) on the critic/encoder GPU, next to vLLM; the policy GPU keeps its memory
         self.actor, self.tok, self.device, self.enc_layer = actor, tokenizer, device, enc_layer
         self.actor_device = actor_device if actor_device is not None else device; self.shared_trunk = shared_trunk
         self.enc_device = enc_device if enc_device is not None else device   # the 27B token encoder can live on another GPU than the denoiser (async layout: encoder + vLLM on the critic GPU, denoiser on the policy GPU)
-        self.eps_per_t = max(1, int(eps_per_t))
+        self.eps_per_t = max(1, int(eps_per_t)); self.cotrain_max_pairs = int(cotrain_max_pairs); self._peak_printed = set()
         self.dev_type = torch.device(device).type
         self.p_uncond, self.t_grid, self.fve_t, self.micro_batch, self.max_len = p_uncond, tuple(float(t) for t in t_grid), fve_t, micro_batch, max_len
         self.norm = Normalizer.load(stats_path).to(device)
@@ -123,13 +127,45 @@ class FlowCritic:
         prior = prior.to_empty(device=device).to(torch.bfloat16)
         prior.load_state_dict(sd, strict=True)                    # copies with dtype conversion, tensor by tensor
         prior.requires_grad_(False); del sd, m
-        ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]
-        self.cond_mode = aa.get("cond_mode", "tokens")
         self.use_tokens = self.cond_mode in ("tokens", "both")                       # cross-reads into the FROZEN BASE trunk (= the actor with adapters off)
         use_arvec = self.cond_mode in ("ar_vec", "both")                             # pooled AR vector from the critic trunk (+LoRA)
         self.use_enc = self.cond_mode in ("tokens_ar", "tokens_base")                # cross-reads into an ARVecEncoder trunk's token states (LoRA-tuned by the flow loss)
         self.resid_shift = bool(aa.get("resid_shift", False))
         d_enc = cfg["d_input"]
+        if self.use_trunk:
+            # ---- whole-trunk denoiser (nla/flow/trunk_denoiser.py): the LoRA-tuned 27B trunk + fresh bidirectional blocks IS v(x_t, t | z); no separate encoder
+            from transformers import AutoTokenizer
+            from nla.flow.trunk_denoiser import TrunkDenoiser
+            src = aa.get("trunk_dir") or aa.get("ar_ckpt", ar_ckpt)
+            ttok = AutoTokenizer.from_pretrained(src); ttok.padding_side = "right"
+            if ttok.pad_token_id is None: ttok.pad_token = ttok.eos_token
+            self.model = TrunkDenoiser(prior, src, ttok, device, enc_layer=aa.get("enc_layer", enc_layer), n_act_tokens=aa.get("trunk_act_tokens", 4), fresh_every=aa.get("trunk_fresh_every", 4),
+                                       fresh_heads=aa.get("trunk_fresh_heads", 8), fresh_dhead=aa.get("trunk_fresh_dhead", 128), grad_ckpt=True)
+            n_ad = self.model.load_adapter_state_dict(ad["adapter"])
+            lora_path = os.path.join(os.path.dirname(adapter_path), "ar_encoder_latest.pt"); n_lora = 0
+            if os.path.exists(lora_path): n_lora = self.model.load_lora_state_dict(torch.load(lora_path, map_location="cpu")["lora"])
+            self.arvec = None; self.use_enc = False; self.use_tokens = False
+            self.model.requires_grad_(False)
+            self.trainable = []; self.optim = None; opt_name = "none"
+            if train_adapter:
+                ad_params = list(self.model.adapter_parameters()); lora_params = self.model.lora_parameters()
+                for p_ in ad_params + lora_params: p_.requires_grad_(True)
+                self.trainable = ad_params + lora_params
+                groups = [{"params": ad_params, "lr": lr}, {"params": lora_params, "lr": lr / 3}]      # stage-2 recipe: adapters 1e-4, trunk LoRA 3e-5
+                try:
+                    import bitsandbytes as _bnb
+                    self.optim = _bnb.optim.AdamW8bit(groups, lr=lr, betas=(0.9, 0.95), weight_decay=0.0); opt_name = "AdamW8bit (2 groups)"
+                except ImportError:
+                    self.optim = torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95), weight_decay=0.0); opt_name = "AdamW (2 groups)"
+            self.d = cfg["d_input"]; self.msf = math.sqrt(self.d); self.adapter_step = int(ad.get("step", 0)); self.cfg, self.adapter_args = cfg, aa
+            self.pool = None
+            if grounded_shards and grounded_n > 0:
+                from nla.flow.train_cond import load_shards
+                acts, zs = load_shards(grounded_shards, grounded_n, skip=grounded_skip); self.pool = (acts, zs)
+                print(f"[flow] grounded co-training pool: {len(zs)} pairs from {grounded_shards} (skip {grounded_skip})", flush=True)
+            print(f"[flow] WHOLE-TRUNK critic on {device}: adapter step {self.adapter_step} ({n_ad} adapter tensors, {n_lora} LoRA tensors) from {adapter_path}; trainable {sum(p_.numel() for p_ in self.trainable)/1e6:.0f}M ({opt_name}); "
+                  f"t grid {self.t_grid} x {self.eps_per_t} eps; scoring micro-batch {self.micro_batch} rollouts; co-training cap {self.cotrain_max_pairs or 'none'} pairs/step", flush=True)
+            return
         if self.use_enc:
             from transformers import AutoTokenizer
             from nla.flow.train_cond import ARVecEncoder
@@ -220,6 +256,8 @@ class FlowCritic:
         """-> (enc, mask, cvec, shift): token states (adapters off) and/or the AR vector; shift = standardised AR prediction if the adapter
         was trained with --resid-shift (the flow then models x0 - shift), else None."""
         enc = mask = cvec = shift = None
+        if self.use_trunk:
+            ids, mk = self.model.tokenize(texts); return ids, mk, None, None          # the trunk runs inside the model; nothing to detach
         if self.use_tokens: enc, mask = self.encode(texts)
         if self.use_enc:
             with (torch.enable_grad() if (grad and self.arvec.trainable) else torch.no_grad()), torch.autocast(device_type=self.dev_type, dtype=torch.bfloat16):
@@ -261,7 +299,18 @@ class FlowCritic:
             x0_full = x0
             if shift is not None: x0 = x0 - shift                                             # residual parametrisation
             tot = torch.zeros(B, device=self.device)
-            with self._ac():
+            if self.use_trunk:
+                # one trunk forward per chunk: rows = [t_1 .. t_n] x eps draws + the fve_t row, each on the same B explanations
+                blocks = [(tv, eps if k == 0 else torch.stack([eps_for(groups[i], k) for i in chunk])) for k in range(self.eps_per_t) for tv in self.t_grid] + [(self.fve_t, eps)]
+                xs = torch.cat([(1 - tv) * x0 + tv * e for tv, e in blocks]); ts = torch.cat([torch.full((B,), tv, device=self.device) for tv, _ in blocks])
+                with self._ac():
+                    v_all = self.model(xs, ts, enc.repeat(len(blocks), 1), mask.repeat(len(blocks), 1)).float()
+                for j, (tv, e) in enumerate(blocks[:-1]):
+                    tot += ((v_all[j * B:(j + 1) * B] - (e - x0)) ** 2).mean(1)
+                v = v_all[-B:]; x_t = xs[-B:]; x0_hat = self.norm.denormalize(x_t - self.fve_t * v + (shift if shift is not None else 0.0))
+                self._peak("score")
+            else:
+              with self._ac():
                 for k in range(self.eps_per_t):
                     eps_k = eps if k == 0 else torch.stack([eps_for(groups[i], k) for i in chunk])
                     for tv in self.t_grid:
@@ -286,6 +335,7 @@ class FlowCritic:
         Returns the mean loss (float) or nan if non-finite."""
         pairs = [(z, a) for z, a in zip(explanations, activations) if z is not None and len(z.strip()) > 0]
         if not pairs or self.optim is None: return float("nan")
+        if self.cotrain_max_pairs > 0 and len(pairs) > self.cotrain_max_pairs: pairs = pairs[: self.cotrain_max_pairs]   # whole-trunk critic: bound the 27B fwd+bwd cost per step
         self.model.train(); n = len(pairs); total = 0.0
         for cs in range(0, n, self.micro_batch):
             ch = pairs[cs: cs + self.micro_batch]; B = len(ch)
@@ -296,8 +346,15 @@ class FlowCritic:
             if not torch.isfinite(loss): return float("nan")
             (loss * (B / n) / accum).backward(); total += loss.item() * B / n
             del enc, mask, x0, loss
+        if self.use_trunk: self._peak("train")
         if self.dev_type == "cuda": torch.cuda.empty_cache()
         return total
+
+    def _peak(self, tag):
+        """print the critic device's peak memory once per phase (trunk mode: this GPU also holds vLLM)"""
+        if tag in self._peak_printed or self.dev_type != "cuda": return
+        self._peak_printed.add(tag)
+        print(f"[flow] peak memory on {self.device} after first {tag}: {torch.cuda.max_memory_allocated(self.device) / 2**30:.1f} GiB allocated, {torch.cuda.max_memory_reserved(self.device) / 2**30:.1f} GiB reserved", flush=True)
 
     def train_backward_grounded(self, n: int, accum: int = 1, seed: int | None = None):
         """conditional FM step on n random GROUNDED pairs from the pool (gold explanations of held-in activations) instead of rollouts."""
@@ -308,6 +365,10 @@ class FlowCritic:
 
     def save(self, out_dir: str, step: int):
         os.makedirs(out_dir, exist_ok=True); tmp = os.path.join(out_dir, "adapter_latest.pt.tmp")
+        if self.use_trunk:   # same two files stage 2 writes, so FlowBundle / eval tooling load the co-trained trunk critic unchanged
+            torch.save({"lora": self.model.lora_state_dict(), "step": step, "rl_step": step}, os.path.join(out_dir, "ar_encoder_latest.pt"))
+            torch.save({"adapter": self.model.adapter_state_dict(), "args": self.adapter_args, "prior_cfg": self.cfg, "step": step, "rl_step": step}, tmp)
+            os.replace(tmp, os.path.join(out_dir, "adapter_latest.pt")); return
         if self.arvec is not None and self.shared_trunk:
             lora = {f"backbone.model.layers.{n.split('.layers.')[1].replace('.ar_critic', '.default')}": p_.detach().cpu() for n, p_ in self.actor.named_parameters() if ".ar_critic." in n}
             torch.save({"lora": lora, "value_head": self.arvec.value_head.state_dict(), "step": step}, os.path.join(out_dir, "ar_encoder_latest.pt"))
@@ -318,6 +379,11 @@ class FlowCritic:
         os.replace(tmp, os.path.join(out_dir, "adapter_latest.pt"))
 
     def load(self, path: str):
-        ad = torch.load(path, map_location="cpu"); res = self.model.load_state_dict(ad["adapter"], strict=False); assert not res.unexpected_keys
+        ad = torch.load(path, map_location="cpu")
+        if self.use_trunk:
+            self.model.load_adapter_state_dict(ad["adapter"]); lp = os.path.join(os.path.dirname(path), "ar_encoder_latest.pt")
+            if os.path.exists(lp): self.model.load_lora_state_dict(torch.load(lp, map_location="cpu")["lora"])
+            return int(ad.get("rl_step", ad.get("step", 0)))
+        res = self.model.load_state_dict(ad["adapter"], strict=False); assert not res.unexpected_keys
         for mod in self.model.adapter_modules(): mod.float()
         return int(ad.get("rl_step", ad.get("step", 0)))

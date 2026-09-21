@@ -1862,6 +1862,7 @@ def main():
     p.add_argument("--flow-grounded-n", type=int, default=100000, help="grounded pairs held per rank (rank-disjoint slices)")
     p.add_argument("--flow-ar-sft-lora", default="/vol/ckpts/qwen36_27b/ar_sft_delta_lora", help="PEFT adapter of the SFT reconstructor's merged LoRA (only with --flow-shared-trunk)")
     p.add_argument("--flow-device", default="", help="device for the flow critic (prior, adapter, AR trunk), e.g. cuda:1 when each rank owns 2 GPUs; default = the actor's device")
+    p.add_argument("--flow-cotrain-max-pairs", type=int, default=0, help="cap on grounded pairs per critic co-training step (0 = all; the whole-trunk critic runs a 27B fwd+bwd per pair)")
     p.add_argument("--flow-shared-trunk", action="store_true", help="AR-vector conditioner reads through the actor's weights + LoRA adapters instead of the real reconstructor trunk (approximate)")
     p.add_argument("--ar-loss", choices=["vector_mse", "downstream_kl", "mse_plus_kl", "flow"],
                    default="vector_mse",
@@ -2206,7 +2207,7 @@ def main():
                           lr=args.flow_lr, p_uncond=args.flow_p_uncond, t_grid=[float(x) for x in args.flow_t_grid.split(",")],
                           micro_batch=args.flow_micro_batch, train_adapter=args.train_critic, eps_per_t=args.flow_eps_per_t, prior_override=args.flow_prior_override,
                           grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
-                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora, base_path=args.av_ckpt, enc_device=(torch.device(args.flow_enc_device) if args.flow_enc_device else None))
+                          grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora, base_path=args.av_ckpt, enc_device=(torch.device(args.flow_enc_device) if args.flow_enc_device else None), cotrain_max_pairs=args.flow_cotrain_max_pairs)
         if args.flow_cotrain != "rollouts": assert flow.pool is not None, "--flow-cotrain grounded/mix needs --flow-grounded-shards"
         _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
         if args.resume_from_lora is not None and _flow_latest.exists():
