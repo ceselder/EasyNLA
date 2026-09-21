@@ -80,7 +80,13 @@ class CondMLPBlock(nn.Module):
             return x + b.down_proj(F.silu(g) * b.up_proj(h))
         r = None; has = None
         if enc is not None and self.read is not None:
-            r = self.read(h, enc, enc_mask); has = enc_mask.any(-1)                 # zero at init and zero for condition-dropped samples
+            # long memories (tokens_ar_all: 15 layers x T tokens) make the read's saved activations the memory hog — every block keeps its own
+            # fp32 LayerNorm copy of the memory for backward. Recompute the read in backward instead (identical numerics, ~1 extra read/block).
+            if torch.is_grad_enabled() and enc.shape[1] > 512:
+                from torch.utils.checkpoint import checkpoint
+                r = checkpoint(self.read, h, enc, enc_mask, use_reentrant=False)
+            else: r = self.read(h, enc, enc_mask)
+            has = enc_mask.any(-1)                                                  # zero at init and zero for condition-dropped samples
         if c is not None and self.cvec_out is not None:
             rc = self.cvec_out(c.to(h.dtype)) * c_has[:, None].to(h.dtype)
             r = rc if r is None else r + rc; has = c_has if has is None else (has | c_has)
