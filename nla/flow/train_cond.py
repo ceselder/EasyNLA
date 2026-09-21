@@ -102,7 +102,7 @@ class ARVecEncoder(torch.nn.Module):
     cvec = concat(normalise(value_head(last_hidden)) [= the MSE critic's E[h|z] estimate at init], normalise(last_hidden)). LoRA on the trunk
     (r 64, alpha 16, rsLoRA) and the value head are trainable; trained by the flow-matching loss, not MSE."""
     TM = r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))"
-    def __init__(self, ar_dir, tok, device, lora_r=64, lora_alpha=16, grad_ckpt=True, trainable=True, enc_layer=42, enc_model=None, keep_norm=False):
+    def __init__(self, ar_dir, tok, device, lora_r=64, lora_alpha=16, grad_ckpt=True, trainable=True, enc_layer=42, enc_model=None, keep_norm=False, enc_layers=None, bidir=False):
         super().__init__()
         from nla.models import NLACriticModel
         from peft import LoraConfig, inject_adapter_in_model
@@ -138,13 +138,14 @@ class ARVecEncoder(torch.nn.Module):
                     except Exception as e: print("[arvec] grad ckpt off:", e, flush=True)
             else: lm.eval()
             self.crit = None; self.lm, self.owner = lm, owner; self.msf = math.sqrt(owner.config.hidden_size if hasattr(owner, "config") else 5120)
-            print(f"[arvec] token encoder {enc_model or ar_dir}: {len(owner.layers)} layers, d {owner.config.hidden_size}, keep_norm={keep_norm}, trainable={trainable}", flush=True); return
+            print(f"[arvec] token encoder {enc_model or ar_dir}: {len(owner.layers)} layers, d {owner.config.hidden_size}, keep_norm={keep_norm}, trainable={trainable}", flush=True)
+            self._install(enc_layers, bidir); return
         crit = NLACriticModel.from_pretrained(ar_dir, dtype=torch.bfloat16).to(device)
         for p_ in crit.parameters(): p_.requires_grad_(False)
         self.trainable = trainable
         if not trainable:   # frozen encoder (tokens_ar with --ar-lr 0): no LoRA, no grads
             crit.eval(); self.crit, self.tok, self.device = crit, tok, device; self.msf = math.sqrt(crit.value_head.weight.shape[0])
-            self.tmpl = "Summary of the following text: <text>{explanation}</text> <summary>"; return
+            self.tmpl = "Summary of the following text: <text>{explanation}</text> <summary>"; self._install(enc_layers, bidir); return
         tm = r"(?!.*(?:^|\.)(?:mtp|visual)\.).*layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|linear_attn\.(?:in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)|mlp\.(?:gate_proj|up_proj|down_proj))"
         # inject LoRA IN PLACE (no PeftModel wrapper): NLACriticModel.forward unwraps its backbone to the inner transformer and needs the module structure intact
         inject_adapter_in_model(LoraConfig(r=lora_r, lora_alpha=lora_alpha, use_rslora=True, target_modules=tm, lora_dropout=0.0, bias="none"), crit.backbone)
@@ -159,13 +160,51 @@ class ARVecEncoder(torch.nn.Module):
         self.crit, self.tok, self.device = crit, tok, device
         self.msf = math.sqrt(crit.value_head.weight.shape[0])
         self.tmpl = "Summary of the following text: <text>{explanation}</text> <summary>"
+        self._install(enc_layers, bidir)
+    def _layers(self):
+        if self.crit is None: return self.owner.layers
+        inner = self.crit.backbone.model; return (inner if hasattr(inner, "layers") else inner.language_model).layers
+    def _install(self, enc_layers, bidir):
+        """tokens_ar_all: capture the residual stream after every layer in `enc_layers` (forward hooks) and expose them as ONE memory of
+        L x T tokens with a learned per-layer embedding (zero-init) so the denoiser's cross-reads can tell layers apart.
+        --enc-bidir: the FULL-attention layers attend bidirectionally over the explanation (padding-only mask replaces the causal one via a
+        forward pre-hook on self_attn). The 33 linear-attention (Gated DeltaNet) layers of the Qwen3.5 hybrid trunk are recurrent scans and
+        stay causal — making them bidirectional would need a second reverse scan, which the frozen weights were never trained for."""
+        self.enc_layers = sorted(set(int(x) for x in enc_layers)) if enc_layers else None; self.bidir = bool(bidir); self._cap = {}; self._cur_am = None
+        self.layer_emb = None
+        if not self.enc_layers and not self.bidir: return
+        layers = self._layers()
+        if self.enc_layers:
+            assert max(self.enc_layers) < len(layers), f"--enc-layers {self.enc_layers} vs {len(layers)} kept layers"
+            d = self.crit.value_head.weight.shape[0] if self.crit is not None else self.owner.config.hidden_size
+            self.layer_emb = torch.nn.Embedding(len(self.enc_layers), d).to(self.device); torch.nn.init.zeros_(self.layer_emb.weight); self.layer_emb.weight.requires_grad_(bool(self.trainable))
+            for li in self.enc_layers:
+                layers[li].register_forward_hook(lambda m_, i_, o_, li=li: self._cap.__setitem__(li, o_[0] if isinstance(o_, tuple) else o_))
+        if self.bidir:
+            n_full = 0
+            for layer in layers:
+                if getattr(layer, "layer_type", "full_attention") != "full_attention": continue
+                layer.self_attn.is_causal = False; layer.self_attn.register_forward_pre_hook(self._bidir_pre_hook, with_kwargs=True); n_full += 1
+            print(f"[arvec] bidirectional full-attention layers: {n_full} of {len(layers)} (linear-attention layers stay causal)", flush=True)
+        print(f"[arvec] multi-layer memory: layers {self.enc_layers} ({len(self.enc_layers or [])} x T tokens, learned layer embedding)" if self.enc_layers else "[arvec] single-layer memory", flush=True)
+    def _bidir_pre_hook(self, mod, args, kwargs):
+        am = self._cur_am
+        if am is None: return None
+        B, T = am.shape; allowed = am.bool()[:, None, None, :].expand(B, 1, T, T)          # every query may attend to every REAL key: bidirectional, padding-only
+        if "attention_mask" in kwargs: kwargs = dict(kwargs); kwargs["attention_mask"] = allowed; return args, kwargs
+        args = list(args)
+        if len(args) >= 3: args[2] = allowed
+        return tuple(args), kwargs
     def trainable_parameters(self):
         mod = self.crit if self.crit is not None else self.lm
-        return [p_ for p_ in mod.parameters() if p_.requires_grad]
+        ps = [p_ for p_ in mod.parameters() if p_.requires_grad]
+        if getattr(self, "layer_emb", None) is not None and self.layer_emb.weight.requires_grad: ps.append(self.layer_emb.weight)
+        return ps
     def state_for_save(self):
         mod = self.crit if self.crit is not None else self.lm
         d = {"lora": {k: v for k, v in mod.state_dict().items() if "lora_" in k}}
         if self.crit is not None: d["value_head"] = self.crit.value_head.state_dict()
+        if getattr(self, "layer_emb", None) is not None: d["layer_emb"] = self.layer_emb.state_dict(); d["enc_layers"] = self.enc_layers; d["bidir"] = self.bidir
         return d
     def load_saved(self, st):
         mod = self.crit if self.crit is not None else self.lm
@@ -174,12 +213,15 @@ class ARVecEncoder(torch.nn.Module):
         assert have <= want or not have, f"encoder has {len(have - want)} LoRA tensors the checkpoint lacks — resuming would leave them random"
         mod.load_state_dict(st["lora"], strict=False); print(f"[arvec] loaded {len(want)} encoder LoRA tensors", flush=True)
         if self.crit is not None and "value_head" in st: self.crit.value_head.load_state_dict(st["value_head"])
+        if "layer_emb" in st:
+            assert getattr(self, "layer_emb", None) is not None and st.get("enc_layers") == self.enc_layers, f"checkpoint enc_layers {st.get('enc_layers')} vs encoder {getattr(self, 'enc_layers', None)}"
+            self.layer_emb.load_state_dict(st["layer_emb"]); print(f"[arvec] loaded layer embedding for {len(self.enc_layers)} layers", flush=True)
     def forward(self, texts):
         assert self.crit is not None, "pooled AR vector needs the critic encoder (tokens_base has no value head)"
         from nla.schema import normalize_activation
         enc = self.tok([self.tmpl.format(explanation=z) for z in texts], return_tensors="pt", padding=True, truncation=True, max_length=256, add_special_tokens=False)
-        ids, am = enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
-        out = self.crit(input_ids=ids, attention_mask=am).backbone_last_hidden
+        ids, am = enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device); self._cur_am = am
+        out = self.crit(input_ids=ids, attention_mask=am).backbone_last_hidden; self._cap.clear()
         last = out[torch.arange(ids.shape[0], device=self.device), am.sum(1) - 1].float()      # right padding -> last real token
         pred = self.crit.value_head(normalize_activation(last, self.msf).to(self.crit.value_head.weight.dtype)).float()
         self.last_pred_raw = pred                                                                          # [B, d] activation units (the MSE critic's E[h|z])
@@ -188,10 +230,14 @@ class ARVecEncoder(torch.nn.Module):
         """Layer-42 token states of the critic-templated explanation, [B, T, d] + key mask (position 0 = attention sink dropped) — the
         cross-attention conditioning (tokens_ar): every denoiser block reads these with its own learned heads; nothing is pooled."""
         enc = self.tok([self.tmpl.format(explanation=z) for z in texts], return_tensors="pt", padding=True, truncation=True, max_length=max_len, add_special_tokens=False)
-        ids, am = enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
+        ids, am = enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device); self._cur_am = am
         if self.crit is not None: out = self.crit(input_ids=ids, attention_mask=am).backbone_last_hidden
         else: out = self.owner(input_ids=ids, attention_mask=am, use_cache=False).last_hidden_state      # norm removed -> raw residual after enc_layer
         mask = am.bool().clone(); mask[:, 0] = False
+        if getattr(self, "enc_layers", None):
+            hs = [self._cap[li] for li in self.enc_layers]; self._cap.clear(); emb = self.layer_emb.weight.to(hs[0].dtype)
+            out = torch.cat([h_ + emb[j][None, None, :] for j, h_ in enumerate(hs)], 1)                 # [B, L*T, d]: all selected layers as one memory
+            mask = mask.repeat(1, len(hs))
         return out, mask
 
 
@@ -203,13 +249,16 @@ def main():
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=64); p.add_argument("--grad-accum", type=int, default=1, help="micro-batches of --batch accumulated per optimizer step (effective batch = batch x grad_accum)"); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128); p.add_argument("--d-c", type=int, default=4096, help="width of the shared AR-vector features injected into every block"); p.add_argument("--enc-self-layers", type=int, default=0, help="trainable self-attention layers over the frozen token states before the cross-reads"); p.add_argument("--enc-self-dim", type=int, default=1024); p.add_argument("--chunk-queries", type=int, default=0, help="Flamingo-style per-slice queries: split the block hidden state into this many chunks, each attends over the explanation tokens (0 = pooled slots)")
     p.add_argument("--max-train", type=int, default=200000); p.add_argument("--train-shards-glob", default=None, help="raw extraction shards (activation_vector/explanation/is_val) instead of --train-parquet; all non-val rows up to --max-train"); p.add_argument("--mined-dir", default=None, help="on-policy pairs dir (mine_av_rollouts shards)"); p.add_argument("--mined-acts-parquet", default=None); p.add_argument("--max-mined", type=int, default=2000000); p.add_argument("--mined-val-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--match-n", type=int, default=256)
-    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar", "tokens_base", "trunk"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
+    p.add_argument("--wandb", default="nla-glp"); p.add_argument("--tag", default="cond"); p.add_argument("--cond-mode", default="tokens", choices=["tokens", "ar_vec", "both", "tokens_ar", "tokens_base", "trunk", "tokens_ar_all"]); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--ar-lr", type=float, default=3e-5); p.add_argument("--unfreeze-prior", action="store_true", help="co-train the prior blocks (FSDP over all ranks, fp32 master) at --prior-lr"); p.add_argument("--prior-lr", type=float, default=1e-5); p.add_argument("--seed", type=int, default=0); p.add_argument("--max-hours", type=float, default=22.0); p.add_argument("--resid-shift", action="store_true", help="start from the prediction: the flow models x0 - standardise(AR prediction) (ar_vec/both only)"); p.add_argument("--resume-from", default=None, help="dir with adapter_latest.pt (+ ar_encoder_latest.pt, prior_cotrained_latest.pt) to continue from"); p.add_argument("--start-step", type=int, default=0)
     p.add_argument("--trunk-dir", default=None, help="trunk mode: LM dir whose layers 0..--enc-layer become the denoiser (default: --ar-ckpt, the AR-SFT-merged trunk)"); p.add_argument("--trunk-act-tokens", type=int, default=4); p.add_argument("--trunk-fresh-every", type=int, default=4, help="trunk mode: a fresh bidirectional attention block after every N-th trunk layer (+ the last)"); p.add_argument("--trunk-fresh-heads", type=int, default=8); p.add_argument("--trunk-fresh-dhead", type=int, default=128)
     p.add_argument("--neg-frac", type=float, default=0.0, help="contrastive hard negatives: fraction of the batch that also gets a same-text-one-specific-changed negative (number perturbed / entity swapped); hinge on the paired FM-loss gap")
     p.add_argument("--group-contrast", type=int, default=0, help="same-document InfoNCE: number of document groups per step (0 = off); the G activations of one document are each other's hard negatives")
     p.add_argument("--group-size", type=int, default=8); p.add_argument("--group-tau", type=float, default=0.02, help="temperature on the per-dim FM loss: logits = -loss / tau"); p.add_argument("--group-lambda", type=float, default=1.0)
     p.add_argument("--eval-samedoc", action="store_true", help="also report same-document discrimination accuracy in eval (on by default when --group-contrast > 0)")
     p.add_argument("--neg-margin", type=float, default=0.02, help="per-dim FM-loss gap (neg - pos) the hinge asks for"); p.add_argument("--neg-lambda", type=float, default=2.0)
+    p.add_argument("--enc-layers", default=None, help="tokens_ar_all: comma list of trunk layers whose token states form the cross-read memory (default every 3rd layer from 2 plus --enc-layer)")
+    p.add_argument("--enc-bidir", action="store_true", help="encoder's full-attention layers attend bidirectionally over the explanation (linear-attention layers stay causal)")
+    p.add_argument("--enc-bidir-check", action="store_true", help="at start-up, verify that an early token's state depends on a later token iff --enc-bidir")
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     import torch.distributed as dist
     ddp = "RANK" in os.environ
@@ -236,7 +285,9 @@ def main():
     # both      = tokens + ar_vec
     # tokens_ar = cross-reads into the critic trunk's layer-42 TOKEN states (LoRA-tuned by the flow loss; frozen with --ar-lr 0); NO pooled vector
     # tokens_base = like tokens_ar but the encoder is the RAW BASE trunk (never MSE-trained), LoRA-tuned by the flow loss: no mean-prediction anywhere
-    d_enc = cfg["d_input"]; use_tokens = a.cond_mode in ("tokens", "both", "tokens_ar", "tokens_base"); use_arvec = a.cond_mode in ("ar_vec", "both", "tokens_ar", "tokens_base")
+    d_enc = cfg["d_input"]; use_tokens = a.cond_mode in ("tokens", "both", "tokens_ar", "tokens_base", "tokens_ar_all"); use_arvec = a.cond_mode in ("ar_vec", "both", "tokens_ar", "tokens_base", "tokens_ar_all")
+    # tokens_ar_all = tokens_ar whose memory is the token states of MANY trunk layers (each with a learned layer embedding), not only layer 42
+    a.enc_layers_list = ([int(x) for x in a.enc_layers.split(",") if x] if a.enc_layers else sorted(set(list(range(2, a.enc_layer, 3)) + [a.enc_layer]))) if a.cond_mode == "tokens_ar_all" else None
     if a.cond_mode in ("tokens", "both"): encode, tok = load_encoder(a.base, a.enc_layer, dev)
     else:
         from transformers import AutoTokenizer
@@ -244,7 +295,15 @@ def main():
         if tok.pad_token_id is None: tok.pad_token = tok.eos_token
         encode = None
     arvec = ARVecEncoder(a.base if a.cond_mode == "tokens_base" else a.ar_ckpt, tok, dev, trainable=a.ar_lr > 0, enc_layer=a.enc_layer,
-                         enc_model=a.enc_model if a.cond_mode == "tokens_base" else None, keep_norm=a.enc_keep_norm) if use_arvec else None
+                         enc_model=a.enc_model if a.cond_mode == "tokens_base" else None, keep_norm=a.enc_keep_norm, enc_layers=a.enc_layers_list, bidir=a.enc_bidir) if use_arvec else None
+    if arvec is not None and a.enc_bidir_check and is0:
+        # an EARLY token's state must depend on a LATER token iff the encoder is bidirectional (same prefix, different last word)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            e1, m1 = arvec.tokens(["The text is about the river Nile and its yearly flood cycle in Egypt."]); e2, m2 = arvec.tokens(["The text is about the river Nile and its yearly flood cycle in Sudan."])
+        L_ = len(arvec.enc_layers) if arvec.enc_layers else 1; T = m1.shape[1] // L_; off = (L_ - 1) * T                    # LAST layer's block (layers before the first full-attention layer are causal scans)
+        d_early = (e1[:, off + 1:off + T // 2] - e2[:, off + 1:off + T // 2]).float().abs().max().item(); d_last = (e1[:, off + T - 1] - e2[:, off + T - 1]).float().abs().max().item()
+        print(f"[bidir-check] enc_bidir={a.enc_bidir}: layer-{arvec.enc_layers[-1] if arvec.enc_layers else a.enc_layer} states, max |Δ| over the FIRST half of the tokens = {d_early:.4g} (expected {'> 0' if a.enc_bidir else '= 0'}), at the last token = {d_last:.4g}", flush=True)
+        assert (d_early > 1e-3) == bool(a.enc_bidir), "bidirectional-attention check failed"
     if arvec is not None and arvec.crit is None: d_enc = arvec.owner.config.hidden_size      # cross-read K/V width follows the encoder (4096 for Qwen3-Embedding-8B)
     if arvec is not None and a.resume_from and os.path.exists(os.path.join(a.resume_from, "ar_encoder_latest.pt")):
         st_ = torch.load(os.path.join(a.resume_from, "ar_encoder_latest.pt"), map_location="cpu")
@@ -347,7 +406,7 @@ def main():
         if a.cond_mode == "trunk":
             ids_, mk_ = model.tokenize(zs); return ids_, mk_, None
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            if a.cond_mode in ("tokens_ar", "tokens_base"):
+            if a.cond_mode in ("tokens_ar", "tokens_base", "tokens_ar_all"):
                 if grad and arvec.trainable: e, mk = arvec.tokens(zs)
                 else:
                     with torch.no_grad(): e, mk = arvec.tokens(zs)
@@ -360,6 +419,8 @@ def main():
             if a.resid_shift: enc_batch.shift = norm.normalize(arvec.last_pred_raw).detach() if not grad else norm.normalize(arvec.last_pred_raw)
             return e, mk, cv
 
+    EB = 32 if a.cond_mode == "tokens_ar_all" else 128          # eval micro-batch: the multi-layer memory is 15x longer, so 4x fewer rows per forward
+    XB = 16 if a.cond_mode == "tokens_ar_all" else 64           # exact-PMI rows per ODE pass (the Hutchinson VJP keeps every block's memory read alive)
     @torch.no_grad()
     def evaluate(step, ev_acts=None, ev_z=None, prefix="eval"):
         ev_acts = va_acts if ev_acts is None else ev_acts; ev_z = va_z if ev_z is None else ev_z; n_ev = min(a.eval_n, len(ev_z))
@@ -372,12 +433,12 @@ def main():
             eps = torch.randn(x0.shape, device=dev, generator=g); t = torch.full((n_ev,), t_val, device=dev)
             for name, cond in (("uncond", None), ("cond", zs), ("shuf", zs_shuf)):
                 ls = []
-                for i in range(0, n_ev, 128):
-                    e, mk, cv = enc_batch(cond[i:i+128]) if cond is not None else (None, None, None)
-                    xs = x0[i:i+128] - enc_batch.shift if (cond is not None and enc_batch.shift is not None) else x0[i:i+128]   # residual parametrisation
+                for i in range(0, n_ev, EB):
+                    e, mk, cv = enc_batch(cond[i:i+EB]) if cond is not None else (None, None, None)
+                    xs = x0[i:i+EB] - enc_batch.shift if (cond is not None and enc_batch.shift is not None) else x0[i:i+EB]   # residual parametrisation
                     with torch.autocast("cuda", dtype=torch.bfloat16):
-                        x_t = (1 - t_val) * xs + t_val * eps[i:i+128]; v = model(x_t, t[i:i+128], e, mk, cv)
-                    ls.append(F.mse_loss(v.float(), (eps[i:i+128] - xs).float(), reduction="sum").item() / x0.shape[1])
+                        x_t = (1 - t_val) * xs + t_val * eps[i:i+EB]; v = model(x_t, t[i:i+EB], e, mk, cv)
+                    ls.append(F.mse_loss(v.float(), (eps[i:i+EB] - xs).float(), reduction="sum").item() / x0.shape[1])
                 out[f"eval/fm_{name}_t{t_val}"] = sum(ls) / n_ev
         for name in ("uncond", "cond", "shuf"): out[f"eval/fm_{name}"] = sum(out[f"eval/fm_{name}_t{t}"] for t in (0.1, 0.3, 0.5, 0.7, 0.9)) / 5
         # hard-negative detection: same text with one specific changed; paired (same t, eps) per-row loss; P(neg loss > true loss)
@@ -414,10 +475,10 @@ def main():
         # conditional FVE: x0-prediction at high noise, x0_hat = x_t - t*v ; NLA convention: unit-L2 to sqrt(d), MSE, predict-mean baseline
         t_val = 0.9; eps = torch.randn(x0.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(7)); t = torch.full((n_ev,), t_val, device=dev)
         preds = []
-        for i in range(0, n_ev, 128):
-            e, mk, cv = enc_batch(zs[i:i+128]); sh = enc_batch.shift if enc_batch.shift is not None else 0.0
-            xs = x0[i:i+128] - sh; x_t = (1 - t_val) * xs + t_val * eps[i:i+128]
-            with torch.autocast("cuda", dtype=torch.bfloat16): v = model(x_t, t[i:i+128], e, mk, cv).float()
+        for i in range(0, n_ev, EB):
+            e, mk, cv = enc_batch(zs[i:i+EB]); sh = enc_batch.shift if enc_batch.shift is not None else 0.0
+            xs = x0[i:i+EB] - sh; x_t = (1 - t_val) * xs + t_val * eps[i:i+EB]
+            with torch.autocast("cuda", dtype=torch.bfloat16): v = model(x_t, t[i:i+EB], e, mk, cv).float()
             preds.append(norm.denormalize(x_t - t_val * v + sh))
         pred = normalize_activation(torch.cat(preds), msf); gold = normalize_activation(ev_acts[: n_ev].to(dev), msf)
         mse = ((pred - gold) ** 2).mean().item(); out["eval/cond_fve_x0_t0.9"] = 100 * (1 - mse / base_mse); out["eval/cond_mse_x0_t0.9"] = mse
@@ -447,11 +508,13 @@ def main():
             from nla.flow.eval_cond import exact_logp
             n_x = min(a.exact_n, n_ev); xx = x0[:n_x]; zz = list(ev_z[:n_x]); d_ = xx.shape[1]
             perm = torch.randperm(n_x, generator=torch.Generator().manual_seed(1)).tolist()
-            e_, m_, c_ = enc_batch(zz); es, ms, cs = enc_batch([zz[i] for i in perm])
-            lp = {}
-            for name, (ee, mm, cc) in (("uncond", (None, None, None)), ("cond", (e_, m_, c_)), ("shuf", (es, ms, cs))):
-                gx = torch.Generator(device=dev).manual_seed(11)
-                lp[name] = exact_logp(model, xx, ee, mm, n_steps=a.exact_steps, probes=1, gen=gx, cvec=cc)
+            zs_shuf_x = [zz[i] for i in perm]; lp = {"uncond": [], "cond": [], "shuf": []}
+            for c0 in range(0, n_x, XB):   # chunked: same probe seed per chunk for the three variants -> paired PMI per row
+                sl = slice(c0, min(n_x, c0 + XB)); e_, m_, c_ = enc_batch(zz[sl]); es, ms, cs = enc_batch(zs_shuf_x[sl])
+                for name, (ee, mm, cc) in (("uncond", (None, None, None)), ("cond", (e_, m_, c_)), ("shuf", (es, ms, cs))):
+                    gx = torch.Generator(device=dev).manual_seed(11 + c0)
+                    lp[name].append(exact_logp(model, xx[sl], ee, mm, n_steps=a.exact_steps, probes=1, gen=gx, cvec=cc))
+            lp = {k_: torch.cat(v_) for k_, v_ in lp.items()}
             pmi = (lp["cond"] - lp["uncond"]) / math.log(2); pms = (lp["shuf"] - lp["uncond"]) / math.log(2)
             out.update({f"{prefix}/exact_pmi_bits": pmi.mean().item(), f"{prefix}/exact_pmi_median_bits": pmi.median().item(), f"{prefix}/exact_pmi_sem_bits": (pmi.std() / math.sqrt(n_x)).item(),
                         f"{prefix}/exact_pmi_shuf_bits": pms.mean().item(), f"{prefix}/exact_frac_positive": (pmi > 0).float().mean().item(),

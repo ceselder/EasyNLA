@@ -34,9 +34,9 @@ class FlowBundle:
             self.model.eval(); self.model.requires_grad_(False)
             self.encode = None; self.arvec = None; self.use_enc = self.use_vec = False
             print(f"[scoring] frozen whole-trunk flow: adapter step {ad.get('step')} ({n_ad} adapter tensors, {n_lora} LoRA tensors) from {adapter_path}", flush=True); return
-        use_tokens = self.cond_mode in ("tokens", "both", "tokens_ar", "tokens_base")     # cross-reads present in the adapter
-        use_vec = self.cond_mode in ("ar_vec", "both")                                    # pooled AR vector present
-        use_enc = self.cond_mode in ("tokens_ar", "tokens_base")                          # token states come from an ARVecEncoder trunk (LoRA-tuned or frozen)
+        use_tokens = self.cond_mode in ("tokens", "both", "tokens_ar", "tokens_base", "tokens_ar_all")   # cross-reads present in the adapter
+        use_vec = self.cond_mode in ("ar_vec", "both")                                                     # pooled AR vector present
+        use_enc = self.cond_mode in ("tokens_ar", "tokens_base", "tokens_ar_all")                          # token states come from an ARVecEncoder trunk (LoRA-tuned or frozen); _all = many layers
         self.encode = None; self.arvec = None; d_enc = cfg["d_input"]
         enc_state = None
         if use_vec or use_enc:
@@ -52,7 +52,8 @@ class FlowBundle:
             if tok.pad_token_id is None: tok.pad_token = tok.eos_token
             # trainable=True only to instantiate the LoRA modules the checkpoint fills; everything is frozen below
             self.arvec = ARVecEncoder(src, tok, dev, grad_ckpt=False, trainable=bool(enc_state["lora"]), enc_layer=aa.get("enc_layer", enc_layer),
-                                      enc_model=enc_model, keep_norm=aa.get("enc_keep_norm", False))
+                                      enc_model=enc_model, keep_norm=aa.get("enc_keep_norm", False),
+                                      enc_layers=aa.get("enc_layers_list") or enc_state.get("enc_layers"), bidir=aa.get("enc_bidir", False) or enc_state.get("bidir", False))
             if enc_state["lora"]: self.arvec.load_saved(enc_state)
             elif use_vec: self.arvec.crit.value_head.load_state_dict(enc_state["value_head"])
             self.arvec.eval(); self.arvec.requires_grad_(False)

@@ -27,7 +27,7 @@ class CrossRead(nn.Module):
         B, T, _ = enc.shape
         has = enc_mask.any(-1)                                                                        # samples with a condition (per-sample dropout = all-False mask)
         safe_mask = enc_mask | (~has)[:, None]                                                        # avoid all-masked rows (NaN) — their output is zeroed below
-        e = self.enc_ln(enc)
+        e = self.enc_ln(enc).to(h.dtype)                                                              # one cast: autocast would keep separate bf16 copies of e for k and v
         q = self.q(h).view(B, self.n_slots, self.n_heads, self.d_head).transpose(1, 2)              # [B, H, S, dh]
         k = self.k(e).view(B, T, self.n_heads, self.d_head).transpose(1, 2)                          # [B, H, T, dh]
         v = self.v(e).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
@@ -50,7 +50,7 @@ class ChunkCrossRead(nn.Module):
     def forward(self, h, enc, enc_mask):
         B, T, _ = enc.shape; C = self.n_chunks
         has = enc_mask.any(-1); safe_mask = enc_mask | (~has)[:, None]
-        e = self.enc_ln(enc)
+        e = self.enc_ln(enc).to(h.dtype)
         q = (self.q(h.view(B, C, self.d_slice)) + self.pos[None]).view(B, C, self.n_heads, self.d_head).transpose(1, 2)   # [B, H, C, dh]
         k = self.k(e).view(B, T, self.n_heads, self.d_head).transpose(1, 2); v = self.v(e).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         att = F.scaled_dot_product_attention(q, k, v, attn_mask=safe_mask[:, None, None, :])                                  # [B, H, C, dh]
