@@ -1638,6 +1638,9 @@ def main():
                    help="Use rsLoRA scaling (alpha/sqrt(r) instead of alpha/r). "
                         "Default ON because we use r=128 where vanilla LoRA's "
                         "alpha/r=0.125 collapses the effective learning rate.")
+    p.add_argument("--cotrain-select", choices=["all", "best"], default="all",
+                   help="which rollouts the critic (AR or flow, --flow-cotrain rollouts/mix) co-trains on each step: every kept rollout, or only the "
+                        "highest-reward rollout of each prompt group (best-of-group bootstrapping of the ground truth)")
     p.add_argument("--train-critic", action=argparse.BooleanOptionalAction, default=True,
                    help="Co-train the AR critic (paper-faithful, default ON; "
                         "--no-train-critic to disable). Adds a separate optimizer for "
@@ -3289,6 +3292,7 @@ def main():
         # Gradient from this update does NOT flow into the actor (z is discrete).
         critic_loss_val = float("nan")
         critic_grad_norm_val = float("nan")
+        cotrain_n_pairs = 0; cotrain_sel_reward = float("nan")   # logged as critic/n_pairs, critic/sel_reward_mean
         critic_bwd_ok = False  # DP: did THIS rank run a finite critic backward this step?
         critic_kl_val = float("nan")
         _critic_now = (args.critic_update_every <= 1) or (step % args.critic_update_every == 0)
@@ -3304,9 +3308,18 @@ def main():
             # mismatched (explanation, activation) pair would teach the critic noise.
             _mm = grpo_metrics.get("sampler_mismatch_idx", []) if grpo_metrics else []
             _mm_orig = {keep[j] for j in _mm if j < len(keep)}
-            for i in keep:
-                if i in _mm_orig:
-                    continue
+            _crit_iter = [i for i in keep if i not in _mm_orig]
+            cotrain_sel_reward = float("nan")
+            if getattr(args, "cotrain_select", "all") == "best":   # best-of-group: one (h, z) pair per prompt = the rollout the reward liked most
+                _best = {}
+                for i in _crit_iter:
+                    r_ = rewards[i] if i < len(rewards) else None
+                    if r_ is None or not math.isfinite(r_): continue
+                    g_ = all_prompt_group[i]
+                    if g_ not in _best or r_ > _best[g_][0]: _best[g_] = (r_, i)
+                _crit_iter = [i for _, i in _best.values()]
+                if _best: cotrain_sel_reward = float(sum(r_ for r_, _ in _best.values()) / len(_best))
+            for i in _crit_iter:
                 expl = all_explanations[i]
                 act = all_activations[i]
                 if expl is None:
@@ -3328,6 +3341,7 @@ def main():
                 crit_inputs = [crit_inputs[j] for j in _sel]
                 crit_golds = [crit_golds[j] for j in _sel]
                 crit_pg = [crit_pg[j] for j in _sel]
+            cotrain_n_pairs = len(crit_inputs)
             if crit_inputs:
                 # Micro-batch the critic update — single forward on 256 sequences
                 # × 200 tokens × 5.5B-param critic with grad blows past 130GB.
@@ -3526,6 +3540,7 @@ def main():
         log["time/critic_s"] = max(0.0, (t_critic_end - t_grpo_end) - vllm_sync_secs)  # AR co-train
         log["time/step_s"] = log["wall_s"]                       # headline: total wall per step
         log["train/lr"] = float(optim.param_groups[0]["lr"])
+        log["critic/n_pairs"] = cotrain_n_pairs; log["critic/sel_reward_mean"] = cotrain_sel_reward; log["critic/cotrain_select"] = 1.0 if getattr(args, "cotrain_select", "all") == "best" else 0.0
         log["time/rollouts_per_s"] = _n_rollouts / max(1e-6, log["wall_s"])  # throughput
         # ---- DP grad-sync straggler wait: time this rank idled at the ACTOR grad all-reduce
         # barrier waiting for the SLOWEST rank to finish its backward (the load-imbalance tax).
