@@ -1825,6 +1825,7 @@ def main():
     p.add_argument("--vllm-gpu-index", type=int, default=None, help="which GPU of the rank's slice hosts the vLLM engine (default 0 = the policy GPU)")
     p.add_argument("--flow-enc-device", default="", help="device for the flow critic's 27B token ENCODER (default = --flow-device). Async layout: --flow-device cuda:0 --flow-enc-device cuda:1 --vllm-gpu-index 1 puts the 13.7B denoiser next to the policy and the encoder next to the engine")
     p.add_argument("--prefix-cache", action="store_true", help="run the shared AV prompt prefix once per step and only [left neighbour, marker, tail, response] per rollout (MAEMM prefix cache; needs the ceselder/transformers@maemm-prefix-cache fork and --no-gradient-checkpointing)")
+    p.add_argument("--oom-keep-prefix", action="store_true", help="OOM ladder order: turn gradient checkpointing on and halve the micro-batch (down to 4) BEFORE dropping the prefix cache (default ladder drops the prefix cache first)")
     p.add_argument("--no-gradient-checkpointing", action="store_true", help="override a config's gradient_checkpointing: true (the policy GPU has room once vLLM moved off it); on OOM the GRPO update falls back to checkpointing for the rest of the run")
     p.add_argument("--no-sort-microbatches", action="store_true", help="keep the original (unsorted) GRPO micro-batch order; default sorts rollouts by length to cut padding")
     p.add_argument("--adv-mode", choices=["group", "none", "batch"], default=None,
@@ -3241,7 +3242,7 @@ def main():
           except torch.OutOfMemoryError:
             # fallback ladder: (1) turn gradient checkpointing on, (2) halve the micro-batch; grads from the failed attempt are discarded
             vectors_ref[0] = None; optim.zero_grad(set_to_none=True); torch.cuda.empty_cache()
-            if _prefix_cache is not None:
+            if _prefix_cache is not None and not (args.oom_keep_prefix and (not args.gradient_checkpointing or args.logp_micro_batch > 4)):
                 _prefix_cache = None; print(f"step {step}: GRPO OOM -> prefix cache OFF for the rest of the run", flush=True)
             elif not args.gradient_checkpointing:
                 args.gradient_checkpointing = True; actor.gradient_checkpointing_enable()
