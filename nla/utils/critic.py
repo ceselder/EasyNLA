@@ -5,7 +5,7 @@ import torch
 from nla.schema import normalize_activation
 
 
-def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
+def _critic_predict_impl(critic, input_ids, attention_mask, mse_scale_f):
     """pred = value_head(normalize(backbone_last_hidden, mse_scale)) at the suffix anchor.
 
     Normalising the backbone-last-hidden BEFORE the value_head bounds the head's
@@ -33,3 +33,13 @@ def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
     # autocast (fp32 full-FT mode) — autocast would silently demote it.
     with torch.autocast(device_type=last_h_norm.device.type, enabled=False):
         return critic.value_head(last_h_norm.to(critic.value_head.weight.dtype)).float()
+
+
+def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
+    """Device-agnostic wrapper: with --critic-device the critic lives on another GPU than the caller's tensors; run the forward
+    there and return the prediction on the caller's device (autograd crosses the device copy, so the co-training backward works)."""
+    in_dev = input_ids.device; cdev = next(critic.parameters()).device
+    if cdev == in_dev:
+        return _critic_predict_impl(critic, input_ids, attention_mask, mse_scale_f)
+    out = _critic_predict_impl(critic, input_ids.to(cdev), attention_mask.to(cdev) if attention_mask is not None else None, mse_scale_f)
+    return out.to(in_dev)
