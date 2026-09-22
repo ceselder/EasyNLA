@@ -1662,6 +1662,7 @@ def main():
                         "The EMA critic scores rollouts via shadow-swap while the "
                         "co-train loss/optimizer stay on live weights. 0.0 (default) "
                         "= control, no EMA. Sweep values: 0.98, 0.995.")
+    p.add_argument("--critic-device", default="", help="device for the MSE (AR) critic, e.g. cuda:1 when each rank owns 2 GPUs (frees ~60 GB on the policy GPU -> no gradient checkpointing / larger micro-batch); default = the actor device")
     p.add_argument("--ar-lora", action="store_true", default=False,
                    help="Co-train the AR critic as a LoRA (frozen backbone + LoRA "
                         "+ value head) instead of full fine-tune. Frees ~20GB "
@@ -2221,7 +2222,8 @@ def main():
         print(f"[critic] loading {ar_src}")
         critic = NLACriticModel.from_pretrained(
             ar_src, torch_dtype=torch.bfloat16,
-        ).to(device)
+        ).to(torch.device(args.critic_device) if args.critic_device else device)   # --critic-device cuda:1: critic off the policy GPU (critic_predict moves inputs/outputs)
+        if args.critic_device: print(f"[critic] on {args.critic_device} (policy on {device})", flush=True)
         # NLACriticModel.from_pretrained returns params with requires_grad=True by
         # default. Freeze everything first, then conditionally unfreeze backbone.
         for p_ in critic.parameters():
