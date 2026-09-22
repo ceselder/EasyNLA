@@ -3216,7 +3216,7 @@ def main():
         upd_adv = adv.index_select(0, torch.tensor(keep, device=device))
         actor.train()
         _grpo_kwargs_common = None
-        for _attempt in range(3):
+        for _attempt in range(5 if args.oom_keep_prefix else 3):
           try:
             if getattr(args, "lr_warmup_steps", 0) > 0:   # linear lr warm-up (user: 'if it diverged do a warmup and/or lower the lr')
                 _lr_scale = min(1.0, (step + 1) / args.lr_warmup_steps)
@@ -3244,7 +3244,12 @@ def main():
             # fallback ladder: (1) turn gradient checkpointing on, (2) halve the micro-batch; grads from the failed attempt are discarded
             print(f"step {step}: GRPO OOM reason: {str(_oom_e).splitlines()[0][:260]} | allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB reserved {torch.cuda.memory_reserved() / 2**30:.1f} GiB", flush=True)
             vectors_ref[0] = None; optim.zero_grad(set_to_none=True); torch.cuda.empty_cache()
-            if _prefix_cache is not None and not (args.oom_keep_prefix and (not args.gradient_checkpointing or args.logp_micro_batch > 4)):
+            if _prefix_cache is not None and args.oom_keep_prefix and args.logp_micro_batch > 4:
+                # the prefix cache needs the KV cache, which HF drops under gradient checkpointing -> with --oom-keep-prefix shrink the
+                # micro-batch first (prefix on, checkpointing off); only at the floor fall through to the default rungs below
+                args.logp_micro_batch = max(1, args.logp_micro_batch // 2)
+                print(f"step {step}: GRPO OOM -> micro-batch halved to {args.logp_micro_batch} (prefix cache kept, checkpointing off)", flush=True)
+            elif _prefix_cache is not None:
                 _prefix_cache = None; print(f"step {step}: GRPO OOM -> prefix cache OFF for the rest of the run", flush=True)
             elif not args.gradient_checkpointing:
                 args.gradient_checkpointing = True; actor.gradient_checkpointing_enable()
@@ -3254,7 +3259,7 @@ def main():
             else:
                 args.logp_micro_batch = max(1, args.logp_micro_batch // 2)
                 print(f"step {step}: GRPO OOM -> micro-batch halved to {args.logp_micro_batch}", flush=True)
-            if _attempt == 2: raise
+            if _attempt == (4 if args.oom_keep_prefix else 2): raise
         t_grpo_end = time.time()  # [timing] end of GRPO forward+backward+step
         if (_async or _prefix_cache is not None) and grpo_metrics.get('sampler_logp_absdiff_mean') is not None:
             print(f"  [sampler-vs-hf@{step}] mean|Δlogp| {grpo_metrics['sampler_logp_absdiff_mean']:.4f} max {grpo_metrics.get('sampler_logp_absdiff_max', float('nan')):.3f} (noise floor ~0.02; one-step policy lag adds a little; a wrong suffix path would be ≫)", flush=True)
