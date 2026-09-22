@@ -1705,6 +1705,7 @@ def main():
                         "CPU round-trip ×workers) but needs same-node + GPU P2P. "
                         "Validate via FVE tracking single-GPU before trusting it.")
     p.add_argument("--save-every", type=int, default=50)
+    p.add_argument("--critic-save-every", type=int, default=0, help="cadence (steps) of the co-trained CRITIC save (critic_latest = a full 27B merge, ~35 s; flow_latest = adapter + LoRA); 0 = same as --save-every; the final step always saves")
     p.add_argument("--resume-from-lora", type=str, default=None,
                    help="Directory containing a saved LoRA adapter (iter_NNNNNN); "
                         "loaded onto the AV-SFT base so training continues "
@@ -3812,9 +3813,11 @@ def main():
             out_dir = save_dir / f"iter_{step + 1:06d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             actor.save_pretrained(str(out_dir))
-            if args.train_critic and flow is not None:
+            _cse = args.critic_save_every or args.save_every
+            _save_critic = args.train_critic and ((step + 1) % _cse == 0 or step + 1 >= args.num_steps)   # the critic save is the expensive part (54 GB merge for the AR critic)
+            if _save_critic and flow is not None:
                 flow.save(str(save_dir / "flow_latest"), step + 1)
-            elif args.train_critic:
+            elif _save_critic:
                 # The co-trained critic is the reward model behind this run's
                 # FVE curve; without it, resume/eval scores against the stale
                 # SFT critic. Full-model save is ~11GB, so keep latest-only:
