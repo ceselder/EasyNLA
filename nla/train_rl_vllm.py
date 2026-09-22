@@ -3239,8 +3239,9 @@ def main():
             loss_mode=args.loss, cispo_eps_max=args.cispo_eps_max, ppo_clip=args.ppo_clip, sort_by_length=not args.no_sort_microbatches, prefix=_prefix_cache,
             )
             break
-          except torch.OutOfMemoryError:
+          except torch.OutOfMemoryError as _oom_e:
             # fallback ladder: (1) turn gradient checkpointing on, (2) halve the micro-batch; grads from the failed attempt are discarded
+            print(f"step {step}: GRPO OOM reason: {str(_oom_e).splitlines()[0][:260]} | allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB reserved {torch.cuda.memory_reserved() / 2**30:.1f} GiB", flush=True)
             vectors_ref[0] = None; optim.zero_grad(set_to_none=True); torch.cuda.empty_cache()
             if _prefix_cache is not None and not (args.oom_keep_prefix and (not args.gradient_checkpointing or args.logp_micro_batch > 4)):
                 _prefix_cache = None; print(f"step {step}: GRPO OOM -> prefix cache OFF for the rest of the run", flush=True)
