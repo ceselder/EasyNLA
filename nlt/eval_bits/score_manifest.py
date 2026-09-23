@@ -24,14 +24,14 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--ckpt", required=True); p.add_argument("--manifest", required=True); p.add_argument("--out", required=True)
     p.add_argument("--split", default="val"); p.add_argument("--n", type=int, default=0, help="score only the first n rows (0 = all)"); p.add_argument("--batch", type=int, default=64)
     p.add_argument("--ode-steps", type=int, default=32); p.add_argument("--probes", type=int, default=1); p.add_argument("--seed", type=int, default=0); p.add_argument("--skip-exact", action="store_true")
-    p.add_argument("--enc-model", default=None); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--data-device", default="cuda")
+    p.add_argument("--enc-model", default=None); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--data-device", default="cuda"); p.add_argument("--stats", default=None, help="stats.pt of the critic's prior (default <data-dir>/stats.pt)")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pandas as pd
     m = pd.read_parquet(a.manifest) if a.manifest.endswith(".parquet") else pd.read_json(a.manifest, lines=True)
     if a.n: m = m.iloc[: a.n]
     m = m.reset_index(drop=True); m["text"] = m["text"].fillna("").astype(str)
     store = ActStore(a.data_dir, a.split, device=a.data_device)
-    norm = GlobalNorm.load(os.path.join(a.data_dir, "stats.pt"), "affine").to(dev); d = store.d
+    norm = GlobalNorm.load(a.stats or os.path.join(a.data_dir, "stats.pt"), "affine").to(dev); d = store.d
     model, aa, step = load_critic(a.ckpt, dev); src_rms = bool(aa.get("src_rms", 0)); assert model.cond == "text", "score_manifest needs a text critic"
     from nlt.critic.text_encoder import TextEncoder
     encoder = TextEncoder(a.enc_model or aa.get("enc_model", "Qwen/Qwen3-0.6B"), a.enc_layer if a.enc_layer is not None else aa.get("enc_layer", 20), dev, aa.get("enc_max_len", 128))
