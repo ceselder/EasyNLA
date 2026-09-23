@@ -25,6 +25,8 @@ def parse():
     p.add_argument("--enc-model", default=None); p.add_argument("--enc-layer", type=int, default=None)
     p.add_argument("--lam", default="0.1", help="bits per token, or 'auto' = 0.25 x within-group std(bits) / within-group std(tokens) over the WORKSPACE-band groups of the first batch (DECISIONS v1.5), then fixed")
     p.add_argument("--lam-fallback", type=float, default=0.1); p.add_argument("--floor", type=float, default=-5.0)
+    p.add_argument("--lam-autohalve", action=argparse.BooleanOptionalAction, default=True, help="DECISIONS #214: at each eval, if mean length fell >= --lam-len-drop (fraction) since the previous eval while the FROZEN critic's content (bits - random-pair control) did not improve by --lam-content-gain, halve lambda (floor --lam-min)")
+    p.add_argument("--lam-len-drop", type=float, default=0.08); p.add_argument("--lam-content-gain", type=float, default=0.2); p.add_argument("--lam-min", type=float, default=0.0025)
     p.add_argument("--cross-critics", default=None, help="comma list name:ckpt of extra critics that re-score a subsample of the step's rollouts every --cross-every steps (private-code / critic-hacking check; DECISIONS v1.6); 'frozen' = a frozen copy of the starting critic is always included when --frozen-critic-eval")
     p.add_argument("--cross-every", type=int, default=20); p.add_argument("--cross-n", type=int, default=256)
     p.add_argument("--copy-thresh", type=float, default=0.05); p.add_argument("--adv-std", action="store_true", help="divide advantages by the group std (default Dr.GRPO: no)")
@@ -173,7 +175,7 @@ def main():
     from nlt.evals.diversity import distinct_n, self_bleu
     lam = None if str(a.lam).strip().lower() == "auto" else float(a.lam)
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"rl_{a.tag}", group="rl", config=vars(a))
-    gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id
+    gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id; lam_hist = []
     meta_pos = store.meta["pos_idx"].values; meta_next = store.meta["next_token_id"].values
     for step in range(a.steps):
         t0 = time.time(); B, G = a.batch_prompts, a.group
@@ -226,7 +228,8 @@ def main():
                "bits/mean": float(b_ok.mean()), "bits/median": float(b_ok.median()), "bits/within_group_std": within_group_std(bits.masked_fill(~fin, 0), groups),
                "bits/frac_pos": float((b_ok > 0).float().mean()), "bits/frac_nonpos_all": float((bits <= 0).float().mean()), "proxy/mean": float(proxy[ok].mean()) if ok.any() else float("nan"),
                "proxy/over_exact": float(proxy[ok].mean() / b_ok.mean()) if ok.any() and float(b_ok.mean()) != 0 else float("nan"),
-               "tokens/mean": float(n_tok.mean()), "tokens/median": float(n_tok.median()), "tokens/frac_lt4": float((n_tok < 4).float().mean()), "tokens/truncated": float(np.mean([r["truncated"] for r in res])),
+               "tokens/mean": float(n_tok.mean()), "tokens/median": float(n_tok.median()), "tokens/p10": float(n_tok.quantile(0.1)), "tokens/p90": float(n_tok.quantile(0.9)), "tokens/std": float(n_tok.std()),
+               "tokens/frac_lt4": float((n_tok < 4).float().mean()), "tokens/truncated": float(np.mean([r["truncated"] for r in res])),
                "corr/reward_tokens": corr(rewards, n_tok), "corr/bits_tokens": corr(bits, n_tok), "paraphrase/frac": float(pmask.float().mean()),
                "paraphrase/bits_mean": float(bits[pmask & ok].mean()) if (pmask & ok).any() else float("nan"), "paraphrase/bits_mean_unparaphrased": float(bits[~pmask & ok].mean()) if (~pmask & ok).any() else float("nan"),
                "kl": um["kl_mean"], "entropy": um["entropy"], "sampler/absdiff_mean": um["sampler_logp_absdiff_mean"], "sampler/absdiff_max": um["sampler_logp_absdiff_max"], "sampler/masked": um["sampler_mismatch_masked"],
@@ -276,7 +279,19 @@ def main():
                 if m.any(): log[f"eval/bits_{bname}"] = float(eb[m].mean())
             if frozen is not None:
                 fb = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
-                log.update({"eval/bits_frozen_mean": float(fb.mean()), "eval/bits_live_minus_frozen": float((eb - fb).mean())})
+                fb_rp = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in rp_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
+                fro_content = float((fb - fb_rp).mean())
+                log.update({"eval/bits_frozen_mean": float(fb.mean()), "eval/bits_frozen_rp_mean": float(fb_rp.mean()), "eval/frozen_content": fro_content, "eval/bits_live_minus_frozen": float((eb - fb).mean())})
+                for bname in ("pre", "workspace", "motor"):
+                    m = torch.tensor([band(int(j_)) == bname for j_ in ev_j.tolist()])
+                    if m.any(): log[f"eval/frozen_content_{bname}"] = float((fb[m] - fb_rp[m]).mean())
+                # DECISIONS #214: length trending down with flat frozen-critic content = lambda too high -> halve it
+                if a.lam_autohalve and lam_hist:
+                    prev_tok, prev_con = lam_hist[-1]
+                    if float(et.mean()) <= (1 - a.lam_len_drop) * prev_tok and fro_content < prev_con + a.lam_content_gain and lam > a.lam_min:
+                        lam = max(a.lam_min, lam / 2); log["lambda_halved"] = 1.0
+                        print(f"   [lambda] length {prev_tok:.1f} -> {float(et.mean()):.1f} with frozen content {prev_con:+.2f} -> {fro_content:+.2f}: lambda halved to {lam:.4f}", flush=True)
+                lam_hist.append((float(et.mean()), fro_content))
             fro = f"; frozen critic {log['eval/bits_frozen_mean']:+.3f} (live-frozen {log['eval/bits_live_minus_frozen']:+.3f})" if "eval/bits_frozen_mean" in log else ""
             bands = " ".join(f"{b}={log[f'eval/bits_{b}']:+.1f}" for b in ("pre", "workspace", "motor") if f"eval/bits_{b}" in log)
             print(f"   eval: bits {log['eval/bits_mean']:+.3f} (med {log['eval/bits_median']:+.3f}, /tok {log['eval/bits_per_token']:+.3f}; random-pair control {log['eval/bits_rp_mean']:+.3f}{fro}) by band {bands} | tok {log['eval/tokens_mean']:.1f} viol {log['eval/viol_any']:.2f} nonpos {log['eval/frac_nonpos']:.2f}", flush=True)
