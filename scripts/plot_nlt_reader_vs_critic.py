@@ -21,8 +21,8 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 # controls-table source -> (reader key, short label, colour slot). Colours fixed per source across every figure of the report.
-SOURCES = {"teacher_v1": ("reader_teacher_v1", "Sonnet teacher\n+ lens + final", CAT[0]), "teacher_nofinal_v1": ("reader_teacher_nofinal_v1", "Sonnet teacher\n+ lens", CAT[1]),
-           "teacher_nolens_v1": ("reader_teacher_nolens_v1", "Sonnet teacher\npassage only", CAT[2]), "lensdiff_L1": ("reader_lensdiff_jlens_L1", "J-lens change\ndescription", CAT[6]),
+SOURCES = {"teacher_v1": ("reader_teacher_v1", "teacher\n+ lens + final", CAT[0]), "teacher_nofinal_v1": ("reader_teacher_nofinal_v1", "teacher\n+ lens", CAT[1]),
+           "teacher_nolens_v1": ("reader_teacher_nolens_v1", "teacher\npassage only", CAT[2]), "lensdiff_L1": ("reader_lensdiff_jlens_L1", "J-lens\nsentence", CAT[6]),
            "v0_ao_tsv1": ("reader_v0_ao_tsv1", "VERBALIZER\nactivations only", CAT[7]), "lensdiff_L3": ("reader_lensdiff_jlens_L3", "J-lens lists\n(137 tokens)", CAT[4])}
 
 
@@ -66,11 +66,11 @@ def main():
     ib = json.load(open(os.path.join(D, "info_budget.json"))) if os.path.exists(os.path.join(D, "info_budget.json")) else {"text": {}}
     t2 = next((s for k, c in ib.get("text", {}).items() if k in ("jlens20_text", "text_t2_jlens20") for s in c["sets"].values()), None)
     t2_content = (t2["bands"]["all"].get("content") if t2 else None) or 14.03; t2_p = (t2.get("frac_z_beats_dm") if t2 else None) or 0.78; t2_src = "data/info_budget.json (jlens20_text)" if t2 else "board #245/#249 (exact, Heun 32, n=1024)"
-    ax2.text(0.98, 0.97, f"Reference: the raw J-lens top-20 token lists written as\nplain text earn {t2_content:.1f} content bits (P = {t2_p:.2f}) from the same\ncritic family — not natural language, but it shows the\nchannel can carry it: sentences keep ~{100 * rows[0]['content'] / t2_content:.0f}%, the verbalizer ~{100 * next(r['content'] for r in rows if r['source'] == 'v0_ao_tsv1') / t2_content:.0f}%",
+    ax2.text(0.98, 0.97, f"Reference: the raw J-lens top-20 token lists written as\nplain text earn {t2_content:.1f} content bits (P = {t2_p:.2f}) from the same\ncritic family — not natural language, but it shows the\nchannel can carry it: the best sentence keeps ~{100 * max(r['content'] for r in rows if r['source'] != 'lensdiff_L3') / t2_content:.0f}%, the verbalizer ~{100 * next(r['content'] for r in rows if r['source'] == 'v0_ao_tsv1') / t2_content:.0f}%",
              transform=ax2.transAxes, ha="right", va="top", fontsize=9.5, color=INK2, bbox={"boxstyle": "round,pad=0.4", "fc": "#f0eee6", "ec": GRID})
     ax2.axhline(0, color=INK2, lw=0.8); ax2.set_ylim(0, max(4.0, max(r["content"] + r["content_sem"] for r in rows) * 1.55)); ax2.set_ylabel("exact content bits = bits(z) − bits(z_dm), paired;  P = P(z beats z_dm)")
     ax2.set_xticks(x); ax2.set_xticklabels([r["label"] for r in rows], fontsize=9.5); ax2.grid(axis="x", visible=False)
-    ax2.set_title("What the headline flow critic pays for the same sentences:\n1–2.5 exact bits over another pair's sentence at the same (i, j);\nP(z beats z_dm) 0.59–0.71 against a 0.75 gate — and the ranking flips", loc="left", fontsize=12.5)
+    ax2.set_title("What the headline flow critic pays for the same texts:\n0.8–3.4 exact bits over another pair's text at the same (i, j);\nP(z beats z_dm) 0.59–0.78 against a 0.75 gate — and the ranking flips", loc="left", fontsize=12.5)
     fig.suptitle("\n".join(textwrap.wrap("The reader–critic gap: sentences that let a reader recover the model's next token 3× above chance are worth about one exact bit to the flow critic, "
                                           "and the two channels rank the text sources in opposite order — the critic, not the text, is the bottleneck", 112)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
     fig.text(0.01, 0.005, "Sonnet teacher = Sonnet 5 shown the passage (+ J-lens readouts at i and j, + the model's final top-10), never the continuation. Qwen3-8B, layer pairs 9–34, fixed held-out set. Reader = Sonnet 5 given the sentence only (512 pairs per source, accuracy on parsed answers). Critic = all-sources adapter with the null regulariser on the "
