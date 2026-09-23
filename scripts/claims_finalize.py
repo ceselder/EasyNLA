@@ -45,6 +45,7 @@ class Twins:
     """donor pools per family:type (slot values and whole claims from other anchors) -> twin(claim, family, type, own_claims)"""
     def __init__(self, rng, cap=4000):
         self.rng, self.cap = rng, cap; self.slots = collections.defaultdict(list); self.whole = collections.defaultdict(list); self.pool = []
+        self.byb = collections.defaultdict(lambda: collections.defaultdict(list))   # family:type -> bucket -> donor claims (bucketed types)
 
     def add(self, claims, fams, types):
         for c, f, t in zip(claims, fams, types):
@@ -52,6 +53,8 @@ class Twins:
             if m: self._push(self.slots[k], m.group(1) or m.group(2))
             self._push(self.whole[k], c)
             self._push(self.pool, c)
+            b = _bucket(t.split("/")[0], c)
+            if b is not None: self._push(self.byb[k][b], c)
 
     def _push(self, lst, x):
         if len(lst) < self.cap: lst.append(x)
@@ -71,9 +74,8 @@ class Twins:
                         if _norm(tw) not in ownn: return tw
             b = _bucket(base, c)
             if b is not None:
-                cands = [x for x in self.whole[k] if _bucket(base, x) not in (None, b)]
-                far = [x for x in cands if abs(_bucket(base, x) - b) >= 2]
-                if far or cands: return self.rng.choice(far or cands)
+                far = [bb for bb in self.byb[k] if abs(bb - b) >= 2 and self.byb[k][bb]]; other = [bb for bb in self.byb[k] if bb != b and self.byb[k][bb]]
+                if far or other: return self.rng.choice(self.byb[k][self.rng.choice(far or other)])
             if base in BUCKETS: return None                                            # bucketed type without a far bucket in the pool
             if self.whole[k]:                                                          # same claim type, another anchor (concept lists, next sentence, language, ...)
                 for _ in range(8):
@@ -113,9 +115,13 @@ def main():
     if not names: print("[final] nothing to do", flush=True); return
     fam = {f: {} for f in FAMILIES}
     for f in FAMILIES:
-        for p in [x for n in names for x in (f"{a.root}/claims/{f}_{n}.parquet", f"{a.root}/semantic/{f}_{n}.parquet") if os.path.exists(x)]:
+        for p in [x for n in names for x in (f"{a.root}/claims/{f}_{n}.parquet", f"{a.root}/semantic/{f}_{n}.parquet", f"{a.root}/claims/{f}_sonnet_{n}.parquet",
+                                             f"{a.root}/gemma/{f}_{n}.parquet") if os.path.exists(x)]:
             cols = ["anchor_id", "claims", "types"] + (["twins"] if "twins" in pq.read_schema(p).names else [])
-            for r in pq.read_table(p, columns=cols).to_pylist(): fam[f][r["anchor_id"]] = r
+            for r in pq.read_table(p, columns=cols).to_pylist():
+                r["twins"] = r.get("twins") or [None] * len(r["claims"]); q = fam[f].get(r["anchor_id"])
+                if q is None: fam[f][r["anchor_id"]] = r
+                else: q["claims"] = q["claims"] + r["claims"]; q["types"] = q["types"] + r["types"]; q["twins"] = q["twins"] + r["twins"]   # several sources of one family
     print(f"[final] {len(names)} anchor files; claims for {[len(fam[f]) for f in FAMILIES]} anchors per family ({time.time() - t0:.0f}s)", flush=True)
     # pass 1: pool + exact-repeat counts (normalised strings, counted once per anchor)
     meta = {}

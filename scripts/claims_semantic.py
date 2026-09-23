@@ -96,6 +96,84 @@ C: The owner blames a 40 percent increase in the cost of flour. || Q: flour has 
 Example (aspect: upcoming | granularity: label | style: label):
 C: Next: a customer's reaction || Q: said Maria Lopez, who has shopped there || F: Next: the mayor's reaction"""
 
+# ---------------------------------------------------------------- wider aspect taxonomy for the Gemma-4 generator (semantic claims ~free)
+ASPECTS_WIDE = {   # aspect -> (definition, base weight); source-specific weights in SRC_W_WIDE; number aspects only when the text has digits
+    "topic": ("what the text is about, from the broad subject to the specific point being made", 1.0),
+    "entities": ("people, places, organisations, products and works named in the text", 1.0),
+    "relations": ("how two named things relate: who did what to whom, part-of, owned-by, located-in", 0.8),
+    "numbers": ("a number that appears in the text and exactly what it counts or measures (quote the number itself)", 1.6),
+    "number_detail": ("the exact value, unit or order of magnitude of a quantity, price, date, score, percentage or measurement (quote it)", 1.2),
+    "comparison": ("what the text compares, ranks or contrasts, and in which direction", 0.6),
+    "causality": ("causes, reasons, consequences, conditions stated in the text", 0.6),
+    "time": ("when things happen, tense, the order of events, dates and durations", 0.7),
+    "place": ("where things happen or are located", 0.6),
+    "stance": ("sentiment, opinion, attitude or evaluation expressed by the author or a speaker", 0.6),
+    "register": ("tone, formality, intended audience, level of expertise", 0.6),
+    "genre": ("document type: recipe, forum post, product page, contract, news report, README, lecture notes, ...", 0.6),
+    "intent": ("what the author or speaker is trying to achieve", 0.5),
+    "discourse_state": ("where the text is at the last character of the prefix: what the current sentence, paragraph or list is doing", 1.2),
+    "grammar_next": ("what is grammatically or logically required next at the end of the prefix (a noun, a verb, a closing bracket, an answer ...)", 1.0),
+    "upcoming": ("what the continuation does: its next words, what the next sentence says, whether a list, number, name or new section follows", 1.3),
+    "upcoming_numbers": ("a number, date or quantity that appears in the CONTINUATION and what it refers to (quote it)", 1.0),
+    "world_knowledge": ("background knowledge the text relies on or implies (still entailed by the text)", 0.4),
+    "lists": ("items being enumerated, their count and their order", 0.6),
+    "definitions": ("terms the text defines or explains, and their meaning in the text", 0.4),
+    "instructions": ("steps, requirements, recommendations or commands given in the text", 0.5),
+    "style": ("word choice, rhetorical devices, formatting choices, markup", 0.4),
+    "syntax": ("the grammatical structure of the current sentence", 0.4),
+    "language": ("the language(s), script, spelling conventions, code-switching or translation in the text", 0.3),
+    "narrative": ("characters, events, plot, point of view, what a character wants or does", 0.0),
+    "dialogue": ("who is speaking, what the user asked for, what the assistant is doing or about to do", 0.0),
+    "code": ("what the code does: functions, variables, types, control flow, libraries, the construct being written", 0.0),
+    "code_values": ("concrete literals in the code: numbers, strings, argument values, return values (quote them)", 0.0),
+    "math": ("mathematical objects, statements, notation and the step of the argument currently being made", 0.0),
+    "math_values": ("specific numbers, variables and expressions in the mathematics (quote them)", 0.0),
+}
+SRC_W_WIDE = {"fiction": {"narrative": 1.6, "place": 0.8, "time": 0.8}, "chat": {"dialogue": 1.6, "instructions": 0.8},
+              "code": {"code": 2.0, "code_values": 1.2, "stance": 0.1, "register": 0.1, "genre": 0.3, "place": 0.0, "narrative": 0.0, "causality": 0.2},
+              "math": {"math": 1.5, "math_values": 1.2}, "multi": {"language": 1.0}}
+NUMBER_ASPECTS = {"numbers", "number_detail", "upcoming_numbers", "code_values", "math_values"}
+_DIGIT = re.compile(r"\d")
+
+SYSTEM_WIDE = """You write ATOMIC CLAIMS about a piece of text. They are training data for a model that reads a language model's internal state, so each claim must be TRUE, SPECIFIC and checkable.
+
+Setting. A language model is reading a document. It has read the PREFIX and is about to produce its next token. It has NOT read the CONTINUATION (the true next ~64 tokens), which is shown so that some claims can be about what comes next.
+
+Rules for every claim:
+1. TRUE: entailed by the text shown. No guesses, no outside facts the text does not itself imply, nothing about the model or about you.
+2. ATOMIC: exactly one fact per claim.
+3. SELF-CONTAINED: name things explicitly ("the recipe", "Dr. Okafor", "the function parse_args"), never "it" or "this" without a referent.
+4. SPECIFIC: prefer concrete details (names, numbers, exact words) over vague summaries. When the aspect is about numbers, the claim must contain the exact number as written in the text and say what it refers to.
+5. QUOTED: each claim carries a QUOTE, an exact substring of the PREFIX or of the CONTINUATION (copy the characters exactly, 1-12 words) that shows the claim is true.
+6. Claims about the CONTINUATION say so in their wording ("The next sentence ...", "The text is about to ...", "Coming up: ...") and quote the CONTINUATION. All other claims describe the PREFIX as it stands at its last character and quote the PREFIX.
+7. FALSE TWIN: for every claim also write F: a minimal edit that makes it clearly FALSE for this text (swap one entity, number, word, attribute or direction; keep the wording and length otherwise). Number claims get a different number. The false twin must be contradicted by the text or plainly unsupported by it, and still be a plausible claim about some other text.
+
+Aspects (each request names ONE aspect to focus on; if it does not fit this text, use the closest aspect that does):
+""" + "\n".join(f"- {k}: {v[0]}" for k, v in ASPECTS_WIDE.items()) + """
+
+Granularity (each request names one): label = 1-5 words ("Genre: recipe", "Price: $49"); phrase = 5-10 words; sentence = one full sentence of 10-25 words.
+Style (each request names one): plain = declarative statements about the text; reader = what a reader knows or expects at this point; label = "Key: value" pairs; casual = informal wording.
+
+Output format: one claim per line and nothing else, no numbering, no preamble:
+C: <claim> || Q: <exact quote> || F: <false twin>
+
+Examples:
+C: The price of a loaf of sourdough is going up to $7.50. || Q: sourdough will cost $7.50 || F: The price of a loaf of sourdough is going up to $5.50.
+C: Flour costs have risen by 40 percent. || Q: flour has gone up 40 percent || F: Flour costs have risen by 15 percent.
+C: Next: a customer's reaction || Q: said Maria Lopez, who has shopped there || F: Next: the mayor's reaction
+C: The recipe calls for 3 eggs. || Q: 3 large eggs || F: The recipe calls for 6 eggs."""
+
+
+def sample_request_wide(r, rng):
+    """one aspect (source-weighted; number aspects only if the shown text has digits), granularity, style, 1-2 claims (val: 3)"""
+    w = {k: v[1] for k, v in ASPECTS_WIDE.items()}; w.update(SRC_W_WIDE.get(r["source"], {}))
+    if not _DIGIT.search(shown_prefix(r, 1500) + r["cont_text"]): w = {k: (0.0 if k in NUMBER_ASPECTS else v) for k, v in w.items()}
+    elif not _DIGIT.search(r["cont_text"]): w["upcoming_numbers"] = 0.0
+    names = [k for k in w if w[k] > 0]; asp = rng.choices(names, weights=[w[k] for k in names], k=1)
+    g = rng.choices(list(GRAN), weights=list(GRAN.values()))[0]; s = rng.choices(list(STYLE), weights=list(STYLE.values()))[0]
+    return {"aspects": asp, "gran": g, "style": s, "n": 3 if r.get("is_val") else rng.randint(1, 2), "short": True}
+
+
 SRC_DESC = {"ffw": "web page", "code": "source code ({lang})", "chat": "conversation transcript", "math": "web page with mathematical content",
             "fiction": "book excerpt (Project Gutenberg)", "multi": "web page in {lang}"}
 

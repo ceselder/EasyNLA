@@ -51,7 +51,7 @@ def sample_subset(claims, K, rng=random):
 # anchors (is_val) keep every family and every claim (gates / composition evals need them).
 import zlib as _zlib
 
-FAMILY_SHARES = {"internal": 0.40, "text": 0.40, "semantic": 0.20}   # semantic share sized to the $3k Sonnet budget at ~$0.0021 / anchor over ~7M anchors
+FAMILY_SHARES = {"internal": 0.25, "text": 0.25, "semantic": 0.50}   # Gemma-4 semantic claims are ~free: half the activations get a semantic claim (was .4/.4/.2 with Sonnet)
 INTERNAL_TYPES = {"next_token": 1.0, "top_candidates": 1.0, "entropy": 1.0, "jlens": 1.0, "greedy": 1.0}
 TEXT_TYPE_WEIGHTS = {"unfinished_word": 2.0, "last_word": 2.0, "sentence_so_far": 1.5, "position": 1.5}   # others 1.0; types drawn among those available
 

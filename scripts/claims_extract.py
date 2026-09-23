@@ -117,7 +117,7 @@ def _gen_source(src, n, rng, sl=(0, 1)):
             if len(t) < 3 * MAX_CHARS: continue
             for w in range(max(2, min(12, math.ceil(n0 * sk / 28000) + 1))):   # windows per book so the slice reaches its target (PG-19 train ~28k books)
                 s = rng.randint(len(t) // 10, len(t) - MAX_CHARS - 1); s = t.find("\n\n", s) + 2 if t.find("\n\n", s) > 0 else s
-                yield "fiction", "pg19", "English", t[s: s + MAX_CHARS], f"pg19:{j}:{w}"; n -= 1
+                yield "fiction", "pg19", "English", t[s: s + MAX_CHARS], (f"pg19:{j}:{w}" if w < 2 else f"pg19:{j}:{w}:{s // 1000}"); n -= 1   # later windows keyed by offset (dedupe across tags)
             if n <= 0: break
     elif src == "multi":
         k = max(1, math.ceil(n / len(FW2_LANGS)))

@@ -279,18 +279,21 @@ def claims_text(root: str, shard: int = 0, nshards: int = 1, extra: str = "", fi
     return rc
 
 
-@app.function(gpu="B200", timeout=8 * 3600, max_containers=14, **COMMON)
+@app.function(gpu="B200", timeout=8 * 3600, max_containers=12, **COMMON)
 def claims_anchors_v2(root: str, shard: int, nshards: int, tag: str = "v2", extra: str = ""):
     """streaming one-claim extraction: anchors + state for docs shard i of n (at most 14 containers at once: + 8 training + 2 baselines = 24 B200), then (non-blocking) the text
     claims + per-shard finalize of this shard on a CPU container, so training can consume shards as they land"""
     from modal_nla_exp import _prep
     from playground_app import resolve_base
     os.environ.update({"NLA_VLLM_EAGER": "1", "VLLM_ATTENTION_BACKEND": "FLASH_ATTN"}); _prep(patch_lens=True)
-    vol_glp.reload(); base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    vol_glp.reload(); name = f"{tag}_{shard:03d}"
+    if os.path.exists(f"{root}/anchors/anchors_{name}.parquet"):
+        if not os.path.exists(f"{root}/claims/text_{name}.parquet"): claims_text.spawn(root, 0, 1, f"--names {name}", "")
+        return 0                                                                   # resumable: finished shards are skipped
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
     rc = _claims([f"{REPO_REMOTE}/scripts/claims_extract.py", "anchors", "--root", root, "--shard", str(shard), "--nshards", str(nshards), "--tag", tag, "--base", base,
                   "--one-claim", "--min-anchors", "2", "--max-anchors", "3", "--docs-glob", f"docs_*_{tag}_*.parquet"] + extra.split())
-    if rc == 0:
-        name = f"{tag}_{shard:03d}"; claims_text.spawn(root, 0, 1, f"--names {name}", name)
+    if rc == 0: claims_text.spawn(root, 0, 1, f"--names {name}", "")                  # text claims now; finalize after the Gemma semantic claims
     return rc
 
 
