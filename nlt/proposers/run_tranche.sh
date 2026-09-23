@@ -9,6 +9,7 @@
 set -uo pipefail
 SPLIT=$1; START=$2; END=$3; CHUNK=${4:-2048}; CONC=${5:-32}; VARIANTS=${6:-"final nofinal"}
 DATA_DIR=${DATA_DIR:-/vol/data/qwen3_8b}
+PERM_SEED=${PERM_SEED:--1}       # >=0: rows of a fixed permutation of the pairs table (use 0 for train); val uses -1 = first rows
 ZROOT=${ZROOT:-/vol/z}          # override for rehearsals so smoke pair_ids never land under /vol/z
 ROOT=/home/celeste/nlt; LOCAL=${LOCAL:-/home/celeste/nlt-prop-data}
 TAG=$(printf "%07d_%07d" "$START" "$END")
@@ -16,7 +17,7 @@ mkdir -p "$LOCAL/features_v1/$SPLIT" "$LOCAL/teacher/$SPLIT" "$ROOT/nlt/proposer
 cd "$ROOT"
 if [[ "${SKIP_FEATURES:-0}" != "1" ]]; then
   echo "[tranche] $(date -u +%H:%M:%S) features $SPLIT $START:$END chunk $CHUNK"
-  modal run nlt/proposers/modal_features.py --data-dir "$DATA_DIR" --split "$SPLIT" --start "$START" --end "$END" --chunk "$CHUNK" --out-dir "$ZROOT/features_v1" \
+  modal run nlt/proposers/modal_features.py --data-dir "$DATA_DIR" --split "$SPLIT" --start "$START" --end "$END" --chunk "$CHUNK" --out-dir "$ZROOT/features_v1" --perm-seed "$PERM_SEED" \
     > "nlt/proposers/logs/feat_${SPLIT}_${TAG}.log" 2>&1 || { echo "[tranche] features FAILED, see log"; exit 1; }
 fi
 declare -a CH_S CH_E

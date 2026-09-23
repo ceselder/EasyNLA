@@ -8,13 +8,14 @@
 set -uo pipefail
 SPLIT=$1; START=$2; END=$3; CHUNK=${4:-2048}; CONC=${5:-16}
 DATA_DIR=${DATA_DIR:-/vol/data/qwen3_8b}
+PERM_SEED=${PERM_SEED:--1}       # >=0: rows of a fixed permutation of the pairs table (use 0 for train); val uses -1 = first rows
 ROOT=/home/celeste/nlt; LOCAL=/home/celeste/nlt-prop-data
 TAG=$(printf "%07d_%07d" "$START" "$END")
 mkdir -p "$LOCAL/ao_raw_v1/$SPLIT" "$LOCAL/ao_rewrite/$SPLIT" "$ROOT/nlt/proposers/logs"
 cd "$ROOT"
 if [[ "${SKIP_AO:-0}" != "1" ]]; then
   echo "[ao-tranche] $(date -u +%H:%M:%S) AO raw $SPLIT $START:$END chunk $CHUNK"
-  modal run nlt/proposers/modal_ao_proposers.py::run_ao --data-dir "$DATA_DIR" --split "$SPLIT" --start "$START" --end "$END" --chunk "$CHUNK" \
+  modal run nlt/proposers/modal_ao_proposers.py::run_ao --data-dir "$DATA_DIR" --split "$SPLIT" --start "$START" --end "$END" --chunk "$CHUNK" --perm-seed "$PERM_SEED" \
     > "nlt/proposers/logs/ao_${SPLIT}_${TAG}.log" 2>&1 || { echo "[ao-tranche] AO FAILED, see log"; exit 1; }
 fi
 PIDS=(); declare -a CTS

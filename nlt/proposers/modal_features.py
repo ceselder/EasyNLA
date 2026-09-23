@@ -76,7 +76,17 @@ def load_split_index(data_dir: str, split: str):
 
 
 @app.function(gpu="H100", volumes={"/vol": vol, "/vol_nla_exp": vol_ro}, secrets=SECRETS, timeout=4 * 60 * 60, max_containers=4)
-def features(data_dir: str, split: str, start: int, end: int, out_dir: str = "/vol/z/features_v1", fwd_bs: int = 8, lens_bs: int = 512) -> str:
+def select_rows(pairs, start: int, end: int, perm_seed: int):
+    """rows [start, end) of the pairs table, or of a fixed random permutation of it when perm_seed >= 0
+    (train pairs are stored in extraction order, so a prefix would be a biased source mix; the SAME seed must be used by every job)."""
+    import numpy as np
+    if perm_seed is None or perm_seed < 0:
+        return pairs.iloc[start:end].reset_index(drop=True)
+    perm = np.random.default_rng(perm_seed).permutation(len(pairs))
+    return pairs.iloc[perm[start:end]].reset_index(drop=True)
+
+
+def features(data_dir: str, split: str, start: int, end: int, out_dir: str = "/vol/z/features_v1", fwd_bs: int = 8, lens_bs: int = 512, perm_seed: int = -1) -> str:
     import numpy as np
     import pandas as pd
     import pyarrow as pa
@@ -86,8 +96,8 @@ def features(data_dir: str, split: str, start: int, end: int, out_dir: str = "/v
 
     vol.reload()
     pairs = pq.read_table(os.path.join(data_dir, f"pairs_{split}.parquet")).to_pandas()
-    pairs = pairs.iloc[start:end].reset_index(drop=True)
-    print(f"[feat] {split} pairs {start}:{end} -> {len(pairs)} rows; cols {list(pairs.columns)}", flush=True)
+    pairs = select_rows(pairs, start, end, perm_seed)
+    print(f"[feat] {split} pairs {start}:{end} (perm_seed {perm_seed}) -> {len(pairs)} rows; cols {list(pairs.columns)}", flush=True)
     row_of, docs = load_split_index(data_dir, split)
     print(f"[feat] index: {len(row_of)} positions, {len(docs)} docs", flush=True)
 
@@ -165,11 +175,11 @@ def features(data_dir: str, split: str, start: int, end: int, out_dir: str = "/v
 
 
 @app.local_entrypoint()
-def main(data_dir: str = "/vol/data/qwen3_8b", split: str = "val", start: int = 0, end: int = 4096, chunk: int = 0, out_dir: str = "/vol/z/features_v1"):
-    """chunk > 0 -> fan out [start,end) in chunks of that size across containers (<= 4 at once)."""
+def main(data_dir: str = "/vol/data/qwen3_8b", split: str = "val", start: int = 0, end: int = 4096, chunk: int = 0, out_dir: str = "/vol/z/features_v1", perm_seed: int = -1):
+    """chunk > 0 -> fan out [start,end) in chunks of that size across containers (<= 4 at once). perm_seed >= 0 -> rows of a fixed permutation."""
     if chunk <= 0:
-        print(features.remote(data_dir, split, start, end, out_dir))
+        print(features.remote(data_dir, split, start, end, out_dir, 8, 512, perm_seed))
     else:
         rngs = [(s, min(s + chunk, end)) for s in range(start, end, chunk)]
-        for out in features.starmap([(data_dir, split, s, e, out_dir) for s, e in rngs]):
+        for out in features.starmap([(data_dir, split, s, e, out_dir, 8, 512, perm_seed) for s, e in rngs]):
             print(out)

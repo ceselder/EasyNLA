@@ -20,7 +20,7 @@ import os
 
 import modal
 
-from nlt.proposers.modal_features import app, vol, vol_ro, SECRETS, base_path, load_split_index, K_LO  # shared app / image
+from nlt.proposers.modal_features import app, vol, vol_ro, SECRETS, base_path, load_split_index, select_rows, K_LO  # shared app / image
 
 AO_REPO = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B"
 LABEL = 18
@@ -33,7 +33,7 @@ DELTA_MAX_GAP, DELTA_MAX_J = 10, 30
 
 
 @app.function(gpu="H100", volumes={"/vol": vol, "/vol_nla_exp": vol_ro}, secrets=SECRETS, timeout=4 * 60 * 60, max_containers=4)
-def ao_propose(data_dir: str, split: str, start: int, end: int, out_dir: str = "/vol/z/ao_raw_v1", batch_size: int = 48, max_new_tokens: int = 32) -> str:
+def ao_propose(data_dir: str, split: str, start: int, end: int, out_dir: str = "/vol/z/ao_raw_v1", batch_size: int = 48, max_new_tokens: int = 32, perm_seed: int = -1) -> str:
     import numpy as np
     import pandas as pd
     import pyarrow as pa
@@ -44,7 +44,7 @@ def ao_propose(data_dir: str, split: str, start: int, end: int, out_dir: str = "
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     vol.reload()
-    pairs = pq.read_table(os.path.join(data_dir, f"pairs_{split}.parquet")).to_pandas().iloc[start:end].reset_index(drop=True)
+    pairs = select_rows(pq.read_table(os.path.join(data_dir, f"pairs_{split}.parquet")).to_pandas(), start, end, perm_seed)
     row_of, _docs = load_split_index(data_dir, split)
     bp = base_path()
     tok = AutoTokenizer.from_pretrained(bp); tok.padding_side = "left"
@@ -129,11 +129,11 @@ def ao_propose(data_dir: str, split: str, start: int, end: int, out_dir: str = "
 
 
 @app.local_entrypoint()
-def run_ao(data_dir: str = "/vol/data/qwen3_8b", split: str = "val", start: int = 0, end: int = 4096, chunk: int = 0, out_dir: str = "/vol/z/ao_raw_v1"):
-    """modal run nlt/proposers/modal_ao_proposers.py::run_ao --split val --start 0 --end 4096 [--chunk 1024]"""
+def run_ao(data_dir: str = "/vol/data/qwen3_8b", split: str = "val", start: int = 0, end: int = 4096, chunk: int = 0, out_dir: str = "/vol/z/ao_raw_v1", perm_seed: int = -1):
+    """modal run nlt/proposers/modal_ao_proposers.py::run_ao --split val --start 0 --end 4096 [--chunk 1024] [--perm-seed 0]"""
     if chunk <= 0:
-        print(ao_propose.remote(data_dir, split, start, end, out_dir))
+        print(ao_propose.remote(data_dir, split, start, end, out_dir, 48, 32, perm_seed))
     else:
         rngs = [(s, min(s + chunk, end)) for s in range(start, end, chunk)]
-        for out in ao_propose.starmap([(data_dir, split, s, e, out_dir) for s, e in rngs]):
+        for out in ao_propose.starmap([(data_dir, split, s, e, out_dir, 48, 32, perm_seed) for s, e in rngs]):
             print(out)
