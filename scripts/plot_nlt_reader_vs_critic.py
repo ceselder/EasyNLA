@@ -23,7 +23,7 @@ CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa
 # controls-table source -> (reader key, short label, colour slot). Colours fixed per source across every figure of the report.
 SOURCES = {"teacher_v1": ("reader_teacher_v1", "Sonnet teacher\n+ lens + final", CAT[0]), "teacher_nofinal_v1": ("reader_teacher_nofinal_v1", "Sonnet teacher\n+ lens", CAT[1]),
            "teacher_nolens_v1": ("reader_teacher_nolens_v1", "Sonnet teacher\npassage only", CAT[2]), "lensdiff_L1": ("reader_lensdiff_jlens_L1", "J-lens change\ndescription", CAT[6]),
-           "v0_ao_tsv1": ("reader_v0_ao_tsv1", "VERBALIZER\nactivations only", CAT[7])}
+           "v0_ao_tsv1": ("reader_v0_ao_tsv1", "VERBALIZER\nactivations only", CAT[7]), "lensdiff_L3": ("reader_lensdiff_jlens_L3", "J-lens lists\n(137 tokens)", CAT[4])}
 
 
 def style():
@@ -48,7 +48,7 @@ def main():
                      "content_ws": (c.get("content_by_band") or {}).get("workspace"), "n_critic": c["n"], "n_reader_top1": r.get("top1_n_parsed"), "bits_per_token": c.get("bits_per_token"), "orig": c["orig"], "dm": c["dm"], "rp": c["rp"]})
     rows.sort(key=lambda r: -r["content"])
     style(); x = np.arange(len(rows)); w = 0.38
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 7.8), dpi=150)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 8), dpi=150)
     cols = [r["colour"] for r in rows]
     ax1.bar(x - w / 2, [100 * r["top1"] for r in rows], w, color=cols, label="model's final top-1 among 4 (chance 25%)")
     ax1.bar(x + w / 2, [100 * r["posmatch"] for r in rows], w, color=cols, alpha=0.45, label="document position among 5 cuts (chance 20%)")
