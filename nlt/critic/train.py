@@ -116,6 +116,7 @@ def main():
     p.add_argument("--lr-decay", default="cosine", choices=["none", "cosine"]); p.add_argument("--p-uncond", type=float, default=0.3); p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--max-train-pos", type=int, default=None); p.add_argument("--data-device", default="cuda", help="where the fp16 store lives (cuda on a B200; cpu on smaller GPUs)")
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=4096); p.add_argument("--save-every", type=int, default=1000)
+    p.add_argument("--eval-offset", type=int, default=4096, help="held-out pairs for in-training eval / model selection start HERE in pairs_val (default: after the fixed 4096-row eval set, so selection never sees it)")
     p.add_argument("--text-parquet", default=None, help="comma-separated text files/globs [pair_id, text, verbosity, source] for the TRAIN pairs (cond=text)"); p.add_argument("--text-verbosity", default=None, help="comma list of verbosity levels to train on (default all)")
     p.add_argument("--val-text-parquet", default=None, help="text files/globs for the VAL pairs (default: --text-parquet with '/train/' -> '/val/')")
     p.add_argument("--text-smoke", action="store_true", help="PLUMBING TEST: synthetic 'next token: X' text instead of --text-parquet")
@@ -135,7 +136,7 @@ def main():
     # ---- fixed val pairs (from the finalize pair list; disjoint docs) + fixed eps bank
     import pyarrow.parquet as pq
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas()
-    vp = vp[vp["pos_idx"].isin(store_val.row_of)].iloc[: a.eval_n]
+    vp = vp[vp["pos_idx"].isin(store_val.row_of)].iloc[a.eval_offset: a.eval_offset + a.eval_n]
     val_rows = store_val.rows_for(vp["pos_idx"].values); val_i = torch.tensor(vp["i"].values); val_j = torch.tensor(vp["j"].values)
     g_eval = torch.Generator().manual_seed(1234); eps_bank = [torch.randn(len(val_rows), d, generator=g_eval) for _ in T_GRID]
     # the same fixed eval on TRAIN pairs (first rows of pairs_train.parquet that are in the store): the D3 gate compares eval/fm_loss with eval_train/fm_loss
@@ -157,7 +158,7 @@ def main():
             text_df = text_df[text_df["pos_idx"].isin(store.row_of)].reset_index(drop=True)
             val_files = a.val_text_parquet.split(",") if a.val_text_parquet else [x.replace("/train/", "/val/") for x in a.text_parquet.split(",")]
             vdf = load_text_pairs(val_files, os.path.join(a.data_dir, "pairs_val.parquet"), verb)
-            vdf = vdf.drop_duplicates("pair_id").set_index("pair_id")
+            vdf = vdf.sample(frac=1.0, random_state=0).drop_duplicates("pair_id").set_index("pair_id")      # one random verbosity per pair
             pid = [f"val:{p_}:{i_}:{j_}" for p_, i_, j_ in zip(vp["pos_idx"].values, vp["i"].values, vp["j"].values)]
             have = [x in vdf.index for x in pid]
             keep = np.where(have)[0]; assert len(keep) > 0, "no val pairs have text"
@@ -194,7 +195,7 @@ def main():
     gen = torch.Generator().manual_seed(a.seed + step0)
     def save(step, name="ckpt_latest.pt"):
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "args": vars(a), "config": model.config(), "d_enc": (encoder.d_enc if encoder else 0)}, os.path.join(a.out, name))
-    t0 = time.time(); ema = None
+    t0 = time.time(); ema = None; best = None
     for step in range(step0, a.steps):
         if a.cond == "text" and not a.text_smoke:
             idx = torch.randint(0, len(text_df), (a.batch,), generator=gen).numpy(); sub = text_df.iloc[idx]
@@ -225,6 +226,10 @@ def main():
                 out.update({k: v for k, v in out_tr.items() if "_gap/" not in k}); out["gate/heldout_over_train_fm"] = out["eval/fm_loss"] / max(1e-9, out_tr["eval_train/fm_loss"])
                 br["train_by_gap"] = br_tr["by_gap"]
             wandb.log(out, step=step); json.dump({"step": step + 1, "scalars": out, "breakdown": br}, open(os.path.join(a.out, "eval_latest.json"), "w"), indent=1)
+            score = out.get("eval/pmi_proxy_bits", -out["eval/fm_loss"])
+            if best is None or score > best[0]:
+                best = (score, step + 1); save(step + 1, "ckpt_best.pt"); json.dump({"step": step + 1, "score": score, "metric": "eval/pmi_proxy_bits" if "eval/pmi_proxy_bits" in out else "-eval/fm_loss"}, open(os.path.join(a.out, "best.json"), "w"))
+                print(f"[train] new best ({best[1]}): {score:.3f} -> ckpt_best.pt", flush=True)
             print(f"[eval@{step+1}] " + " ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in out.items() if "/" in k and "_gap/" not in k), flush=True)
             print("[eval] by gap: " + json.dumps({k: {kk: round(vv, 4) for kk, vv in v.items()} for k, v in br["by_gap"].items()}), flush=True)
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps: save(step + 1)
