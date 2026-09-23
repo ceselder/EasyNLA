@@ -212,18 +212,22 @@ def main():
                 finish_chunk(c["feat"], answers, a.out_dir, a.remote_dir, tok, st, t, log)
                 del answers
                 save_state(a.state, st)
-            elif done == 0 and time.time() - c["last_progress_at"] > a.stall_min * 60:
-                log(f"[chunk {t}] batch {c['batch_id']} stalled at 0 for {a.stall_min} min -> cancel, sync fallback")
+            else:
+                c["stalled"] = bool(done == 0 and time.time() - c["last_progress_at"] > a.stall_min * 60)
+                log(f"[chunk {t}] {b.processing_status} {done}/{c['n']} ({(time.time() - c['submitted_at']) / 60:.0f} min){' STALLED' if c['stalled'] else ''}")
+        # sync fallback: at most ONE stalled batch is cancelled per pass (the oldest), then redone synchronously while the other
+        # batches keep running server-side and are harvested on the next poll. Never cancels a batch that has made progress.
+        sp = [t for t in todo if st["chunks"][t]["status"] == "sync_pending"]
+        if not sp:
+            stalled = [t for t in active if st["chunks"][t]["status"] == "submitted" and st["chunks"][t].get("stalled")]
+            if stalled:
+                t = min(stalled, key=lambda x: st["chunks"][x]["submitted_at"]); c = st["chunks"][t]
+                log(f"[chunk {t}] batch {c['batch_id']} at 0 for > {a.stall_min} min -> cancel this one, sync fallback")
                 try:
                     client.messages.batches.cancel(c["batch_id"])
                 except Exception:
                     pass
-                c["status"] = "sync_pending"
-                save_state(a.state, st)
-            else:
-                log(f"[chunk {t}] {b.processing_status} {done}/{c['n']} ({(time.time() - c['submitted_at']) / 60:.0f} min)")
-        # sync fallbacks (one chunk at a time to respect the local process cap; the batches keep running meanwhile)
-        sp = [t for t in todo if st["chunks"][t]["status"] == "sync_pending"]
+                c["status"] = "sync_pending"; save_state(a.state, st); sp = [t]
         if sp:
             t = sp[0]; c = st["chunks"][t]
             log(f"[chunk {t}] sync fallback start (concurrency {a.sync_concurrency})")
