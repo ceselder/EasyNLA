@@ -9,19 +9,20 @@
 set -uo pipefail
 SPLIT=$1; START=$2; END=$3; CHUNK=${4:-2048}; CONC=${5:-32}; VARIANTS=${6:-"final nofinal"}
 DATA_DIR=${DATA_DIR:-/vol/data/qwen3_8b}
-ROOT=/home/celeste/nlt; LOCAL=/home/celeste/nlt-prop-data
+ZROOT=${ZROOT:-/vol/z}          # override for rehearsals so smoke pair_ids never land under /vol/z
+ROOT=/home/celeste/nlt; LOCAL=${LOCAL:-/home/celeste/nlt-prop-data}
 TAG=$(printf "%07d_%07d" "$START" "$END")
 mkdir -p "$LOCAL/features_v1/$SPLIT" "$LOCAL/teacher/$SPLIT" "$ROOT/nlt/proposers/logs"
 cd "$ROOT"
 if [[ "${SKIP_FEATURES:-0}" != "1" ]]; then
   echo "[tranche] $(date -u +%H:%M:%S) features $SPLIT $START:$END chunk $CHUNK"
-  modal run nlt/proposers/modal_features.py --data-dir "$DATA_DIR" --split "$SPLIT" --start "$START" --end "$END" --chunk "$CHUNK" \
+  modal run nlt/proposers/modal_features.py --data-dir "$DATA_DIR" --split "$SPLIT" --start "$START" --end "$END" --chunk "$CHUNK" --out-dir "$ZROOT/features_v1" \
     > "nlt/proposers/logs/feat_${SPLIT}_${TAG}.log" 2>&1 || { echo "[tranche] features FAILED, see log"; exit 1; }
 fi
 declare -a CH_S CH_E
 for ((s=START; s<END; s+=CHUNK)); do e=$(( s+CHUNK < END ? s+CHUNK : END )); CH_S+=("$s"); CH_E+=("$e")
   f=$(printf "feat_%07d_%07d.parquet" "$s" "$e")
-  [[ -s "$LOCAL/features_v1/$SPLIT/$f" ]] || modal volume get nlt "/z/features_v1/$SPLIT/$f" "$LOCAL/features_v1/$SPLIT/$f" --force > /dev/null || { echo "[tranche] download FAILED $f"; exit 1; }
+  [[ -s "$LOCAL/features_v1/$SPLIT/$f" ]] || modal volume get nlt "${ZROOT#/}/features_v1/$SPLIT/$f" "$LOCAL/features_v1/$SPLIT/$f" --force > /dev/null || { echo "[tranche] download FAILED $f"; exit 1; }
 done
 echo "[tranche] $(date -u +%H:%M:%S) features ready: ${#CH_S[@]} chunks"
 PIDS=()
@@ -43,7 +44,7 @@ for VAR in $VARIANTS; do
   for k in "${!CH_S[@]}"; do
     ct=$(printf "%07d_%07d" "${CH_S[$k]}" "${CH_E[$k]}"); OUT="$LOCAL/teacher/$SPLIT/${SRC}_part_${ct}.parquet"
     if [[ -s "$OUT" ]]; then
-      modal volume put nlt "$OUT" "/z/$SRC/$SPLIT/part_${ct}.parquet" --force > /dev/null && echo "[tranche] uploaded /z/$SRC/$SPLIT/part_${ct}.parquet ($(python3 -c "import pyarrow.parquet as q;print(q.read_metadata('$OUT').num_rows)") rows)"
+      modal volume put nlt "$OUT" "$ZROOT/$SRC/$SPLIT/part_${ct}.parquet" --force > /dev/null && echo "[tranche] uploaded $ZROOT/$SRC/$SPLIT/part_${ct}.parquet ($(python3 -c "import pyarrow.parquet as q;print(q.read_metadata('$OUT').num_rows)") rows)"
     else echo "[tranche] MISSING $OUT"; fi
   done
 done

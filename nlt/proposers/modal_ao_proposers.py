@@ -32,7 +32,7 @@ QUESTIONS = {
 DELTA_MAX_GAP, DELTA_MAX_J = 10, 30
 
 
-@app.function(gpu="H100", volumes={"/vol": vol, "/vol_nla_exp": vol_ro}, secrets=SECRETS, timeout=4 * 60 * 60)
+@app.function(gpu="H100", volumes={"/vol": vol, "/vol_nla_exp": vol_ro}, secrets=SECRETS, timeout=4 * 60 * 60, max_containers=4)
 def ao_propose(data_dir: str, split: str, start: int, end: int, out_dir: str = "/vol/z/ao_raw_v1", batch_size: int = 48, max_new_tokens: int = 32) -> str:
     import numpy as np
     import pandas as pd

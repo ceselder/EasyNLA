@@ -75,7 +75,7 @@ def load_split_index(data_dir: str, split: str):
     return row_of, docs
 
 
-@app.function(gpu="H100", volumes={"/vol": vol, "/vol_nla_exp": vol_ro}, secrets=SECRETS, timeout=4 * 60 * 60)
+@app.function(gpu="H100", volumes={"/vol": vol, "/vol_nla_exp": vol_ro}, secrets=SECRETS, timeout=4 * 60 * 60, max_containers=4)
 def features(data_dir: str, split: str, start: int, end: int, out_dir: str = "/vol/z/features_v1", fwd_bs: int = 8, lens_bs: int = 512) -> str:
     import numpy as np
     import pandas as pd
@@ -165,11 +165,11 @@ def features(data_dir: str, split: str, start: int, end: int, out_dir: str = "/v
 
 
 @app.local_entrypoint()
-def main(data_dir: str = "/vol/data/qwen3_8b", split: str = "val", start: int = 0, end: int = 4096, chunk: int = 0):
-    """chunk > 0 -> fan out [start,end) in chunks of that size across containers."""
+def main(data_dir: str = "/vol/data/qwen3_8b", split: str = "val", start: int = 0, end: int = 4096, chunk: int = 0, out_dir: str = "/vol/z/features_v1"):
+    """chunk > 0 -> fan out [start,end) in chunks of that size across containers (<= 4 at once)."""
     if chunk <= 0:
-        print(features.remote(data_dir, split, start, end))
+        print(features.remote(data_dir, split, start, end, out_dir))
     else:
         rngs = [(s, min(s + chunk, end)) for s in range(start, end, chunk)]
-        for out in features.starmap([(data_dir, split, s, e) for s, e in rngs]):
+        for out in features.starmap([(data_dir, split, s, e, out_dir) for s, e in rngs]):
             print(out)
