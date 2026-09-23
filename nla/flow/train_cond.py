@@ -455,6 +455,28 @@ def main():
         if is0:
             nc = [len(c) for c in tr_claims]
             print(f"[cond] claim-set mode K={a.claim_subsets}: {np.mean(nc):.2f} claims/explanation (p10 {np.percentile(nc,10):.0f}, p90 {np.percentile(nc,90):.0f}); eval condition = full claim set ({'SET-ENCODED' if a.set_encode else 'one bullet text'}); single-frac {a.single_frac} gold-whole-frac {a.gold_whole_frac}; example:\n{va_z[0]}", flush=True)
+    def draw(i):
+        """claim-set training condition for anchor i: whole gold paragraph (gold anchors, --gold-whole-frac) or k claims (P(k=1) = --single-frac,
+        else U{2..min(K, n)}; with --single-frac 0 the plain U{1..min(K, n)}), drawn by --claim-weights, shuffled"""
+        c = tr_claims[i]
+        if i < n_gold and a.gold_whole_frac > 0 and crng.random() < a.gold_whole_frac: return whole_of(tr_z[i])
+        n_ = len(c); kmax = min(a.claim_subsets, n_)
+        if a.single_frac > 0: k_ = 1 if (kmax == 1 or crng.random() < a.single_frac) else crng.randint(2, kmax)
+        else: k_ = crng.randint(1, kmax)
+        return cond_of(weighted_subset(c, tr_w[i] if tr_w is not None else None, k_, crng))
+    def neg_of(cond, pool, rng_, twins=None, claims=None):
+        """hard negative of a condition: claim-set mode = one claim replaced by its false twin (precomputed) or by make_negative of that claim;
+        paragraph mode = make_negative of the text. -> (negative condition, kind) or (None, None)"""
+        if isinstance(cond, str) and not a.set_encode and not (a.claim_subsets > 0 and cond.startswith("• ")): return make_negative(cond, rng_, pool)
+        items = list(cond) if not isinstance(cond, str) else [x[2:] for x in cond.split("\n")]
+        tmap = dict(zip(claims, twins)) if (twins and claims) else {}
+        for j in rng_.sample(range(len(items)), len(items)):
+            t_ = tmap.get(items[j]); kind = "twin"
+            if not t_: t_, kind = make_negative(items[j], rng_, pool)
+            if t_:
+                new = items[:j] + [t_] + items[j + 1:]
+                return (new if a.set_encode else format_claims(new)), kind
+        return None, None
     from nla.schema import compute_predict_mean_baselines, resolve_target_scale, normalize_activation
     msf = math.sqrt(cfg["d_input"]); _, base_mse = compute_predict_mean_baselines(va_acts[: a.eval_n], msf)
     adapter_ids = {id(p_) for p_ in model.adapter_parameters()}
@@ -651,28 +673,6 @@ def main():
         cursor = (a.start_step % bpp) * a.batch
         if is0: print(f"[cond] resuming at step {a.start_step} (cursor {cursor}/{N})", flush=True)
     neg_rng = _random.Random(a.seed + 17 + int(os.environ.get('RANK', 0)))
-    def draw(i):
-        """claim-set training condition for anchor i: whole gold paragraph (gold anchors, --gold-whole-frac) or k claims (P(k=1) = --single-frac,
-        else U{2..min(K, n)}; with --single-frac 0 the plain U{1..min(K, n)}), drawn by --claim-weights, shuffled"""
-        c = tr_claims[i]
-        if i < n_gold and a.gold_whole_frac > 0 and crng.random() < a.gold_whole_frac: return whole_of(tr_z[i])
-        n_ = len(c); kmax = min(a.claim_subsets, n_)
-        if a.single_frac > 0: k_ = 1 if (kmax == 1 or crng.random() < a.single_frac) else crng.randint(2, kmax)
-        else: k_ = crng.randint(1, kmax)
-        return cond_of(weighted_subset(c, tr_w[i] if tr_w is not None else None, k_, crng))
-    def neg_of(cond, pool, rng_, twins=None, claims=None):
-        """hard negative of a condition: claim-set mode = one claim replaced by its false twin (precomputed) or by make_negative of that claim;
-        paragraph mode = make_negative of the text. -> (negative condition, kind) or (None, None)"""
-        if isinstance(cond, str) and not a.set_encode and not (a.claim_subsets > 0 and cond.startswith("• ")): return make_negative(cond, rng_, pool)
-        items = list(cond) if not isinstance(cond, str) else [x[2:] for x in cond.split("\n")]
-        tmap = dict(zip(claims, twins)) if (twins and claims) else {}
-        for j in rng_.sample(range(len(items)), len(items)):
-            t_ = tmap.get(items[j]); kind = "twin"
-            if not t_: t_, kind = make_negative(items[j], rng_, pool)
-            if t_:
-                new = items[:j] + [t_] + items[j + 1:]
-                return (new if a.set_encode else format_claims(new)), kind
-        return None, None
     for step in range(a.start_step + 1, a.steps + 1):
         sched = min(1.0, step / a.warmup) * (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1)
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched

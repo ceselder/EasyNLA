@@ -148,14 +148,21 @@ def cmd_run(a):
         json.dump(state, open(sp, "w"), indent=1); print(f"[sem] submitted chunk {ci} ({len(idx)} requests) as {b.id}", flush=True)
 
     done = {int(re.search(r"chunk_(\d+)", f).group(1)) for f in glob.glob(f"{a.out}/raw/chunk_*.jsonl")}
-    for ci, idx in chunks:
-        if ci not in done and str(ci) not in state: submit(ci, idx)
-    t0 = time.time()
+    def submit_pending():   # queue limits: whatever cannot be submitted now is retried on the next poll
+        for ci, idx in chunks:
+            if ci not in done and str(ci) not in state:
+                try: submit(ci, idx)
+                except Exception as e: print(f"[sem] submit of chunk {ci} deferred: {str(e)[:160]}", flush=True); return
+    submit_pending(); t0 = time.time()
     while True:
         pending = [ci for ci, _ in chunks if ci not in done]
         if not pending: break
+        submit_pending()
         for ci in pending:
-            st = state[str(ci)]; b = cl.messages.batches.retrieve(st["id"]); rc = b.request_counts
+            if str(ci) not in state: continue
+            st = state[str(ci)]
+            try: b = cl.messages.batches.retrieve(st["id"]); rc = b.request_counts
+            except Exception as e: print(f"[sem] retrieve chunk {ci} failed: {str(e)[:120]}", flush=True); continue
             if b.processing_status != "ended":
                 if rc.succeeded + rc.errored == 0 and time.time() - st["submitted"] > a.stall_h * 3600:
                     print(f"[sem] chunk {ci} stalled {(time.time() - st['submitted']) / 3600:.1f} h at 0 completed -> cancel + resubmit", flush=True)
