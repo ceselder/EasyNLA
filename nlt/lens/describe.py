@@ -203,7 +203,11 @@ class LensDiffDescriber:
     def _cos_words(self, f: PairFeatures) -> str:
         return _bucket(f.cos, (0.5, 0.75, 0.9), ("changes substantially", "shifts moderately", "shifts a little", "barely moves"))
 
-    def text(self, f: PairFeatures, level: int) -> str:
+    def text(self, f: PairFeatures, level) -> str:
+        """level in {0, 1, 2, 3, "2m", "3m"}: the 'm' variants add the MAGNITUDE readout (cosine sentence / explicit
+        confidence-entropy-cosine numbers), which redteam #66 identified as a gap leak; priced separately in exact bits."""
+        magnitude = isinstance(level, str) and level.endswith("m")
+        level = int(str(level).rstrip("m"))
         if level == 0:
             if f.top1_i.lower() != f.top1_j.lower():
                 s = self.rng.choice([f"from {self._q(f.top1_i)} to {self._q(f.top1_j)}", f"{self._q(f.top1_j)} replaces {self._q(f.top1_i)}",
@@ -226,18 +230,20 @@ class LensDiffDescriber:
             s2 = self.rng.choice([f"Gaining ground: {em}.", f"Newly prominent are {em}.", f"Coming to the fore: {em}."]) if em else "Little new comes to the fore."
             fa = self._join(f.fading, 4) or self._join(f.fallers, 4)
             s3 = (self.rng.choice([f"Fading: {fa}.", f"Receding are {fa}.", f"Losing ground: {fa}."]) if fa else "Nothing notable recedes.")
-            s3 += f" Overall the representation {self._cos_words(f)}."
+            if magnitude:
+                s3 += f" Overall the representation {self._cos_words(f)}."
             s = " ".join([s1, s2, s3])
         else:
             ris = ", ".join(d for d, *_ in f.risers[:20]) or "nothing besides the top choice"; fal = ", ".join(d for d, *_ in f.fallers[:20]) or "nothing notable"
             now = ", ".join(d for d, *_ in f.top_j[:10]) or "(none)"; before = ", ".join(d for d, *_ in f.top_i[:10]) or "(none)"
-            s = (f"Rising: {ris}. Falling: {fal}. Now favoured: {now}. Previously favoured: {before}. "
-                 f"Top choice {f.top1_i} -> {f.top1_j}; confidence {f.p1_i:.2f} -> {f.p1_j:.2f}; entropy {f.ent_i:.1f} -> {f.ent_j:.1f} nats; cosine {f.cos:.2f}.")
+            s = f"Rising: {ris}. Falling: {fal}. Now favoured: {now}. Previously favoured: {before}. Top choice {f.top1_i} -> {f.top1_j}."
+            if magnitude:
+                s += f" Confidence {f.p1_i:.2f} -> {f.p1_j:.2f}; entropy {f.ent_i:.1f} -> {f.ent_j:.1f} nats; cosine {f.cos:.2f}."
         if FORBIDDEN.search(s):
             s = FORBIDDEN.sub("[...]", s)      # belt and braces: the vocab filter already drops these words
         return s
 
-    def describe(self, h_i, i, h_j, j, levels=(0, 1, 2, 3)):
+    def describe(self, h_i, i, h_j, j, levels=(0, 1, 2, 3, "2m", "3m")):
         feats = self.features(h_i, i, h_j, j)
         return [{lvl: self.text(f, lvl) for lvl in levels} for f in feats], feats
 

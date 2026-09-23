@@ -23,6 +23,8 @@ from .data import DEFAULT_ROOT, ActStore
 from .describe import LensDiffDescriber, copy_stats, leak_check
 from .lenses import load_banks
 
+LEVELS = (0, 1, 2, 3, "2m", "3m")     # L2/L3 = without the magnitude readout; L2m/L3m = with it (redteam #66)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -70,8 +72,9 @@ def main():
                 ii = torch.as_tensor(b["i"].to_numpy().astype(np.int64)); jj = torch.as_tensor(b["j"].to_numpy().astype(np.int64))
                 fs = desc.features(hi, ii, hj, jj)
                 for pid, i_, j_, f in zip(b["pair_id"], b["i"], b["j"], fs):
-                    for lvl in (0, 1, 2, 3):
-                        rows.append({"pair_id": pid, "text": desc.text(f, lvl), "verbosity": lvl, "source": source, "sample_idx": 0})
+                    for lvl in LEVELS:
+                        rows.append({"pair_id": pid, "text": desc.text(f, lvl), "verbosity": int(str(lvl).rstrip("m")), "magnitude": int(str(lvl).endswith("m")),
+                                     "level": f"L{lvl}", "source": source, "sample_idx": 0})
                     feats.append({"pair_id": pid, "source": source, "i": int(i_), "j": int(j_), "p1_i": f.p1_i, "p1_j": f.p1_j, "ent_i": f.ent_i,
                                   "ent_j": f.ent_j, "cos": f.cos, "top1_i": f.top1_i, "top1_j": f.top1_j,
                                   "top1_i_id": f.top1_i_id, "top1_j_id": f.top1_j_id,
@@ -85,7 +88,7 @@ def main():
             print(f"[make_z] {source}: {done}/{len(pairs)} pairs ({time.time()-t0:.0f}s)", flush=True)
     # null control (empty text) once per pair
     for pid in pairs["pair_id"]:
-        rows.append({"pair_id": pid, "text": "", "verbosity": 0, "source": f"lensdiff-{args.version}-null", "sample_idx": 0})
+        rows.append({"pair_id": pid, "text": "", "verbosity": 0, "magnitude": 0, "level": "L0", "source": f"lensdiff-{args.version}-null", "sample_idx": 0})
     df = pd.DataFrame(rows)
     enc = tok(df["text"].tolist(), add_special_tokens=False)["input_ids"]
     df["n_tokens"] = [len(e) for e in enc]
@@ -94,15 +97,15 @@ def main():
     for kind in kinds:
         d = args.out if kind == "jlens" else f"{args.out}_{kind}"
         os.makedirs(f"{d}/{args.split}", exist_ok=True)
-        for lvl in (0, 1, 2, 3):
-            sub = df[(df.source == f"lensdiff-{args.version}-{kind}") & (df.verbosity == lvl)][["pair_id", "text", "n_tokens", "verbosity", "source", "sample_idx"]]
+        for lvl in LEVELS:
+            sub = df[(df.source == f"lensdiff-{args.version}-{kind}") & (df.level == f"L{lvl}")][["pair_id", "text", "n_tokens", "verbosity", "magnitude", "source", "sample_idx"]]
             sub.to_parquet(f"{d}/{args.split}/L{lvl}{suffix}.parquet", index=False)
     os.makedirs(f"{args.out}_all", exist_ok=True)
     df.to_parquet(f"{args.out}_all/{args.split}{suffix}.parquet", index=False)
     pd.DataFrame(feats).to_parquet(f"{args.out}_all/{args.split}{suffix}_feats.parquet", index=False)
     stats = {"n_pairs": int(len(pairs)), "n_rows": int(len(df)), "sources": kinds,
              "leak_violations": int(sum(not leak_check(t) for t in df["text"])),
-             "n_tokens_mean_by_level": {str(l): float(df[(df.verbosity == l) & (df.source != f'lensdiff-{args.version}-null')]["n_tokens"].mean()) for l in (0, 1, 2, 3)}}
+             "n_tokens_mean_by_level": {f"L{l}": float(df[(df.level == f"L{l}") & (df.source != f'lensdiff-{args.version}-null')]["n_tokens"].mean()) for l in LEVELS}}
     # copy-rate check against the preceding context (docs parquet: token_ids of the doc / window; ctx = token_ids[:pos+1])
     try:
         import glob as _glob
@@ -118,7 +121,7 @@ def main():
             if ids is None:
                 continue
             ctx_ids = [int(t) for t in ids[: int(m["pos"]) + 1]][-256:]
-            c = copy_stats(r.text, ctx_ids, tok); c["verbosity"] = int(r.verbosity); cs.append(c)
+            c = copy_stats(r.text, ctx_ids, tok); c["verbosity"] = r.level; cs.append(c)
         if cs:
             cdf = pd.DataFrame(cs)
             stats["copy"] = {str(l): {"word_in_ctx_frac": float(g["word_in_ctx_frac"].mean()), "shared_3grams_mean": float(g["shared_ngrams"].mean()),
@@ -129,9 +132,9 @@ def main():
         json.dump(stats, f, indent=1)
     print("[make_z] stats", json.dumps(stats, indent=1), flush=True)
     for kind in kinds:
-        ex = df[(df.source == f"lensdiff-{args.version}-{kind}")].head(8)
+        ex = df[(df.source == f"lensdiff-{args.version}-{kind}")].head(12)
         for r in ex.itertuples():
-            print(f"[example {kind} L{r.verbosity} {r.pair_id}] {r.text}", flush=True)
+            print(f"[example {kind} {r.level} {r.pair_id}] {r.text}", flush=True)
     print(f"[make_z] wrote {args.out}_all/{args.split}{suffix}.parquet ({len(df)} rows) + per-level files under {args.out}[_kind]/{args.split}/", flush=True)
 
 
