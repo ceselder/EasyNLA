@@ -63,7 +63,7 @@ def grpo_update(actor, optim, rollouts, acts, advantages, injector, ref_prompt_i
             chunk.append(loss_i); kls.append(float(kl_i))
         del ref_hid
         if not chunk: del hid; continue
-        cl = torch.stack(chunk).sum() / denom; cl.backward(); losses.append(float(cl) * denom / len(chunk)); del hid
+        cl = torch.stack(chunk).sum() / denom; cl.backward(); losses.append(float(cl.detach()) * denom / len(chunk)); del hid
     params = [p for p in actor.parameters() if p.requires_grad]
     gn = float(torch.nn.utils.clip_grad_norm_(params, max_grad_norm)) if losses else float("nan")
     if losses and math.isfinite(gn): optim.step()

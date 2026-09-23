@@ -34,6 +34,7 @@ def parse():
     p.add_argument("--steps", type=int, default=300); p.add_argument("--batch-prompts", type=int, default=32); p.add_argument("--group", type=int, default=8)
     p.add_argument("--max-new-tokens", type=int, default=64); p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--vllm-gpu-mem", type=float, default=0.45); p.add_argument("--vllm-max-len", type=int, default=512)
+    p.add_argument("--ipc-sync", action=argparse.BooleanOptionalAction, default=True, help="GPU->GPU CUDA-IPC weight sync into vLLM (the 27B recipe; the CPU pickle path moves ~14 GB/step)")
     # optimisation
     p.add_argument("--lr", type=float, default=1e-5); p.add_argument("--lr-warmup", type=int, default=10); p.add_argument("--micro-batch", type=int, default=8)
     p.add_argument("--max-grad-norm", type=float, default=1.0); p.add_argument("--kl-beta", type=float, default=0.01)
@@ -117,7 +118,13 @@ def main():
     params = [p for p in policy.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
     llm = make_engine(a.base, tokenizer=a.base, gpu_mem=a.vllm_gpu_mem, max_len=a.vllm_max_len, seed=a.seed)
-    if a.init != "base": print(f"[rl] initial sync {sync_actor_to_vllm(policy, llm):.1f}s", flush=True)
+    def sync():
+        try: return sync_actor_to_vllm(policy, llm, ipc=a.ipc_sync)
+        except Exception as e:
+            if not a.ipc_sync: raise
+            print(f"[rl] IPC weight sync failed ({type(e).__name__}: {str(e)[:120]}) -> falling back to the CPU path for the rest of the run", flush=True)
+            a.ipc_sync = False; return sync_actor_to_vllm(policy, llm, ipc=False)
+    if a.init != "base": print(f"[rl] initial sync {sync():.1f}s (ipc={a.ipc_sync})", flush=True)
     # ---- critic + paraphraser
     scorer = make_scorer(a, cdev)
     para = Paraphraser(a.paraphrase_model, gpu_mem=a.paraphrase_gpu_mem, gpu_index=cidx, seed=a.seed) if a.paraphrase_p > 0 else None
@@ -155,7 +162,7 @@ def main():
         loss, gn, um = grpo_update(policy, optim, res, acts_list, adv, inj, ref_ids, dev, pad_id, micro_batch=a.micro_batch, kl_beta=a.kl_beta,
                                    max_grad_norm=a.max_grad_norm, loss_mode=a.loss, cispo_eps_max=a.cispo_eps, sampler_mismatch_thresh=a.mismatch_thresh,
                                    length_normalizer=a.length_normalizer, n_total=n)
-        t_upd = time.time() - t3; t4 = time.time(); t_sync = sync_actor_to_vllm(policy, llm); t_sync = time.time() - t4
+        t_upd = time.time() - t3; t4 = time.time(); sync(); t_sync = time.time() - t4
         # ---- critic co-training on best-of-group (honest members only) + replay
         cot_loss = float("nan")
         if cot is not None:
