@@ -53,6 +53,7 @@ def main():
     p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default=None, help="default: the text critic's own encoder (from its args)"); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--enc-max-len", type=int, default=None)
     p.add_argument("--skip-exact", action="store_true"); p.add_argument("--data-device", default="cuda"); p.add_argument("--stats", default=None, help="stats.pt (default <data-dir>/stats.pt; must match the critics')")
     p.add_argument("--paired-sets", default=None, help="additional label:path[@v] sets that only define the common/paired rows (not scored)")
+    p.add_argument("--skip-extra-controls", action="store_true", help="skip the shuf_words and mask_next controls (2 extra exact passes per set)")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
     store_val = ActStore(a.data_dir, "val", device=a.data_device)
@@ -98,6 +99,26 @@ def main():
             out[k] = c[(idx.index(k) + 1) % len(c)] if c else k
         return out
 
+    _rng_sw = np.random.default_rng(a.seed + 7)
+    def shuf_words(texts):
+        """bag-of-words control (redteam #114.4): the pair's OWN text with its words randomly permuted (same tokens, no syntax)"""
+        out = []
+        for z in texts:
+            w = z.split(); out.append(" ".join(w[q] for q in _rng_sw.permutation(len(w))) if len(w) > 1 else z)
+        return out
+
+    _tok8 = [None]
+    def mask_next(texts, idx):
+        """next-token control (redteam #114.3): every whole-word occurrence of the TRUE next token in z replaced by a neutral word"""
+        import re as _re
+        if _tok8[0] is None:
+            from transformers import AutoTokenizer; _tok8[0] = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+        out = []
+        for z, k in zip(texts, idx):
+            w = _tok8[0].decode([int(store_val.meta["next_token_id"].values[int(rows_all[k])])]).strip()
+            out.append(_re.sub(r"(?i)(?<!\w)" + _re.escape(w) + r"(?!\w)", "something", z) if len(w) >= 2 else z)
+        return out
+
     encoder = None
     ckpts = [c.split(":", 1) for c in a.ckpts.split(",")]
     jobs = []                                          # (result name, ckpt path, set label or None)
@@ -121,19 +142,21 @@ def main():
         if texts:
             dmp = dm_partner(idx); shuf_texts = [text_sets[label][pid_all[dmp[k]]] for k in idx]
             rp_texts = [texts[(q + n // 2) % n] for q in range(n)]
+            sw_texts = shuf_words(texts); mn_texts = mask_next(texts, idx); n_masked = sum(1 for z1, z2 in zip(texts, mn_texts) if z1 != z2)
         print(f"[bits] critic {name}: cond={cond} target={target} step={step} params {model.n_params()/1e6:.0f}M; {n} rows ({sum(1 for k in idx if k in set(common))} paired)", flush=True)
         gaps = (J_all[idx] - I_all[idx]).numpy(); js = J_all[idx].numpy()
         L_u = torch.zeros(len(T_GRID), n); L_c = torch.zeros(len(T_GRID), n); L_s = torch.zeros(len(T_GRID), n); L_r = torch.zeros(len(T_GRID), n)
-        lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); lp_r = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
+        lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); lp_r = torch.zeros(n); lp_w = torch.zeros(n); lp_m = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
         for s in range(0, n, a.batch):
             kk = idx[s:s + a.batch]; r = rows_all[kk]; i = I_all[kk]; j = J_all[kk]; B = len(kk)
             h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target, src_rms)
             x_aff = norm.normalize(store_val.gather(r, j, dev))
             depth = torch.stack([i, j], 1).to(dev) if cond == "depth" else None
-            enc = mask = enc_s = mask_s = enc_r = mask_r = None
+            enc = mask = enc_s = mask_s = enc_r = mask_r = enc_w = mask_w = enc_m = mask_m = None
             if texts:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     enc, mask = encoder(texts[s:s + B]); enc_s, mask_s = encoder(shuf_texts[s:s + B]); enc_r, mask_r = encoder(rp_texts[s:s + B])
+                    if not a.skip_extra_controls: enc_w, mask_w = encoder(sw_texts[s:s + B]); enc_m, mask_m = encoder(mn_texts[s:s + B])
             eb = [e[kk] for e in eps_all]
             need = [k for k in kk if (path, k) not in _uncond]
             if need:                                   # unconditional term once per (critic, fixed-set row)
@@ -152,6 +175,9 @@ def main():
                     if texts:
                         lp_s[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_s, enc_mask=mask_s, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
                         lp_r[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_r, enc_mask=mask_r, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
+                        if not a.skip_extra_controls:
+                            lp_w[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_w, enc_mask=mask_w, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
+                            lp_m[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_m, enc_mask=mask_m, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
             print(f"[bits] {name}: {min(n, s + a.batch)}/{n} rows, {time.time() - t0:.0f}s", flush=True)
         paired = np.array([k in set(common) for k in idx])
         res = {"cond": cond, "target": target, "src_rms": src_rms, "step": step, "ckpt": path, "n_rows": n, "n_paired": int(paired.sum()),
@@ -173,6 +199,18 @@ def main():
                     if paired.any(): res["shuffle_exact_pmi_bits_paired"] = summarize(ps_[paired], gaps[paired], js[paired], "shuf_paired"); res["rp_exact_pmi_bits_paired"] = summarize(pr_[paired], gaps[paired], js[paired], "rp_paired")
                     res["n_tokens_mean"] = float(np.mean([len(encoder.tok(z, add_special_tokens=False)["input_ids"]) for z in texts]))
                     res["exact_bits_per_token"] = res["exact_pmi_bits"]["mean"] / max(1e-9, res["n_tokens_mean"])
+                    # redteam #114.2: subtract the text-presence offset (a random pair's text) before the D6 ratio; flag the offset when its CI excludes 0
+                    rp_m, rp_sem = float(pr_.mean()), float(pr_.std() / math.sqrt(len(pr_)))
+                    res["exact_bits_rp_corrected"] = float(pe.mean() - rp_m); res["dm_bits_rp_corrected"] = float(ps_.mean() - rp_m)
+                    res["ratio_to_dm_raw"] = float(pe.mean() / ps_.mean()) if abs(ps_.mean()) > 1e-9 else None
+                    res["ratio_to_dm_rp_corrected"] = float((pe.mean() - rp_m) / (ps_.mean() - rp_m)) if abs(ps_.mean() - rp_m) > 1e-9 else None
+                    res["text_presence_offset_flag"] = bool(abs(rp_m) > 2 and abs(rp_m) > 1.96 * rp_sem)
+                    res["frac_z_beats_dm"] = float((pe > ps_).mean()); res["frac_z_beats_rp"] = float((pe > pr_).mean())
+                    if not a.skip_extra_controls:
+                        pw_ = (lp_w - lp_u).numpy() / math.log(2); pm_ = (lp_m - lp_u).numpy() / math.log(2)
+                        res["shuf_words_exact_pmi_bits"] = summarize(pw_, gaps, js, "shuf_words"); res["frac_z_beats_shuf_words"] = float((pe > pw_).mean())
+                        res["mask_next_exact_pmi_bits"] = summarize(pm_, gaps, js, "mask_next"); res["n_mask_next_changed"] = int(n_masked)
+                        res["mask_next_drop_bits_by_band"] = {b: float(res["exact_pmi_bits"]["by_band"][b]["mean"] - res["mask_next_exact_pmi_bits"]["by_band"][b]["mean"]) for b in res["exact_pmi_bits"].get("by_band", {}) if b in res["mask_next_exact_pmi_bits"].get("by_band", {})}
         results["critics"][name] = res
         hdr = {k: (round(v, 4) if isinstance(v, float) else (round(v["mean"], 3) if isinstance(v, dict) and "mean" in v else None)) for k, v in res.items() if k not in ("proxy_fm_loss_uncond_by_t", "proxy_pmi_bits_by_t", "ckpt")}
         print(f"[bits] {name}: {json.dumps(hdr)}", flush=True)
