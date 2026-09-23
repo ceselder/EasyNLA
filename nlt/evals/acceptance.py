@@ -30,7 +30,9 @@ def main():
                    "A3_rp_within_3x_noise": bool(all(abs(v) <= 3 * max(noise, 0.5) for v in rp_by_band.values())) if rp_by_band else None}
             row["ACCEPT"] = bool(row["A1_content_ws_ge_5"] and row["A1b_orig_ws_gt_0"] and row["A2_P_ge_0.70"] and row["A3_rp_within_3x_noise"])
             # A4 (proposed, board #285): P(z > twin) >= 0.65 from this critic's paraphrase/twin summary of the same source, if scored
-            for tf in glob.glob(os.path.join(a.scored_dir, f"*para_{src}.summary.json")):
+            prefix = a.pattern.split("*")[0]                      # e.g. 'scored_big_' -> this critic's twin file is scored_big_para_<src>; pooled_n's were written without a critic tag
+            cands = [os.path.join(a.scored_dir, f"{prefix}para_{src}.summary.json")] + ([os.path.join(a.scored_dir, f"scored_para_{src}.summary.json")] if a.critic == "union_pooled_null" else [])
+            for tf in [c for c in cands if os.path.exists(c)][:1]:
                 ts = json.load(open(tf)); tw = ts.get("twin", {})
                 if tw.get("p_orig_preferred") is not None:
                     row["twin"] = {"p_orig_gt_twin": tw["p_orig_preferred"], "retention_median": tw.get("retention_median"), "delta_bits_mean": tw.get("delta_bits_mean"), "file": os.path.basename(tf)}
