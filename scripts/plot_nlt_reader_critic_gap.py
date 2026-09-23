@@ -14,10 +14,11 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 D = "/home/celeste/shared/reports/natural-language-transcoder/data"
 # (label, reader key, controls-summary file or (content, p) tuple, colour)
-SOURCES = [("teacher\npassage+lens\n+final", "reader_teacher_v1", "verdicts_union_pooled_null_teacher_v1_controls.json", "#2a78d6"),
+SOURCES = [("teacher\npassage+lens+final", "reader_teacher_v1", "verdicts_union_pooled_null_teacher_v1_controls.json", "#2a78d6"),
            ("teacher\npassage+lens", "reader_teacher_nofinal_v1", "verdicts_union_pooled_null_teacher_nofinal_v1_controls.json", "#eb6834"),
+           ("teacher\npassage only", "reader_teacher_nolens_v1", "verdicts_union_pooled_null_teacher_nolens_v1_controls.json", "#1baf7a"),
            ("J-lens diff\ntwo readouts", "reader_lensdiff_jlens_L1", "verdicts_union_pooled_null_lensdiff_L1_controls.json", "#4a3aa7"),
-           ("V0 verbalizer\nactivations\nonly", "reader_v0_ao_tsv1", ("manual", 0.61, 0.10, "rl #169: V0 - z_dm, workspace band, text_union_v1n"), "#e34948")]
+           ("V0 verbalizer\nactivations only", "reader_v0_ao_tsv1", "verdicts_union_pooled_null_v0_ao_tsv1_controls.json", "#e34948")]
 
 
 def main():
@@ -31,25 +32,25 @@ def main():
             csem = 0.5 * (s["orig"]["ci95"][1] - s["orig"]["ci95"][0]) / 1.96; note = f"{crit}: n={s['orig']['n']}"
         rows.append(dict(label=label, top1=r.get("top1"), posmatch=r.get("posmatch"), content_bits=content, content_sem=csem, p_z_gt_dm=p_dm, colour=col, note=note))
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2})
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 6.4), dpi=150, gridspec_kw={"wspace": 0.3}); x = np.arange(len(rows)); w = 0.38
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6.6), dpi=150, gridspec_kw={"wspace": 0.3}); x = np.arange(len(rows)); w = 0.38
     ax1.bar(x - w / 2, [100 * (r["top1"] or 0) for r in rows], w, color=[r["colour"] for r in rows], label="final top-1 among 4 (chance 25%)")
     ax1.bar(x + w / 2, [100 * (r["posmatch"] or 0) for r in rows], w, color=[r["colour"] for r in rows], alpha=0.45, hatch="//", edgecolor=SURFACE, label="position among 5 cuts (chance 20%)")
     for xi, r in zip(x, rows): ax1.text(xi - w / 2, 100 * (r["top1"] or 0) + 1.5, f"{100*(r['top1'] or 0):.0f}", ha="center", fontsize=10); ax1.text(xi + w / 2, 100 * (r["posmatch"] or 0) + 1.5, f"{100*(r['posmatch'] or 0):.0f}", ha="center", fontsize=10, color=INK2)
     ax1.axhline(25, color="#b91c1c", lw=1, ls="--"); ax1.axhline(20, color="#b91c1c", lw=1, ls=":"); ax1.set_ylim(0, 100); ax1.set_ylabel("reader accuracy, %")
-    ax1.set_xticks(x); ax1.set_xticklabels([r["label"] for r in rows], fontsize=9.5); ax1.legend(frameon=False, fontsize=9, loc="upper right")
-    ax1.set_title("A reader given only the sentence recovers the model's\nnext token and document position 3-4x above chance", loc="left")
+    ax1.set_xticks(x); ax1.set_xticklabels([r["label"] for r in rows], fontsize=9, rotation=12, ha="right", rotation_mode="anchor"); ax1.legend(frameon=False, fontsize=9, loc="upper right")
+    ax1.set_title("A reader given only the sentence recovers the model's\nnext token and document position 3-4x above chance", loc="left", pad=8)
     ax2.bar(x, [r["content_bits"] for r in rows], 0.6, color=[r["colour"] for r in rows], yerr=[r["content_sem"] for r in rows], capsize=3, ecolor=INK2)
     for xi, r in zip(x, rows):
         lab = f"{r['content_bits']:.1f} bits" + (f"\nP(z>z_dm) {r['p_z_gt_dm']:.2f}" if not np.isnan(r["p_z_gt_dm"]) else "")
         ax2.text(xi, r["content_bits"] + r["content_sem"] + 0.08, lab, ha="center", fontsize=9.5)
     ax2.axhline(0, color=INK2, lw=0.8); ax2.set_ylim(0, max(4, max(r["content_bits"] + r["content_sem"] for r in rows) * 1.6)); ax2.set_ylabel("content bits: log p(h_j | h_i, z) − log p(h_j | h_i, z_dm)")
-    ax2.set_xticks(x); ax2.set_xticklabels([r["label"] for r in rows], fontsize=9.5)
-    ax2.set_title("The flow critic pays the same sentences 1-3 bits over a\ndepth-matched generic sentence (headline critic, pooled prior)", loc="left")
+    ax2.set_xticks(x); ax2.set_xticklabels([r["label"] for r in rows], fontsize=9, rotation=12, ha="right", rotation_mode="anchor")
+    ax2.set_title("The flow critic pays the same sentences 1-2.5 bits over a\ndepth-matched generic sentence (headline critic, pooled prior)", loc="left")
     for ax in (ax1, ax2):
         ax.grid(True, axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s_ in ("top", "right"): ax.spines[s_].set_visible(False)
-    fig.text(0.01, 0.005, "Fixed 4,096-pair eval set (Qwen3-8B, layer pairs 9-34). Reader = Sonnet-5 with the sentence only (512 pairs/source). Critic = exact ODE likelihood, union adapter on the pooled prior, ~1000 pairs/source; V0 critic value from rl step-0 (text_union_v1n, workspace band).", fontsize=9, color=INK2, ha="left", va="bottom", wrap=True)
-    fig.tight_layout(rect=(0, 0.07, 1, 1)); os.makedirs(a.out_dir, exist_ok=True)
+    fig.text(0.01, 0.005, "Fixed 4,096-pair eval set (Qwen3-8B, layer pairs 9-34). Reader = Sonnet-5 with the sentence only (512 pairs/source). Critic = exact ODE likelihood (Heun 32, paired probes), null-regularised union adapter on the pooled prior, ~1000 pairs/source, 95% CI.", fontsize=9, color=INK2, ha="left", va="bottom", wrap=True)
+    fig.tight_layout(rect=(0, 0.06, 1, 1)); os.makedirs(a.out_dir, exist_ok=True)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.out_dir, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"rows": [{k: v for k, v in r.items() if k != "colour"} for r in rows], "chance": {"top1": 0.25, "posmatch": 0.20}}, open(os.path.join(a.out_dir, "data", f"{a.stem}.json"), "w"), indent=1, default=str)
     print("saved", os.path.join(a.out_dir, f"{a.stem}.png"))
