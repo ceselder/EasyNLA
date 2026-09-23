@@ -40,8 +40,8 @@ ax.plot([0, 1, 2], [fb["prelim_v1n_0"], fb["prelim_v1n_20"], fb["prelim_v1n_40"]
 for xi, v in zip([0, 1, 2], [fb["prelim_v1n_0"], fb["prelim_v1n_20"], fb["prelim_v1n_40"]]):
     ax.annotate(f"{v:+.2f}", (xi, v), textcoords="offset points", xytext=(0, 8), ha="center")
 ax.set_xticks([0, 1, 2]); ax.set_xticklabels(["step\n0", "step\n20", "step\n40"])
-ax.set_ylabel("PMI under frozen critic (bits)")
-ax.set_title("(a) Critic bits: dip at step 20, up at step 40")
+ax.set_ylabel("PMI(z) vs empty on training rollouts (bits)")
+ax.set_title("(a) rl's frozen-critic total: up at step 40")
 ax.axhline(0, color="grey", lw=0.8)
 ax.set_ylim(-0.5, 3.6)
 
