@@ -69,6 +69,26 @@ def build_manifest(extra: str = "", data: str = DATA):
     return _run(cmd)
 
 
+@app.function(timeout=4 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=48 * 1024)
+def batch_cpu(specs_json: str = "", data: str = DATA):
+    """ONE container, many CPU jobs (one local driver process): specs = JSON list of {"task": "text"|"build-manifest"|"summarize"|"cmd", "extra": "..."}"""
+    import json, glob
+    specs = json.loads(specs_json); rcs = []
+    for sp in specs:
+        t, extra = sp["task"], sp.get("extra", "")
+        if t == "text":
+            cmd = [sys.executable, "-m", "nlt.evals.run_text_evals", "--pairs", f"{data}/pairs_val.parquet"] + extra.split()
+            if "--meta" not in extra: cmd += ["--meta", f"{data}/val/meta_*.parquet", "--docs", f"{data}/val/docs_*.parquet"]
+        elif t == "build-manifest":
+            cmd = [sys.executable, "-m", "nlt.evals.controls", "--pairs", f"{data}/pairs_val.parquet"] + extra.split()
+            if "--meta" not in extra: cmd += ["--meta", f"{data}/val/meta_*.parquet", "--docs", f"{data}/val/docs_*.parquet"]
+        elif t == "summarize": cmd = [sys.executable, "-m", "nlt.evals.summarize_scored"] + extra.split()
+        elif t == "cmd": cmd = extra.split()
+        else: raise SystemExit(t)
+        rc = _run(cmd); rcs.append(rc); print(f"[batch] {t} rc={rc} :: {extra[:120]}", flush=True)
+    print("[batch] rcs", rcs, flush=True); return max(rcs) if rcs else 0
+
+
 @app.function(timeout=1800, volumes={"/vol": vol}, cpu=4, memory=16 * 1024)
 def concat(extra: str = ""):
     """--glob '/vol/evals/causal_val_s*.parquet' --out /vol/evals/causal_val.parquet : concatenate shard parquets (+ merged summary json)"""
@@ -103,6 +123,7 @@ def main(task: str = "text", extra: str = "", data: str = DATA, path: str = ""):
     elif task == "build-manifest": print("rc", build_manifest.remote(extra, data))
     elif task == "cat": cat.remote(path)
     elif task == "concat": concat.remote(extra)
+    elif task == "batch-cpu": print("rc", batch_cpu.remote(extra, data))
     elif task == "ls": ls.remote(path)
     else: raise SystemExit(task)
     print("done.")
