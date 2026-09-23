@@ -19,6 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT_DATA_LOCAL = os.path.expanduser("~/shared/reports/natural-language-transcoder/data")
 vol = modal.Volume.from_name("nlt", create_if_missing=True)
 image = (modal.Image.debian_slim(python_version="3.12").pip_install("huggingface_hub[hf_xet]>=0.34", "pyarrow", "pandas", "numpy")
+         .pip_install("torch", index_url="https://download.pytorch.org/whl/cpu")                      # to strip optimizer states from critic checkpoints
          .add_local_dir(HERE, "/root/scripts", copy=False, ignore=["__pycache__", "*.pyc"])
          .add_local_dir(REPORT_DATA_LOCAL, "/report_data", copy=False, ignore=["*.png", "*.pdf"]))
 app = modal.App(os.environ.get("NLT_APP", "nlt-packager"), image=image)
@@ -49,14 +50,25 @@ def _card_vars(repo: dict) -> dict:
     return v
 
 
-def _build_dataset_files(repo: dict, work: str) -> list:
-    """dataset builders -> list of (local_path, path_in_repo); every dataset gets parquet"""
+def _build_dataset_files(repo: dict, work: str, plan_only: bool = False) -> list:
+    """builders -> list of (local_path, path_in_repo); every dataset gets parquet. plan_only skips heavy builders (reports the source instead)."""
     import glob, shutil
     import pyarrow.parquet as pq, pandas as pd
     out = []
     for b in repo.get("builders", []):
         kind = b["kind"]
-        if kind == "copy_parquet":                      # copy parquet files as they are (globs on the volume)
+        if kind == "strip_ckpt":                        # critic checkpoint without optimizer states (22-39 GB -> 4-13 GB); keeps model/args/config/step/d_enc
+            for src in b["src"]:
+                dst = os.path.join(work, b["dst"], os.path.basename(os.path.dirname(src)), os.path.basename(src)); os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if plan_only or not os.path.exists(src):
+                    out.append((src if os.path.exists(src) else src + ".MISSING", os.path.relpath(dst, work))); continue
+                import torch
+                ck = torch.load(src, map_location="cpu", mmap=True, weights_only=False)
+                torch.save({k: ck[k] for k in ck if k != "opt"}, dst); del ck; out.append((dst, os.path.relpath(dst, work)))
+                for extra in b.get("sidecars", []):
+                    e = os.path.join(os.path.dirname(src), extra)
+                    if os.path.exists(e): d2 = os.path.join(os.path.dirname(dst), extra); shutil.copy(e, d2); out.append((d2, os.path.relpath(d2, work)))
+        elif kind == "copy_parquet":                      # copy parquet files as they are (globs on the volume)
             for pat in b["src"]:
                 for f in sorted(glob.glob(pat)):
                     dst = os.path.join(work, b["dst"], os.path.basename(f)); os.makedirs(os.path.dirname(dst), exist_ok=True); shutil.copy(f, dst); out.append((dst, os.path.relpath(dst, work)))
@@ -83,7 +95,7 @@ def _build_dataset_files(repo: dict, work: str) -> list:
     return out
 
 
-def _plan_repo(repo: dict, work: str):
+def _plan_repo(repo: dict, work: str, plan_only: bool = False):
     """-> list of (local_path, path_in_repo) for files + folders + built datasets (no card)"""
     import glob
     items = []
@@ -94,20 +106,22 @@ def _plan_repo(repo: dict, work: str):
         for root, _, fs in os.walk(fo["src"]):
             for fn in fs:
                 p = os.path.join(root, fn); items.append((p, os.path.join(fo["dst"], os.path.relpath(p, fo["src"]))))
-    items += _build_dataset_files(repo, work)
+    items += _build_dataset_files(repo, work, plan_only=plan_only)
     return items
 
 
-@app.function(timeout=6 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=4, memory=32 * 1024, ephemeral_disk=512 * 1024)
+@app.function(timeout=6 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=160 * 1024, ephemeral_disk=512 * 1024)
 def run(task: str = "plan", only: str = "", dry_run: int = 1):
     import shutil, tempfile
     vol.reload(); man = _load_manifest(); total = 0
     for repo in man["repos"]:
         if only and repo["name"] != only: continue
         repo_id = f"{OWNER}/{repo['name']}"; work = tempfile.mkdtemp(prefix="hfrel_")
-        items = _plan_repo(repo, work)
+        items = _plan_repo(repo, work, plan_only=(task == "plan" or bool(dry_run)))
         card_t = open(os.path.join("/root/scripts/hf_cards", repo["card"])).read(); card = _fill(card_t, _card_vars(repo))
         sizes = [(os.path.getsize(p) if os.path.exists(p) else -1) for p, _ in items]; total += sum(s for s in sizes if s > 0)
+        for (p, d), s_ in zip(items, sizes):
+            if p.endswith(".pt") and s_ > 0 and "/vol/critic/" in p: print(f"   (ckpt {d}: {s_/1e9:.1f} GB on disk incl. optimizer; shipped WITHOUT optimizer states)", flush=True)
         print(f"\n=== {repo_id} ({repo['type']}, private): {len(items)} files, {sum(s for s in sizes if s > 0)/1e9:.2f} GB", flush=True)
         for (p, d), s in zip(items, sizes): print(f"   {s/1e6:9.1f} MB  {d}   <- {p}" + ("  MISSING" if s < 0 else ""), flush=True)
         print("   --- README.md (first 600 chars) ---\n" + card[:600].replace("\n", "\n   "), flush=True)
