@@ -55,7 +55,8 @@ def parse():
     p.add_argument("--content-abs", type=float, default=0.2, help="redteam #228 H2: reward = content + content_abs x PMI(own), so junk that hurts distractors more than itself does not win")
     p.add_argument("--iterated-paraphrase-p", type=float, default=1.0, help="redteam #228 H3: share of recent rollouts PARAPHRASED during the iterated-learning refit (1.0 = paraphrased only)")
     p.add_argument("--iterated-eval-every", type=int, default=10, help="learnability curve: evaluate the fresh listener every k refit steps; report steps to reach P(own > distractor) = 0.7")
-    p.add_argument("--cotrain-contrast", type=float, default=1.0, help="weight of the listener's hinge softplus((L(z|own) - L(z|distractor) + margin)/tau)*tau at shared (t, eps)")
+    p.add_argument("--cotrain-contrast", type=float, default=0.0, help="DEPRECATED by DECISIONS v1.16 (one-sided hinge Goodharts: the critic destroys the density under wrong text). Weight of softplus((L(z|own) - L(z|distractor) + margin)/tau)*tau; keep 0")
+    p.add_argument("--cotrain-nulldm", type=float, default=1.0, help="DECISIONS v1.16 NULL-DM: weight of ||v(x_t^d, z; h_i^d) - v_uncond(x_t^d; h_i^d)||^2 on the depth-matched DISTRACTOR pair at shared eps -- the velocity under a wrong (same-depth) text is pulled TOWARD the unconditional velocity, never pushed away")
     p.add_argument("--cotrain-tau", type=float, default=0.005); p.add_argument("--cotrain-margin", type=float, default=0.005)
     p.add_argument("--cotrain-replay-frac", type=float, default=0.333, help="share of each listener batch drawn from the teacher/lens pool")
     p.add_argument("--cotrain-paraphrase-p", type=float, default=0.5, help="share of the listener's rollout texts replaced by a non-Qwen paraphrase (anti private code)")
@@ -102,7 +103,7 @@ class Listener:
             df = load_text_pairs(files, os.path.join(a.data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of)]
             self.replay = df.reset_index(drop=True); print(f"[listener] replay pool {len(self.replay)} rows", flush=True)
         self.buffer = collections.deque(maxlen=a.buffer_steps); self.last = {}
-        print(f"[listener] {sum(q.numel() for q in self.params)/1e6:.1f}M adapter params trainable, prior frozen; contrast {a.cotrain_contrast} (tau {a.cotrain_tau}, margin {a.cotrain_margin}), null {a.cotrain_null_reg}, lr {a.cotrain_lr}", flush=True)
+        print(f"[listener] {sum(q.numel() for q in self.params)/1e6:.1f}M adapter params trainable, prior frozen; NULL-DM {a.cotrain_nulldm} (v1.16), contrast {a.cotrain_contrast} (deprecated), null {a.cotrain_null_reg}, lr {a.cotrain_lr}", flush=True)
 
     def _new_opt(self):
         self.opt = torch.optim.AdamW(self.params, lr=self.a.cotrain_lr, betas=(0.9, 0.95), weight_decay=0.0)
@@ -130,10 +131,17 @@ class Listener:
         with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
             l_own, _, kept = pair_fm_loss(self.model, x0, hi, t, eps, enc=enc, enc_mask=mask, p_uncond=a.cotrain_p_uncond, log_s=log_s)
             l_dist, _, _ = pair_fm_loss(self.model, x0d, hid, t, eps, enc=enc, enc_mask=mask & kept[:, None], log_s=log_sd)
-        gap = (l_own.float() - l_dist.float())[kept]                                                    # < 0 = the own pair wins
+        gap = (l_own.float() - l_dist.float())[kept]                                                    # < 0 = the own pair wins (diagnostic; v1.16: no hinge on it)
         con = torch.nn.functional.softplus((gap + a.cotrain_margin) / a.cotrain_tau).mean() * a.cotrain_tau if gap.numel() else torch.zeros((), device=dev)
         con_acc = float((gap < 0).float().mean()) if gap.numel() else float("nan")
-        loss = l_own.float().mean() + a.cotrain_contrast * con
+        loss = l_own.float().mean() + (a.cotrain_contrast * con if a.cotrain_contrast > 0 else 0.0)
+        nulldm = torch.zeros((), device=dev)
+        if a.cotrain_nulldm > 0:                        # v1.16 NULL-DM on the depth-matched distractor pair, shared (t, eps): v(z) -> v(no text), never away
+            x_td = (1 - t)[:, None] * x0d + t[:, None] * eps
+            with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.no_grad(): v_null_d = self.model(x_td, t, hid, enc=enc, enc_mask=torch.zeros_like(mask), log_s=log_sd)
+                v_dm = self.model(x_td, t, hid, enc=enc, enc_mask=mask, log_s=log_sd)
+            nulldm = ((v_dm.float() - v_null_d.float().detach()) ** 2).mean(); loss = loss + a.cotrain_nulldm * nulldm
         null = torch.zeros((), device=dev)
         if a.cotrain_null_reg > 0:
             eps_n = torch.randn_like(x0); t_n = torch.rand(B, device=dev); x_tn = (1 - t_n)[:, None] * x0 + t_n[:, None] * eps_n
@@ -142,7 +150,7 @@ class Listener:
                 with torch.no_grad(): v_null = self.model(x_tn, t_n, hi, enc=enc_rp, enc_mask=torch.zeros_like(mask_rp), log_s=log_s)
                 v_rp = self.model(x_tn, t_n, hi, enc=enc_rp, enc_mask=mask_rp, log_s=log_s)
             null = ((v_rp.float() - v_null.float().detach()) ** 2).mean(); loss = loss + a.cotrain_null_reg * null
-        return loss, {"fm": float(l_own.float().mean()), "contrast": float(con), "contrast_acc": con_acc, "null": float(null), "n": B}
+        return loss, {"fm": float(l_own.float().mean()), "contrast": float(con), "contrast_acc": con_acc, "null": float(null), "nulldm": float(nulldm), "n": B}
 
     def _augment(self, rows, gen, seed, p=None):
         """paraphrase a share of the rollout texts (non-Qwen model) so the listener can only learn meaning"""
@@ -370,7 +378,8 @@ def main():
         ref = {}
         if a.referential and dist_b is not None:
             okf = ok & torch.isfinite(own_b) & torch.isfinite(dist_b).all(1)
-            ref = {"ref/own_bits": float(own_b[okf].mean()), "ref/dist_bits": float(dist_b[okf].mean()), "ref/content": float(content_b[okf].mean()), "ref/content_median": float(content_b[okf].median()),
+            ref = {"ref/own_bits": float(own_b[okf].mean()), "ref/own_bits_median": float(own_b[okf].median()), "ref/p_own_gt_null": float((own_b[okf] > 0).float().mean()),   # v1.16: PMI(own) and P(z > null) every step
+                   "ref/dist_bits": float(dist_b[okf].mean()), "ref/content": float(content_b[okf].mean()), "ref/content_median": float(content_b[okf].median()),
                    "ref/acc": referential_accuracy(own_b[okf], dist_b[okf]), "ref/frac_content_pos": float((content_b[okf] > 0).float().mean()), "ref/n_winners_cotrained": len(best) if cot is not None else 0}
             for kk, t_ in enumerate(types):                                                       # H1: reward decomposed by distractor type
                 ref[f"ref/content_{t_}_{kk}"] = float((own_b[okf] - dist_b[okf, kk]).mean()); ref[f"ref/acc_{t_}_{kk}"] = referential_accuracy(own_b[okf], dist_b[okf, kk: kk + 1])
@@ -414,7 +423,7 @@ def main():
                     if m.any(): log[f"cross/{cname}/bits_{bname}"] = float(cb[m].mean())
             log["cross/live_bits_mean_subsample"] = float(live_b[torch.isfinite(live_b)].mean()); log["time/cross"] = time.time() - tc
             print("   cross (" + ("content" if a.referential else "bits") + "): " + " | ".join(f"{c}: {log[f'cross/{c}/bits_mean']:+.2f} (corr live {log[f'cross/{c}/corr_live']:.2f}, ws {log.get(f'cross/{c}/bits_workspace', float('nan')):+.1f}" + (f", ref acc {log[f'cross/{c}/ref_acc']:.3f}" if f"cross/{c}/ref_acc" in log else "") + ")" for c in cross) + f" | live {log['cross/live_bits_mean_subsample']:+.2f}", flush=True)
-        print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | {'content' if a.referential else 'bits'} {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} ws {log.get('bits/workspace', float('nan')):+.2f}" + (f" | own {ref['ref/own_bits']:+.2f} dist {ref['ref/dist_bits']:+.2f} acc {ref['ref/acc']:.3f}" if ref else "") + f" | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | d4 {log.get('div/distinct4', float('nan')):.2f} | lam {lam:.4f} | gn {gn:.2f}" + (f" | listener fm {cot_m['fm']:.3f} con {cot_m['contrast']:.4f} acc {cot_m['contrast_acc']:.2f} null {cot_m['null']:.4f}" if cot_m and 'fm' in cot_m else "") + f" | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} cot {t_cot:.0f})", flush=True)
+        print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | {'content' if a.referential else 'bits'} {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} ws {log.get('bits/workspace', float('nan')):+.2f}" + (f" | own {ref['ref/own_bits']:+.2f} P(own>null) {ref['ref/p_own_gt_null']:.2f} dist {ref['ref/dist_bits']:+.2f} acc {ref['ref/acc']:.3f}" if ref else "") + f" | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | d4 {log.get('div/distinct4', float('nan')):.2f} | lam {lam:.4f} | gn {gn:.2f}" + (f" | listener fm {cot_m['fm']:.3f} nulldm {cot_m['nulldm']:.4f} null {cot_m['null']:.4f} own<dist {cot_m['contrast_acc']:.2f}" if cot_m and 'fm' in cot_m else "") + f" | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} cot {t_cot:.0f})", flush=True)
         if step % a.eval_every == 0:
             order = rewards.argsort(); pick = [int(order[0]), int(order[len(order) // 2]), int(order[-1])]
             for k in pick: print(f"   [{int(I[groups[k]])}->{int(J[groups[k]])}] r={float(rewards[k]):+.2f} bits={float(bits[k]):+.2f} tok={int(n_tok[k])} viol={bool(bad[k])} :: {texts[k][:200]!r}", flush=True)
