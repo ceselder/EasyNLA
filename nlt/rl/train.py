@@ -43,7 +43,8 @@ def parse():
     p.add_argument("--mismatch-thresh", type=float, default=0.1); p.add_argument("--length-normalizer", type=float, default=None, help="Dr.GRPO constant token normaliser (default: mean over the response)")
     p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16)
     # critic co-training hook (best-of-group + replay)
-    p.add_argument("--cotrain", action="store_true"); p.add_argument("--cotrain-lr", type=float, default=1e-4); p.add_argument("--replay", default=None, help="comma list of text parquet files (pool) for critic replay")
+    p.add_argument("--cotrain", action="store_true"); p.add_argument("--cotrain-lr", type=float, default=2e-5, help="adapter lr; the text adapter is ~0.6B params and sees ~100 rows/step, so keep it small (infra #112: adapters overfit in a few epochs)")
+    p.add_argument("--cotrain-every", type=int, default=1, help="co-train the critic every k RL steps"); p.add_argument("--replay", default=None, help="comma list / globs of text parquet files (pool) for critic replay")
     p.add_argument("--cotrain-replay-n", type=int, default=64); p.add_argument("--cotrain-p-uncond", type=float, default=0.3)
     # data / eval / logging
     p.add_argument("--train-store-device", default="cpu"); p.add_argument("--max-train-pos", type=int, default=None)
@@ -176,7 +177,7 @@ def main():
         t_upd = time.time() - t3; t4 = time.time(); sync(); t_sync = time.time() - t4
         # ---- critic co-training on best-of-group (honest members only) + replay
         cot_loss = float("nan")
-        if cot is not None:
+        if cot is not None and step % a.cotrain_every == 0:
             best = []
             for g_ in groups.unique().tolist():
                 m = (groups == g_) & ~bad
