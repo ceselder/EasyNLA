@@ -32,6 +32,14 @@ def main():
             # A4 (proposed, board #285): P(z > twin) >= 0.65 from this critic's paraphrase/twin summary of the same source, if scored
             prefix = a.pattern.split("*")[0]                      # e.g. 'scored_big_' -> this critic's twin file is scored_big_para_<src>; pooled_n's were written without a critic tag
             cands = [os.path.join(a.scored_dir, f"{prefix}para_{src}.summary.json")] + ([os.path.join(a.scored_dir, f"scored_para_{src}.summary.json")] if a.critic == "union_pooled_null" else [])
+            t2 = os.path.join(a.scored_dir, f"{prefix}twinnext2_{src}.summary.json")      # generator-independent twins (nlt.evals.twin_next): twin_near / twin_far
+            if os.path.exists(t2):
+                ts2 = json.load(open(t2)); tn, tfar = ts2.get("twin_near", {}), ts2.get("twin_far", {})
+                if tn.get("p_orig_preferred") is not None or tfar.get("p_orig_preferred") is not None:
+                    row["twin_next"] = {"p_orig_gt_near": tn.get("p_orig_preferred"), "p_orig_gt_far": tfar.get("p_orig_preferred"), "n_near": tn.get("n_used"), "n_far": tfar.get("n_used"),
+                                        "delta_near": tn.get("delta_bits_mean"), "delta_far": tfar.get("delta_bits_mean"), "file": os.path.basename(t2)}
+                    ps = [v for v in (tn.get("p_orig_preferred"), tfar.get("p_orig_preferred")) if v is not None]
+                    row["A4b_P_gt_twin_next_ge_0.65"] = bool(min(ps) >= 0.65) if ps else None
             for tf in [c for c in cands if os.path.exists(c)][:1]:
                 ts = json.load(open(tf)); tw = ts.get("twin", {})
                 if tw.get("p_orig_preferred") is not None:
@@ -43,7 +51,7 @@ def main():
             res["edits"].setdefault(src, {})[kind] = {k: v for k, v in s.items() if isinstance(v, dict) or k in ("n_pairs", "orig_bits_mean")}
     json.dump(res, open(a.out, "w"), indent=1, default=str)
     for src, r in res["sources"].items():
-        print(f"{src:22s} content ws {r['content_workspace']:6.2f} | all {r['content_all']:5.2f} | P(z>dm) {r['p_orig_gt_dm']:.2f} | rp by band {({b: round(v, 1) for b, v in r['rp_by_band'].items()})} | A1 {r['A1_content_ws_ge_5']} A1b {r['A1b_orig_ws_gt_0']} A2 {r['A2_P_ge_0.70']} A3 {r['A3_rp_within_3x_noise']} -> {'ACCEPT' if r['ACCEPT'] else 'REJECT'}" + (f" | twin P {r['twin']['p_orig_gt_twin']:.2f} A4 {'PASS' if r.get('A4_P_gt_twin_ge_0.65') else 'FAIL'}" if r.get("twin") else ""))
+        print(f"{src:22s} content ws {r['content_workspace']:6.2f} | all {r['content_all']:5.2f} | P(z>dm) {r['p_orig_gt_dm']:.2f} | rp by band {({b: round(v, 1) for b, v in r['rp_by_band'].items()})} | A1 {r['A1_content_ws_ge_5']} A1b {r['A1b_orig_ws_gt_0']} A2 {r['A2_P_ge_0.70']} A3 {r['A3_rp_within_3x_noise']} -> {'ACCEPT' if r['ACCEPT'] else 'REJECT'}" + (f" | twin P {r['twin']['p_orig_gt_twin']:.2f} A4 {'PASS' if r.get('A4_P_gt_twin_ge_0.65') else 'FAIL'}" if r.get("twin") else "") + (f" | twin_next near/far P {r['twin_next']['p_orig_gt_near']} / {r['twin_next']['p_orig_gt_far']} A4b {'PASS' if r.get('A4b_P_gt_twin_next_ge_0.65') else 'FAIL'}" if r.get("twin_next") else ""))
     for src, e in res["edits"].items():
         for kind, d in e.items():
             keys = [k for k in d if k in ("para_light", "para_strong", "twin", "mask_next", "twin_next")]
