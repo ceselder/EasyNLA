@@ -19,7 +19,7 @@ CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa
 # critic key in the json -> human label (no codenames), in display order
 CRITICS = [("lensmine", "J-lens text only\n2000 steps\nrms space"), ("lens_es", "J-lens text only\nearly-stopped\nrms space"), ("lensmine_pooled", "J-lens text only\n+ null reg.\nPOOLED space"),
            ("union_es", "all sources\nplain FM\nrms space"), ("union_null", "all sources\n+ null reg.\nrms space"),
-           ("union_pooled_null", "all sources\n+ null reg.\nPOOLED (headline)"), ("union_c", "all sources + null\n+ contrastive (T4)\npooled"), ("critic_v3a", "critic v3a\n(all levers, prior\nunfrozen), pooled")]
+           ("union_pooled_null", "all sources\n+ null reg.\nPOOLED (headline)"), ("union_pooled_big", "all sources\n16 slots, 4000 steps\nPOOLED"), ("union_c", "all sources + null\n+ contrastive (T4)\npooled"), ("critic_v3a", "critic v3a\n(all levers, prior\nunfrozen), pooled")]
 SETS = [("teacher_v1", "Sonnet teacher, 1 sentence (41 tok)", CAT[0]), ("lens_L1", "J-lens change description, 1 sentence (40 tok)", CAT[1]),
         ("lens_L2", "J-lens change description, 3 sentences (57 tok)", CAT[2]), ("lens_L3", "J-lens change description, lists (137 tok)", CAT[6])]
 
