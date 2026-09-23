@@ -53,6 +53,7 @@ def main():
     p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default=None, help="default: the text critic's own encoder (from its args)"); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--enc-max-len", type=int, default=None)
     p.add_argument("--skip-exact", action="store_true"); p.add_argument("--data-device", default="cuda"); p.add_argument("--stats", default=None, help="stats.pt (default <data-dir>/stats.pt; must match the critics')")
     p.add_argument("--paired-sets", default=None, help="additional label:path[@v] sets that only define the common/paired rows (not scored)")
+    p.add_argument("--synth-set", default=None, help="synthetic text sets mode:label (depth:depthtag) built from the pair metadata (v1.8 T1 diagnostic)")
     p.add_argument("--skip-extra-controls", action="store_true", help="skip the shuf_words and mask_next controls (2 extra exact passes per set)")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
@@ -73,6 +74,11 @@ def main():
             if "@" in path: path, v_ = path.rsplit("@", 1); verb = [int(v_)]          # label:path@2 -> only verbosity 2 rows of that file
             tdf = load_text_pairs([path], os.path.join(a.data_dir, "pairs_val.parquet"), verbosity=verb).drop_duplicates("pair_id").set_index("pair_id")
             text_sets[label] = tdf["text"].to_dict(); print(f"[bits] set {label}: {len(tdf)} pairs with text ({path}{'@'+str(verb[0]) if verb else ''})", flush=True)
+    if a.synth_set:
+        from nlt.critic.train import synth_texts
+        for item in a.synth_set.split(","):
+            mode, label = item.split(":") if ":" in item else (item, item)
+            zz = synth_texts(mode, store_val, rows_all, I_all, J_all); text_sets[label] = dict(zip(vp["pair_id"].tolist(), zz)); print(f"[bits] synthetic set {label} ({mode}): e.g. {zz[0]!r}", flush=True)
     pid_all = vp["pair_id"].tolist()
     paired_sets = dict(text_sets)                      # extra sets that only DEFINE the common (paired) rows, so parallel jobs over set groups share one paired subset
     if a.paired_sets:

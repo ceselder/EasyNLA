@@ -50,6 +50,15 @@ def smoke_texts(store, rows, i, j, tok):
     return [f"next token: {tok.decode([int(x)])!r}" for x in nt]
 
 
+def synth_texts(mode, store, rows, i, j, tok=None):
+    """SYNTHETIC critic-diagnostic texts (DECISIONS v1.8 text-channel capacity tests; FORBIDDEN as verbalizer targets):
+       depth   -> 'from layer {i} to layer {j}'          (T1: can the text channel read two integers? compare with the depth EMBEDDING critic)
+       nexttok -> 'next token: <tok>'                     (plumbing)"""
+    if mode == "depth": return [f"from layer {int(a)} to layer {int(b)}" for a, b in zip(i.tolist(), j.tolist())]
+    if mode == "nexttok": return smoke_texts(store, rows, i, j, tok)
+    raise ValueError(mode)
+
+
 @torch.no_grad()
 def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank, prefix="eval"):
     """fixed pairs, fixed eps (per t) -> loss tables. Returns a flat dict of scalars + a nested breakdown."""
@@ -120,6 +129,7 @@ def main():
     p.add_argument("--text-parquet", default=None, help="comma-separated text files/globs [pair_id, text, verbosity, source] for the TRAIN pairs (cond=text)"); p.add_argument("--text-verbosity", default=None, help="comma list of verbosity levels to train on (default all)")
     p.add_argument("--val-text-parquet", default=None, help="text files/globs for the VAL pairs (default: --text-parquet with '/train/' -> '/val/')")
     p.add_argument("--text-smoke", action="store_true", help="PLUMBING TEST: synthetic 'next token: X' text instead of --text-parquet")
+    p.add_argument("--text-synth", default=None, choices=["depth", "nexttok"], help="synthetic diagnostic texts generated from (pair) metadata for every sampled pair (v1.8 T1); overrides --text-parquet")
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=128)
     p.add_argument("--wandb", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
@@ -160,7 +170,11 @@ def main():
     if a.cond == "text":
         from nlt.critic.text_encoder import TextEncoder
         encoder = TextEncoder(a.enc_model, a.enc_layer, dev, a.enc_max_len)
-        if a.text_smoke:
+        if a.text_synth:
+            from transformers import AutoTokenizer
+            tok8 = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B"); val_text = synth_texts(a.text_synth, store_val, val_rows, val_i, val_j, tok8); a.text_smoke = True
+            print(f"[train] SYNTHETIC TEXT MODE '{a.text_synth}' (critic diagnostic, forbidden for the verbalizer); example: {val_text[0]!r}", flush=True)
+        elif a.text_smoke:
             from transformers import AutoTokenizer
             tok8 = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B"); val_text = smoke_texts(store_val, val_rows, val_i, val_j, tok8)
             print("[train] TEXT SMOKE MODE: synthetic next-token texts (plumbing test, not a result)", flush=True)
@@ -213,7 +227,7 @@ def main():
             idx = torch.randint(0, len(text_df), (a.batch,), generator=gen).numpy(); sub = text_df.iloc[idx]
             rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values); j = torch.tensor(sub["j"].values); texts = sub["text"].tolist()
         else:
-            rows, i, j = store.sample_pairs(a.batch, gen); texts = smoke_texts(store, rows, i, j, tok8) if (a.cond == "text") else None
+            rows, i, j = store.sample_pairs(a.batch, gen); texts = (synth_texts(a.text_synth, store, rows, i, j, tok8) if a.text_synth else smoke_texts(store, rows, i, j, tok8)) if (a.cond == "text") else None
         h_i, x0, log_s, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), a.target, a.src_rms)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
         enc = mask = None
