@@ -206,6 +206,8 @@ def main():
                     res["ratio_to_dm_rp_corrected"] = float((pe.mean() - rp_m) / (ps_.mean() - rp_m)) if abs(ps_.mean() - rp_m) > 1e-9 else None
                     res["text_presence_offset_flag"] = bool(abs(rp_m) > 2 and abs(rp_m) > 1.96 * rp_sem)
                     res["frac_z_beats_dm"] = float((pe > ps_).mean()); res["frac_z_beats_rp"] = float((pe > pr_).mean())
+                    res["content_exact_bits"] = summarize(pe - ps_, gaps, js, "content")           # PAIRED z - z_dm (the headline quantity)
+                    res["content_rp_exact_bits"] = summarize(pe - pr_, gaps, js, "content_rp")     # PAIRED z - z_rp
                     if not a.skip_extra_controls:
                         pw_ = (lp_w - lp_u).numpy() / math.log(2); pm_ = (lp_m - lp_u).numpy() / math.log(2)
                         res["shuf_words_exact_pmi_bits"] = summarize(pw_, gaps, js, "shuf_words"); res["frac_z_beats_shuf_words"] = float((pe > pw_).mean())

@@ -239,7 +239,7 @@ def main():
             if a.cond != "none":
                 log["train/loss_cond"] = float(loss_vec[kept].mean()) if kept.any() else float("nan"); log["train/loss_uncond"] = float(loss_vec[~kept].mean()) if (~kept).any() else float("nan")
             wandb.log(log, step=step)
-            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step", flush=True)
+            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step" + (f" cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} null {float(null_loss):.4f}" if a.cond != "none" else ""), flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             out, br = evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank)
             if a.cond != "text" and (has_train_eval or True):       # train-pair eval (same grid, fixed eps) for the generalisation gate; text mode has no per-pair train texts here
