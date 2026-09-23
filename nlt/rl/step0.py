@@ -35,7 +35,7 @@ def main():
     tok = load_tokenizer(a.base); spec = build_prompt(tok, a.question or DEFAULT_QUESTION)
     store = ActStore(a.data_dir, "val", device="cpu"); vc = ViolationChecker(store, a.data_dir)
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)].iloc[a.skip: a.skip + a.n_pairs].reset_index(drop=True)
-    rows = store.rows_for(vp["pos_idx"].values); I = torch.tensor(vp["i"].values); J = torch.tensor(vp["j"].values); N = len(vp)
+    rows = store.rows_for(vp["pos_idx"].values); I = torch.as_tensor(vp["i"].values).long(); J = torch.as_tensor(vp["j"].values).long(); N = len(vp)
     h_i = store.gather(rows, I).float(); h_j = store.gather(rows, J).float(); acts = torch.stack([h_i, h_j], 1)
     bands = np.array([band(int(j)) for j in J.tolist()]); print(f"[step0] {N} pairs: " + ", ".join(f"{b}={int((bands == b).sum())}" for b in ("pre", "workspace", "motor")), flush=True)
     policy = load_policy(a.base, a.init, device=dev); policy.eval()

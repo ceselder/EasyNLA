@@ -57,7 +57,7 @@ def main():
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"sft_{a.tag}", group="sft", config=vars(a))
 
     def batch_tensors(sub, st):
-        rows = st.rows_for(sub["pos_idx"].values); acts = torch.stack([st.gather(rows, torch.tensor(sub["i"].values)), st.gather(rows, torch.tensor(sub["j"].values))], 1).float()
+        rows = st.rows_for(sub["pos_idx"].values); acts = torch.stack([st.gather(rows, torch.as_tensor(sub["i"].values).long()), st.gather(rows, torch.as_tensor(sub["j"].values).long())], 1).float()
         seqs = [torch.tensor(spec.ids + response_ids(tok, str(t), a.max_resp_tokens)) for t in sub["text"].values]
         L = max(s.numel() for s in seqs); ids = torch.full((len(seqs), L), pad, dtype=torch.long); lab = torch.full((len(seqs), L), -100, dtype=torch.long); am = torch.zeros_like(ids)
         for r, s in enumerate(seqs): ids[r, : s.numel()] = s; am[r, : s.numel()] = 1; lab[r, spec.n: s.numel()] = s[spec.n:]

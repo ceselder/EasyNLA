@@ -72,7 +72,7 @@ class CriticCotrainer:
         if self.replay is not None and n_replay > 0:
             idx = torch.randint(0, len(self.replay), (n_replay,), generator=gen).tolist(); sub = self.replay.iloc[idx]
             rows = self.store.rows_for(sub["pos_idx"].values)
-            h_i = torch.cat([h_i, self.store.gather(rows, torch.tensor(sub["i"].values)).float()]); h_j = torch.cat([h_j, self.store.gather(rows, torch.tensor(sub["j"].values)).float()])
+            h_i = torch.cat([h_i, self.store.gather(rows, torch.as_tensor(sub["i"].values).long()).float()]); h_j = torch.cat([h_j, self.store.gather(rows, torch.as_tensor(sub["j"].values).long()).float()])
             texts = list(texts) + sub["text"].tolist()
         dev = self.sc.dev; self.model.train()
         hi, x0, log_s, _ = make_x0(self.sc.norm, h_i.to(dev), h_j.to(dev), self.sc.target, self.sc.src_rms)
@@ -110,7 +110,7 @@ def main():
     store_val = ActStore(a.data_dir, "val", device="cpu")
     vc = ViolationChecker(store, a.data_dir, copy_thresh=a.copy_thresh); vc_val = ViolationChecker(store_val, a.data_dir, copy_thresh=a.copy_thresh)
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas(); vp = vp[vp["pos_idx"].isin(store_val.row_of)].iloc[: a.eval_pairs]
-    ev_rows = store_val.rows_for(vp["pos_idx"].values); ev_i = torch.tensor(vp["i"].values); ev_j = torch.tensor(vp["j"].values)
+    ev_rows = store_val.rows_for(vp["pos_idx"].values); ev_i = torch.as_tensor(vp["i"].values).long(); ev_j = torch.as_tensor(vp["j"].values).long()
     ev_acts = torch.stack([store_val.gather(ev_rows, ev_i), store_val.gather(ev_rows, ev_j)], 1).float()
     # ---- policy + engine
     policy = load_policy(a.base, a.init, r=a.lora_r, alpha=a.lora_alpha, device=dev); policy.train()

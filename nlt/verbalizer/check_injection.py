@@ -32,7 +32,7 @@ def main():
     print(f"[check] prompt ({spec.n} tokens) markers at {spec.pos_i},{spec.pos_j}: {spec.text!r}", flush=True)
     store = ActStore(a.data_dir, a.split, device="cpu")
     vp = pq.read_table(os.path.join(a.data_dir, f"pairs_{a.split}.parquet")).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)].iloc[: a.n_pairs]
-    rows = store.rows_for(vp["pos_idx"].values); I = torch.tensor(vp["i"].values); J = torch.tensor(vp["j"].values)
+    rows = store.rows_for(vp["pos_idx"].values); I = torch.as_tensor(vp["i"].values).long(); J = torch.as_tensor(vp["j"].values).long()
     acts = torch.stack([store.gather(rows, I), store.gather(rows, J)], 1).float()          # [N, 2, d]
     print(f"[check] {len(vp)} pairs, gaps {sorted(set((J - I).tolist()))}", flush=True)
     policy = load_policy(a.base, a.init, device=dev); policy.eval()
