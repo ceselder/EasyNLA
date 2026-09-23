@@ -66,6 +66,9 @@ def parse():
     p.add_argument("--cotrain-replay-frac", type=float, default=0.333, help="share of each listener batch drawn from the teacher/lens pool")
     p.add_argument("--cotrain-paraphrase-p", type=float, default=0.5, help="share of the listener's rollout texts replaced by a non-Qwen paraphrase (anti private code)")
     p.add_argument("--cotrain-guard", action=argparse.BooleanOptionalAction, default=True, help="co-train only on group winners whose content reward is > 0 (redteam: else best-of-group selects register)")
+    p.add_argument("--cotrain-micro", type=int, default=24, help="listener rows per gradient chunk (loss accumulated over chunks; the listener loss runs 4 forwards per row)")
+    p.add_argument("--cotrain-max-rows", type=int, default=96, help="cap on listener rows per update (winners + replay)")
+    p.add_argument("--cross-offload", action=argparse.BooleanOptionalAction, default=True, help="keep the frozen / cross critics on CPU between uses (they score every 10-20 steps); saves ~9 GB per critic on the critic GPU")
     p.add_argument("--iterated-every", type=int, default=100, help="iterated learning: every k steps reset the listener's adapter to the pre-RL critic and re-fit on the recent-rollout buffer + pool (0 = off)")
     p.add_argument("--iterated-steps", type=int, default=60); p.add_argument("--iterated-batch", type=int, default=192); p.add_argument("--buffer-steps", type=int, default=50)
     # critic co-training hook (best-of-group + replay)
@@ -172,14 +175,27 @@ class Listener:
     def step(self, rows, gen, seed):
         """one listener update on this step's winners (+ replay); rows = {h_i, h_j, h_i_d, h_j_d [m, d] cpu, texts}"""
         self.buffer.append({k: (v.half() if torch.is_tensor(v) else v) for k, v in rows.items()})
-        rows = self._augment(rows, gen, seed); frac = self.a.cotrain_replay_frac
-        rep = self._replay_rows(int(round(len(rows["texts"]) * frac / max(1e-6, 1 - frac))), gen)
+        a = self.a; frac = a.cotrain_replay_frac; n_win = min(len(rows["texts"]), int(round(a.cotrain_max_rows * (1 - frac))))
+        if n_win < len(rows["texts"]):
+            keep = torch.randperm(len(rows["texts"]), generator=gen)[:n_win]; rows = {k: (v[keep] if torch.is_tensor(v) else [v[int(q)] for q in keep]) for k, v in rows.items()}
+        rows = self._augment(rows, gen, seed)
+        rep = self._replay_rows(min(a.cotrain_max_rows - n_win, int(round(n_win * frac / max(1e-6, 1 - frac)))), gen)
         batch = self._cat([rows, rep])
-        self.model.train()
+        return self._update(batch)
+
+    def _update(self, batch):
+        """one optimizer step, loss accumulated over chunks of --cotrain-micro rows (the loss runs 4 forwards per row)"""
+        a = self.a; n = len(batch["texts"]); self.model.train()
         for q in self.params: q.requires_grad_(True)
-        loss, m = self._loss(batch); self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
-        self.model.eval(); self.model.requires_grad_(False); m["loss"] = float(loss.detach()); self.last = m
-        return m
+        self.opt.zero_grad(set_to_none=True); agg = {}; tot = 0.0
+        for cs in range(0, n, a.cotrain_micro):
+            idx = list(range(cs, min(n, cs + a.cotrain_micro))); chunk = {k: (v[idx] if torch.is_tensor(v) else [v[q] for q in idx]) for k, v in batch.items()}
+            loss, m = self._loss(chunk); (loss * len(idx) / n).backward(); tot += float(loss.detach()) * len(idx) / n
+            for k, v in m.items():
+                if k != "n" and isinstance(v, float) and np.isfinite(v): agg[k] = agg.get(k, 0.0) + v * len(idx) / n
+        torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
+        self.model.eval(); self.model.requires_grad_(False); agg["loss"] = tot; agg["n"] = n; self.last = agg
+        return agg
 
     def _buffer_sample(self, n, gen):
         allrows = self._cat([{k: (v.float() if torch.is_tensor(v) else v) for k, v in b.items()} for b in self.buffer])
@@ -216,10 +232,7 @@ class Listener:
             if rows is None: break
             rows = self._augment(rows, gen, seed * 1000 + k, p=a.iterated_paraphrase_p)        # H3: the fresh listener re-fits on PARAPHRASED recent rollouts
             rep = self._replay_rows(a.iterated_batch - len(rows["texts"]), gen); batch = self._cat([rows, rep])
-            self.model.train()
-            for q in self.params: q.requires_grad_(True)
-            loss, _ = self._loss(batch); self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
-            self.model.eval(); self.model.requires_grad_(False)
+            self._update(batch)
             if a.iterated_eval_every > 0 and (k + 1) % a.iterated_eval_every == 0:
                 acc_k = self.learnability(held, seed=seed); curve.append((k + 1, acc_k))
                 if steps_to_07 is None and acc_k >= 0.7: steps_to_07 = k + 1
@@ -293,6 +306,24 @@ def main():
             print(f"[cross] critic {name} = {path}", flush=True)
     from nlt.evals.diversity import distinct_n, self_bleu
     lam = None if str(a.lam).strip().lower() == "auto" else float(a.lam)
+
+    def _place(sc, device):
+        """move a scorer (critic + norm + text encoder) between CPU and its GPU"""
+        inner = getattr(sc, "inner", None)
+        if inner is None: return
+        inner.model.to(device); inner.norm.to(device); inner.dev = device
+        if getattr(inner, "encoder", None) is not None: inner.encoder.model.to(device); inner.encoder.device = device
+        if device == "cpu": torch.cuda.empty_cache()
+    if a.cross_offload:
+        for cname, csc in cross.items(): _place(csc, "cpu")
+        print(f"[cross] {len(cross)} critic(s) parked on CPU between uses", flush=True)
+    class _OnGPU:
+        def __init__(self, sc): self.sc = sc
+        def __enter__(self):
+            if a.cross_offload: _place(self.sc, cdev)
+            return self.sc
+        def __exit__(self, *e):
+            if a.cross_offload: _place(self.sc, "cpu")
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"rl_{a.tag}", group="rl", config=vars(a))
     gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id; lam_hist = []; lr_mult = 1.0; ent0 = None; last_brake = -10**9; brakes_n = 0; last_dump_dir = None
     meta_pos = store.meta["pos_idx"].values; meta_next = store.meta["next_token_id"].values
@@ -434,7 +465,8 @@ def main():
                 except Exception as e_: log["reader/error"] = str(e_)[:80]
         if cross and step % a.cross_every == 0:             # DECISIONS v1.6: re-score a subsample of THIS step's rollouts under the frozen start critic + the teacher-only critic
             tc = time.time(); sub = list(range(min(a.cross_n, n))); sg = groups[sub]; live_b = bits[sub]; sub_txt = [scored[k] if not viol["empty"][k] else None for k in sub]
-            for cname, csc in cross.items():
+            for cname, csc0 in cross.items():
+              with _OnGPU(csc0) as csc:
                 if a.referential:
                     c_own, c_dist, cb = referential_score(csc, ext_h_i, ext_h_j, sub_txt, sg, dist_idx, seed=step)
                     log[f"cross/{cname}/ref_acc"] = referential_accuracy(c_own, c_dist); log[f"cross/{cname}/own_bits"] = float(c_own[torch.isfinite(c_own)].mean())
@@ -470,8 +502,9 @@ def main():
                 m = torch.tensor([band(int(j_)) == bname for j_ in ev_j.tolist()])
                 if m.any(): log[f"eval/bits_{bname}"] = float(eb[m].mean())
             if frozen is not None:
-                fb = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
-                fb_rp = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in rp_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
+              with _OnGPU(frozen) as fz:
+                fb = fz.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
+                fb_rp = fz.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in rp_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
                 fro_content = float((fb - fb_rp).mean())
                 log.update({"eval/bits_frozen_mean": float(fb.mean()), "eval/bits_frozen_rp_mean": float(fb_rp.mean()), "eval/frozen_content": fro_content, "eval/bits_live_minus_frozen": float((eb - fb).mean()),
                             "gate/Y1_frozen_content_pos": float(fro_content > 0), "gate/Y4_diversity": float(log.get("div/distinct4", 1.0) >= 0.4 and log.get("div/self_bleu", 0.0) <= 0.6)})
