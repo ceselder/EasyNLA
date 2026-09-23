@@ -44,26 +44,27 @@ class ActStore:
         import pyarrow.parquet as pq, pandas as pd
         self.split, self.device = split, device
         files = sorted(glob.glob(os.path.join(data_dir, split, "acts_*.npy"))); assert files, f"no shards in {data_dir}/{split}"
-        chunks, metas, n = [], [], 0
+        # meta first (spike rows from finalize's spikes.json are dropped HERE, before any copy), then ONE preallocated tensor on the target
+        # device filled shard by shard: no torch.cat and no boolean re-indexing, both of which need 2x the store in memory.
+        sp = os.path.join(data_dir, "spikes.json"); bad = set(json.load(open(sp)).get(split, [])) if os.path.exists(sp) else set()
+        plan, metas, total, n_bad = [], [], 0, 0
         for f in files:
+            m = pq.read_table(meta_of(f)).to_pandas(); keep = ~m["pos_idx"].isin(bad).values; n_bad += int((~keep).sum())
+            idx = np.where(keep)[0]
+            if max_pos is not None and total + len(idx) > max_pos: idx = idx[: max_pos - total]
+            if len(idx) == 0: break
+            plan.append((f, idx)); metas.append(m.iloc[idx]); total += len(idx)
+            if max_pos is not None and total >= max_pos: break
+        A0 = np.load(plan[0][0], mmap_mode="r"); L, d = A0.shape[1], A0.shape[2]
+        self.acts = torch.empty((total, L, d), dtype=torch.float16, device=device, pin_memory=(pin and device == "cpu"))
+        n = 0
+        for f, idx in plan:
             A = np.load(f, mmap_mode="r")
-            if max_pos is not None and n + A.shape[0] > max_pos: A = A[: max_pos - n]
-            if A.shape[0] == 0: break
-            t = torch.from_numpy(np.ascontiguousarray(A))                    # fp16 [n, L, d]
-            chunks.append(t.to(device) if device != "cpu" else t); n += A.shape[0]
-            metas.append(pq.read_table(meta_of(f)).to_pandas().iloc[: A.shape[0]])
+            chunk = np.ascontiguousarray(A[idx]) if len(idx) < A.shape[0] else np.ascontiguousarray(A[:len(idx)])
+            self.acts[n:n + len(idx)].copy_(torch.from_numpy(chunk)); n += len(idx); del chunk
             if verbose: print(f"[ActStore:{split}] {os.path.basename(f)} -> {n} positions", flush=True)
-            if max_pos is not None and n >= max_pos: break
-        self.acts = torch.cat(chunks, 0)                                      # [N, L, d] fp16 on device
         self.meta = pd.concat(metas, ignore_index=True)
-        sp = os.path.join(data_dir, "spikes.json")
-        if os.path.exists(sp):                                                # massive-activation rows flagged by finalize: drop them
-            bad = set(json.load(open(sp)).get(split, []))
-            keep = ~self.meta["pos_idx"].isin(bad).values
-            if (~keep).any():
-                self.acts = self.acts[torch.from_numpy(keep).to(self.acts.device)]; self.meta = self.meta[keep].reset_index(drop=True)
-                if verbose: print(f"[ActStore:{split}] dropped {int((~keep).sum())} spike positions", flush=True)
-        if pin and device == "cpu": self.acts = self.acts.pin_memory()
+        if verbose and n_bad: print(f"[ActStore:{split}] dropped {n_bad} spike positions", flush=True)
         self.N, self.L, self.d = self.acts.shape
         assert self.L == N_LAYERS
         self.row_of = dict(zip(self.meta["pos_idx"].tolist(), range(self.N)))
