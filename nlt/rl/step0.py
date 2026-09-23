@@ -80,23 +80,30 @@ def main():
         m = torch.as_tensor(mask); g = groups[m]
         if m.sum() == 0: return {}
         wg = within_group_std(b0[m], g); nz = float(noise_row[m].std()); bm = float(b0[m].mean()); dm = float(b_dm[m].mean()); rp = float(b_rp[m].mean())
-        bpt = b0[m] / n_tok[m].clamp_min(1)
-        return {"n": int(m.sum()), "bits_mean": bm, "bits_median": float(b0[m].median()), "bits_per_token_median": float(bpt.median()), "bits_per_token_mean": float(bpt.mean()),
-                "lambda_max": 0.5 * float(bpt.median()), "within_group_std": wg, "scoring_noise": nz, "std_over_noise": wg / nz if nz > 0 else float("nan"),
-                "bits_dm": dm, "bits_rp": rp, "bits_over_dm": bm / dm if dm > 0 else float("inf"), "frac_nonpos": float((b0[m] <= 0).float().mean()), "tokens_mean": float(n_tok[m].mean()),
+        bpt = b0[m] / n_tok[m].clamp_min(1); nn = int(m.sum())
+        d_dm = (b0[m] - b_dm[m]); d_rp = (b0[m] - b_rp[m]); wg_tok = within_group_std(n_tok[m], g)
+        return {"n": nn, "bits_mean": bm, "bits_median": float(b0[m].median()), "bits_per_token_median": float(bpt.median()), "bits_per_token_mean": float(bpt.mean()),
+                "lambda_max": 0.5 * float(bpt.median()), "lambda_wg": 0.25 * wg / wg_tok if wg_tok > 0 else float("nan"), "within_group_std": wg, "within_group_std_tokens": wg_tok,
+                "scoring_noise": nz, "std_over_noise": wg / nz if nz > 0 else float("nan"),
+                "bits_dm": dm, "bits_rp": rp, "bits_minus_dm": float(d_dm.mean()), "bits_minus_dm_sem": float(d_dm.std() / nn ** 0.5), "bits_minus_rp": float(d_rp.mean()), "bits_minus_rp_sem": float(d_rp.std() / nn ** 0.5),
+                "bits_over_dm": bm / dm if dm > 0 else float("inf"), "critic_presence_offset_over_noise": abs(rp) / nz if nz > 0 else float("nan"),
+                "frac_nonpos": float((b0[m] <= 0).float().mean()), "tokens_mean": float(n_tok[m].mean()),
                 "mention_next": float(viol["mention_next"][mask].mean()), "copy_rate": float(viol["copy_rate"][mask].mean()), "regex": float(viol["regex"][mask].mean()), "empty": float(viol["empty"][mask].mean()), "junk": float(viol["junk"][mask].mean()),
                 "corr_bits_tokens": corr(b0[m], n_tok[m]), "reward_mean": float((b0[m] - a.lam * n_tok[m]).mean())}
     out = {"init": a.init, "n_pairs": N, "group": a.group, "dm_exact_partners": int(N - n_approx), "critic": a.critic or "stub", "ode_steps": a.ode_steps, "probes": a.probes, "score_s_per_row": t_score / n,
            "all": stats(np.ones(n, bool)), "bands": {b: stats(bands[gl] == b) for b in ("pre", "workspace", "motor")}, "rollout": info}
     ws = out["bands"].get("workspace", {})
-    out["pass_workspace"] = bool(ws and ws["std_over_noise"] >= 3 and ws["bits_over_dm"] >= 3 and ws["mention_next"] < 0.2)
+    # signal: within-group std >= 3x scoring noise AND the paired content gain over the depth-matched shuffle is > 3 SEM; critic health: the
+    # random-pair text must buy ~nothing (|bits(z_rp)| within 5x the scoring noise) -- a presence offset means the adapter is reading form
+    out["critic_healthy_workspace"] = bool(ws and ws["critic_presence_offset_over_noise"] <= 5)
+    out["pass_workspace"] = bool(ws and ws["std_over_noise"] >= 3 and ws["bits_minus_dm"] > 3 * ws["bits_minus_dm_sem"] and ws["mention_next"] < 0.2 and out["critic_healthy_workspace"])
     samp = []
     for k in np.argsort(-b0.numpy())[:8].tolist() + np.argsort(b0.numpy())[:4].tolist():
         g = gl[k]; samp.append({"i": int(I[g]), "j": int(J[g]), "bits": float(b0[k]), "bits_dm": float(b_dm[k]), "tokens": int(n_tok[k]), "text": texts[k][:300]})
     out["samples"] = samp
     print(json.dumps({k: v for k, v in out.items() if k != "samples"}, indent=1), flush=True)
     for s in samp: print(f"  [{s['i']}->{s['j']}] bits {s['bits']:+.2f} (dm {s['bits_dm']:+.2f}) tok {s['tokens']}: {s['text']!r}", flush=True)
-    os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out, "w"), indent=1); print(f"[step0] PASS(workspace)={out['pass_workspace']} -> {a.out}", flush=True)
+    os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out, "w"), indent=1); print(f"[step0] PASS(workspace)={out['pass_workspace']} critic_healthy={out['critic_healthy_workspace']} -> {a.out}", flush=True)
 
 
 if __name__ == "__main__":

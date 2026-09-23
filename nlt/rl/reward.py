@@ -50,17 +50,21 @@ def make_scorer(args, device):
     print(f"[reward] exact-bits critic {args.critic} (Heun {args.ode_steps}, probes {args.probes})", flush=True); return s
 
 
-def shape_rewards(bits: torch.Tensor, n_tokens: torch.Tensor, lam: float, viol: np.ndarray, groups: torch.Tensor, floor: float = -5.0):
-    """r = bits - lam*tokens; a violating rollout gets min(worst honest member of its group, 0) + floor (never 0, never above an honest
-    member); a group with no honest member gets floor everywhere. NaN bits (scorer failure) count as violations."""
+def shape_rewards(bits: torch.Tensor, n_tokens: torch.Tensor, lam: float, viol: np.ndarray, groups: torch.Tensor, floor: float = -5.0, floor_scale: float = 1.0):
+    """r = bits - lam*tokens; a violating rollout gets (worst honest member of its group) - penalty, penalty = max(|floor|, floor_scale x the
+    batch's within-group std of the honest rewards) -- a fixed -5 bits is invisible when content swings are +-50 bits; a group with no
+    honest member gets -penalty everywhere. NaN bits (scorer failure) count as violations."""
     r = bits.float() - lam * n_tokens.float()
     bad = torch.as_tensor(viol, dtype=torch.bool) | ~torch.isfinite(r)
     r = torch.where(torch.isfinite(r), r, torch.zeros_like(r))
+    ok_all = ~bad
+    wg = within_group_std(r[ok_all], groups[ok_all]) if ok_all.sum() > 1 else float("nan")
+    pen = max(abs(float(floor)), floor_scale * wg) if np.isfinite(wg) else abs(float(floor))
     out = r.clone()
     for g in groups.unique().tolist():
         m = groups == g; ok = m & ~bad
         base = float(r[ok].min()) if ok.any() else 0.0
-        out[m & bad] = min(base, 0.0) + floor
+        out[m & bad] = base - pen
     return out, bad
 
 
