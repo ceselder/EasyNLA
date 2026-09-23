@@ -8,6 +8,12 @@ import re
 _JUNK = re.compile(r"<think>|</think>|<\|im_(?:start|end)\|>|\n\s*assistant\s*\n", re.I)
 
 
+_STOP = set("""the and that this with for was are from not but have has had its his her they them their which what when were will would been being
+into than then there these those also about over after before between under more most some such only other very can may one two all any each
+you your our who how why where does did doing done just like make made much many new now off out own same she him too use used way well yet
+per via upon among without within because while both either neither every few less least own said says say get got give given take took""".split())
+
+
 def cjk_fraction(t: str) -> float:
     n = sum(1 for c in t if "\u3000" <= c <= "\u9fff" or "\uac00" <= c <= "\ud7af" or "\uf900" <= c <= "\ufaff" or "\u3400" <= c <= "\u4dbf" or "\U00020000" <= c <= "\U0002a6df")
     return n / max(1, len(t))
@@ -33,7 +39,7 @@ class ViolationChecker:
         Short / punctuation / sub-word next tokens are never counted (a single-token id match over-counts ' the', ',' ...)."""
         if not next_word: return False
         w = next_word.strip()
-        if len(w) < 3 or not w.isalpha(): return False
+        if len(w) < 3 or not w.isalpha() or w.lower() in _STOP: return False
         return re.search(r"(?<![A-Za-z])" + re.escape(w) + r"(?![A-Za-z])", text or "", re.I) is not None
 
     def check(self, texts, resp_ids_list, pos_idx_list, next_ids_list=None, next_words=None):
