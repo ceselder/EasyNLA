@@ -20,7 +20,8 @@ def main():
         if any(k in stem for k in ("_para_", "_twinnext", "_doc_", "_mask_")):      # edit / same-doc manifests are read via their own branches below, not as control sources
             continue
         if "orig" in s and "dm" in s and "by_band" in s:      # controls summary
-            src = re.sub(r"^scored_[^_]+_", "", stem); ws = s["by_band"]["orig"].get("workspace"); wd = s["by_band"]["dm"].get("workspace"); wr = s["by_band"]["rp"].get("workspace") if "rp" in s["by_band"] else None
+            pfx = a.pattern.split("*")[0]; src = stem[len(pfx):] if stem.startswith(pfx) else re.sub(r"^scored_[^_]+_", "", stem)      # source name = stem minus the critic prefix (works for scored_2_, scored_big_, scored_enc_e2_manifest2_, scored_v3be2fbi_)
+            ws = s["by_band"]["orig"].get("workspace"); wd = s["by_band"]["dm"].get("workspace"); wr = s["by_band"]["rp"].get("workspace") if "rp" in s["by_band"] else None
             n = s["orig"]["n"]; noise = (s["orig"]["ci95"][1] - s["orig"]["ci95"][0]) / 2 / 1.96 * math.sqrt(max(1, n)) / math.sqrt(max(1, n))   # per-pair sem as the stand-in
             content_ws = (ws["bits_mean"] - wd["bits_mean"]) if ws and wd else float("nan"); p_dm = s["dm"]["p_orig_higher"]
             rp_by_band = {b: s["by_band"]["rp"][b]["bits_mean"] for b in s["by_band"].get("rp", {})}
