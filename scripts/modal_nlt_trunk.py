@@ -21,14 +21,22 @@ GPU = os.environ.get("NLT_GPU", "H100")
 COMMON = dict(volumes={"/vol": vol}, secrets=SECRETS, cpu=16, memory=200 * 1024, ephemeral_disk=512 * 1024)
 
 
-def _run(cmd):
-    import subprocess
+def _run(cmd, commit_every: int = 300):
+    """run a repo module in the container; the volume is committed every `commit_every` s so eval jsons / ckpts become visible while the job runs"""
+    import subprocess, time
     os.environ["HF_HOME"] = "/vol/hf_cache"; os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"; os.environ["TRANSFORMERS_VERBOSITY"] = "error"; os.environ["TQDM_DISABLE"] = "1"   # keep the Modal log small (the loader's progress bar hit the log query limit)
     os.environ.setdefault("WANDB_DIR", "/root/wandb"); os.makedirs("/root/wandb", exist_ok=True)
     vol.reload()
     print("[modal] " + " ".join(cmd), flush=True)
-    rc = subprocess.call(cmd, cwd=REPO_REMOTE)
-    vol.commit(); return rc
+    proc = subprocess.Popen(cmd, cwd=REPO_REMOTE); last = time.time()
+    while proc.poll() is None:
+        time.sleep(5)
+        if time.time() - last > commit_every:
+            try: vol.commit()
+            except Exception as e: print("[modal] commit failed:", e, flush=True)
+            last = time.time()
+    vol.commit(); return proc.returncode
 
 
 @app.function(gpu=GPU, timeout=23 * 3600, **COMMON)
