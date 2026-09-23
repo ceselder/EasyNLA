@@ -32,9 +32,9 @@ def nll_per_token(model, tok, texts, dev, batch=16):
 def main():
     from nlt.evals.common import load_table
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    ap = argparse.ArgumentParser(); ap.add_argument("--z", required=True); ap.add_argument("--out", required=True); ap.add_argument("--ref-z"); ap.add_argument("--model", default="Qwen/Qwen3-8B"); ap.add_argument("--n", type=int, default=1024)
-    a = ap.parse_args(); dev = "cuda"
-    tok = AutoTokenizer.from_pretrained(a.model); model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, attn_implementation="sdpa").to(dev).eval()
+    ap = argparse.ArgumentParser(); ap.add_argument("--z", required=True); ap.add_argument("--out", required=True); ap.add_argument("--ref-z"); ap.add_argument("--model", default="Qwen/Qwen3-8B"); ap.add_argument("--n", type=int, default=1024); ap.add_argument("--device", default="cuda"); ap.add_argument("--dtype", default="bfloat16", help="bfloat16 on GPU; float32 on CPU")
+    a = ap.parse_args(); dev = a.device
+    tok = AutoTokenizer.from_pretrained(a.model); model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype), attn_implementation="sdpa").to(dev).eval()
     z = load_table(a.z); texts = z["text"].fillna("").astype(str); texts = texts[texts.str.strip().str.len() > 0].tolist()[: a.n]
     nll = nll_per_token(model, tok, texts, dev); res = {"n": int(np.isfinite(nll).sum()), "nll_per_token_median": float(np.nanmedian(nll)), "nll_per_token_mean": float(np.nanmean(nll)),
                                                       "share_above_2x_median": float(np.nanmean(nll > 2 * np.nanmedian(nll)))}
