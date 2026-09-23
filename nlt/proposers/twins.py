@@ -28,7 +28,7 @@ from nlt.proposers.teacher_sonnet import client_kwargs  # noqa: E402
 
 MODEL = "claude-sonnet-5"
 PACK = 8
-SYSTEM = """Each item is a one-sentence claim about what a language model worked out internally while reading a passage. Write a MINIMAL FALSE TWIN of each: keep the sentence structure, length and register, but invert the key content so the claim becomes false for that situation: swap the specific entity/concept/word it settled on for a plausible but different one of the same type, or reverse the direction (settled -> abandoned, narrowed -> broadened, retrieved X -> retrieved Y), or swap the outcome. Change as little as possible; exactly one substantive change per item. Never mention layers, depth or stages. Answer with JSON only: a list of {"id": <item id>, "twin": "<sentence>"} in the same order."""
+SYSTEM = """Each item is a one-sentence claim about what a language model worked out internally while reading a passage. Write a MINIMAL FALSE TWIN of each: keep the sentence structure, length and register, but invert the key content so the claim becomes false for that situation: swap the specific entity/concept/word it settled on for a plausible but different one of the same type, or reverse the direction (settled -> abandoned, narrowed -> broadened, retrieved X -> retrieved Y), or swap the outcome. Change as little as possible; exactly one substantive change per item. Never mention layers, depth or stages. Use single quotes inside the sentences, never double quotes. Answer with JSON only: a list of {"id": <item id>, "twin": "<sentence>"} in the same order."""
 
 
 def params(chunk):
@@ -38,21 +38,25 @@ def params(chunk):
                 messages=[{"role": "user", "content": "\n".join(lines) + "\n\nJSON list only."}])
 
 
+_ITEM = re.compile(r'"id"\s*:\s*(\d+)\s*,\s*"twin"\s*:\s*"((?:[^"\\]|\\.)*)"', re.S)
+
+
 def parse_list(text, n):
     m = re.search(r"\[.*\]", text or "", re.S)
-    if not m:
-        return {}
-    try:
-        lst = json.loads(m.group(0))
-    except Exception:
-        return {}
-    out = {}
-    for o in lst:
+    if m:
         try:
-            out[int(o["id"])] = str(o["twin"]).strip()
+            lst = json.loads(m.group(0))
+            out = {}
+            for o in lst:
+                try:
+                    out[int(o["id"])] = str(o["twin"]).strip()
+                except Exception:
+                    pass
+            if out:
+                return out
         except Exception:
             pass
-    return out
+    return {int(a): b.replace('\\"', '"').strip() for a, b in _ITEM.findall(text or "")}   # per-item recovery
 
 
 async def _one(client, sem, k, chunk, out, retries=8):
