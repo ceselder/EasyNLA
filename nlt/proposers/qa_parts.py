@@ -33,11 +33,12 @@ def main():
     ap.add_argument("--parts", nargs="+", required=True); ap.add_argument("--features", nargs="+", required=True)
     ap.add_argument("--examples", type=int, default=3); ap.add_argument("--json", default="")
     a = ap.parse_args()
-    parts = [f for p in a.parts for f in sorted(glob.glob(p))]
+    parts = [f for p in a.parts for f in sorted(glob.glob(p)) if "_rejects" not in f and "_stats" not in f]
     feats = [f for p in a.features for f in sorted(glob.glob(p))]
     z = pd.concat([pq.read_table(f).to_pandas() for f in parts], ignore_index=True)
     F = pd.concat([pq.read_table(f, columns=["pair_id", "i", "j", "true_next_token", "source"]).to_pandas() for f in feats], ignore_index=True)
     F = F.rename(columns={"source": "doc_source"})
+    z = z[z["source"].notna()]
     d = z.merge(F, on="pair_id", how="left")
     d["band"] = d["j"].apply(band); d["gap"] = d["j"] - d["i"]
     d["mention"] = [mentions(t, n) for t, n in zip(d["text"], d["true_next_token"])]
