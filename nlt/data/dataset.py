@@ -6,7 +6,7 @@
   norm = GlobalNorm.load(f"{data_dir}/stats.pt", mode="affine")   # ONE map for every layer (j-agnostic)
 """
 from __future__ import annotations
-import glob, os
+import glob, json, os
 import numpy as np
 import torch
 from nlt.data.extract import K_LO, K_HI, N_LAYERS
@@ -55,8 +55,15 @@ class ActStore:
             if verbose: print(f"[ActStore:{split}] {os.path.basename(f)} -> {n} positions", flush=True)
             if max_pos is not None and n >= max_pos: break
         self.acts = torch.cat(chunks, 0)                                      # [N, L, d] fp16 on device
-        if pin and device == "cpu": self.acts = self.acts.pin_memory()
         self.meta = pd.concat(metas, ignore_index=True)
+        sp = os.path.join(data_dir, "spikes.json")
+        if os.path.exists(sp):                                                # massive-activation rows flagged by finalize: drop them
+            bad = set(json.load(open(sp)).get(split, []))
+            keep = ~self.meta["pos_idx"].isin(bad).values
+            if (~keep).any():
+                self.acts = self.acts[torch.from_numpy(keep).to(self.acts.device)]; self.meta = self.meta[keep].reset_index(drop=True)
+                if verbose: print(f"[ActStore:{split}] dropped {int((~keep).sum())} spike positions", flush=True)
+        if pin and device == "cpu": self.acts = self.acts.pin_memory()
         self.N, self.L, self.d = self.acts.shape
         assert self.L == N_LAYERS
         self.row_of = dict(zip(self.meta["pos_idx"].tolist(), range(self.N)))
