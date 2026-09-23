@@ -383,6 +383,12 @@ def main():
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             out, br = evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank, lf=lf)
             if a.cond != "text" and (has_train_eval or True):       # train-pair eval (same grid, fixed eps) for the generalisation gate; text mode has no per-pair train texts here
+                if hasattr(store, "maybe_swap"):
+                    # CyclingStore: the resident shards (and N) change over time, so row indices sampled at start go stale -> IndexError at
+                    # eval (this killed none_v2 at eval@15000). Re-sample the train-pair eval from the CURRENTLY resident rows with the same seed
+                    # (same (i, j) draws; rows differ) -- the held-out/train gate stays a train-vs-heldout comparison.
+                    tr_rows, tr_i, tr_j = store.sample_pairs(len(tr_rows), torch.Generator().manual_seed(999))
+                    tr_rows = tr_rows.clamp_(0, store.N - 1)
                 out_tr, br_tr = evaluate(model, store, norm, a, tr_rows, tr_i, tr_j, None, None, dev, eps_bank_tr, prefix="eval_train", lf=lf)
                 out.update({k: v for k, v in out_tr.items() if "_gap/" not in k}); out["gate/heldout_over_train_fm"] = out["eval/fm_loss"] / max(1e-9, out_tr["eval_train/fm_loss"])
                 br["train_by_gap"] = br_tr["by_gap"]
