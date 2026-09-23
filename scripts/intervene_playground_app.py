@@ -3,7 +3,7 @@ last token, EDIT the explanation yourself (or ask Sonnet to edit it under a rule
 change (paper-style AR Δ, flow bridge, bridge Δ, paired-sample Δ, SDEdit, random control; optionally re-applied at every generated token),
 and read the continuations before vs after — with the next-token KL at the cut and, optionally, a Sonnet judge of whether the continuation
 reflects the target proposition. Served by scripts/modal_intervene_playground.py on 2 B200s (LM + AR critic on cuda:0, flow on cuda:1)."""
-import json, os, re, threading, time
+import contextlib, html as _html, json, os, re, threading, time
 import numpy as np, torch
 
 DEV0, DEV1 = "cuda:0", "cuda:1"
@@ -12,7 +12,16 @@ FLOWS = {"644-bit conditioner (sw_tokar, pre-RL)": "/vol_glp/cond/sw_tokar/adapt
          "MSE-free conditioner (sw_tokbase)": "/vol_glp/cond/sw_tokbase/adapter_latest.pt"}
 CRITICS = {"SFT reconstructor (ar_sft_merged, pre-RL)": "/vol/ckpts/qwen36_27b/ar_sft_merged", "reconstructor after 400 RL steps (rlQ36_base/critic_latest)": "/vol/ckpts/qwen36_27b/rlQ36_base/critic_latest"}
 ROWS_PARQUET = "/vol_q36/data/sft/av_sft_val_clean1.parquet"
-S = {"lock": threading.Lock()}
+S = {"lock": threading.Lock(), "gpu": threading.RLock()}   # "gpu": serialises every GPU request (hook state, PEFT adapter switching are global)
+# verbalizer (AV) checkpoints: each is a standalone LoRA (r64, a16, rsLoRA) on the RAW Qwen3.6-27B base; loaded as named PEFT adapters into the SAME
+# model the steering uses (the plain LM forward runs with adapters disabled). Lazy + cached.
+AVS = {"warm start (SFT verbalizer, iter_0007813)": ("av_warm", "/vol_q36/ckpts/qwen36_av/iter_0007813"),
+       "twin: flow reward, 252×8 REINFORCE, step 400": ("av_twin400", "/vol/ckpts/qwen36_27b/rlQ36_flowtokar_b252/iter_000400"),
+       "512×8 CISPO, flow reward (644-bit critic), step 400": ("av_flow512", "/vol/ckpts/qwen36_27b/rlQ36_flow512/iter_000400"),
+       "fast 128×8, MSE reward, step 400": ("av_mse128", "/vol/ckpts/qwen36_27b/rlQ36_mse128/iter_000400"),
+       "fast 128×8, whole-trunk flow critic, step 400": ("av_trunk128", "/vol/ckpts/qwen36_27b/rlQ36_trunk128/iter_000400"),
+       "fast 128×8, whole-trunk flow critic, NO KL, step 100 (best judged checkpoint)": ("av_trunk128_nokl100", "/vol/ckpts/qwen36_27b/rlQ36_trunk128_nokl/iter_000100")}
+MAX_VERB = 512
 
 
 def _load():
@@ -28,13 +37,15 @@ def _load():
         from nla.schema import resolve_target_scale, extract_explanation
         snap = snapshot_download("Qwen/Qwen3.6-27B", token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap", allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
         tok = AutoTokenizer.from_pretrained(snap); lm = AutoModelForCausalLM.from_pretrained(snap, dtype=torch.bfloat16, attn_implementation="sdpa").to(DEV0).eval(); lm.requires_grad_(False)
-        st = {"cap": None, "vec": None, "pos": None, "decode_fn": None}
+        st = {"cap": None, "vec": None, "pos": None, "decode_fn": None, "prefill_fn": None, "prefill_idx": None}
         def hook(_m, _i, out):
             h = out[0] if isinstance(out, tuple) else out
             if h.shape[1] > 1:
                 if st["cap"] is not None: st["cap"].append(h[:, st["pos"]].detach().float().clone())
                 if st["vec"] is not None:
                     v = st["vec"]; v = v if v.shape[0] == h.shape[0] else v[:1].expand(h.shape[0], -1); h[:, st["pos"]] = v.to(h.dtype)
+                if st["prefill_fn"] is not None:   # every-activation tab: edit the residual at a set of prompt positions during the prefill forward
+                    ix = st["prefill_idx"]; h[:, ix] = st["prefill_fn"](h[:, ix].float()).to(h.dtype)
             elif st["decode_fn"] is not None: h[:, 0] = st["decode_fn"](h[:, 0].float()).to(h.dtype)
             return out
         resolve_decoder_layers(lm)[42].register_forward_hook(hook)
@@ -107,7 +118,17 @@ def judge(texts, orig_prop, target_prop, prefix_tail):
     return out
 
 
-def run(mode, row_idx, custom_text, z, z_edit, flow_name, critic_name, method, alpha, tau, closed_loop, k, n_tokens, temperature, do_judge, orig_prop, target_prop, progress=None):
+def _base():
+    """plain Qwen3.6-27B forward: disable every loaded AV adapter (the LoRA layers are injected in place into S['lm'])."""
+    p = S.get("peft"); return p.disable_adapter() if p is not None else contextlib.nullcontext()
+
+
+def run(*a, **kw):
+    _load()
+    with S["gpu"], _base(): return _run_last_token(*a, **kw)
+
+
+def _run_last_token(mode, row_idx, custom_text, z, z_edit, flow_name, critic_name, method, alpha, tau, closed_loop, k, n_tokens, temperature, do_judge, orig_prop, target_prop, progress=None):
     _load(); from nla.flow.intervene import ode
     tok, lm, st = S["tok"], S["lm"], S["st"]; K = int(k); n_tokens = int(n_tokens); t0 = time.time()
     text = S["rows"]["text"][int(row_idx) % len(S["rows"]["z"])] if mode == "eval row" else custom_text
@@ -164,11 +185,245 @@ def run(mode, row_idx, custom_text, z, z_edit, flow_name, critic_name, method, a
     return head + summ, fmt(base_texts, jb), fmt(int_texts, ja)
 
 
+# ============================== every-activation tab ==============================
+def _av(name):
+    """load (once) the verbalizer adapter `name` into the shared model as a named PEFT adapter; returns its adapter name."""
+    _load(); key, path = AVS[name]
+    with S["lock"]:
+        if "peft" not in S:
+            import pyarrow.parquet as pq
+            from peft import PeftModel
+            from nla.utils.hooks import register_karvonen_hook
+            from nla.config import load_nla_config
+            from nla.utils.prompts import build_prompt_text
+            cfg = load_nla_config("/vol_q36/data/rl/rl_shuf.parquet", S["tok"]); vref = [None]
+            # the AV's activation injection = the RL/SFT HF path: ADD-norm-matched at the marker, output of decoder layer 1 (no-op while vref[0] is None)
+            register_karvonen_hook(S["lm"], vref, cfg.injection_token_id, cfg.injection_left_neighbor_id, cfg.injection_right_neighbor_id, layer_idx=1)
+            msgs = pq.read_table(ROWS_PARQUET, columns=["prompt"]).slice(0, 1).column("prompt").to_pylist()[0]   # identical for every row
+            ptxt = build_prompt_text(msgs, cfg.injection_char, S["tok"])
+            S.update(vref=vref, av_ids=S["tok"](ptxt, return_tensors="pt", add_special_tokens=False)["input_ids"].to(DEV0), avs=set())
+            S["peft"] = PeftModel.from_pretrained(S["lm"], path, adapter_name=key); S["peft"].eval(); S["avs"].add(key)
+            print(f"[pg] AV adapter {key} loaded (first; karvonen hook @ layer 1, prompt {S['av_ids'].shape[1]} tokens)", flush=True)
+        elif key not in S["avs"]:
+            S["peft"].load_adapter(path, adapter_name=key); S["avs"].add(key); print(f"[pg] AV adapter {key} loaded", flush=True)
+    return key
+
+
+def _verbalize(vecs, av_name, temperature=1.0, max_new=200, bs=32):
+    """explanations of raw layer-42 activations vecs [N, d] from the chosen verbalizer (batched HF generate, RL sampling: top_p 1, no top-k)."""
+    from nla.schema import extract_explanation
+    key = _av(av_name); tok, peft, ids0, st = S["tok"], S["peft"], S["av_ids"], S["st"]; outs = []
+    with S["gpu"]:
+        st.update(cap=None, vec=None, decode_fn=None, prefill_fn=None); peft.set_adapter(key)
+        for i in range(0, vecs.shape[0], bs):
+            v = vecs[i:i + bs].to(DEV0).float(); B = v.shape[0]; S["vref"][0] = v
+            try:
+                with torch.no_grad():
+                    g = peft.generate(input_ids=ids0.expand(B, -1), attention_mask=torch.ones(B, ids0.shape[1], dtype=torch.long, device=DEV0), do_sample=temperature > 0,
+                                      temperature=max(float(temperature), 1e-3), top_p=1.0, top_k=0, max_new_tokens=int(max_new), pad_token_id=tok.pad_token_id or tok.eos_token_id)
+            finally: S["vref"][0] = None
+            outs += tok.batch_decode(g[:, ids0.shape[1]:], skip_special_tokens=True)
+    return [(extract_explanation(o) or o).strip() for o in outs]
+
+
+def _tok_text(text):
+    ids = S["tok"](text, return_tensors="pt", add_special_tokens=False)["input_ids"][:, -1024:]
+    return ids, [S["tok"].decode([t]) for t in ids[0].tolist()]
+
+
+def capture_all(text):
+    """layer-42 residual at EVERY position of `text` (last 1024 tokens) in one plain-LM forward, plus the next-token logits after the last one."""
+    tok, lm, st = S["tok"], S["lm"], S["st"]; ids = _tok_text(text)[0].to(DEV0)
+    with S["gpu"], _base():
+        st.update(cap=[], vec=None, decode_fn=None, prefill_fn=None, pos=slice(None))
+        with torch.no_grad(): lg = lm(input_ids=ids).logits[0, -1].float()
+        H = st["cap"][0][0]; st["cap"] = None
+    return ids, H, lg
+
+
+def _parse_positions(spec, T):
+    spec = (spec or "").strip().lower()
+    if spec in ("", "all"): return list(range(T))
+    out = []
+    for part in re.split(r"[,\s]+", spec):
+        if not part: continue
+        m = re.fullmatch(r"(\d+)\s*[-:]\s*(\d+)", part)
+        if m: a, b = int(m.group(1)), int(m.group(2)); out += list(range(max(0, a), min(T - 1, b) + 1))
+        elif re.fullmatch(r"-?\d+", part): out.append(int(part) % T)
+        elif part == "last": out.append(T - 1)
+    return sorted(set(out))
+
+
+def ea_load_row(idx):
+    _load(); r = S["rows"]; idx = int(idx) % len(r["z"]); return r["text"][idx], f"held-out row {idx} · doc {r['doc'][idx]} · gold explanation (Opus) of the LAST token:\n\n> " + r["z"][idx][:600].replace("\n", "\n> ")
+
+
+def ea_tokenize(text):
+    _load()
+    if not text.strip(): return [], "paste text first"
+    ids, toks = _tok_text(text)
+    return [[i, repr(t)[1:-1]] for i, t in enumerate(toks)], f"{len(toks)} tokens (last 1024 kept); positions 0–{len(toks)-1}; the activation at position i is layer 42's residual after token i"
+
+
+def _expl_html(rows):
+    h = ['<table style="width:100%;font-size:13px"><tr><th>pos</th><th>token</th><th>explanation (click to expand)</th></tr>']
+    for p_, t_, e_ in rows:
+        e = _html.escape(e_); h.append(f'<tr><td>{p_}</td><td><code>{_html.escape(repr(t_)[1:-1])}</code></td><td><details><summary>{e[:300]}{"…" if len(e) > 300 else ""}</summary><pre style="white-space:pre-wrap">{e}</pre></details></td></tr>')
+    return "".join(h) + "</table>"
+
+
+def ea_verbalize(text, spec, av_name, temperature, max_new, cache):
+    _load(); t0 = time.time()
+    if not text.strip(): return "paste text first", cache, ""
+    ids, H, _ = capture_all(text); T = ids.shape[1]; toks = [S["tok"].decode([t]) for t in ids[0].tolist()]
+    pos = _parse_positions(spec, T)
+    note = f" (capped at the first {MAX_VERB} of {len(pos)})" if len(pos) > MAX_VERB else ""; pos = pos[:MAX_VERB]
+    ex = _verbalize(H[pos], av_name, temperature, max_new)
+    cache = dict(cache or {}); key = f"{av_name}||{text}"
+    d = dict(cache.get(key, {})); d.update({int(p_): e for p_, e in zip(pos, ex)}); cache[key] = d
+    rows = [(p_, toks[p_], d[p_]) for p_ in sorted(d)]
+    return f"verbalized {len(pos)} positions with **{av_name}** in {time.time()-t0:.0f} s{note} · table shows every position verbalized so far for this text + verbalizer", cache, _expl_html(rows)
+
+
+def ea_use_position(text, pos, av_name, temperature, cache):
+    _load()
+    ids, toks = _tok_text(text); T = ids.shape[1]; p_ = int(pos) % T; d = (cache or {}).get(f"{av_name}||{text}", {})
+    if p_ in d: z = d[p_]
+    else:
+        _, H, _ = capture_all(text); z = _verbalize(H[p_:p_ + 1], av_name, temperature, 200)[0]
+    return z, z, f"position {p_} of {T}, token `{repr(toks[p_])[1:-1]}` — z filled from **{av_name}**"
+
+
+def _resc(h, delta, a_): return h + a_ * h.norm(dim=-1, keepdim=True) * delta / delta.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+EA_METHODS = ["AR Δ: h + α‖h‖·unit(AR(z′)−AR(z))", "AR replace: AR(z′) rescaled to ‖h‖", "flow bridge Δ: h + α‖h‖·unit(bridge(h_pos) − h_pos)", "random Δ (control)"]
+EA_SCOPES = ["one position", "every prompt position", "every generated position", "every position (prompt + generated)"]
+
+
+def _make_edit(method, alpha, z, z_edit, h_ref, critic_name, flow_name):
+    """one direction from (z, z′), computed once; returns fn(h[..., d]) -> edited h (applied α‖h_i‖-rescaled at every position in scope)."""
+    info = {}
+    if method.startswith("AR Δ"):
+        c = _critic(critic_name); d = ar_pred(c, z_edit) - ar_pred(c, z); info["‖AR(z′)−AR(z)‖/‖h‖"] = (d.norm() / h_ref.norm()).item()
+        return (lambda hb: _resc(hb, d, alpha)), info
+    if method.startswith("AR replace"):
+        c = _critic(critic_name); pz = ar_pred(c, z_edit)
+        return (lambda hb: pz.expand_as(hb) * hb.norm(dim=-1, keepdim=True) / pz.norm()), info
+    if method.startswith("flow bridge"):
+        from nla.flow.intervene import ode
+        fb = _flow(flow_name); c_o, c_e = fb.cond([z]), fb.cond([z_edit])
+        xn = fb.norm.normalize(h_ref[None].to(DEV1)); e_ = ode(fb, xn, c_o, 0.0, 1.0, 24); hb_ = fb.norm.denormalize(ode(fb, e_, c_e, 1.0, 0.0, 24))[0].to(DEV0)
+        d = hb_ - h_ref; info["‖bridge−h‖/‖h‖"] = (d.norm() / h_ref.norm()).item()
+        return (lambda hb: _resc(hb, d, alpha)), info
+    g = torch.Generator(device=DEV0).manual_seed(0); d = torch.randn(h_ref.shape, device=DEV0, generator=g)
+    return (lambda hb: _resc(hb, d, alpha)), info
+
+
+def ea_steer(text, pos, z, z_edit, method, alpha, scope, flow_name, critic_name, k, n_tokens, temperature, do_judge, orig_prop, target_prop):
+    _load(); t0 = time.time(); tok, lm, st = S["tok"], S["lm"], S["st"]; K, n_tokens = int(k), int(n_tokens)
+    if not text.strip() or not z.strip(): return "paste text and fill z first (verbalize a position, then 'use position')", "", ""
+    z_edit = z_edit if z_edit.strip() else z
+    ids, H, base_lg = capture_all(text); T = ids.shape[1]; p_ = int(pos) % T
+    edit, info = _make_edit(method, float(alpha), z, z_edit, H[p_], critic_name, flow_name)
+    pidx = {"one position": [p_], "every prompt position": list(range(T)), "every generated position": [], "every position (prompt + generated)": list(range(T))}[scope]
+    on_gen = scope in ("every generated position", "every position (prompt + generated)")
+    def gen(steer):
+        with S["gpu"], _base():
+            st.update(cap=None, vec=None, decode_fn=None, prefill_fn=(edit if steer and pidx else None), prefill_idx=torch.tensor(pidx or [0], device=DEV0))
+            try:
+                with torch.no_grad(): lg = lm(input_ids=ids).logits[0, -1].float()
+                st["decode_fn"] = edit if (steer and on_gen) else None
+                with torch.no_grad():
+                    g_ = lm.generate(input_ids=ids.expand(K, -1), attention_mask=torch.ones(K, T, device=DEV0, dtype=torch.long), do_sample=temperature > 0, temperature=max(float(temperature), 1e-3),
+                                     top_p=0.95, max_new_tokens=n_tokens, pad_token_id=tok.pad_token_id or tok.eos_token_id)
+            finally: st.update(prefill_fn=None, decode_fn=None)
+        return tok.batch_decode(g_[:, T:], skip_special_tokens=True), lg
+    base_texts, _ = gen(False); st_texts, lg = gen(True)
+    kl = torch.nn.functional.kl_div(torch.log_softmax(base_lg, -1), torch.log_softmax(lg, -1), log_target=True, reduction="sum").item()   # 0 when only generated positions are edited
+    jb = ja = None
+    tail = tok.decode(ids[0, :p_ + 1].tolist())[-700:]
+    if do_judge and target_prop.strip(): jb = judge(base_texts, orig_prop, target_prop, tail); ja = judge(st_texts, orig_prop, target_prop, tail)
+    def fmt(texts, js):
+        return "\n\n".join(f"**{i+1}.** {t.strip()}" + (f"\n<sub>judge: reflects target {j.get('reflects_target')} · retains original {j.get('retains_original')} · coherence {j.get('coherence_1_10')}</sub>" if js and js[i] else "") for i, (t, j) in enumerate(zip(texts, js or [None] * len(texts))))
+    head = (f"**{method}** · α={float(alpha):g} · scope **{scope}**" + (f" (position {p_}, token `{repr(tok.decode([ids[0, p_].item()]))[1:-1]}`)" if scope == "one position" else f" ({len(pidx)} prompt positions{' + every generated token' if on_gen else ''})")
+            + f" · KL(steered‖base) at the first generated token = {kl:.3f}" + "".join(f" · {k_}={v:.3f}" for k_, v in info.items()) + f" · {time.time()-t0:.0f} s")
+    if ja is not None:
+        rt = lambda js: sum(1 for j in js if j.get("reflects_target")) / max(1, len(js)); co = lambda js: np.mean([j.get("coherence_1_10", np.nan) for j in js])
+        head += f"\n\n**judge** — steered: reflects target {100*rt(ja):.0f} %, coherence {co(ja):.1f} · baseline: reflects target {100*rt(jb):.0f} %, coherence {co(jb):.1f}"
+    return head, fmt(base_texts, jb), fmt(st_texts, ja)
+
+
+def ea_readback(text, pos, z, z_edit, method, alpha, flow_name, critic_name, av_name, temperature):
+    """verbalize the chosen position's activation before and after the edit (2 samples each) — did the edit land where the verbalizer can read it?"""
+    _load(); t0 = time.time()
+    if not text.strip() or not z.strip(): return "paste text and fill z first"
+    ids, H, _ = capture_all(text); T = ids.shape[1]; p_ = int(pos) % T
+    edit, info = _make_edit(method, float(alpha), z, z_edit if z_edit.strip() else z, H[p_], critic_name, flow_name)
+    h0 = H[p_:p_ + 1]; h1 = edit(h0.clone()); ex = _verbalize(torch.cat([h0, h0, h1, h1]), av_name, temperature, 200)
+    cos = torch.nn.functional.cosine_similarity(h0, h1).item(); rel = ((h1 - h0).norm() / h0.norm()).item()
+    q = lambda e: "> " + e.replace("\n", "\n> ")
+    return (f"**read-back at position {p_}** with {av_name} · ‖h′−h‖/‖h‖ = {rel:.3f}, cos(h, h′) = {cos:.3f} · {time.time()-t0:.0f} s\n\n**original activation**\n\n{q(ex[0])}\n\n{q(ex[1])}\n\n**edited activation**\n\n{q(ex[2])}\n\n{q(ex[3])}")
+
+
+def ea_sonnet(text, pos, z, instr):
+    ids, _ = _tok_text(text); p_ = int(pos) % ids.shape[1]
+    return sonnet_edit(S["tok"].decode(ids[0, :p_ + 1].tolist())[-1500:], z, instr)
+
+
+def build_every_activation_tab(gr):
+    gr.Markdown("## Steer on every activation — Qwen3.6-27B layer 42\n"
+                "Paste text (or load a held-out row), **tokenize** to see every position, **verbalize** the layer-42 activation at any set of positions (or all) with any verbalizer checkpoint, "
+                "pick a position's explanation as **z**, edit it into **z′** (by hand or with Sonnet), and **steer** at a chosen scope: that one position, every prompt position, every generated position, or all of them. "
+                "The edit direction is computed ONCE from (z, z′) at the chosen position and applied α‖h_i‖-rescaled at every position in scope — re-verbalizing every position per step would be far too slow. "
+                "Verbalizing costs ~35–40 s per batch of 32 positions (HF generate, up to 200 tokens each; a 56-token text fully verbalized in ~75 s; the first use of a checkpoint adds ~30 s to load its adapter). Steering: ~12–20 s for K=2 × 40 tokens.")
+    with gr.Row():
+        row = gr.Number(value=22, precision=0, label="held-out row (0–735)"); loadb = gr.Button("Load held-out row into the text box")
+    text = gr.Textbox(lines=6, label="text (the model reads it; position i = the activation after token i)")
+    meta = gr.Markdown()
+    tokb = gr.Button("Tokenize"); toks = gr.Dataframe(headers=["pos", "token"], label="positions", interactive=False, wrap=True, max_height=300)
+    with gr.Row():
+        av = gr.Dropdown(list(AVS), value=list(AVS)[0], label="verbalizer checkpoint"); spec = gr.Textbox(value="last", label="positions to verbalize: 'all', 'last', '12', '10-20', '3,7,-1'")
+        vtemp = gr.Slider(0.0, 1.2, value=1.0, step=0.1, label="verbalizer temperature (0 = greedy; RL used 1.0)"); vmax = gr.Slider(64, 256, value=200, step=8, label="max explanation tokens")
+    verb = gr.Button("Verbalize positions", variant="primary"); vmeta = gr.Markdown(); vtable = gr.HTML(); cache = gr.State({})
+    gr.Markdown("### Steer")
+    with gr.Row():
+        pos = gr.Number(value=-1, precision=0, label="position (−1 = last)"); usep = gr.Button("Use this position's explanation as z (verbalizes it if needed)"); pmeta = gr.Markdown()
+    with gr.Row():
+        z = gr.Textbox(lines=8, label="SOURCE explanation z"); z_edit = gr.Textbox(lines=8, label="TARGET explanation z′ — edit by hand, or ask Sonnet")
+    with gr.Row():
+        instr = gr.Textbox(lines=2, label="rewrite rule for Sonnet (blank = change one entity / fact / register)"); ask = gr.Button("Ask Sonnet to edit z → z′")
+    with gr.Row():
+        orig_prop = gr.Textbox(lines=2, label="original proposition (for the judge)"); target_prop = gr.Textbox(lines=2, label="target proposition (for the judge)")
+    with gr.Row():
+        method = gr.Dropdown(EA_METHODS, value=EA_METHODS[0], label="how z → z′ becomes an activation change"); alpha = gr.Slider(0.0, 4.0, value=1.0, step=0.25, label="α (push strength in units of ‖h_i‖)")
+        scope = gr.Radio(EA_SCOPES, value=EA_SCOPES[0], label="scope")
+    with gr.Row():
+        flow = gr.Dropdown(list(FLOWS), value=list(FLOWS)[0], label="flow conditioner (bridge Δ)"); critic = gr.Dropdown(list(CRITICS), value=list(CRITICS)[0], label="MSE reconstructor (AR methods)")
+    with gr.Row():
+        k = gr.Slider(1, 8, value=4, step=1, label="samples"); ntok = gr.Slider(16, 128, value=48, step=8, label="tokens to generate"); temp = gr.Slider(0.0, 1.2, value=1.0, step=0.1, label="LM temperature"); dj = gr.Checkbox(value=False, label="judge with Sonnet")
+    with gr.Row():
+        go = gr.Button("Steer: baseline vs steered", variant="primary"); rb = gr.Button("Verbalize the steered activation at this position (read-back)")
+    head = gr.Markdown()
+    with gr.Row():
+        out_b = gr.Markdown(label="baseline"); out_s = gr.Markdown(label="steered")
+    rbo = gr.Markdown()
+    loadb.click(ea_load_row, [row], [text, meta]); tokb.click(ea_tokenize, [text], [toks, meta])
+    verb.click(ea_verbalize, [text, spec, av, vtemp, vmax, cache], [vmeta, cache, vtable])
+    usep.click(ea_use_position, [text, pos, av, vtemp, cache], [z, z_edit, pmeta])
+    ask.click(ea_sonnet, [text, pos, z, instr], [z_edit, orig_prop, target_prop])
+    go.click(ea_steer, [text, pos, z, z_edit, method, alpha, scope, flow, critic, k, ntok, temp, dj, orig_prop, target_prop], [head, out_b, out_s])
+    rb.click(ea_readback, [text, pos, z, z_edit, method, alpha, flow, critic, av, vtemp], [rbo])
+
+
 def build_ui():
     import gradio as gr
     methods = ["AR Δ (paper): h + α‖h‖·unit(AR(z′)−AR(z))", "AR replace: AR(z′) rescaled to ‖h‖", "flow bridge: encode h under z, decode under z′ (faithful edit)", "flow bridge Δ: h + α‖h‖·unit(bridge − h)",
                "paired-sample Δ: same ε decoded under z′ and z", "SDEdit: noise h to τ, denoise under z′", "random Δ (control)"]
     with gr.Blocks(title="NLA causal-intervention playground") as demo:
+      with gr.Tab("every activation"):
+        build_every_activation_tab(gr)
+      with gr.Tab("last-token playground (original)"):
         gr.Markdown("# Causal-intervention playground — Qwen3.6-27B layer 42\nPick a held-out prefix (or paste text), read the explanation of the activation at its last token, **edit the explanation**, choose how the edit becomes an activation change, and compare continuations. Closed-loop (every token) with the flow bridge is slow (~1–2 s per generated token).")
         with gr.Row():
             mode = gr.Radio(["eval row", "custom text"], value="eval row", label="input"); row = gr.Number(value=22, precision=0, label="held-out row (0–735)"); load = gr.Button("Load row")
