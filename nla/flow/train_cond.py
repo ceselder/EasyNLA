@@ -5,7 +5,7 @@ Evals (held-out pairs): conditional vs unconditional vs SHUFFLED-condition FM lo
 (the "conditional FVE", comparable to the MSE critic); source-match accuracy (true h vs 7 distractor explanations by denoising loss)."""
 import argparse, json, math, os, time
 import numpy as np, pyarrow.parquet as pq, torch, torch.nn.functional as F
-from nla.flow.model import Denoiser, Normalizer
+from nla.flow.model import Denoiser, Normalizer, maybe_whiten
 from nla.flow.cond_model import CondDenoiser, cond_fm_loss
 from nla.flow.negatives import make_negative
 import random as _random
@@ -323,6 +323,8 @@ def main():
     p.add_argument("--balance-types", type=float, default=0.0, help="claim-set mode with --claims-dir: type-balanced sampling, weight *= (median type count / type count) ** p (clipped x10)")
     p.add_argument("--claim-weights", default="", help="claim-set mode: sampling weights for synthetic claims, e.g. 'internal=2,text:last_word=2' (family or family:type; default 1)")
     p.add_argument("--claim-subsets", type=int, default=0, help="compositional-NLA claim-SET conditioner: split each explanation into claims (nla.flow.claims), train on a random subset of k ~ U{1..min(K,n)} shuffled claims formatted as bullets; evals condition on the full claim set and also report single-claim and raw-gold PMI (0 = off)")
+    p.add_argument("--whiten", default=None, help="PriorGrad-style noise: path to a whitening file from scripts/fit_whitening.py; the flow is trained in W(standardise(h)-mu) coordinates (isotropic noise there = data-covariance noise); needs --prior-init random (a pretrained prior lives in the unwhitened space)")
+    p.add_argument("--whiten-loss", default="whitened", choices=["whitened", "original"], help="with --whiten: 'whitened' = squared error in whitened space (Sigma^-1-weighted, PriorGrad, arm B); 'original' = the velocity error mapped back by W_inv before squaring (covariance-shaped noise, plain standardised-space loss, arm A)")
     p.add_argument("--eval-samedoc", action="store_true", help="also report same-document discrimination accuracy in eval (on by default when --group-contrast > 0)")
     p.add_argument("--neg-margin", type=float, default=0.02, help="per-dim FM-loss gap (neg - pos) the hinge asks for"); p.add_argument("--neg-lambda", type=float, default=2.0)
     p.add_argument("--enc-layers", default=None, help="tokens_ar_all: comma list of trunk layers whose token states form the cross-read memory (default every 3rd layer from 2 plus --enc-layer)")
@@ -337,7 +339,10 @@ def main():
     assert not (ddp and a.cond_mode == "trunk"), "--cond-mode trunk is single-GPU (the 27B trunk is the denoiser; no gradient sync implemented)"
     assert not (a.unfreeze_prior and a.cond_mode == "trunk"), "--cond-mode trunk keeps the prior frozen (its velocity is the residual base)"
     is0 = rank == 0
-    norm = Normalizer.load(a.stats).to(dev)
+    norm = maybe_whiten(Normalizer.load(a.stats), a.whiten).to(dev)   # --whiten: PriorGrad-style covariance-matched noise (flow trained in whitened space)
+    assert not a.whiten or a.prior_init == "random", "--whiten needs --prior-init random (a pretrained prior was trained in the unwhitened space)"
+    err_map = norm.W_inv if (a.whiten and a.whiten_loss == "original") else None   # A arm: same whitened inputs + noise, loss = squared error mapped back to the standardised space
+    if a.whiten and rank == 0: print(f"[cond] WHITENED model space from {a.whiten} (logdet_W {norm.logdet_w:.1f} nats; exact log p in standardised space = log p_model + logdet_W); training loss measured in the {a.whiten_loss} space", flush=True)
     m = torch.load(os.path.join(a.prior, "model.pt"), map_location="cpu"); cfg = m["args"]
     sd = m.get("model") if a.prior_weights == "raw" and m.get("model") is not None else torch.load(os.path.join(a.prior, "ema.pt"), map_location="cpu")["ema"]
     if a.prior_arch:   # random-init only: override the denoiser shape (d_model,d_mlp,n_layers); cfg is mutated so the saved co-trained prior carries the right args
@@ -690,7 +695,7 @@ def main():
                 if is0: print(f"  [exact@{step}] ({prefix}) claim-set PMI {pmi.mean().item():.1f} bits | " + " | ".join(f"{nm}: {out[prefix + '/exact_pmi_' + nm + '_bits']:.1f}" for nm, _ in _cx), flush=True)
             out.update({f"{prefix}/exact_pmi_bits": pmi.mean().item(), f"{prefix}/exact_pmi_median_bits": pmi.median().item(), f"{prefix}/exact_pmi_sem_bits": (pmi.std() / math.sqrt(n_x)).item(),
                         f"{prefix}/exact_pmi_shuf_bits": pms.mean().item(), f"{prefix}/exact_frac_positive": (pmi > 0).float().mean().item(),
-                        f"{prefix}/exact_bits_per_dim_uncond": (-lp["uncond"].mean() / (d_ * math.log(2))).item(), f"{prefix}/exact_bits_per_dim_cond": (-lp["cond"].mean() / (d_ * math.log(2))).item()})
+                        f"{prefix}/exact_bits_per_dim_uncond": (-(lp["uncond"].mean() + norm.logdet_w) / (d_ * math.log(2))).item(), f"{prefix}/exact_bits_per_dim_cond": (-(lp["cond"].mean() + norm.logdet_w) / (d_ * math.log(2))).item()})   # standardised space
             if is0: print(f"  [exact@{step}] PMI {pmi.mean().item():.1f} bits (median {pmi.median().item():.1f}, sem {pmi.std().item() / math.sqrt(n_x):.1f}, {100 * (pmi > 0).float().mean().item():.0f}% positive) | shuffled z {pms.mean().item():.1f} bits | n {n_x}, {a.exact_steps} Heun steps", flush=True)
         if not is0: return out
         if P + "/samedoc_acc_row" in out and is0: print(f"  [{P}@{step}] same-document discrimination: activation->explanation {100*out[P+'/samedoc_acc_row']:.1f}%, explanation->activation {100*out[P+'/samedoc_acc_col']:.1f}% (chance {100/a.group_size:.1f}%, {out[P+'/samedoc_groups']} docs x {a.group_size} cuts)", flush=True)
@@ -730,8 +735,9 @@ def main():
             idx = perm[cursor:cursor + a.batch]; cursor += a.batch
             _txt = [draw(i) for i in idx.tolist()] if tr_claims is not None else [tr_z[i] for i in idx.tolist()]
             x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch(_txt, grad=True)
+            if step == a.start_step + 1 and _acc == 0 and is0: print(f"[cond] model-space scale check: |x0|^2/d = {float((x0.float() ** 2).mean()):.3f} (1.0 = matches the N(0, I) noise)", flush=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift)
+                loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift, err_map=err_map)
             (loss / a.grad_accum).backward(); loss_acc += loss.item() / a.grad_accum
         loss = torch.tensor(loss_acc)
         closs = None; neg_stats = {}

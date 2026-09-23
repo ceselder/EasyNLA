@@ -12,7 +12,8 @@ acts = torch.tensor(np.stack(t.column("activation_vector").to_pylist()), dtype=t
 zs = [extract_explanation(r) or r for r in t.column("response").to_pylist()]
 perm = torch.randperm(N, generator=torch.Generator().manual_seed(1)).tolist(); zs_shuf = [zs[i] for i in perm]
 tags = sys.argv[1:] or ["cond_655M_all", "sw_base", "sw_wide", "sw_enc2", "sw_arvec", "sw_both", "sw_final", "sw_tokar_frozen", "sw_tokar"]
-out_path = "/vol_glp/cond/exact_pmi_adapters.json"; out = json.load(open(out_path)) if os.path.exists(out_path) else {}
+out_path = os.environ.get("EXACT_OUT", "/vol_glp/cond/exact_pmi_adapters.json")   # EXACT_OUT: smoke tests write elsewhere, not into the shared leaderboard
+out = json.load(open(out_path)) if os.path.exists(out_path) else {}
 for tag in tags:
     ap = f"/vol_glp/cond/{tag}/adapter_latest.pt"
     if not os.path.exists(ap): print("skip", tag, "(no adapter)"); continue
@@ -29,11 +30,13 @@ for tag in tags:
                 gx = torch.Generator(device=dev).manual_seed(11 + i)
                 lp[name].append(exact_logp(fb.model, xx, enc, mk, n_steps=STEPS, probes=1, gen=gx, cvec=cv).cpu())
         lp = {k: torch.cat(v) for k, v in lp.items()}; d = x0.shape[1]
+        ldw = float(getattr(fb.norm, "logdet_w", 0.0))   # whitened runs: absolute code length in the standardised space adds log|det W| (PMI is unaffected: it cancels)
         pmi = (lp["cond"] - lp["uncond"]) / math.log(2); pms = (lp["shuf"] - lp["uncond"]) / math.log(2)
         step = torch.load(ap, map_location="cpu").get("step")
         out[tag] = dict(adapter_step=step, cond_mode=fb.cond_mode, prior=aa["prior"].split("/")[-1], n=N, ode_steps=STEPS,
                         pmi_bits_mean=pmi.mean().item(), pmi_bits_median=pmi.median().item(), pmi_bits_sem=(pmi.std() / math.sqrt(N)).item(), frac_positive=(pmi > 0).float().mean().item(),
-                        shuf_bits_mean=pms.mean().item(), bits_per_dim_uncond=(-lp["uncond"].mean() / (d * math.log(2))).item(), bits_per_dim_cond=(-lp["cond"].mean() / (d * math.log(2))).item())
+                        shuf_bits_mean=pms.mean().item(), bits_per_dim_uncond=(-(lp["uncond"].mean() + ldw) / (d * math.log(2))).item(), bits_per_dim_cond=(-(lp["cond"].mean() + ldw) / (d * math.log(2))).item(),
+                        cond_code_bits=(-(lp["cond"].mean() + ldw) / math.log(2)).item(), whiten=aa.get("whiten"), logdet_w_nats=ldw, prior_init=aa.get("prior_init"))
         print(tag, json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in out[tag].items()}), flush=True)
         json.dump(out, open(out_path, "w"), indent=1)
         del fb; gc.collect(); torch.cuda.empty_cache()

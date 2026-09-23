@@ -15,3 +15,12 @@ t = pq.read_table("/vol_q36/data/sft/av_sft_val.parquet"); d = t.column("doc_id"
 keep = [i for i, x in enumerate(d) if is_val_doc(x, 10)]
 tc = t.take(pa.array(keep)); pq.write_table(tc, "/vol_q36/data/sft/av_sft_val_clean.parquet")
 print(f"clean eval parquet: {tc.num_rows} rows, {len(set(tc.column('doc_id').to_pylist()))} docs (from {t.num_rows} rows / {len(set(d))} docs)")
+
+# (3) ONE ROW PER DOCUMENT: rows of a document are prefix cuts of the same text (~10 per doc), so they are not independent samples.
+# Keep one seeded-random row per clean doc -> av_sft_val_clean1.parquet (736 rows, 736 docs). Eval with --eval-n-prompts 736.
+import random
+rng = random.Random(0); by_doc = {}
+for i, x in enumerate(tc.column("doc_id").to_pylist()): by_doc.setdefault(x, []).append(i)
+keep1 = sorted(rng.choice(v) for v in by_doc.values())
+t1 = tc.take(pa.array(keep1)); pq.write_table(t1, "/vol_q36/data/sft/av_sft_val_clean1.parquet")
+print(f"one-row-per-doc eval parquet: {t1.num_rows} rows, {len(set(t1.column('doc_id').to_pylist()))} docs; n_raw_tokens mean {sum(t1.column('n_raw_tokens').to_pylist())/t1.num_rows:.0f}")

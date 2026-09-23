@@ -167,7 +167,15 @@ class CondDenoiser(nn.Module):
         return sum(p.numel() for p in self.adapter_parameters())
 
 
-def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=None, shift=None):
+def fm_mse(v, tgt, err_map=None):
+    """mean squared velocity error. err_map [d, d] maps the error before squaring (W_inv of a whitened model trained with --whiten-loss original:
+    covariance-shaped noise but the plain squared error of the standardised space); computed in fp32 outside autocast."""
+    if err_map is None: return F.mse_loss(v.float(), tgt.float())
+    with torch.autocast(v.device.type, enabled=False):
+        return (((v.float() - tgt.float()) @ err_map.T) ** 2).mean()
+
+
+def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=None, shift=None, err_map=None):
     """Conditional flow-matching loss with PER-SAMPLE condition dropout: a dropped sample gets an all-False token mask and cvec_has=False,
     so the adapter contributes exactly the prior for it (keeps the unconditional path alive for the shuffle / no-text controls).
     shift [B, d] (optional, 'start from the prediction'): the flow models the RESIDUAL x0 - shift(z); dropped samples keep x0 (no shift)."""
@@ -176,7 +184,7 @@ def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=
     if eps is None: eps = torch.randn_like(x0)
     if enc is None and cvec is None:
         x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
-        return F.mse_loss(model(x_t, t).float(), (eps - x0).float()), t, False
+        return fm_mse(model(x_t, t), eps - x0, err_map), t, False
     cvec_has = None if cvec is None else torch.ones(B, dtype=torch.bool, device=x0.device)
     keep = torch.ones(B, dtype=torch.bool, device=x0.device)
     if p_uncond > 0:
@@ -186,4 +194,4 @@ def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=
     if shift is not None: x0 = x0 - shift * keep[:, None].to(x0.dtype)
     x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
     v = model(x_t, t, enc, enc_mask, cvec, cvec_has)
-    return F.mse_loss(v.float(), (eps - x0).float()), t, True
+    return fm_mse(v, eps - x0, err_map), t, True

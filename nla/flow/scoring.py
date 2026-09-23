@@ -7,7 +7,7 @@ import os, torch
 
 class FlowBundle:
     def __init__(self, prior_dir, adapter_path, stats_path, dev, base=None, enc_layer=42, ar_ckpt="/vol/ckpts/qwen36_27b/ar_sft_merged", prior_override=None):
-        from nla.flow.model import Denoiser, Normalizer
+        from nla.flow.model import Denoiser, Normalizer, maybe_whiten
         from nla.flow.cond_model import CondDenoiser
         self.dev = dev; self.norm = Normalizer.load(stats_path).to(dev)
         if prior_override:
@@ -18,6 +18,8 @@ class FlowBundle:
             prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"])
         prior = prior.to_empty(device=dev).to(torch.bfloat16); prior.load_state_dict(sd, strict=True); prior.requires_grad_(False)
         ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]; self.aa = aa; self.d = cfg["d_input"]
+        self.norm = maybe_whiten(self.norm, aa.get("whiten")).to(dev)   # --whiten runs: the flow lives in whitened coordinates; exact log p_std = log p_model + norm.logdet_w
+        self.err_map = self.norm.W_inv if (aa.get("whiten") and aa.get("whiten_loss") == "original") else None   # the metric the critic was trained with (see fm_err)
         self.cond_mode = aa.get("cond_mode", "tokens")
         if self.cond_mode == "trunk":
             # whole-trunk denoiser: the LM trunk (LoRA + fresh bidirectional blocks) IS the conditional velocity field; adapter + trunk LoRA from the run dir
@@ -84,6 +86,15 @@ class FlowBundle:
         return enc, mk, None
 
     @torch.no_grad()
+    def fm_err(self, v, tgt, metric="train"):
+        """per-row mean squared velocity error in the metric the critic was TRAINED with (metric='train', = its RL reward): model space (isotropic
+        runs; whitened runs = Sigma^-1-weighted), or for --whiten-loss original runs the error mapped back to the standardised space by W_inv
+        (fp32, outside autocast). metric='model' = always the model's own (whitened) space, where (d/2) x loss differences are the nats proxy."""
+        d = v.float() - tgt.float()
+        if self.err_map is None or metric == "model": return (d ** 2).mean(-1)
+        with torch.autocast(d.device.type, enabled=False):
+            return ((d.reshape(-1, d.shape[-1]) @ self.err_map.T) ** 2).mean(-1).view(d.shape[:-1])
+
     def cond(self, texts):
         """-> (enc, mask, cvec); with a --resid-shift adapter the standardised AR prediction is left in self.last_shift (else None):
         score x0 - shift under the conditional model, x0 under the prior (unit Jacobian, so log p(h|z) - log p(h) is unchanged in form)."""

@@ -34,8 +34,10 @@ def stage_score(a):
     from huggingface_hub import snapshot_download
     snap = snapshot_download("Qwen/Qwen3.6-27B", token=os.environ.get("HF_TOKEN"), local_dir="/root/base_snap", allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
     gen = json.load(open(f"{OUT}/gen.json")); A = torch.load(f"{OUT}/twin_acts.pt"); dele = json.load(open(f"{OUT}/deletions.json"))["items"]; dev = a.device
-    ap = CRITICS[a.critic]; aa = torch.load(ap, map_location="cpu")["args"]
-    fb = FlowBundle(aa["prior"], ap, aa["stats"], dev, base=snap, enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged")); fb.model.eval()
+    ap = CRITICS.get(a.critic, f"/vol_glp/cond/{a.critic}/adapter_latest.pt"); aa = torch.load(ap, map_location="cpu")["args"]
+    pco = os.path.join(os.path.dirname(ap), "prior_cotrained_latest.pt")   # from-scratch / co-trained critics: the prior weights live next to the adapter
+    fb = FlowBundle(aa["prior"], ap, aa["stats"], dev, base=snap, enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"),
+                    prior_override=pco if os.path.exists(pco) else None); fb.model.eval()
     T = len(TS); tt = torch.tensor(TS, device=dev); t0 = time.time(); res = {"critic": a.critic, "ts": TS, "D": a.D, "rows": {}, "deletions": []}
 
     def build(X0, eps):                                    # X0 [nA, d], eps [D, d] -> x_t, t, target flattened over (a, d, t)
@@ -47,7 +49,7 @@ def stage_score(a):
     def uncond(X0, eps):
         xt, tv, tgt, shp = build(X0, eps)
         with torch.autocast("cuda", dtype=torch.bfloat16): v = fb.model(xt, tv).float()
-        return ((v - tgt) ** 2).mean(-1).view(*shp).mean(1)                                  # [nA, T] draw-averaged
+        return fb.fm_err(v, tgt, a.metric).view(*shp).mean(1)                                  # [nA, T] draw-averaged
 
     @torch.no_grad()
     def cond(texts, X0, eps):
@@ -61,7 +63,7 @@ def stage_score(a):
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     v = fb.model(xt[s:s + n], tv[s:s + n], ej.expand(n, *ej.shape[1:]) if ej is not None else None, mj.expand(n, *mj.shape[1:]) if mj is not None else None,
                                  cj.expand(n, *cj.shape[1:]) if cj is not None else None).float()
-                L[s:s + n] = ((v - tgt[s:s + n]) ** 2).mean(-1)
+                L[s:s + n] = fb.fm_err(v, tgt[s:s + n], a.metric)
             out[j] = L.view(*shp).mean(1)
         return out                                                                              # [nZ, nA, T]
 
@@ -79,10 +81,13 @@ def stage_score(a):
             res["deletions"].append({"av": it["av"], "g": it["g"], "i": it["i"], "row": row, "n_removed": it["n_removed"], "n_false": it["n_false"], "Lu": Lu[0].cpu().numpy().round(6).tolist(), "Lc": Lc[:, 0].cpu().numpy().round(6).tolist()})
         res["rows"][str(row)] = rec
         print(f"[score {a.critic}] row {g + 1}/{len(gen['rows'])} ({len(acts)} activations) {time.time() - t0:.0f}s", flush=True)
-    json.dump(res, open(f"{OUT}/contrastive_{a.critic}.json", "w")); print(f"[score] wrote contrastive_{a.critic}.json in {time.time() - t0:.0f}s", flush=True)
+    od = a.out_dir or OUT; os.makedirs(od, exist_ok=True); res["metric"] = a.metric; sfx = "" if a.metric == "train" else "_model_space"
+    json.dump(res, open(f"{od}/contrastive_{a.critic}{sfx}.json", "w")); print(f"[score] wrote {od}/contrastive_{a.critic}{sfx}.json in {time.time() - t0:.0f}s", flush=True)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(); p.add_argument("--stage", required=True, choices=["capture", "score"]); p.add_argument("--critic", default="sw_tokar")
     p.add_argument("--D", type=int, default=8); p.add_argument("--chunk", type=int, default=240); p.add_argument("--device", default="cuda:0")
+    p.add_argument("--out-dir", default=None, help="output dir (default /vol_glp/cond/flow_noise; the PriorGrad comparison writes to .../flow_noise/pg)")
+    p.add_argument("--metric", default="train", choices=["train", "model"], help="velocity-error metric: the critic's training metric (= its RL reward) or its model space (nats proxy); differ only for --whiten-loss original critics")
     a = p.parse_args(); (stage_capture if a.stage == "capture" else stage_score)(a)

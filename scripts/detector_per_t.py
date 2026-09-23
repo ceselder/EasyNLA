@@ -39,8 +39,8 @@ def main():
             xB = xt.repeat(len(V), 1); tB = torch.full((B,), tt, device=dev)
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 v = fb.model(xB, tB, encB, mkB, cvB).float(); vu = fb.model(xt, torch.full((K,), tt, device=dev)).float()
-            loss = ((v - target.repeat(len(V), 1)) ** 2).mean(-1).view(len(V), K).mean(1)              # [V]
-            rec["loss"][str(tt)] = {vn: loss[i].item() for i, vn in enumerate(V)}; rec["loss_uncond"][str(tt)] = ((vu - target) ** 2).mean(-1).mean().item()
+            loss = fb.fm_err(v, target.repeat(len(V), 1)).view(len(V), K).mean(1)                      # [V]; the critic's training metric (= its RL reward)
+            rec["loss"][str(tt)] = {vn: loss[i].item() for i, vn in enumerate(V)}; rec["loss_uncond"][str(tt)] = fb.fm_err(vu, target).mean().item()
         rec["pmi_bits_exact"] = {vn: it["variants"][vn].get("pmi_bits") for vn in V}
         res.append(rec)
         if (j + 1) % 32 == 0 or j == 0: print(f"[per-t] {j+1}/{len(items)} ({time.time()-t0:.1f}s/item)", flush=True); json.dump({"adapter": a.adapter, "ts": ts, "k": K, "modes": modes, "items": res}, open(a.out, "w"))

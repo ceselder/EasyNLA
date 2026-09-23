@@ -12,6 +12,8 @@ import torch.nn.functional as F
 
 
 class Normalizer(nn.Module):
+    logdet_w = 0.0   # log|det| of any extra linear map applied after standardising (0 here; see WhitenedNormalizer)
+
     def __init__(self, mean: torch.Tensor, var: torch.Tensor):
         super().__init__()
         self.register_buffer("mean", mean.float().clone())
@@ -27,6 +29,28 @@ class Normalizer(nn.Module):
     def load(cls, path):
         d = torch.load(path, map_location="cpu")
         return cls(d["mean"], d["var"])
+
+
+class WhitenedNormalizer(nn.Module):
+    """PriorGrad-style noise via whitening: model space x' = W (standardise(h) - mu), W = Sigma^{-1/2} (ZCA, ridge-regularised) fitted by
+    scripts/fit_whitening.py. Isotropic N(0, I) noise in x' == N(mu, Sigma)-shaped noise in the standardised space, and the FM loss in x' is the
+    Sigma^{-1}-weighted loss. log p_std(x) = log p_model(x') + logdet_w (exact likelihoods reported in the standardised space must add it)."""
+    def __init__(self, base: "Normalizer", path: str):
+        super().__init__()
+        d = torch.load(path, map_location="cpu")
+        self.base = base; self.path = path; self.logdet_w = float(d["logdet_W"])
+        self.register_buffer("mu", d["mu"].float().clone()); self.register_buffer("W", d["W"].float().clone()); self.register_buffer("W_inv", d["W_inv"].float().clone())
+
+    def normalize(self, x):
+        return (self.base.normalize(x) - self.mu) @ self.W.T
+
+    def denormalize(self, z):
+        return self.base.denormalize(z.float() @ self.W_inv.T + self.mu)
+
+
+def maybe_whiten(norm, path):
+    """wrap a Normalizer with the whitening map when `path` is set (adapter/run args key 'whiten'), else return it unchanged."""
+    return WhitenedNormalizer(norm, path) if path else norm
 
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:

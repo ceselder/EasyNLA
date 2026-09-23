@@ -116,6 +116,12 @@ class FlowCritic:
         self.dev_type = torch.device(device).type
         self.p_uncond, self.t_grid, self.fve_t, self.micro_batch, self.max_len = p_uncond, tuple(float(t) for t in t_grid), fve_t, micro_batch, max_len
         self.norm = Normalizer.load(stats_path).to(device)
+        self.err_map = None
+        if aa.get("whiten"):   # PriorGrad-style (--whiten) critics were trained in whitened coordinates: every normalize/denormalize goes through W
+            from nla.flow.model import maybe_whiten
+            self.norm = maybe_whiten(self.norm, aa["whiten"]).to(device)
+            if aa.get("whiten_loss") == "original": self.err_map = self.norm.W_inv   # arm A: reward + co-training loss = squared error mapped back to the standardised space
+            print(f"[flow-critic] WHITENED critic ({aa['whiten']}, loss in the {aa.get('whiten_loss', 'whitened')} space)", flush=True)
         # build the 13.7B prior on the meta device and stream the checkpoint in with mmap: no 55 GB fp32 CPU copy per rank
         if prior_override:      # e.g. a stage-2 co-trained prior (prior_cotrained_latest.pt: {"model": prior state dict, "args": cfg})
             m = torch.load(prior_override, map_location="cpu", mmap=True); cfg = m["args"]; sd = m["model"]
@@ -306,7 +312,7 @@ class FlowCritic:
                 with self._ac():
                     v_all = self.model(xs, ts, enc.repeat(len(blocks), 1), mask.repeat(len(blocks), 1)).float()
                 for j, (tv, e) in enumerate(blocks[:-1]):
-                    tot += ((v_all[j * B:(j + 1) * B] - (e - x0)) ** 2).mean(1)
+                    tot += self._sq(v_all[j * B:(j + 1) * B] - (e - x0))
                 v = v_all[-B:]; x_t = xs[-B:]; x0_hat = self.norm.denormalize(x_t - self.fve_t * v + (shift if shift is not None else 0.0))
                 self._peak("score")
             else:
@@ -316,7 +322,7 @@ class FlowCritic:
                     for tv in self.t_grid:
                         t = torch.full((B,), tv, device=self.device); x_t = (1 - tv) * x0 + tv * eps_k
                         v = self.model(x_t, t, enc, mask, cvec).float()
-                        tot += ((v - (eps_k - x0)) ** 2).mean(1)
+                        tot += self._sq(v - (eps_k - x0))
                 t = torch.full((B,), self.fve_t, device=self.device); x_t = (1 - self.fve_t) * x0 + self.fve_t * eps
                 v = self.model(x_t, t, enc, mask, cvec).float(); x0_hat = self.norm.denormalize(x_t - self.fve_t * v + (shift if shift is not None else 0.0))
             fl = tot / (len(self.t_grid) * self.eps_per_t)
@@ -352,7 +358,7 @@ class FlowCritic:
                 for tv in self.t_grid:
                     t = torch.full((B,), tv, device=self.device); x_t = (1 - tv) * x0 + tv * eps_k
                     v = (self.model(x_t, t, enc, mask, cvec) if cond is not None else self.model(x_t, t)).float()
-                    tot += ((v - (eps_k - x0)) ** 2).mean(1)
+                    tot += self._sq(v - (eps_k - x0))
         return tot / (len(self.t_grid) * len(eps_list))
 
     @torch.no_grad()
@@ -513,9 +519,9 @@ class FlowCritic:
                     S = torch.zeros(R, self.d, device=self.device).index_add_(0, owner, D)
                     vf = v0 + wm[:, None] * S
                     if tv in extra: fve = (x_t, vf); continue
-                    Lu += ((v0 - tgt) ** 2).mean(1); Lf += ((vf - tgt) ** 2).mean(1)
-                    Ls += ((v0[owner] + D - tgt[owner]) ** 2).mean(1)
-                    Ll += ((v0[owner] + wl[:, None] * (S[owner] - D) - tgt[owner]) ** 2).mean(1)
+                    Lu += self._sq(v0 - tgt); Lf += self._sq(vf - tgt)
+                    Ls += self._sq(v0[owner] + D - tgt[owner])
+                    Ll += self._sq(v0[owner] + wl[:, None] * (S[owner] - D) - tgt[owner])
                     if tv == self.fve_t and k == 0: fve = (x_t, vf)
             nrm = len(tvals) * K; Lu, Lf, Ls, Ll = Lu / nrm, Lf / nrm, Ls / nrm, Ll / nrm
             pf = (half_d * (Lu - Lf)).tolist(); ps = (half_d * (Lu[owner] - Ls)).tolist(); cr = (half_d * (Ll - Lf[owner])).tolist()
@@ -531,6 +537,12 @@ class FlowCritic:
         if self.dev_type == "cuda": torch.cuda.empty_cache()
         return out
 
+    def _sq(self, d):
+        """per-row mean squared velocity error in the critic's training metric (model space, or the standardised space for --whiten-loss original critics)."""
+        if self.err_map is None: return (d.float() ** 2).mean(1)
+        with torch.autocast(self.dev_type, enabled=False):
+            return ((d.float() @ self.err_map.T) ** 2).mean(1)
+
     # ------------------------------------------------------------------ co-training
     def train_backward(self, explanations, activations, accum: int = 1):
         """conditional FM loss (per-sample condition dropout) on (explanation, activation) pairs; grads accumulate on the adapter.
@@ -544,7 +556,7 @@ class FlowCritic:
             enc, mask, cvec, shift = self._cond([z for z, _ in ch], grad=True)
             x0 = self.norm.normalize(torch.stack([a.to(self.device).float() for _, a in ch]))
             with self._ac():
-                loss, _, _ = cond_fm_loss(self.model, x0, enc, mask, p_uncond=self.p_uncond, cvec=cvec, shift=shift)
+                loss, _, _ = cond_fm_loss(self.model, x0, enc, mask, p_uncond=self.p_uncond, cvec=cvec, shift=shift, err_map=self.err_map)
             if not torch.isfinite(loss): return float("nan")
             (loss * (B / n) / accum).backward(); total += loss.item() * B / n
             del enc, mask, x0, loss
