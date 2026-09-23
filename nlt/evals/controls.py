@@ -69,7 +69,7 @@ def summarize_scores(scored: pd.DataFrame) -> dict:
     """scored = manifest + column logp (nats, exact ODE) [or bits]. -> bits per variant relative to 'empty' of the same pair, verdicts EVALS 3a-3d, 4e."""
     from nlt.evals.common import bootstrap_ci
     import math
-    s = scored.copy()
+    s = scored.copy(); s["pair_id"] = s["pair_id"].astype(str); s = s.drop_duplicates(["pair_id", "variant"], keep="first")    # scorers may write a pair twice
     if "bits" not in s.columns:
         emp = s[s.variant == "empty"].set_index("pair_id")["logp"]
         s["bits"] = [(lp - emp.get(p, float("nan"))) / math.log(2) for p, lp in zip(s.pair_id, s.logp)]

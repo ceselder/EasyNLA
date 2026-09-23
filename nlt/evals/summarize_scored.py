@@ -10,7 +10,7 @@ import numpy as np
 def summarize(scored):
     from nlt.evals.controls import summarize_scores
     from nlt.evals.common import band
-    s = scored.copy(); s["pair_id"] = s["pair_id"].astype(str)
+    s = scored.copy(); s["pair_id"] = s["pair_id"].astype(str); s = s.drop_duplicates(["pair_id", "variant"], keep="first")
     summ = summarize_scores(s)
     emp = s[s.variant == "empty"].set_index("pair_id")["logp"]
     s["bits"] = [(lp - emp.get(p, np.nan)) / math.log(2) for p, lp in zip(s.pair_id, s.logp)]
