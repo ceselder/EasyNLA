@@ -60,7 +60,7 @@ def chunk_tag(path):
 
 
 def finish_chunk(feat_path, answers, out_dir, remote_dir, tok, st, tag, log):
-    feats = pq.read_table(feat_path).to_pandas()
+    feats = pq.read_table(feat_path).to_pandas().drop_duplicates("pair_id")
     df, rej, stats = T.make_rows(feats, answers, tok)
     out = os.path.join(out_dir, f"{T.SOURCE}_part_{tag}.parquet")
     pq.write_table(pa.Table.from_pandas(df, preserve_index=False), out)
@@ -81,14 +81,14 @@ def finish_chunk(feat_path, answers, out_dir, remote_dir, tok, st, tag, log):
 
 
 def build_requests(feat_path):
-    feats = pq.read_table(feat_path).to_pandas()
+    feats = pq.read_table(feat_path).to_pandas().drop_duplicates("pair_id")     # custom_ids must be unique within a batch
     reqs = [{"custom_id": cid(r["pair_id"]), "params": T.params(r)} for r in feats.to_dict("records")]
     del feats
     return reqs
 
 
 async def sync_chunk(client, feat_path, concurrency, st, log):
-    feats = pq.read_table(feat_path).to_pandas()
+    feats = pq.read_table(feat_path).to_pandas().drop_duplicates("pair_id")
     rows = feats.to_dict("records")
     del feats
     out = {}
@@ -172,7 +172,10 @@ def main():
                         b = client.messages.batches.create(requests=reqs)
                         break
                     except Exception as e:
-                        log(f"[chunk {t}] batch create failed ({str(e)[:120]}), retry {attempt + 1}")
+                        log(f"[chunk {t}] batch create failed ({str(e)[:160]}), retry {attempt + 1}")
+                        if "invalid_request_error" in str(e):
+                            attempt = 5
+                            break
                         time.sleep(20 * (attempt + 1))
                 else:
                     c["status"] = "sync_pending"
