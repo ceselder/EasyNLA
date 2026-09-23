@@ -1,6 +1,6 @@
 """Modal app `nlt-evals` (volume `nlt`; owner redteam): GPU pieces of the eval suite.
 
-  modal run --detach scripts/modal_nlt_evals.py --task manifest --extra "--ckpt /vol/critic/text_v0/ckpt_latest.pt --manifest /vol/evals/manifest_lensL1.parquet --out /vol/evals/scored_lensL1.parquet"
+  modal run --detach scripts/modal_nlt_evals.py --task manifest --extra "--ckpt /vol/critic/text_v0/ckpt_latest.pt --manifest /vol/evals/manifest_lensL1.parquet --out /vol/evals/scored_lensL1.parquet"   (runs infra nlt.eval_bits.score_manifest, then nlt.evals.summarize_scored)
   modal run --detach scripts/modal_nlt_evals.py --task causal   --extra "--out /vol/evals/causal_val.parquet --n-pairs 4096"
   modal run          scripts/modal_nlt_evals.py --task text     --extra "--z /vol/z/lensdiff_v1/val/L1.parquet --out /vol/evals/text_lensL1.json"   (CPU)
   modal run          scripts/modal_nlt_evals.py --task build-manifest --extra "--z /vol/z/lensdiff_v1/val/L1.parquet --out /vol/evals/manifest_lensL1.parquet"  (CPU)
@@ -9,8 +9,8 @@ Data dir default /vol/data/qwen3_8b (infra). HF: shared cache /vol/hf_cache, xet
 """
 import os, sys
 import modal
-for _p in (os.path.dirname(os.path.abspath(__file__)),):
-    if _p not in sys.path: sys.path.insert(0, _p)
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.join(os.environ.get("PYTHONPATH", "/root/easyNLA").split(":")[0], "scripts")):
+    if os.path.isdir(_p) and _p not in sys.path: sys.path.insert(0, _p)     # local: scripts/; remote: the repo mount /root/easyNLA/scripts
 from modal_nla_exp import image_base, REPO_LOCAL, REPO_REMOTE, REPO_IGNORE  # noqa: E402
 
 vol = modal.Volume.from_name("nlt", create_if_missing=True)
@@ -32,7 +32,10 @@ def _run(cmd):
 
 @app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
 def manifest(extra: str = "", data: str = DATA):
-    return _run([sys.executable, "-m", "nlt.evals.score_manifest", "--data-dir", data] + extra.split())
+    rc = _run([sys.executable, "-m", "nlt.eval_bits.score_manifest", "--data-dir", data] + extra.split())     # infra's scorer (owns the normalisation)
+    args = extra.split(); out = args[args.index("--out") + 1] if "--out" in args else None
+    if rc == 0 and out: rc = _run([sys.executable, "-m", "nlt.evals.summarize_scored", "--scored", out, "--out", out + ".summary.json"])
+    return rc
 
 
 @app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
