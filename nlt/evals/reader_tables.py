@@ -31,7 +31,10 @@ def build(a):
     from nlt.evals.common import load_table, save_table, PrefixStore
     from nlt.data.dataset import ActStore
     rng = np.random.default_rng(a.seed)
-    z = load_table(a.z); z["pair_id"] = z["pair_id"].astype(str); c = load_table(a.causal); c["pair_id"] = c["pair_id"].astype(str)
+    z = load_table(a.z)
+    if a.source and "source" in z.columns: z = z[z["source"] == a.source]
+    if a.verbosity is not None and "verbosity" in z.columns: z = z[z["verbosity"] == a.verbosity]
+    z = z.drop_duplicates("pair_id"); z["pair_id"] = z["pair_id"].astype(str); c = load_table(a.causal); c["pair_id"] = c["pair_id"].astype(str)
     df = z.merge(c, on="pair_id", how="inner"); df = df[df["text"].fillna("").str.strip().str.len() > 0]
     if a.n and len(df) > a.n: df = df.sample(n=a.n, random_state=a.seed)
     df = df.reset_index(drop=True); os.makedirs(a.out_dir, exist_ok=True)
@@ -90,5 +93,6 @@ def correlate(a):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("build"); p.add_argument("--z", required=True); p.add_argument("--causal", required=True); p.add_argument("--data-dir", required=True); p.add_argument("--out-dir", required=True); p.add_argument("--n", type=int, default=512); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--source"); p.add_argument("--verbosity", type=int)
     p = sub.add_parser("correlate"); p.add_argument("--judged", required=True); p.add_argument("--table", required=True); p.add_argument("--out")
     a = ap.parse_args(); {"build": build, "correlate": correlate}[a.cmd](a)
