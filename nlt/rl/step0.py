@@ -22,6 +22,7 @@ def main():
     p.add_argument("--n-pairs", type=int, default=512); p.add_argument("--group", type=int, default=8); p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--temperature", type=float, default=1.0); p.add_argument("--vllm-gpu-mem", type=float, default=0.40); p.add_argument("--vllm-max-len", type=int, default=512)
     p.add_argument("--lam", type=float, default=0.1); p.add_argument("--seed", type=int, default=0); p.add_argument("--skip", type=int, default=0, help="skip the first rows of pairs_val")
+    p.add_argument("--dump-dir", default=None, help="write the rollouts in the board #31 format here (e.g. /vol/z/ref_v1_0/val)")
     a = p.parse_args(); torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
     from nlt.data.dataset import ActStore
@@ -44,10 +45,29 @@ def main():
         from nla.train_rl_vllm import sync_actor_to_vllm
         sync_actor_to_vllm(policy, llm)
     res, info = rollout(llm, spec, acts, a.group, a.max_new_tokens, a.temperature, seed=a.seed); print(f"[step0] rollout {info}", flush=True)
-    del policy; torch.cuda.empty_cache()
+    del policy, llm; torch.cuda.empty_cache()
     n = len(res); groups = torch.tensor([r["prompt_idx"] for r in res]); texts = [r["text"].strip() for r in res]; n_tok = torch.tensor([r["n_resp"] for r in res], dtype=torch.float32)
     viol = vc.check(texts, [r["full_ids"][r["prompt_len"]:].tolist() for r in res], [int(vp["pos_idx"][g]) for g in groups.tolist()], next_words=[tok.decode([int(vp["next_token_id"][g])]) for g in groups.tolist()])
-    scorer = make_scorer(a, cdev)
+    if a.dump_dir:                                        # the policy's own samples on the fixed pairs, board #31 format (redteam Y2 bar = the step-0 dump)
+        import pyarrow as pa
+        os.makedirs(a.dump_dir, exist_ok=True); src = os.path.basename(os.path.dirname(a.dump_dir.rstrip("/"))) or a.tag
+        pq.write_table(pa.table({"pair_id": [vp["pair_id"][g] for g in groups.tolist()], "text": texts, "n_tokens": pa.array([int(x) for x in n_tok.tolist()], pa.int32()), "verbosity": pa.array([1] * n, pa.int32()),
+                                 "source": [src] * n, "sample_idx": pa.array([r["group_idx"] for r in res], pa.int32())}), os.path.join(a.dump_dir, f"part_0000000_{N:07d}.parquet"))
+        print(f"[step0] dumped {n} rollouts -> {a.dump_dir}", flush=True)
+    critics = [(c.split(":", 1) if ":" in c else (os.path.basename(os.path.dirname(c)), c)) for c in (a.critic.split(",") if a.critic else ["stub:stub"])]
+    all_out = {}
+    for cname, cpath in critics:
+        a.critic = None if cpath == "stub" else cpath
+        scorer = make_scorer(a, cdev)
+        out = _evaluate(a, scorer, h_i, h_j, groups, texts, n_tok, viol, vp, I, J, N, bands, info, cname)
+        all_out[cname] = out; print(f"[step0] {cname}: PASS(ws)={out['pass_workspace']} signal={out['signal_workspace']} healthy(ws)={out['critic_healthy_workspace']} content_ws={out['bands']['workspace'].get('bits_minus_dm', float('nan')):+.3f} P(z>dm)_ws={out['bands']['workspace'].get('p_own_gt_dm', float('nan')):.3f} lambda_content={out.get('lambda_content')}", flush=True)
+        del scorer; torch.cuda.empty_cache()
+    final = all_out[critics[0][0]] if len(critics) == 1 else {"init": a.init, "n_pairs": N, "group": a.group, "critics": all_out, "rollout": info}
+    os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(final, open(a.out, "w"), indent=1); print(f"[step0] -> {a.out}", flush=True)
+
+
+def _evaluate(a, scorer, h_i, h_j, groups, texts, n_tok, viol, vp, I, J, N, bands, info, cname):
+    n = len(texts)
     def score(txts, seed):
         return scorer.score(h_i[groups], h_j[groups], [z if z else None for z in txts], groups.tolist(), seed=seed)["exact_bits"].float()
     t0 = time.time(); b0 = score(texts, 0); t_score = time.time() - t0; b1 = score(texts, 1)
@@ -81,18 +101,19 @@ def main():
         if m.sum() == 0: return {}
         wg = within_group_std(b0[m], g); nz = float(noise_row[m].std()); bm = float(b0[m].mean()); dm = float(b_dm[m].mean()); rp = float(b_rp[m].mean())
         bpt = b0[m] / n_tok[m].clamp_min(1); nn = int(m.sum())
-        d_dm = (b0[m] - b_dm[m]); d_rp = (b0[m] - b_rp[m]); wg_tok = within_group_std(n_tok[m], g)
+        d_dm = (b0[m] - b_dm[m]); d_rp = (b0[m] - b_rp[m]); wg_tok = within_group_std(n_tok[m], g); p_dm = float((d_dm > 0).float().mean()); p_rp = float((d_rp > 0).float().mean())
         return {"n": nn, "bits_mean": bm, "bits_median": float(b0[m].median()), "bits_per_token_median": float(bpt.median()), "bits_per_token_mean": float(bpt.mean()),
                 "lambda_max": 0.5 * float(bpt.median()), "lambda_wg": 0.25 * wg / wg_tok if wg_tok > 0 else float("nan"),
                 "lambda_content": 0.25 * max(0.0, float(d_dm.mean())) / wg_tok if wg_tok > 0 else float("nan"),   # scaled by the CONTENT signal (bits - z_dm), not the critic's spread
                 "within_group_std": wg, "within_group_std_tokens": wg_tok,
                 "scoring_noise": nz, "std_over_noise": wg / nz if nz > 0 else float("nan"),
                 "bits_dm": dm, "bits_rp": rp, "bits_minus_dm": float(d_dm.mean()), "bits_minus_dm_sem": float(d_dm.std() / nn ** 0.5), "bits_minus_rp": float(d_rp.mean()), "bits_minus_rp_sem": float(d_rp.std() / nn ** 0.5),
+                "p_own_gt_dm": p_dm, "p_own_gt_rp": p_rp, "p_own_gt_null": float((b0[m] > 0).float().mean()),
                 "bits_over_dm": bm / dm if dm > 0 else float("inf"), "critic_presence_offset_over_noise": abs(rp) / nz if nz > 0 else float("nan"),
                 "frac_nonpos": float((b0[m] <= 0).float().mean()), "tokens_mean": float(n_tok[m].mean()),
                 "mention_next": float(viol["mention_next"][mask].mean()), "copy_rate": float(viol["copy_rate"][mask].mean()), "regex": float(viol["regex"][mask].mean()), "empty": float(viol["empty"][mask].mean()), "junk": float(viol["junk"][mask].mean()),
                 "corr_bits_tokens": corr(b0[m], n_tok[m]), "reward_mean": float((b0[m] - a.lam * n_tok[m]).mean())}
-    out = {"init": a.init, "n_pairs": N, "group": a.group, "dm_exact_partners": int(N - n_approx), "critic": a.critic or "stub", "ode_steps": a.ode_steps, "probes": a.probes, "score_s_per_row": t_score / n,
+    out = {"init": a.init, "n_pairs": N, "group": a.group, "critic": a.critic or "stub", "dm_exact_partners": int(N - n_approx), "ode_steps": a.ode_steps, "probes": a.probes, "score_s_per_row": t_score / n,
            "all": stats(np.ones(n, bool)), "bands": {b: stats(bands[gl] == b) for b in ("pre", "workspace", "motor")}, "rollout": info}
     ws = out["bands"].get("workspace", {})
     # critic health (DECISIONS v1.5): per band with n >= 100 rows, |bits(z_rp)| AND |bits(z_dm)| within 3x the scoring noise (text about
@@ -110,10 +131,10 @@ def main():
     samp = []
     for k in np.argsort(-b0.numpy())[:8].tolist() + np.argsort(b0.numpy())[:4].tolist():
         g = gl[k]; samp.append({"i": int(I[g]), "j": int(J[g]), "bits": float(b0[k]), "bits_dm": float(b_dm[k]), "tokens": int(n_tok[k]), "text": texts[k][:300]})
-    out["samples"] = samp
+    out["samples"] = samp; out["critic_name"] = cname
     print(json.dumps({k: v for k, v in out.items() if k != "samples"}, indent=1), flush=True)
     for s in samp: print(f"  [{s['i']}->{s['j']}] bits {s['bits']:+.2f} (dm {s['bits_dm']:+.2f}) tok {s['tokens']}: {s['text']!r}", flush=True)
-    os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out, "w"), indent=1); print(f"[step0] PASS(workspace)={out['pass_workspace']} signal={out['signal_workspace']} critic_healthy(ws)={out['critic_healthy_workspace']} all={out['critic_healthy_all']} lambda_rec={out['lambda_recommended']} -> {a.out}", flush=True)
+    return out
 
 
 if __name__ == "__main__":
