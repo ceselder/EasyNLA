@@ -8,8 +8,19 @@ from nlt.evals.common import load_table, join_pairs, PrefixStore
 from nlt.evals import regex_tags, copy_rate, diversity, depth_clf
 
 
-def run(z, pairs=None, meta=None, docs=None, tag: str = "", ref_soft_rate=None) -> dict:
-    texts = z["text"].fillna("").tolist()
+TEXT_COLS = ("text", "text_out", "answer", "z", "explanation", "rewrite", "raw")
+
+
+def pick_text_col(z, text_col=None):
+    """use --text-col if given, else the first known text column; rename it to 'text' so every module sees the same name"""
+    col = text_col or next((c for c in TEXT_COLS if c in z.columns), None)
+    if col is None: raise SystemExit(f"no text column in {list(z.columns)}; pass --text-col")
+    if col != "text": z = z.rename(columns={col: "text"})
+    return z
+
+
+def run(z, pairs=None, meta=None, docs=None, tag: str = "", ref_soft_rate=None, text_col=None) -> dict:
+    z = pick_text_col(z, text_col); texts = z["text"].fillna("").astype(str).tolist()
     out = {"tag": tag, "n": len(texts), "ts": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}
     out["regex"] = regex_tags.scan(texts, ref_soft_rate)
     out["diversity"] = diversity.evaluate(texts)
@@ -29,9 +40,9 @@ def run(z, pairs=None, meta=None, docs=None, tag: str = "", ref_soft_rate=None) 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--z", required=True); ap.add_argument("--pairs"); ap.add_argument("--meta"); ap.add_argument("--docs")
-    ap.add_argument("--out", required=True); ap.add_argument("--tag", default=""); ap.add_argument("--ref-soft-rate", type=float)
+    ap.add_argument("--out", required=True); ap.add_argument("--tag", default=""); ap.add_argument("--ref-soft-rate", type=float); ap.add_argument("--text-col")
     a = ap.parse_args()
-    res = run(load_table(a.z), load_table(a.pairs) if a.pairs else None, load_table(a.meta) if a.meta else None, load_table(a.docs) if a.docs else None, a.tag, a.ref_soft_rate)
+    res = run(load_table(a.z), load_table(a.pairs) if a.pairs else None, load_table(a.meta) if a.meta else None, load_table(a.docs) if a.docs else None, a.tag, a.ref_soft_rate, a.text_col)
     json.dump(res, open(a.out, "w"), indent=1, default=str)
     print(json.dumps(res["verdicts"], indent=1)); print("regex hard/1000:", res["regex"]["hard_hits_per_1000_z"], "| tokens median:", res["diversity"]["tokens_median"], "| distinct4:", round(res["diversity"]["distinct_4gram_ratio"], 3),
                                                        "| MI(z;j) bits:", res.get("depth", {}).get("j", {}).get("mi_bits"), "| copy4:", res.get("copy", {}).get("copy_rate_4gram_mean"))
