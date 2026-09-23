@@ -62,6 +62,12 @@ def main():
     ax1.set_title("What an outside reader recovers from ONE sentence:\nthe verbalizer's sentence, written from the two activations\nalone, gives the next token 73% and the position 72%", loc="left", fontsize=12.5)
     ax2.bar(x, [r["content"] for r in rows], 0.6, color=cols, yerr=[r["content_sem"] for r in rows], error_kw={"ecolor": INK2, "capsize": 3, "lw": 1})
     for xi, r in zip(x, rows): ax2.text(xi, r["content"] + r["content_sem"] + 0.08, f"{r['content']:.1f} bits\nP = {r['p_dm']:.2f}", ha="center", va="bottom", fontsize=10, color=INK2)
+    # calibration point: the raw J-lens top-20 lists written as plain text (T2), from the merged info-budget json when present
+    ib = json.load(open(os.path.join(D, "info_budget.json"))) if os.path.exists(os.path.join(D, "info_budget.json")) else {"text": {}}
+    t2 = next((s for k, c in ib.get("text", {}).items() if k in ("jlens20_text", "text_t2_jlens20") for s in c["sets"].values()), None)
+    t2_content = (t2["bands"]["all"].get("content") if t2 else None) or 14.03; t2_p = (t2.get("frac_z_beats_dm") if t2 else None) or 0.78; t2_src = "data/info_budget.json (jlens20_text)" if t2 else "board #245/#249 (exact, Heun 32, n=1024)"
+    ax2.text(0.98, 0.97, f"Reference: the raw J-lens top-20 token lists written as\nplain text earn {t2_content:.1f} content bits (P = {t2_p:.2f}) from the same\ncritic family — not natural language, but it shows the\nchannel can carry it: sentences keep ~{100 * rows[0]['content'] / t2_content:.0f}%, the verbalizer ~{100 * next(r['content'] for r in rows if r['source'] == 'v0_ao_tsv1') / t2_content:.0f}%",
+             transform=ax2.transAxes, ha="right", va="top", fontsize=9.5, color=INK2, bbox={"boxstyle": "round,pad=0.4", "fc": "#f0eee6", "ec": GRID})
     ax2.axhline(0, color=INK2, lw=0.8); ax2.set_ylim(0, max(4.0, max(r["content"] + r["content_sem"] for r in rows) * 1.55)); ax2.set_ylabel("exact content bits = bits(z) − bits(z_dm), paired;  P = P(z beats z_dm)")
     ax2.set_xticks(x); ax2.set_xticklabels([r["label"] for r in rows], fontsize=9.5); ax2.grid(axis="x", visible=False)
     ax2.set_title("What the headline flow critic pays for the same sentences:\n1–2.5 exact bits over another pair's sentence at the same (i, j);\nP(z beats z_dm) 0.59–0.71 against a 0.75 gate — and the ranking flips", loc="left", fontsize=12.5)
@@ -73,6 +79,7 @@ def main():
     fig.subplots_adjust(left=0.065, right=0.985, top=0.79, bottom=0.2, wspace=0.28)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"critic": C.get("critic"), "rows": [{k: v for k, v in r.items() if k != "colour"} for r in rows], "chance": {"top1": 0.25, "posmatch": 0.20, "direction": 0.5},
+               "reference_raw_jlens_list_as_text": {"content_bits": t2_content, "p_z_gt_dm": t2_p, "source": t2_src},
                "sources": {"reader": "data/reader_evals_v1.json", "critic": f"data/{a.controls}"}}, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)
     print("saved", os.path.join(a.report, f"{a.stem}.png"), [r["source"] for r in rows])
 
