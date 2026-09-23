@@ -102,3 +102,65 @@ class ActStore:
         r = self.row_of[int(pos_idx)]; m = self.meta.iloc[r]
         ids = self.docs[int(m["doc_id"])][2]
         return ids[: int(m["pos"]) + 1][-ctx:]
+
+
+class CyclingStore:
+    """A store larger than the device: keeps `resident` positions resident (GPU or CPU) as a ring of shards drawn from SEVERAL data dirs, and
+    swaps the oldest resident shard for the next unseen one every `refresh_every` calls of sample_pairs (loaded from the volume in a background
+    thread). Same interface as ActStore (sample_pairs / gather / N / d / L). Spike rows (spikes.json of each dir) are dropped at load."""
+    def __init__(self, data_dirs, split="train", device="cuda", resident=200_000, refresh_every=400, seed=0, verbose=True):
+        import threading, queue, random
+        self.split, self.device, self.refresh_every, self.verbose = split, device, refresh_every, verbose
+        self.files = []
+        for d_ in data_dirs:
+            sp = os.path.join(d_, "spikes.json"); bad = set(json.load(open(sp)).get(split, [])) if os.path.exists(sp) else set()
+            for f in sorted(glob.glob(os.path.join(d_, split, "acts_*.npy"))): self.files.append((f, bad))
+        random.Random(seed).shuffle(self.files); self.next_file = 0
+        self.shards = []                                             # list of (acts tensor on device, n)
+        n = 0
+        while n < resident and self.next_file < len(self.files):
+            t = self._load(self.files[self.next_file]); self.next_file += 1
+            if t is None: continue
+            self.shards.append(t); n += t.shape[0]
+        self._rebuild(); self.calls = 0; self.q = queue.Queue(maxsize=1); self.stop = False
+        self.loader = threading.Thread(target=self._prefetch, daemon=True); self.loader.start()
+        if verbose: print(f"[CyclingStore:{split}] {len(self.files)} shards in {len(data_dirs)} dirs; {len(self.shards)} resident ({self.N} positions, {self.N * self.L * self.d * 2 / 1e9:.1f} GB on {device}); swap every {refresh_every} batches", flush=True)
+
+    def _load(self, item):
+        f, bad = item; A = np.load(f, mmap_mode="r")
+        import pyarrow.parquet as pq
+        m = pq.read_table(meta_of(f), columns=["pos_idx"]).column(0).to_numpy(); keep = ~np.isin(m, list(bad)) if bad else np.ones(len(m), bool)
+        idx = np.where(keep)[0]
+        if len(idx) == 0: return None
+        chunk = np.ascontiguousarray(A[idx]) if len(idx) < A.shape[0] else np.ascontiguousarray(A[:])
+        return torch.from_numpy(chunk).to(self.device, non_blocking=False)
+
+    def _rebuild(self):
+        self.acts = torch.cat(self.shards, 0) if len(self.shards) > 1 else self.shards[0]     # resident set is small (<= `resident` rows): the cat is affordable
+        self.N, self.L, self.d = self.acts.shape
+
+    def _prefetch(self):
+        while not self.stop:
+            if self.next_file >= len(self.files): self.next_file = 0                                   # new epoch over the shard list
+            t = self._load(self.files[self.next_file]); self.next_file += 1
+            if t is not None: self.q.put(t)                                                            # blocks until the consumer takes it
+
+    def maybe_swap(self):
+        self.calls += 1
+        if self.calls % self.refresh_every: return
+        try: t = self.q.get_nowait()
+        except Exception: return
+        self.shards.pop(0); self.shards.append(t); self._rebuild()
+        if self.verbose and (self.calls // self.refresh_every) % 10 == 0: print(f"[CyclingStore] swapped shard #{self.calls // self.refresh_every} (next file {self.next_file}/{len(self.files)})", flush=True)
+
+    def sample_pairs(self, B, gen=None, j_lo=J_LO, j_hi=J_HI, i_lo=K_LO):
+        self.maybe_swap()
+        rows = torch.randint(0, self.N, (B,), generator=gen)
+        j = torch.randint(j_lo, j_hi + 1, (B,), generator=gen)
+        i = (torch.rand(B, generator=gen) * (j - i_lo).float()).long() + i_lo
+        return rows, i, j
+
+    def gather(self, rows, k, out_device=None):
+        rows = torch.as_tensor(rows).long(); k = torch.as_tensor(k).long()
+        x = self.acts[rows.to(self.acts.device), (k - K_LO).to(self.acts.device)]
+        return x if out_device is None else x.to(out_device, non_blocking=True)

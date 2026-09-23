@@ -123,6 +123,8 @@ def main():
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=128)
     p.add_argument("--wandb", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
+    p.add_argument("--extra-data-dirs", default=None, help="comma list of additional activation dirs (same layout): the train store becomes a CyclingStore over ALL dirs (blind/depth modes only)")
+    p.add_argument("--cycle-resident", type=int, default=200_000); p.add_argument("--cycle-refresh", type=int, default=400, help="batches between shard swaps")
     p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
     p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
     p.add_argument("--init-from", default=None, help="checkpoint of a trained BLIND prior (cond none): its weights are loaded into this model (text/depth extras stay zero/fresh, so at step 0 the conditional path IS the prior)")
@@ -131,7 +133,12 @@ def main():
     torch.manual_seed(a.seed); np.random.seed(a.seed); dev = "cuda"; torch.backends.cuda.matmul.allow_tf32 = True
     os.makedirs(a.out, exist_ok=True); t_start = time.time()
     norm = GlobalNorm.load(a.stats or os.path.join(a.data_dir, "stats.pt"), a.norm).to(dev)
-    store = ActStore(a.data_dir, "train", device=a.data_device, max_pos=a.max_train_pos)
+    if a.extra_data_dirs:
+        from nlt.data.dataset import CyclingStore
+        assert a.cond != "text", "CyclingStore has no pair_id index; text mode needs a single ActStore"
+        store = CyclingStore([a.data_dir] + a.extra_data_dirs.split(","), "train", device=a.data_device, resident=a.cycle_resident, refresh_every=a.cycle_refresh, seed=a.seed)
+    else:
+        store = ActStore(a.data_dir, "train", device=a.data_device, max_pos=a.max_train_pos)
     store_val = ActStore(a.data_dir, "val", device=a.data_device)
     d = store.d
     # ---- fixed val pairs (from the finalize pair list; disjoint docs) + fixed eps bank
@@ -141,8 +148,12 @@ def main():
     val_rows = store_val.rows_for(vp["pos_idx"].values); val_i = torch.tensor(vp["i"].values); val_j = torch.tensor(vp["j"].values)
     g_eval = torch.Generator().manual_seed(1234); eps_bank = [torch.randn(len(val_rows), d, generator=g_eval) for _ in T_GRID]
     # the same fixed eval on TRAIN pairs (first rows of pairs_train.parquet that are in the store): the D3 gate compares eval/fm_loss with eval_train/fm_loss
-    tp = pq.read_table(os.path.join(a.data_dir, "pairs_train.parquet")).to_pandas(); tp = tp[tp["pos_idx"].isin(store.row_of)].iloc[: len(val_rows)]
-    tr_rows = store.rows_for(tp["pos_idx"].values); tr_i = torch.tensor(tp["i"].values); tr_j = torch.tensor(tp["j"].values)
+    has_train_eval = hasattr(store, "row_of")
+    if has_train_eval:
+        tp = pq.read_table(os.path.join(a.data_dir, "pairs_train.parquet")).to_pandas(); tp = tp[tp["pos_idx"].isin(store.row_of)].iloc[: len(val_rows)]
+        tr_rows = store.rows_for(tp["pos_idx"].values); tr_i = torch.tensor(tp["i"].values); tr_j = torch.tensor(tp["j"].values)
+    else:   # cycling store: a fixed sample of its currently resident rows (train-side generalisation gate stays approximate)
+        g_tr = torch.Generator().manual_seed(999); tr_rows, tr_i, tr_j = store.sample_pairs(len(val_rows), g_tr)
     g_eval2 = torch.Generator().manual_seed(4321); eps_bank_tr = [torch.randn(len(tr_rows), d, generator=g_eval2) for _ in T_GRID]
     # ---- text
     encoder = None; text_df = None; val_text = None; tok8 = None
@@ -192,7 +203,7 @@ def main():
         if a.lr_decay == "none": return a.lr
         pr = (s - a.warmup) / max(1, a.steps - a.warmup); return a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, pr))))
     import wandb
-    run = wandb.init(project=a.wandb, entity=a.wandb_entity, name=a.tag, config=vars(a) | {"n_params": model.n_params(), "n_train_pos": store.N, "n_val_pos": store_val.N}, resume="allow")
+    run = wandb.init(project=a.wandb, entity=a.wandb_entity, name=a.tag, config=vars(a) | {"n_params": model.n_params(), "n_train_pos": store.N, "n_val_pos": store_val.N, "n_shards": len(getattr(store, "files", []))}, resume="allow")
     gen = torch.Generator().manual_seed(a.seed + step0)
     def save(step, name="ckpt_latest.pt"):
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "args": vars(a), "config": model.config(), "d_enc": (encoder.d_enc if encoder else 0)}, os.path.join(a.out, name))
@@ -231,7 +242,7 @@ def main():
             if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step", flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             out, br = evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank)
-            if a.cond != "text":       # train-pair eval (same grid, fixed eps) for the generalisation gate; text mode has no per-pair train texts here
+            if a.cond != "text" and (has_train_eval or True):       # train-pair eval (same grid, fixed eps) for the generalisation gate; text mode has no per-pair train texts here
                 out_tr, br_tr = evaluate(model, store, norm, a, tr_rows, tr_i, tr_j, None, None, dev, eps_bank_tr, prefix="eval_train")
                 out.update({k: v for k, v in out_tr.items() if "_gap/" not in k}); out["gate/heldout_over_train_fm"] = out["eval/fm_loss"] / max(1e-9, out_tr["eval_train/fm_loss"])
                 br["train_by_gap"] = br_tr["by_gap"]
