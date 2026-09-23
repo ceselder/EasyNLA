@@ -244,8 +244,14 @@ class TrunkCritic(nn.Module):
         grp = torch.arange(G * Kp, device=dev) // Kp; apos = torch.arange(G * Kp, device=dev) % Kp
         m[:, T:, :T] = key_mask[:, None, :] & keep[:, grp][:, :, None]
         m[:, T:, T:] = ((grp[:, None] == grp[None, :]) & (apos[:, None] >= apos[None, :]))[None]
+        if not getattr(self, "_multi_dbg", False) and x_t.is_cuda:
+            torch.cuda.reset_peak_memory_stats(); mem0 = torch.cuda.memory_allocated() / 2**30
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = self.owner(inputs_embeds=x_in, attention_mask=m[:, None], position_ids=pos, use_cache=False, trunk_n_act=Kp, trunk_groups=G).last_hidden_state
+        if not getattr(self, "_multi_dbg", False) and x_t.is_cuda:
+            self._multi_dbg = True
+            print(f"[trunk] multi_forward B={B} G={G} T={T} S={S} ids={tuple(ids.shape)} x_in={tuple(x_in.shape)} mask={tuple(m.shape)} grad_ckpt={self.grad_ckpt} training={self.owner.training}: "
+                  f"mem before {mem0:.1f} GiB, peak during trunk {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB, after {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
         hs = out[:, T:].float().reshape(B * G, Kp, H)
         delta = self.readout(self.readout_ln(hs).reshape(B * G, Kp * H)).view(B, G, d)
         self.last_delta_rms = float(delta.detach().float().pow(2).mean().sqrt())

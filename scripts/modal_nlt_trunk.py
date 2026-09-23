@@ -26,6 +26,7 @@ def _run(cmd, commit_every: int = 300):
     import subprocess, time
     os.environ["HF_HOME"] = "/vol/hf_cache"; os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"; os.environ["TRANSFORMERS_VERBOSITY"] = "error"; os.environ["TQDM_DISABLE"] = "1"   # keep the Modal log small (the loader's progress bar hit the log query limit)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("WANDB_DIR", "/root/wandb"); os.makedirs("/root/wandb", exist_ok=True)
     vol.reload()
     print("[modal] " + " ".join(cmd), flush=True)
