@@ -91,14 +91,15 @@ def para_files(files: list[str], source: str, verbosities: list[int], out_root: 
         df = pq.read_table(f).to_pandas()
         if "verbosity" in df.columns and verbosities:
             df = df[df["verbosity"].isin(verbosities)]
-        if "source" in df.columns:
-            src_col = df["source"].astype(str)
-        else:
-            src_col = pd.Series([source] * len(df), index=df.index)
-        df = df[df["text"].astype(str).str.len() > 0].reset_index(drop=True); src_col = src_col.loc[df.index] if len(src_col) == len(df) else pd.Series([source] * len(df))
+        df = df[df["text"].astype(str).str.len() > 0].reset_index(drop=True)
+        if "source" not in df.columns:
+            df["source"] = source
+        if "verbosity" not in df.columns:
+            df["verbosity"] = -1
         if max_texts_per_file:
             df = df.iloc[:max_texts_per_file].reset_index(drop=True)
         texts = df["text"].astype(str).tolist()
+        pids = df["pair_id"].astype(str).tolist(); srcs = df["source"].astype(str).tolist(); verbs = df["verbosity"].astype(int).tolist()
         rows = []
         for kind, sysmsg in PROMPTS.items():
             outs = []
@@ -115,12 +116,11 @@ def para_files(files: list[str], source: str, verbosities: list[int], out_root: 
                 n = len(tok.encode(t, add_special_tokens=False)); n0 = max(1, len(tok.encode(orig, add_special_tokens=False)))
                 if n < 3 or n > 3 * n0 + 8:
                     continue
-                pid = str(df["pair_id"].iloc[k])
-                rows.append(dict(pair_id=pid, text=t, n_tokens=n, source=PARA_SOURCE, sample_idx=0, para_of_source=str(df["source"].iloc[k]) if "source" in df.columns else source,
-                                 para_kind=kind, verbosity=int(df["verbosity"].iloc[k]) if "verbosity" in df.columns else -1, heldout=(pid in held)))
+                rows.append(dict(pair_id=pids[k], text=t, n_tokens=n, source=PARA_SOURCE, sample_idx=0, para_of_source=srcs[k],
+                                 para_kind=kind, verbosity=verbs[k], heldout=(pids[k] in held)))
         out = pd.DataFrame(rows)
         stem = os.path.basename(f).replace(".parquet", "")
-        for ho, g in out.groupby("heldout") if len(out) else []:
+        for ho, g in (out.groupby("heldout") if len(out) else []):
             d = f"{out_root}/heldout/{source}" if ho else f"{out_root}/{source}/train"
             os.makedirs(d, exist_ok=True)
             p = f"{d}/part_{stem}.parquet"
