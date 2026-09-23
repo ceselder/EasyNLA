@@ -83,7 +83,9 @@ def main():
         bpt = b0[m] / n_tok[m].clamp_min(1); nn = int(m.sum())
         d_dm = (b0[m] - b_dm[m]); d_rp = (b0[m] - b_rp[m]); wg_tok = within_group_std(n_tok[m], g)
         return {"n": nn, "bits_mean": bm, "bits_median": float(b0[m].median()), "bits_per_token_median": float(bpt.median()), "bits_per_token_mean": float(bpt.mean()),
-                "lambda_max": 0.5 * float(bpt.median()), "lambda_wg": 0.25 * wg / wg_tok if wg_tok > 0 else float("nan"), "within_group_std": wg, "within_group_std_tokens": wg_tok,
+                "lambda_max": 0.5 * float(bpt.median()), "lambda_wg": 0.25 * wg / wg_tok if wg_tok > 0 else float("nan"),
+                "lambda_content": 0.25 * max(0.0, float(d_dm.mean())) / wg_tok if wg_tok > 0 else float("nan"),   # scaled by the CONTENT signal (bits - z_dm), not the critic's spread
+                "within_group_std": wg, "within_group_std_tokens": wg_tok,
                 "scoring_noise": nz, "std_over_noise": wg / nz if nz > 0 else float("nan"),
                 "bits_dm": dm, "bits_rp": rp, "bits_minus_dm": float(d_dm.mean()), "bits_minus_dm_sem": float(d_dm.std() / nn ** 0.5), "bits_minus_rp": float(d_rp.mean()), "bits_minus_rp_sem": float(d_rp.std() / nn ** 0.5),
                 "bits_over_dm": bm / dm if dm > 0 else float("inf"), "critic_presence_offset_over_noise": abs(rp) / nz if nz > 0 else float("nan"),
@@ -104,6 +106,7 @@ def main():
     out["signal_workspace"] = bool(ws and ws["std_over_noise"] >= 3 and ws["bits_minus_dm"] > 3 * ws["bits_minus_dm_sem"] and ws["mention_next"] < 0.2)
     out["pass_workspace"] = bool(out["signal_workspace"] and out["critic_healthy_workspace"])
     out["lambda_recommended"] = ws.get("lambda_wg") if ws else None            # DECISIONS v1.5: 0.25 x wg std(bits) / wg std(tokens), WORKSPACE band
+    out["lambda_content"] = ws.get("lambda_content") if ws else None            # 0.25 x (bits - z_dm) / wg std(tokens): a length difference costs a quarter of the CONTENT signal
     samp = []
     for k in np.argsort(-b0.numpy())[:8].tolist() + np.argsort(b0.numpy())[:4].tolist():
         g = gl[k]; samp.append({"i": int(I[g]), "j": int(J[g]), "bits": float(b0[k]), "bits_dm": float(b_dm[k]), "tokens": int(n_tok[k]), "text": texts[k][:300]})

@@ -49,6 +49,7 @@ def parse():
     p.add_argument("--cotrain", action="store_true"); p.add_argument("--cotrain-lr", type=float, default=2e-5, help="adapter lr; the text adapter is ~0.6B params and sees ~100 rows/step, so keep it small (infra #112: adapters overfit in a few epochs)")
     p.add_argument("--cotrain-every", type=int, default=1, help="co-train the critic every k RL steps"); p.add_argument("--replay", default=None, help="comma list / globs of text parquet files (pool) for critic replay")
     p.add_argument("--cotrain-replay-n", type=int, default=64); p.add_argument("--cotrain-p-uncond", type=float, default=0.3)
+    p.add_argument("--cotrain-null-reg", type=float, default=1.0, help="weight of infra's NULL regulariser in the co-training loss: ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another row's text (keeps bits(random text) ~ 0 while co-training; 0 = off)")
     # data / eval / logging
     p.add_argument("--train-store-device", default="cpu"); p.add_argument("--max-train-pos", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=10); p.add_argument("--eval-pairs", type=int, default=128); p.add_argument("--save-every", type=int, default=25)
@@ -65,9 +66,9 @@ def lr_at(step, base_lr, warmup):
 
 class CriticCotrainer:
     """optional: one FM step per RL step on the best-of-group (h_i, h_j, z) rollouts + replay rows from the pool (DECISIONS D5)."""
-    def __init__(self, scorer, lr, p_uncond, replay_paths, data_dir, store):
+    def __init__(self, scorer, lr, p_uncond, replay_paths, data_dir, store, null_reg: float = 1.0):
         from nlt.critic.train import load_text_pairs
-        self.sc = scorer.inner; self.model = self.sc.model; self.enc = self.sc.encoder; self.p_uncond = p_uncond; self.store = store
+        self.sc = scorer.inner; self.model = self.sc.model; self.enc = self.sc.encoder; self.p_uncond = p_uncond; self.store = store; self.null_reg = null_reg
         # train ONLY the conditioning (text adapter) parameters, exactly infra's --freeze-prior selection: the unconditional path stays the
         # blind prior, so the bits baseline log p(h_j|h_i) never drifts under co-training (DECISIONS D3).
         self.cond_names = {n for n, _ in self.model.named_parameters() if (".read." in n or ".gate_mod." in n)}
@@ -96,8 +97,16 @@ class CriticCotrainer:
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = self.enc(texts)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, _, _ = pair_fm_loss(self.model, x0, hi, enc=enc, enc_mask=mask, p_uncond=self.p_uncond, log_s=log_s)
-        loss = loss.mean(); self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
-        self.model.eval(); self.model.requires_grad_(False)
+        loss = loss.mean(); null_loss = torch.zeros((), device=dev)
+        if self.null_reg > 0:                        # infra's null regulariser (nlt/critic/train.py): under ANOTHER row's text the velocity must equal the no-text velocity
+            Bn = x0.shape[0]; eps_n = torch.randn_like(x0); t_n = torch.rand(Bn, device=dev); x_tn = (1 - t_n)[:, None] * x0 + t_n[:, None] * eps_n
+            enc_rp = torch.roll(enc, Bn // 2, 0); mask_rp = torch.roll(mask, Bn // 2, 0)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.no_grad(): v_null = self.model(x_tn, t_n, hi, enc=enc_rp, enc_mask=torch.zeros_like(mask_rp), log_s=log_s)
+                v_rp = self.model(x_tn, t_n, hi, enc=enc_rp, enc_mask=mask_rp, log_s=log_s)
+            null_loss = ((v_rp.float() - v_null.float().detach()) ** 2).mean(); loss = loss + self.null_reg * null_loss
+        self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
+        self.model.eval(); self.model.requires_grad_(False); self.last_null = float(null_loss.detach())
         return float(loss.detach())
 
     def prepare_score(self):
@@ -151,7 +160,7 @@ def main():
     # ---- critic + paraphraser
     scorer = make_scorer(a, cdev)
     para = Paraphraser(a.paraphrase_model, gpu_mem=a.paraphrase_gpu_mem, gpu_index=cidx, seed=a.seed) if a.paraphrase_p > 0 else None
-    cot = CriticCotrainer(scorer, a.cotrain_lr, a.cotrain_p_uncond, a.replay, a.data_dir, store) if (a.cotrain and not a.stub_critic and a.critic) else None
+    cot = CriticCotrainer(scorer, a.cotrain_lr, a.cotrain_p_uncond, a.replay, a.data_dir, store, null_reg=a.cotrain_null_reg) if (a.cotrain and not a.stub_critic and a.critic) else None
     frozen = make_scorer(a, cdev) if (cot is not None and a.frozen_critic_eval) else None
     cross = {}
     if frozen is not None: cross["frozen"] = frozen
@@ -221,7 +230,7 @@ def main():
                "corr/reward_tokens": corr(rewards, n_tok), "corr/bits_tokens": corr(bits, n_tok), "paraphrase/frac": float(pmask.float().mean()),
                "paraphrase/bits_mean": float(bits[pmask & ok].mean()) if (pmask & ok).any() else float("nan"), "paraphrase/bits_mean_unparaphrased": float(bits[~pmask & ok].mean()) if (~pmask & ok).any() else float("nan"),
                "kl": um["kl_mean"], "entropy": um["entropy"], "sampler/absdiff_mean": um["sampler_logp_absdiff_mean"], "sampler/absdiff_max": um["sampler_logp_absdiff_max"], "sampler/masked": um["sampler_mismatch_masked"],
-               "steer/written": info["steer_written"], "steer/expected": info["steer_expected"], "cotrain/loss": cot_loss,
+               "steer/written": info["steer_written"], "steer/expected": info["steer_expected"], "cotrain/loss": cot_loss, "cotrain/null_loss": getattr(cot, "last_null", float("nan")) if cot is not None else float("nan"),
                "time/gen": t_gen, "time/para": t_para, "time/score": t_score, "time/update": t_upd, "time/sync": t_sync, "time/step": time.time() - t0, "gen_tok_per_s": info["tok_per_s"], **summarize_violations(viol)}
         log["lambda"] = lam
         for bname in ("pre", "workspace", "motor"):
