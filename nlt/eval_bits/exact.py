@@ -10,7 +10,7 @@ import math
 import torch
 
 
-def exact_logp(model, x0, h_i, depth=None, enc=None, enc_mask=None, n_steps=32, probes=1, gen=None, probe_bank=None):
+def exact_logp(model, x0, h_i, depth=None, enc=None, enc_mask=None, n_steps=32, probes=1, gen=None, probe_bank=None, log_s=None):
     """x0, h_i [B, d] normalised. depth long [B, 2] or None; enc/enc_mask for text (None = unconditional). Returns log p in nats [B].
     probe_bank: optional list of n_steps*2 x probes tensors [1, d] in {-1, +1} so several calls share the SAME probes (paired PMI)."""
     B, d = x0.shape; x = x0.clone(); logdet = torch.zeros(B, device=x0.device)
@@ -21,7 +21,7 @@ def exact_logp(model, x0, h_i, depth=None, enc=None, enc_mask=None, n_steps=32, 
         x = x.detach().requires_grad_(True); tt = torch.full((B,), float(t), device=x.device)
         with torch.enable_grad():
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                v = model(x, tt, h_i, depth=depth, depth_has=depth_has, enc=enc, enc_mask=enc_mask)
+                v = model(x, tt, h_i, depth=depth, depth_has=depth_has, enc=enc, enc_mask=enc_mask, log_s=log_s)
             v = v.float(); div = torch.zeros(B, device=x.device)
             for pi in range(probes):
                 if probe_bank is not None: e = probe_bank[k[0] * probes + pi].to(x.device).expand_as(x)
@@ -43,14 +43,14 @@ def make_probe_bank(n_steps, probes, d, gen, device="cpu"):
 
 
 @torch.no_grad()
-def proxy_losses(model, x0, h_i, t_grid, eps_bank, depth=None, enc=None, enc_mask=None):
+def proxy_losses(model, x0, h_i, t_grid, eps_bank, depth=None, enc=None, enc_mask=None, log_s=None):
     """FM loss per t (mean over dims) with GIVEN eps per t -> [len(t_grid), B]. Shared eps across variants = common random numbers."""
     from nlt.critic.model import pair_fm_loss
     B = x0.shape[0]; out = torch.zeros(len(t_grid), B)
     for ti, t in enumerate(t_grid):
         tt = torch.full((B,), float(t), device=x0.device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            l, _, _ = pair_fm_loss(model, x0, h_i, tt, eps_bank[ti].to(x0.device), depth=depth, enc=enc, enc_mask=enc_mask)
+            l, _, _ = pair_fm_loss(model, x0, h_i, tt, eps_bank[ti].to(x0.device), depth=depth, enc=enc, enc_mask=enc_mask, log_s=log_s)
         out[ti] = l.cpu()
     return out
 

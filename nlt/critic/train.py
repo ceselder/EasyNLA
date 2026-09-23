@@ -55,7 +55,7 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
     L_c = torch.zeros(len(T_GRID), n); L_u = torch.zeros(len(T_GRID), n); mse_id = torch.zeros(n); mse_x0 = torch.zeros(n); var_j = torch.zeros(n)
     for s in range(0, n, B):
         rows, i, j = val_rows[s:s + B], val_i[s:s + B], val_j[s:s + B]
-        h_i, x0 = make_x0(norm, store_val.gather(rows, i, dev), store_val.gather(rows, j, dev), a.target)
+        h_i, x0, log_s, _ = make_x0(norm, store_val.gather(rows, i, dev), store_val.gather(rows, j, dev), a.target, a.src_rms)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
         enc = mask = None
         if a.cond == "text":
@@ -64,16 +64,16 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
         for ti, t in enumerate(T_GRID):
             tt = torch.full((len(rows),), t, device=dev); eps = eps_bank[ti][s:s + B].to(dev)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                lc, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, depth=depth, enc=enc, enc_mask=mask)
+                lc, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, depth=depth, enc=enc, enc_mask=mask, log_s=log_s)
             L_c[ti, s:s + B] = lc.cpu()
             if a.cond != "none":
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    lu, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, depth=None, enc=None, enc_mask=None)
+                    lu, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, depth=None, enc=None, enc_mask=None, log_s=log_s)
                 L_u[ti, s:s + B] = lu.cpu()
             if t == 0.9:            # x0-prediction at high noise ~ conditional mean -> FVE-like number comparable to an MSE transcoder
                 x_t = (1 - tt)[:, None] * x0 + tt[:, None] * eps
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    v = model(x_t, tt, h_i, depth=depth, depth_has=None if depth is None else torch.ones(len(rows), dtype=torch.bool, device=dev), enc=enc, enc_mask=mask)
+                    v = model(x_t, tt, h_i, depth=depth, depth_has=None if depth is None else torch.ones(len(rows), dtype=torch.bool, device=dev), enc=enc, enc_mask=mask, log_s=log_s)
                 mse_x0[s:s + B] = ((x_t - tt[:, None] * v - x0) ** 2).mean(-1).cpu()
         var_j[s:s + B] = (x0 ** 2).mean(-1).cpu()          # energy of the target around the GLOBAL mean (the j-agnostic reference)
     model.train()
@@ -105,7 +105,8 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="critic")
-    p.add_argument("--cond", default="none", choices=["none", "depth", "text"]); p.add_argument("--target", default="hj", choices=["hj", "delta"]); p.add_argument("--norm", default="affine", choices=["affine", "scalar"])
+    p.add_argument("--cond", default="none", choices=["none", "depth", "text"]); p.add_argument("--target", default="delta", choices=["hj", "delta"]); p.add_argument("--norm", default="affine", choices=["affine", "scalar"])
+    p.add_argument("--src-rms", type=int, default=1, help="DECISIONS D2: divide h_i and the target by rms(h_i) after the pooled affine (1) or not (0, ablation)")
     p.add_argument("--d-model", type=int, default=2048); p.add_argument("--d-mlp", type=int, default=8192); p.add_argument("--n-layers", type=int, default=8)
     p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=512); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200); p.add_argument("--wd", type=float, default=0.01)
@@ -153,7 +154,8 @@ def main():
             print(f"[train] text pairs: train {len(text_df)} (verbosity {sorted(text_df['verbosity'].unique().tolist())}), val {len(keep)}/{len(pid)} with text", flush=True)
     model = PairDenoiser(d, a.d_model, a.d_mlp, a.n_layers, a.cond, d_enc=(encoder.d_enc if encoder else 0), n_slots=a.n_slots, n_heads=a.n_heads, d_head=a.d_head, gate_rank=a.gate_rank, target=a.target).to(dev)
     if encoder: model.d_enc_ = encoder.d_enc
-    print(f"[train] {a.cond} critic: {model.n_params()/1e6:.0f}M params, target {a.target}, norm {a.norm}, batch {a.batch}, {a.steps} steps", flush=True)
+    model.src_rms_ = bool(a.src_rms)
+    print(f"[train] {a.cond} critic: {model.n_params()/1e6:.0f}M params, target {a.target}, norm {a.norm}, src_rms {a.src_rms}, batch {a.batch}, {a.steps} steps", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
     step0 = 0
     if a.resume and os.path.exists(a.resume):
@@ -174,14 +176,14 @@ def main():
             rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values); j = torch.tensor(sub["j"].values); texts = sub["text"].tolist()
         else:
             rows, i, j = store.sample_pairs(a.batch, gen); texts = smoke_texts(store, rows, i, j, tok8) if (a.cond == "text") else None
-        h_i, x0 = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), a.target)
+        h_i, x0, log_s, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), a.target, a.src_rms)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
         enc = mask = None
         if a.cond == "text":
             with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts)
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss_vec, t, kept = pair_fm_loss(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0))
+            loss_vec, t, kept = pair_fm_loss(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s)
         loss = loss_vec.mean(); opt.zero_grad(set_to_none=True); loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip); opt.step()
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()

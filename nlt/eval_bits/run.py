@@ -76,32 +76,33 @@ def main():
         encoder = TextEncoder(a.enc_model, a.enc_layer, dev)
     results = {"n": n, "ode_steps": a.ode_steps, "probes": a.probes, "t_grid": list(T_GRID), "critics": {}}
     for name, path in ckpts:
-        model, aa, step = load_critic(path, dev, d_enc_override=(encoder.d_enc if encoder else None)); cond = model.cond; target = model.target
+        model, aa, step = load_critic(path, dev, d_enc_override=(encoder.d_enc if encoder else None)); cond = model.cond; target = model.target; src_rms = bool(aa.get("src_rms", 0))
         print(f"[bits] critic {name}: cond={cond} target={target} step={step} params {model.n_params()/1e6:.0f}M", flush=True)
         L_u = torch.zeros(len(T_GRID), n); L_c = torch.zeros(len(T_GRID), n); L_s = torch.zeros(len(T_GRID), n)
         lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
         for s in range(0, n, a.batch):
             r, i, j = rows[s:s + a.batch], I[s:s + a.batch], J[s:s + a.batch]
-            h_i, x0 = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target)
+            h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target, src_rms)
+            x_aff = norm.normalize(store_val.gather(r, j, dev))                 # the target in the pooled-affine space (for the Gaussian ruler)
             depth = torch.stack([i, j], 1).to(dev) if cond == "depth" else None
             enc = mask = enc_s = mask_s = None
             if cond == "text" and texts:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     enc, mask = encoder(texts[s:s + a.batch]); enc_s, mask_s = encoder(shuf_texts[s:s + a.batch])
             eb = [e[s:s + a.batch] for e in eps_bank]
-            L_u[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb)
+            L_u[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, log_s=log_s)
             if cond != "none":
-                L_c[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, depth=depth, enc=enc, enc_mask=mask)
-                if cond == "text": L_s[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_s, enc_mask=mask_s)
+                L_c[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, depth=depth, enc=enc, enc_mask=mask, log_s=log_s)
+                if cond == "text": L_s[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_s, enc_mask=mask_s, log_s=log_s)
             if not a.skip_exact:
-                lu = exact_logp(model, x0, h_i, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank); lp_u[s:s + a.batch] = lu.cpu()
-                ruler[s:s + a.batch] = bits_vs_gaussian(lu, x0).cpu()
+                lu = exact_logp(model, x0, h_i, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_u[s:s + a.batch] = lu.cpu()
+                ruler[s:s + a.batch] = bits_vs_gaussian(lu, x_aff).cpu()          # both sides in the pooled-affine space
                 if cond != "none":
-                    lc = exact_logp(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank); lp_c[s:s + a.batch] = lc.cpu()
+                    lc = exact_logp(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_c[s:s + a.batch] = lc.cpu()
                     if cond == "text":
-                        ls = exact_logp(model, x0, h_i, enc=enc_s, enc_mask=mask_s, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank); lp_s[s:s + a.batch] = ls.cpu()
+                        ls = exact_logp(model, x0, h_i, enc=enc_s, enc_mask=mask_s, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_s[s:s + a.batch] = ls.cpu()
             print(f"[bits] {name}: {min(n, s + a.batch)}/{n} rows, {time.time() - t0:.0f}s", flush=True)
-        res = {"cond": cond, "target": target, "step": step, "ckpt": path,
+        res = {"cond": cond, "target": target, "src_rms": src_rms, "step": step, "ckpt": path,
                "proxy_fm_loss_uncond": float(L_u.mean()), "proxy_fm_loss_uncond_by_t": L_u.mean(1).tolist(),
                "uncond_bits_per_dim_vs_gaussian": summarize(ruler.numpy(), gaps, js, "ruler") if not a.skip_exact else None,
                "uncond_nll_bits_per_dim": float(-lp_u.mean() / (d * math.log(2))) if not a.skip_exact else None}

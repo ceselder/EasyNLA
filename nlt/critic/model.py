@@ -25,7 +25,7 @@ class PairDenoiser(nn.Module):
         self.d, self.d_model, self.d_mlp, self.n_layers, self.cond, self.target = d, d_model, d_mlp, n_layers, cond, target
         self.in_proj = nn.Linear(2 * d, d_model)
         self.time_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
-        self.src_embed = nn.Sequential(nn.Linear(d, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
+        self.src_embed = nn.Sequential(nn.Linear(d + 1, d_model), nn.SiLU(), nn.Linear(d_model, d_model))   # [h_i, log rms(h_i)]: the source scale is a function of h_i (allowed)
         if cond == "depth":
             self.emb_i = nn.Embedding(N_LAYERS, d_model); self.emb_j = nn.Embedding(N_LAYERS, d_model)
             nn.init.normal_(self.emb_i.weight, std=0.02); nn.init.normal_(self.emb_j.weight, std=0.02)
@@ -38,15 +38,17 @@ class PairDenoiser(nn.Module):
         self.ln = nn.LayerNorm(d_model); self.out_proj = nn.Linear(d_model, d)
 
     def config(self):
-        return {k: getattr(self, k) for k in ("d", "d_model", "d_mlp", "n_layers", "cond", "target")} | {"d_enc": getattr(self, "d_enc_", 0)}
+        return {k: getattr(self, k) for k in ("d", "d_model", "d_mlp", "n_layers", "cond", "target")} | {"d_enc": getattr(self, "d_enc_", 0), "src_rms": getattr(self, "src_rms_", False)}
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, x_t, t, h_i, depth=None, depth_has=None, enc=None, enc_mask=None):
-        """x_t, h_i: [B, d] normalised; t: [B] in [0, 1] (1 = noise); depth: long [B, 2] = (i, j) layer indices; depth_has / enc_mask: per-sample
+    def forward(self, x_t, t, h_i, depth=None, depth_has=None, enc=None, enc_mask=None, log_s=None):
+        """x_t, h_i: [B, d] normalised (h_i already divided by its rms when --src-rms); log_s [B] = log rms of the source in the pooled-affine space
+        (0 when not scaling); t: [B] in [0, 1] (1 = noise); depth: long [B, 2] = (i, j) layer indices; depth_has / enc_mask: per-sample
         condition switches (False / all-False row = unconditional). Returns the predicted velocity [B, d] (float32)."""
-        emb = self.time_embed(timestep_embedding(t * 1000.0, self.d_model)) + self.src_embed(h_i)
+        if log_s is None: log_s = torch.zeros(h_i.shape[0], device=h_i.device)
+        emb = self.time_embed(timestep_embedding(t * 1000.0, self.d_model)) + self.src_embed(torch.cat([h_i, log_s[:, None].to(h_i.dtype)], -1))
         if self.cond == "depth" and depth is not None:
             de = self.emb_i(depth[:, 0] - K_LO) + self.emb_j(depth[:, 1] - K_LO)
             if depth_has is not None: de = de * depth_has[:, None].to(de.dtype)
@@ -59,10 +61,20 @@ class PairDenoiser(nn.Module):
         return self.out_proj(self.ln(h)).float()
 
 
-def make_x0(norm, h_i_raw, h_j_raw, target):
-    """normalised source and the flow target. delta: x0 = n(h_j) - n(h_i) (unit Jacobian, so log p(h_j|h_i) = log p(x0|h_i))."""
-    hi = norm.normalize(h_i_raw); hj = norm.normalize(h_j_raw)
-    return hi, (hj - hi if target == "delta" else hj)
+def make_x0(norm, h_i_raw, h_j_raw, target, src_rms=False):
+    """-> (source input, flow target x0, log_s [B], log_det [B]).
+    Pooled affine n(.) first (same map for every layer). With src_rms (DECISIONS D2): both are divided by s = rms(n(h_i)) (a function of the
+    source only) and log_s is fed to the critic as a scalar feature. Target: delta = n(h_j) - n(h_i) (unit Jacobian) or hj.
+    log_det = log |d x0 / d n(h_j)| = -d log s: add it to log p_model(x0 | .) to get log p in the pooled-affine space (constant across
+    conditioning variants of a pair, so PMI does not need it; the absolute Gaussian ruler does)."""
+    hi = norm.normalize(h_i_raw); hj = norm.normalize(h_j_raw); d = hi.shape[-1]
+    x0 = hj - hi if target == "delta" else hj
+    if src_rms:
+        s = hi.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-4)          # [B, 1]
+        hi = hi / s; x0 = x0 / s; log_s = s.squeeze(-1).log(); log_det = -d * log_s
+    else:
+        log_s = torch.zeros(hi.shape[0], device=hi.device); log_det = torch.zeros_like(log_s)
+    return hi, x0, log_s, log_det
 
 
 def x0_from_velocity(x_t, t, v):
@@ -70,7 +82,7 @@ def x0_from_velocity(x_t, t, v):
     return x_t - t[:, None] * v
 
 
-def pair_fm_loss(model, x0, h_i, t=None, eps=None, depth=None, enc=None, enc_mask=None, p_uncond=0.0, gen=None):
+def pair_fm_loss(model, x0, h_i, t=None, eps=None, depth=None, enc=None, enc_mask=None, p_uncond=0.0, gen=None, log_s=None):
     """per-sample FM loss (mean over dims) with PER-SAMPLE condition dropout. Returns (loss [B], t, kept [B] bool)."""
     B = x0.shape[0]; dev = x0.device
     if t is None: t = torch.rand(B, device=dev, generator=gen)
@@ -81,5 +93,5 @@ def pair_fm_loss(model, x0, h_i, t=None, eps=None, depth=None, enc=None, enc_mas
     depth_has = keep if depth is not None else None
     if enc_mask is not None: enc_mask = enc_mask & keep[:, None]
     x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
-    v = model(x_t, t, h_i, depth=depth, depth_has=depth_has, enc=enc, enc_mask=enc_mask)
+    v = model(x_t, t, h_i, depth=depth, depth_has=depth_has, enc=enc, enc_mask=enc_mask, log_s=log_s)
     return ((v - (eps - x0)) ** 2).mean(-1), t, keep

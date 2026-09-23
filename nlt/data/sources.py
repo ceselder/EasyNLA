@@ -13,12 +13,12 @@ SOURCES = [
     {"name": "chat",  "weight": 0.12, "kind": "hf_chat", "dataset": "HuggingFaceH4/ultrachat_200k", "data_files": "data/train_sft-*.parquet", "field": "messages"},
     {"name": "math",  "weight": 0.10, "kind": "hf", "dataset": "HuggingFaceTB/finemath", "data_files": "finemath-3plus/*.parquet", "field": "text"},
     {"name": "fiction", "weight": 0.10, "kind": "hf", "dataset": "manu/project_gutenberg", "data_files": "data/en-*.parquet", "field": "text", "window_chars": 6000, "buffer": 8},
-    {"name": "multi_de", "weight": 0.03, "kind": "hf", "dataset": "HuggingFaceFW/fineweb-2", "config": "deu_Latn", "field": "text"},
-    {"name": "multi_fr", "weight": 0.03, "kind": "hf", "dataset": "HuggingFaceFW/fineweb-2", "config": "fra_Latn", "field": "text"},
-    {"name": "multi_es", "weight": 0.02, "kind": "hf", "dataset": "HuggingFaceFW/fineweb-2", "config": "spa_Latn", "field": "text"},
-    {"name": "multi_zh", "weight": 0.03, "kind": "hf", "dataset": "HuggingFaceFW/fineweb-2", "config": "cmn_Hani", "field": "text"},
-    {"name": "multi_ja", "weight": 0.02, "kind": "hf", "dataset": "HuggingFaceFW/fineweb-2", "config": "jpn_Jpan", "field": "text"},
-    {"name": "multi_ru", "weight": 0.02, "kind": "hf", "dataset": "HuggingFaceFW/fineweb-2", "config": "rus_Cyrl", "field": "text"},
+    {"name": "multi_de", "weight": 0.03, "kind": "hf", "dataset": "parquet", "data_files": [f"hf://datasets/HuggingFaceFW/fineweb-2/data/deu_Latn/train/000_0000{k}.parquet" for k in range(3)], "field": "text"},
+    {"name": "multi_fr", "weight": 0.03, "kind": "hf", "dataset": "parquet", "data_files": [f"hf://datasets/HuggingFaceFW/fineweb-2/data/fra_Latn/train/000_0000{k}.parquet" for k in range(3)], "field": "text"},
+    {"name": "multi_es", "weight": 0.02, "kind": "hf", "dataset": "parquet", "data_files": [f"hf://datasets/HuggingFaceFW/fineweb-2/data/spa_Latn/train/000_0000{k}.parquet" for k in range(3)], "field": "text"},
+    {"name": "multi_zh", "weight": 0.03, "kind": "hf", "dataset": "parquet", "data_files": [f"hf://datasets/HuggingFaceFW/fineweb-2/data/cmn_Hani/train/000_0000{k}.parquet" for k in range(3)], "field": "text"},
+    {"name": "multi_ja", "weight": 0.02, "kind": "hf", "dataset": "parquet", "data_files": [f"hf://datasets/HuggingFaceFW/fineweb-2/data/jpn_Jpan/train/000_0000{k}.parquet" for k in range(3)], "field": "text"},
+    {"name": "multi_ru", "weight": 0.02, "kind": "hf", "dataset": "parquet", "data_files": [f"hf://datasets/HuggingFaceFW/fineweb-2/data/rus_Cyrl/train/000_0000{k}.parquet" for k in range(3)], "field": "text"},
 ]
 
 VAL_MOD = 25          # doc -> val iff crc32(text) % VAL_MOD == 0   (4 % of documents)
@@ -31,8 +31,8 @@ def is_val_doc(text: str) -> bool:
 def _hf_stream(src, n_producers, index, seed, hf_token):
     from datasets import load_dataset
     from datasets.distributed import split_dataset_by_node
-    if "config" in src: ds = load_dataset(src["dataset"], name=src["config"], split="train", streaming=True, token=hf_token)
-    else: ds = load_dataset(src["dataset"], data_files=src["data_files"], split="train", streaming=True, token=hf_token)
+    # explicit file lists through the generic parquet/json builders (hf:// paths): no builder-config resolution over thousands of files
+    ds = load_dataset(src["dataset"], data_files=src["data_files"], split="train", streaming=True, token=hf_token)
     ds = ds.shuffle(seed=seed, buffer_size=src.get("buffer", 1_000))     # whole-book rows: tiny buffer (the buffer fill blocks the GPU)
     if n_producers > 1:
         ds = split_dataset_by_node(ds, rank=index, world_size=n_producers)
