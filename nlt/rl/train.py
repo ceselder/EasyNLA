@@ -151,8 +151,8 @@ def main():
         res, info = rollout(llm, spec, acts, G, a.max_new_tokens, a.temperature, seed=a.seed * 1000 + step); t_gen = time.time() - t0
         n = len(res); groups = torch.tensor([r["prompt_idx"] for r in res]); texts = [r["text"].strip() for r in res]
         resp_ids = [r["full_ids"][r["prompt_len"]:].tolist() for r in res]; n_tok = torch.tensor([r["n_resp"] for r in res], dtype=torch.float32)
-        pos_idx = [int(meta_pos[rows[g_]]) for g_ in groups.tolist()]; nxt = [[int(meta_next[rows[g_]])] for g_ in groups.tolist()]
-        viol = vc.check(texts, resp_ids, pos_idx, nxt)
+        pos_idx = [int(meta_pos[rows[g_]]) for g_ in groups.tolist()]; nxt_w = [tok.decode([int(meta_next[rows[g_]])]) for g_ in groups.tolist()]
+        viol = vc.check(texts, resp_ids, pos_idx, next_words=nxt_w)
         # ---- paraphrase-scored rows
         t1 = time.time(); pmask = choose_paraphrase_rows(n, a.paraphrase_p, gen) if para is not None else torch.zeros(n, dtype=torch.bool)
         scored = list(texts)
@@ -206,7 +206,7 @@ def main():
                                                 data=[[step, int(I[groups[k]]), int(J[groups[k]]), float(rewards[k]), float(bits[k]), int(n_tok[k]), bool(bad[k]), texts[k][:400], scored[k][:400]] for k in pick + list(range(min(5, n)))])}, step=step)
             # held-out: one sample per val pair at the current policy
             te = time.time(); ev, _ = rollout(llm, spec, ev_acts, 1, a.max_new_tokens, a.temperature, seed=999); ev_txt = [r["text"].strip() for r in ev]
-            ev_v = vc_val.check(ev_txt, [r["full_ids"][r["prompt_len"]:].tolist() for r in ev], vp["pos_idx"].tolist(), [[int(x)] for x in vp["next_token_id"].tolist()])
+            ev_v = vc_val.check(ev_txt, [r["full_ids"][r["prompt_len"]:].tolist() for r in ev], vp["pos_idx"].tolist(), next_words=[tok.decode([int(x)]) for x in vp["next_token_id"].tolist()])
             es = scorer.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)
             eb = es["exact_bits"].float(); et = torch.tensor([r["n_resp"] for r in ev], dtype=torch.float32)
             # control: the SAME texts on the wrong pairs (random-pair shuffle, same probes/eps) -- an under-trained text path rewards the presence of any text

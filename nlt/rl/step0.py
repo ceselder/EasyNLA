@@ -46,7 +46,7 @@ def main():
     res, info = rollout(llm, spec, acts, a.group, a.max_new_tokens, a.temperature, seed=a.seed); print(f"[step0] rollout {info}", flush=True)
     del policy; torch.cuda.empty_cache()
     n = len(res); groups = torch.tensor([r["prompt_idx"] for r in res]); texts = [r["text"].strip() for r in res]; n_tok = torch.tensor([r["n_resp"] for r in res], dtype=torch.float32)
-    viol = vc.check(texts, [r["full_ids"][r["prompt_len"]:].tolist() for r in res], [int(vp["pos_idx"][g]) for g in groups.tolist()], [[int(vp["next_token_id"][g])] for g in groups.tolist()])
+    viol = vc.check(texts, [r["full_ids"][r["prompt_len"]:].tolist() for r in res], [int(vp["pos_idx"][g]) for g in groups.tolist()], next_words=[tok.decode([int(vp["next_token_id"][g])]) for g in groups.tolist()])
     scorer = make_scorer(a, cdev)
     def score(txts, seed):
         return scorer.score(h_i[groups], h_j[groups], [z if z else None for z in txts], groups.tolist(), seed=seed)["exact_bits"].float()

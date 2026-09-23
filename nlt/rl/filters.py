@@ -27,8 +27,18 @@ class ViolationChecker:
     def prefix_ids(self, pos_idx: int):
         return self.store.context_ids(int(pos_idx), self.ctx) if self.has_docs else []
 
-    def check(self, texts, resp_ids_list, pos_idx_list, next_ids_list=None):
-        """texts: decoded responses; resp_ids_list: response token ids (Qwen); pos_idx_list: the pair's position. -> dict of arrays [B]."""
+    @staticmethod
+    def mentions_word(text: str, next_word: str | None) -> bool:
+        """the decoded true next token, as a WORD (>= 3 alphabetic chars), appears in z (case-insensitive, word boundary).
+        Short / punctuation / sub-word next tokens are never counted (a single-token id match over-counts ' the', ',' ...)."""
+        if not next_word: return False
+        w = next_word.strip()
+        if len(w) < 3 or not w.isalpha(): return False
+        return re.search(r"(?<![A-Za-z])" + re.escape(w) + r"(?![A-Za-z])", text or "", re.I) is not None
+
+    def check(self, texts, resp_ids_list, pos_idx_list, next_ids_list=None, next_words=None):
+        """texts: decoded responses; resp_ids_list: response token ids (Qwen); pos_idx_list: the pair's position; next_words: decoded true
+        next token per row (preferred for the mention metric; next_ids_list is the token-run fallback). -> dict of arrays [B]."""
         B = len(texts)
         regex = np.zeros(B, bool); copy = np.zeros(B, np.float32); empty = np.zeros(B, bool); ment = np.zeros(B, bool); junk = np.zeros(B, bool)
         for k in range(B):
@@ -37,8 +47,9 @@ class ViolationChecker:
             regex[k] = bool(hard_hits(t)); junk[k] = is_junk(t)
             pre = self.prefix_ids(pos_idx_list[k])
             copy[k] = copy_rate_ngram(resp_ids_list[k], pre, self.ngram) if pre else 0.0
-            if next_ids_list is not None and next_ids_list[k] is not None:
-                ment[k] = mentions_continuation(resp_ids_list[k], next_ids_list[k], min_run=1)
+            if next_words is not None: ment[k] = self.mentions_word(t, next_words[k])
+            elif next_ids_list is not None and next_ids_list[k] is not None:
+                ment[k] = mentions_continuation(resp_ids_list[k], next_ids_list[k], min_run=2)
         copy_v = copy > self.copy_thresh
         return {"regex": regex, "copy_rate": copy, "copy": copy_v, "empty": empty, "junk": junk, "mention_next": ment, "any": regex | copy_v | empty | junk}
 
