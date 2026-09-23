@@ -60,18 +60,36 @@ def _iter_source(src, n_producers, index, seed, hf_token, tok, rng):
         yield text
 
 
-def doc_stream(n_producers, index, seed, hf_token, tok, sources=None):
-    """yield (source_name, text). Weighted interleave; a source that runs dry is dropped."""
+def doc_stream(n_producers, index, seed, hf_token, tok, sources=None, per_source_buffer=256):
+    """yield (source_name, text). Every source streams in its OWN thread into its own queue (network IO releases the GIL, so the sources
+    download in parallel); the consumer picks a source by weight. A source that runs dry or fails is dropped."""
+    import queue, threading
     sources = sources or SOURCES
     rng = random.Random(seed * 7919 + index)
-    its = [_iter_source(s, n_producers, index, seed + 13 * k, hf_token, tok, rng) for k, s in enumerate(sources)]
-    names = [s["name"] for s in sources]; weights = [float(s["weight"]) for s in sources]
-    while its:
-        k = rng.choices(range(len(its)), weights=weights)[0]
+    qs = {s["name"]: queue.Queue(maxsize=per_source_buffer) for s in sources}
+    STOP = object()
+
+    def worker(src, k):
+        q = qs[src["name"]]
         try:
-            yield names[k], next(its[k])
-        except StopIteration:
-            print(f"[prod{index}] source {names[k]} exhausted", flush=True); its.pop(k); names.pop(k); weights.pop(k)
-        except Exception as e:                       # a broken parquet row / transient hub error: drop the source rather than the run
-            print(f"[prod{index}] source {names[k]} failed: {type(e).__name__}: {str(e)[:200]} -> dropping it", flush=True)
-            its.pop(k); names.pop(k); weights.pop(k)
+            for text in _iter_source(src, n_producers, index, seed + 13 * k, hf_token, tok, random.Random(seed * 31 + index * 7 + k)):
+                q.put(text)
+            print(f"[prod{index}] source {src['name']} exhausted", flush=True)
+        except Exception as e:
+            print(f"[prod{index}] source {src['name']} failed: {type(e).__name__}: {str(e)[:200]} -> dropping it", flush=True)
+        q.put(STOP)
+    for k, src in enumerate(sources):
+        threading.Thread(target=worker, args=(src, k), daemon=True).start()
+    names = [s["name"] for s in sources]; weights = [float(s["weight"]) for s in sources]
+    while names:
+        k = rng.choices(range(len(names)), weights=weights)[0]; q = qs[names[k]]
+        try:
+            item = q.get(timeout=0.05)
+        except queue.Empty:
+            # this source is slow right now: take whatever any other source has ready instead of idling the GPU
+            ready = [n for n in names if not qs[n].empty()]
+            if not ready: item = q.get()                      # everybody is empty: block on the chosen one
+            else: k = names.index(rng.choice(ready)); item = qs[names[k]].get()
+        if item is STOP:
+            names.pop(k); weights.pop(k); continue
+        yield names[k], item
