@@ -50,17 +50,19 @@ def smoke_texts(store, rows, i, j, tok):
     return [f"next token: {tok.decode([int(x)])!r}" for x in nt]
 
 
-def synth_texts(mode, store, rows, i, j, tok=None):
+def synth_texts(mode, store, rows, i, j, tok=None, lf=None):
     """SYNTHETIC critic-diagnostic texts (DECISIONS v1.8 text-channel capacity tests; FORBIDDEN as verbalizer targets):
        depth   -> 'from layer {i} to layer {j}'          (T1: can the text channel read two integers? compare with the depth EMBEDDING critic)
        nexttok -> 'next token: <tok>'                     (plumbing)"""
     if mode == "depth": return [f"from layer {int(a)} to layer {int(b)}" for a, b in zip(i.tolist(), j.tolist())]
     if mode == "nexttok": return smoke_texts(store, rows, i, j, tok)
+    if mode == "jlens20":    # T2-text: raw J-lens top-20 token lists at the source and the target (needs lf = LensFeats)
+        return lf.texts(store.gather(rows, i), i, store.gather(rows, j), j)
     raise ValueError(mode)
 
 
 @torch.no_grad()
-def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank, prefix="eval"):
+def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank, prefix="eval", lf=None):
     """fixed pairs, fixed eps (per t) -> loss tables. Returns a flat dict of scalars + a nested breakdown."""
     model.eval()
     B = 256; n = len(val_rows); d = norm.mean.numel()
@@ -69,14 +71,15 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
         rows, i, j = val_rows[s:s + B], val_i[s:s + B], val_j[s:s + B]
         h_i, x0, log_s, _ = make_x0(norm, store_val.gather(rows, i, dev), store_val.gather(rows, j, dev), a.target, a.src_rms)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
-        enc = mask = None
+        enc = mask = None; vec = None
         if a.cond == "text":
             with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(val_text[s:s + B])
+        if a.cond == "vec": vec = lf.vec_feats(store_val.gather(rows, i), i, store_val.gather(rows, j), j)
         mse_id[s:s + B] = ((x0 - (0 if a.target == "delta" else h_i)) ** 2).mean(-1).cpu()       # identity transcoder h_j := h_i
         for ti, t in enumerate(T_GRID):
             tt = torch.full((len(rows),), t, device=dev); eps = eps_bank[ti][s:s + B].to(dev)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                lc, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, depth=depth, enc=enc, enc_mask=mask, log_s=log_s)
+                lc, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, depth=depth, enc=enc, enc_mask=mask, log_s=log_s, vec=vec)
             L_c[ti, s:s + B] = lc.cpu()
             if a.cond != "none":
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -85,7 +88,7 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
             if t == 0.9:            # x0-prediction at high noise ~ conditional mean -> FVE-like number comparable to an MSE transcoder
                 x_t = (1 - tt)[:, None] * x0 + tt[:, None] * eps
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    v = model(x_t, tt, h_i, depth=depth, depth_has=None if depth is None else torch.ones(len(rows), dtype=torch.bool, device=dev), enc=enc, enc_mask=mask, log_s=log_s)
+                    v = model(x_t, tt, h_i, depth=depth, depth_has=None if depth is None else torch.ones(len(rows), dtype=torch.bool, device=dev), enc=enc, enc_mask=mask, log_s=log_s, vec=vec, vec_has=None if vec is None else torch.ones(len(rows), dtype=torch.bool, device=dev))
                 mse_x0[s:s + B] = ((x_t - tt[:, None] * v - x0) ** 2).mean(-1).cpu()
         var_j[s:s + B] = (x0 ** 2).mean(-1).cpu()          # energy of the target around the GLOBAL mean (the j-agnostic reference)
     model.train()
@@ -117,7 +120,7 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="critic")
-    p.add_argument("--cond", default="none", choices=["none", "depth", "text"]); p.add_argument("--target", default="delta", choices=["hj", "delta"]); p.add_argument("--norm", default="affine", choices=["affine", "scalar"])
+    p.add_argument("--cond", default="none", choices=["none", "depth", "text", "vec"]); p.add_argument("--target", default="delta", choices=["hj", "delta"]); p.add_argument("--norm", default="affine", choices=["affine", "scalar"])
     p.add_argument("--src-rms", type=int, default=1, help="DECISIONS D2: divide h_i and the target by rms(h_i) after the pooled affine (1) or not (0, ablation)")
     p.add_argument("--d-model", type=int, default=2048); p.add_argument("--d-mlp", type=int, default=8192); p.add_argument("--n-layers", type=int, default=8)
     p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
@@ -129,7 +132,7 @@ def main():
     p.add_argument("--text-parquet", default=None, help="comma-separated text files/globs [pair_id, text, verbosity, source] for the TRAIN pairs (cond=text)"); p.add_argument("--text-verbosity", default=None, help="comma list of verbosity levels to train on (default all)")
     p.add_argument("--val-text-parquet", default=None, help="text files/globs for the VAL pairs (default: --text-parquet with '/train/' -> '/val/')")
     p.add_argument("--text-smoke", action="store_true", help="PLUMBING TEST: synthetic 'next token: X' text instead of --text-parquet")
-    p.add_argument("--text-synth", default=None, choices=["depth", "nexttok"], help="synthetic diagnostic texts generated from (pair) metadata for every sampled pair (v1.8 T1); overrides --text-parquet")
+    p.add_argument("--lens-dir", default="/vol/lens"); p.add_argument("--text-synth", default=None, choices=["depth", "nexttok", "jlens20"], help="synthetic diagnostic texts generated from (pair) metadata for every sampled pair (v1.8 T1); overrides --text-parquet")
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=128)
     p.add_argument("--wandb", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
@@ -166,13 +169,16 @@ def main():
         g_tr = torch.Generator().manual_seed(999); tr_rows, tr_i, tr_j = store.sample_pairs(len(val_rows), g_tr)
     g_eval2 = torch.Generator().manual_seed(4321); eps_bank_tr = [torch.randn(len(tr_rows), d, generator=g_eval2) for _ in T_GRID]
     # ---- text
-    encoder = None; text_df = None; val_text = None; tok8 = None
+    encoder = None; text_df = None; val_text = None; tok8 = None; lf = None
+    if a.text_synth == "jlens20" or a.cond == "vec":
+        from nlt.critic.lens_feats import LensFeats
+        lf = LensFeats(a.lens_dir, dev, k=20)
     if a.cond == "text":
         from nlt.critic.text_encoder import TextEncoder
         encoder = TextEncoder(a.enc_model, a.enc_layer, dev, a.enc_max_len)
         if a.text_synth:
             from transformers import AutoTokenizer
-            tok8 = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B"); val_text = synth_texts(a.text_synth, store_val, val_rows, val_i, val_j, tok8); a.text_smoke = True
+            tok8 = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B"); val_text = synth_texts(a.text_synth, store_val, val_rows, val_i, val_j, tok8, lf); a.text_smoke = True
             print(f"[train] SYNTHETIC TEXT MODE '{a.text_synth}' (critic diagnostic, forbidden for the verbalizer); example: {val_text[0]!r}", flush=True)
         elif a.text_smoke:
             from transformers import AutoTokenizer
@@ -204,7 +210,7 @@ def main():
         print(f"[train] init from {a.init_from} (step {ck.get('step')}): {len(sd)} tensors loaded, {len(res.missing_keys)} fresh (conditioning) tensors", flush=True)
     trainable = list(model.parameters())
     if a.freeze_prior:
-        cond_names = {n for n, _ in model.named_parameters() if (".read." in n or ".gate_mod." in n or n.startswith("emb_i") or n.startswith("emb_j"))}
+        cond_names = {n for n, _ in model.named_parameters() if (".read." in n or ".gate_mod." in n or n.startswith("emb_i") or n.startswith("emb_j") or n.startswith("tok_emb") or n.startswith("vec_in"))}
         for n, p_ in model.named_parameters(): p_.requires_grad_(n in cond_names)
         trainable = [p_ for n, p_ in model.named_parameters() if n in cond_names]
         print(f"[train] prior frozen: {sum(p_.numel() for p_ in trainable)/1e6:.1f}M trainable conditioning params", flush=True)
@@ -227,15 +233,16 @@ def main():
             idx = torch.randint(0, len(text_df), (a.batch,), generator=gen).numpy(); sub = text_df.iloc[idx]
             rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values); j = torch.tensor(sub["j"].values); texts = sub["text"].tolist()
         else:
-            rows, i, j = store.sample_pairs(a.batch, gen); texts = (synth_texts(a.text_synth, store, rows, i, j, tok8) if a.text_synth else smoke_texts(store, rows, i, j, tok8)) if (a.cond == "text") else None
+            rows, i, j = store.sample_pairs(a.batch, gen); texts = (synth_texts(a.text_synth, store, rows, i, j, tok8, lf) if a.text_synth else smoke_texts(store, rows, i, j, tok8)) if (a.cond == "text") else None
         h_i, x0, log_s, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), a.target, a.src_rms)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
-        enc = mask = None
+        enc = mask = None; vec = None
         if a.cond == "text":
             with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts)
+        if a.cond == "vec": vec = lf.vec_feats(store.gather(rows, i), i, store.gather(rows, j), j)
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss_vec, t, kept = pair_fm_loss(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s)
+            loss_vec, t, kept = pair_fm_loss(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s, vec=vec)
         loss = loss_vec.mean(); null_loss = torch.zeros((), device=dev)
         if a.null_reg > 0 and a.cond == "text":
             # NULL regulariser: under ANOTHER pair's text (batch rolled by B/2) the velocity must equal the no-text velocity (the frozen prior)
@@ -255,9 +262,9 @@ def main():
             wandb.log(log, step=step)
             if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step" + (f" cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} null {float(null_loss):.4f}" if a.cond != "none" else ""), flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
-            out, br = evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank)
+            out, br = evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank, lf=lf)
             if a.cond != "text" and (has_train_eval or True):       # train-pair eval (same grid, fixed eps) for the generalisation gate; text mode has no per-pair train texts here
-                out_tr, br_tr = evaluate(model, store, norm, a, tr_rows, tr_i, tr_j, None, None, dev, eps_bank_tr, prefix="eval_train")
+                out_tr, br_tr = evaluate(model, store, norm, a, tr_rows, tr_i, tr_j, None, None, dev, eps_bank_tr, prefix="eval_train", lf=lf)
                 out.update({k: v for k, v in out_tr.items() if "_gap/" not in k}); out["gate/heldout_over_train_fm"] = out["eval/fm_loss"] / max(1e-9, out_tr["eval_train/fm_loss"])
                 br["train_by_gap"] = br_tr["by_gap"]
             wandb.log(out, step=step); json.dump({"step": step + 1, "scalars": out, "breakdown": br}, open(os.path.join(a.out, "eval_latest.json"), "w"), indent=1)

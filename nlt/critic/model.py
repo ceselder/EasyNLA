@@ -19,9 +19,9 @@ from nlt.data.extract import K_LO, N_LAYERS
 
 class PairDenoiser(nn.Module):
     def __init__(self, d: int = 4096, d_model: int = 2048, d_mlp: int = 8192, n_layers: int = 8, cond: str = "none", d_enc: int = 0,
-                 n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, target: str = "hj"):
+                 n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, target: str = "hj", vec_k: int = 20, vec_vocab: int = 151936):
         super().__init__()
-        assert cond in ("none", "depth", "text")
+        assert cond in ("none", "depth", "text", "vec")
         self.d, self.d_model, self.d_mlp, self.n_layers, self.cond, self.target = d, d_model, d_mlp, n_layers, cond, target
         self.in_proj = nn.Linear(2 * d, d_model)
         self.time_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
@@ -29,6 +29,11 @@ class PairDenoiser(nn.Module):
         if cond == "depth":
             self.emb_i = nn.Embedding(N_LAYERS, d_model); self.emb_j = nn.Embedding(N_LAYERS, d_model)
             nn.init.normal_(self.emb_i.weight, std=0.02); nn.init.normal_(self.emb_j.weight, std=0.02)
+        if cond == "vec":            # T2 vector upper bound: top-k lens tokens (ids + log-probs) at the source and at the target, as numbers
+            self.vec_k, self.vec_vocab = vec_k, vec_vocab
+            self.tok_emb = nn.Embedding(vec_vocab, 128); nn.init.normal_(self.tok_emb.weight, std=0.02)
+            self.vec_in = nn.Sequential(nn.Linear(2 * 128 + 2 * vec_k, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
+            nn.init.zeros_(self.vec_in[2].weight); nn.init.zeros_(self.vec_in[2].bias)
         base = [MLPBlock(d_model, d_mlp) for _ in range(n_layers)]
         if cond == "text":
             assert d_enc > 0
@@ -43,7 +48,13 @@ class PairDenoiser(nn.Module):
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, x_t, t, h_i, depth=None, depth_has=None, enc=None, enc_mask=None, log_s=None):
+    def vec_features(self, vec_ids, vec_lp):
+        """vec_ids [B, 2, k] long, vec_lp [B, 2, k] log-probs -> [B, 2*128 + 2*k]: softmax-weighted token embeddings per side + the sorted log-prob profiles"""
+        w = torch.softmax(vec_lp.float(), -1)                                    # [B, 2, k]
+        e = (self.tok_emb(vec_ids) * w[..., None]).sum(2)                        # [B, 2, 128]
+        return torch.cat([e.flatten(1), vec_lp.float().flatten(1)], -1)
+
+    def forward(self, x_t, t, h_i, depth=None, depth_has=None, enc=None, enc_mask=None, log_s=None, vec=None, vec_has=None):
         """x_t, h_i: [B, d] normalised (h_i already divided by its rms when --src-rms); log_s [B] = log rms of the source in the pooled-affine space
         (0 when not scaling); t: [B] in [0, 1] (1 = noise); depth: long [B, 2] = (i, j) layer indices; depth_has / enc_mask: per-sample
         condition switches (False / all-False row = unconditional). Returns the predicted velocity [B, d] (float32)."""
@@ -53,6 +64,10 @@ class PairDenoiser(nn.Module):
             de = self.emb_i(depth[:, 0] - K_LO) + self.emb_j(depth[:, 1] - K_LO)
             if depth_has is not None: de = de * depth_has[:, None].to(de.dtype)
             emb = emb + de
+        if self.cond == "vec" and vec is not None:
+            ve = self.vec_in(self.vec_features(*vec).to(emb.dtype))
+            if vec_has is not None: ve = ve * vec_has[:, None].to(ve.dtype)
+            emb = emb + ve
         h = self.in_proj(torch.cat([x_t, h_i], -1))
         if self.cond == "text":
             for blk in self.blocks: h = blk(h, emb, enc, enc_mask)
@@ -82,16 +97,16 @@ def x0_from_velocity(x_t, t, v):
     return x_t - t[:, None] * v
 
 
-def pair_fm_loss(model, x0, h_i, t=None, eps=None, depth=None, enc=None, enc_mask=None, p_uncond=0.0, gen=None, log_s=None):
+def pair_fm_loss(model, x0, h_i, t=None, eps=None, depth=None, enc=None, enc_mask=None, p_uncond=0.0, gen=None, log_s=None, vec=None):
     """per-sample FM loss (mean over dims) with PER-SAMPLE condition dropout. Returns (loss [B], t, kept [B] bool)."""
     B = x0.shape[0]; dev = x0.device
     if t is None: t = torch.rand(B, device=dev, generator=gen)
     if eps is None: eps = torch.randn(x0.shape, device=dev, generator=gen)
     keep = torch.ones(B, dtype=torch.bool, device=dev)
-    if p_uncond > 0 and (depth is not None or enc is not None):
+    if p_uncond > 0 and (depth is not None or enc is not None or vec is not None):
         keep = torch.rand(B, device=dev, generator=gen) >= p_uncond
-    depth_has = keep if depth is not None else None
+    depth_has = keep if depth is not None else None; vec_has = keep if vec is not None else None
     if enc_mask is not None: enc_mask = enc_mask & keep[:, None]
     x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
-    v = model(x_t, t, h_i, depth=depth, depth_has=depth_has, enc=enc, enc_mask=enc_mask, log_s=log_s)
+    v = model(x_t, t, h_i, depth=depth, depth_has=depth_has, enc=enc, enc_mask=enc_mask, log_s=log_s, vec=vec, vec_has=vec_has)
     return ((v - (eps - x0)) ** 2).mean(-1), t, keep

@@ -53,7 +53,7 @@ def main():
     p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default=None, help="default: the text critic's own encoder (from its args)"); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--enc-max-len", type=int, default=None)
     p.add_argument("--skip-exact", action="store_true"); p.add_argument("--data-device", default="cuda"); p.add_argument("--stats", default=None, help="stats.pt (default <data-dir>/stats.pt; must match the critics')")
     p.add_argument("--paired-sets", default=None, help="additional label:path[@v] sets that only define the common/paired rows (not scored)")
-    p.add_argument("--synth-set", default=None, help="synthetic text sets mode:label (depth:depthtag) built from the pair metadata (v1.8 T1 diagnostic)")
+    p.add_argument("--lens-dir", default="/vol/lens"); p.add_argument("--synth-set", default=None, help="synthetic text sets mode:label (depth:depthtag) built from the pair metadata (v1.8 T1 diagnostic)")
     p.add_argument("--skip-extra-controls", action="store_true", help="skip the shuf_words and mask_next controls (2 extra exact passes per set)")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
@@ -74,11 +74,18 @@ def main():
             if "@" in path: path, v_ = path.rsplit("@", 1); verb = [int(v_)]          # label:path@2 -> only verbosity 2 rows of that file
             tdf = load_text_pairs([path], os.path.join(a.data_dir, "pairs_val.parquet"), verbosity=verb).drop_duplicates("pair_id").set_index("pair_id")
             text_sets[label] = tdf["text"].to_dict(); print(f"[bits] set {label}: {len(tdf)} pairs with text ({path}{'@'+str(verb[0]) if verb else ''})", flush=True)
+    lf = None
+    need_lf = (a.synth_set and "jlens20" in a.synth_set) or any(torch.load(c.split(":", 1)[1], map_location="cpu")["config"]["cond"] == "vec" for c in a.ckpts.split(","))
+    if need_lf:
+        from nlt.critic.lens_feats import LensFeats
+        lf = LensFeats(a.lens_dir, dev, k=20)
     if a.synth_set:
         from nlt.critic.train import synth_texts
         for item in a.synth_set.split(","):
             mode, label = item.split(":") if ":" in item else (item, item)
-            zz = synth_texts(mode, store_val, rows_all, I_all, J_all); text_sets[label] = dict(zip(vp["pair_id"].tolist(), zz)); print(f"[bits] synthetic set {label} ({mode}): e.g. {zz[0]!r}", flush=True)
+            zz = []
+            for s0 in range(0, NF, 256): zz += synth_texts(mode, store_val, rows_all[s0:s0 + 256], I_all[s0:s0 + 256], J_all[s0:s0 + 256], lf=lf)
+            text_sets[label] = dict(zip(vp["pair_id"].tolist(), zz)); print(f"[bits] synthetic set {label} ({mode}): e.g. {zz[0]!r}", flush=True)
     pid_all = vp["pair_id"].tolist()
     paired_sets = dict(text_sets)                      # extra sets that only DEFINE the common (paired) rows, so parallel jobs over set groups share one paired subset
     if a.paired_sets:
@@ -158,6 +165,7 @@ def main():
             h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target, src_rms)
             x_aff = norm.normalize(store_val.gather(r, j, dev))
             depth = torch.stack([i, j], 1).to(dev) if cond == "depth" else None
+            vec = lf.vec_feats(store_val.gather(r, i), i, store_val.gather(r, j), j) if cond == "vec" else None
             enc = mask = enc_s = mask_s = enc_r = mask_r = enc_w = mask_w = enc_m = mask_m = None
             if texts:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -172,12 +180,12 @@ def main():
                 for q, k in enumerate(kk): _uncond[(path, k)] = (Lu_b[:, q].clone(), float(lu_b[q]), float(ru_b[q]))
             for q, k in enumerate(kk): L_u[:, s + q] = _uncond[(path, k)][0]; lp_u[s + q] = _uncond[(path, k)][1]; ruler[s + q] = _uncond[(path, k)][2]
             if cond != "none":
-                L_c[:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, depth=depth, enc=enc, enc_mask=mask, log_s=log_s)
+                L_c[:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, depth=depth, enc=enc, enc_mask=mask, log_s=log_s, vec=vec)
                 if texts:
                     L_s[:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_s, enc_mask=mask_s, log_s=log_s)
                     L_r[:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_r, enc_mask=mask_r, log_s=log_s)
                 if not a.skip_exact:
-                    lp_c[s:s + B] = (exact_logp(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
+                    lp_c[s:s + B] = (exact_logp(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s, vec=vec) + log_det).cpu()
                     if texts:
                         lp_s[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_s, enc_mask=mask_s, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
                         lp_r[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_r, enc_mask=mask_r, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
