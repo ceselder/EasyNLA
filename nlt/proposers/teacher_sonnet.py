@@ -56,6 +56,16 @@ Later snapshot leanings: {lens_j}
 Model's final leanings for the next token: {final}
 
 JSON only."""
+USER_TMPL_NOFINAL = """Passage so far (the model is at its last word):
+<<<
+{context}
+>>>
+
+Earlier snapshot leanings: {lens_i}
+Later snapshot leanings: {lens_j}
+
+JSON only."""
+NO_FINAL = False          # set by --no-final: the teacher never sees the model's final next-token leanings
 
 
 def fmt_tokens(toks):
@@ -63,9 +73,16 @@ def fmt_tokens(toks):
 
 
 def build_messages(row):
-    user = USER_TMPL.format(context=row["context_text"], lens_i=fmt_tokens(row["lens_i_top10"]),
-                            lens_j=fmt_tokens(row["lens_j_top10"]), final=fmt_tokens(row["final_top10"]))
+    if NO_FINAL:
+        user = USER_TMPL_NOFINAL.format(context=row["context_text"], lens_i=fmt_tokens(row["lens_i_top10"]), lens_j=fmt_tokens(row["lens_j_top10"]))
+    else:
+        user = USER_TMPL.format(context=row["context_text"], lens_i=fmt_tokens(row["lens_i_top10"]),
+                                lens_j=fmt_tokens(row["lens_j_top10"]), final=fmt_tokens(row["final_top10"]))
     return [{"role": "user", "content": user}]
+
+
+def system_text():
+    return SYSTEM.replace(" You also get the model's final leanings for the next token.", "") if NO_FINAL else SYSTEM
 
 
 def parse_json(text: str) -> dict | None:
@@ -86,7 +103,7 @@ def client_kwargs():
 
 def params(row):
     return dict(model=MODEL, max_tokens=MAX_TOKENS,
-                system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+                system=[{"type": "text", "text": system_text(), "cache_control": {"type": "ephemeral"}}],
                 messages=build_messages(row))
 
 
@@ -182,7 +199,7 @@ def make_rows(features: pd.DataFrame, answers: dict, tok):
                 stats["hard_regex"] += 1; rejects.append(dict(pair_id=r["pair_id"], reason=f"regex:{hh[:2]}", text=text)); continue
             if cr > COPY_MAX:
                 stats["copy"] += 1; rejects.append(dict(pair_id=r["pair_id"], reason=f"copy:{cr:.2f}", text=text)); continue
-            keep.append(dict(pair_id=r["pair_id"], text=text, n_tokens=len(z_ids), verbosity=verb, source=SOURCE, sample_idx=0, copy_rate=cr))
+            keep.append(dict(pair_id=r["pair_id"], text=text, n_tokens=len(z_ids), verbosity=verb, source=SOURCE + ("-nofinal" if NO_FINAL else ""), sample_idx=0, copy_rate=cr))
             stats["kept"] += 1
     return pd.DataFrame(keep), pd.DataFrame(rejects), stats
 
@@ -195,7 +212,10 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--concurrency", type=int, default=24)
     ap.add_argument("--stall-min", type=int, default=20)
+    ap.add_argument("--no-final", action="store_true", help="teacher does not see the model's final next-token top-10 (DECISIONS v1.2 ablation)")
     a = ap.parse_args()
+    global NO_FINAL
+    NO_FINAL = a.no_final
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
     feats = pd.concat([pq.read_table(f).to_pandas() for f in a.features], ignore_index=True)

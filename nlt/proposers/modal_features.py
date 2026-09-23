@@ -34,6 +34,7 @@ image = (
         "huggingface_hub[hf_xet]", "safetensors", "sentencepiece", "numpy", "pyarrow", "pandas",
     )
     .env({"HF_HOME": HF_CACHE, "HF_HUB_DISABLE_XET": "1", "PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false"})
+    .add_local_python_source("nlt")          # so sibling modules (modal_ao_proposers) can import this one in the container
 )
 app = modal.App(APP_NAME, image=image)
 vol = modal.Volume.from_name("nlt", create_if_missing=True)
