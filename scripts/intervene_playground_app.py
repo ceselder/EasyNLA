@@ -349,7 +349,7 @@ def _ode1(fb, x, cond, t0, t1, steps):
 EA_METHODS = ["AR Δ: h + α‖h‖·unit(AR(z′)−AR(z))", "AR replace: AR(z′) rescaled to ‖h‖", "flow bridge Δ: h + α‖h‖·unit(bridge(h_pos) − h_pos)",
               "flow inversion at noise level τ: ODE h→x_τ under z (or ∅), back to 0 under z′", "SDEdit at noise level τ: noise h to τ, denoise under z′",
               "J-lens swap: exchange the lens coordinates of the source and target WORDS (α = swap strength)", "J-lens direction: h + α‖h‖·unit(v_target − v_source)", "random Δ (control)"]
-EA_SCOPES = ["one position", "every prompt position", "every generated position", "every position (prompt + generated)"]
+EA_SCOPES = ["one position", "this position + every generated position", "every prompt position", "every generated position", "every position (prompt + generated)"]
 
 
 def _make_edit(method, alpha, z, z_edit, h_ref, critic_name, flow_name, tau=0.5, inv_src="z", jsrc="", jtgt="", scope="one position"):
@@ -394,8 +394,8 @@ def ea_steer(text, pos, z, z_edit, method, alpha, scope, flow_name, critic_name,
     ids, H, base_lg = capture_all(text); T = ids.shape[1]; p_ = int(pos) % T
     try: edit, info = _make_edit(method, float(alpha), z, z_edit, H[p_], critic_name, flow_name, tau, inv_src, jsrc, jtgt, scope)
     except ValueError as e: return f"**{e}**", "", ""
-    pidx = {"one position": [p_], "every prompt position": list(range(T)), "every generated position": [], "every position (prompt + generated)": list(range(T))}[scope]
-    on_gen = scope in ("every generated position", "every position (prompt + generated)")
+    pidx = {"one position": [p_], "this position + every generated position": [p_], "every prompt position": list(range(T)), "every generated position": [], "every position (prompt + generated)": list(range(T))}[scope]
+    on_gen = scope in ("this position + every generated position", "every generated position", "every position (prompt + generated)")
     def gen(steer):
         with S["gpu"], _base():
             st.update(cap=None, vec=None, decode_fn=None, prefill_fn=(edit if steer and pidx else None), prefill_idx=torch.tensor(pidx or [0], device=DEV0))
@@ -414,7 +414,7 @@ def ea_steer(text, pos, z, z_edit, method, alpha, scope, flow_name, critic_name,
     if do_judge and target_prop.strip(): jb = judge(base_texts, orig_prop, target_prop, tail); ja = judge(st_texts, orig_prop, target_prop, tail)
     def fmt(texts, js):
         return "\n\n".join(f"**{i+1}.** {t.strip()}" + (f"\n<sub>judge: reflects target {j.get('reflects_target')} · retains original {j.get('retains_original')} · coherence {j.get('coherence_1_10')}</sub>" if js and js[i] else "") for i, (t, j) in enumerate(zip(texts, js or [None] * len(texts))))
-    head = (f"**{method}** · α={float(alpha):g} · scope **{scope}**" + (f" (position {p_}, token `{repr(tok.decode([ids[0, p_].item()]))[1:-1]}`)" if scope == "one position" else f" ({len(pidx)} prompt positions{' + every generated token' if on_gen else ''})")
+    head = (f"**{method}** · α={float(alpha):g} · scope **{scope}**" + (f" (position {p_}, token `{repr(tok.decode([ids[0, p_].item()]))[1:-1]}`)" if scope in ("one position", "this position + every generated position") and not on_gen else f" ({len(pidx)} prompt positions{' + every generated token' if on_gen else ''})")
             + f" · KL(steered‖base) at the first generated token = {kl:.3f}" + "".join(f" · {k_}={v:.3f}" for k_, v in info.items()) + f" · {time.time()-t0:.0f} s")
     if ja is not None:
         rt = lambda js: sum(1 for j in js if j.get("reflects_target")) / max(1, len(js)); co = lambda js: np.mean([j.get("coherence_1_10", np.nan) for j in js])
@@ -451,7 +451,7 @@ def ea_jspace(text, layer, topk, watch, show_edit, pos, z, z_edit, method, alpha
     if show_edit:
         try: edit, info = _make_edit(method, float(alpha), z, z_edit if z_edit.strip() else z, H[p_], critic_name, flow_name, tau, inv_src, jsrc, jtgt, scope)
         except ValueError as e: return f"**{e}**", ""
-        idx = torch.tensor([p_], device=DEV0) if scope == "one position" else torch.arange(T, device=DEV0)
+        idx = torch.tensor([p_], device=DEV0) if scope in ("one position", "this position + every generated position") else torch.arange(T, device=DEV0)
         lge = jl_logits(hs_of(edit, idx), l)
     rk = lambda lg: (lg > lg[:, wt:wt + 1]).sum(-1).tolist() if wt is not None else [None] * lg.shape[0]
     rb, re_ = rk(lgb), (rk(lge) if lge is not None else None)
@@ -459,7 +459,7 @@ def ea_jspace(text, layer, topk, watch, show_edit, pos, z, z_edit, method, alpha
     h = ['<table style="width:100%;font-size:12px"><tr><th>pos</th><th>token</th><th>top J-lens tokens</th>' + (f"<th>rank of '{_html.escape(watch)}'</th>" if wt is not None else "")
          + ("<th>top J-lens tokens AFTER the edit</th>" + (f"<th>rank AFTER</th>" if wt is not None else "") if lge is not None else "") + "</tr>"]
     for i in range(T):
-        mark = ' style="background:#fef3c7"' if (lge is not None and (scope != "one position" or i == p_)) else ""
+        mark = ' style="background:#fef3c7"' if (lge is not None and (scope not in ("one position", "this position + every generated position") or i == p_)) else ""
         h.append(f"<tr{mark}><td>{i}</td><td><code>{_html.escape(repr(toks_[i])[1:-1])}</code></td><td>{top(lgb, i)}</td>" + (f"<td>{rb[i] + 1}</td>" if wt is not None else "")
                  + ((f"<td>{top(lge, i)}</td>" + (f"<td><b>{re_[i] + 1}</b></td>" if wt is not None else "")) if lge is not None else "") + "</tr>")
     head = (f"J-lens layer {l} at all {T} positions" + (f" · watch word '{watch}' best rank {min(rb) + 1} (position {int(np.argmin(rb))})" if wt is not None else "")
@@ -471,6 +471,24 @@ def ea_jspace(text, layer, topk, watch, show_edit, pos, z, z_edit, method, alpha
 def ea_sonnet(text, pos, z, instr):
     ids, _ = _tok_text(text); p_ = int(pos) % ids.shape[1]
     return sonnet_edit(S["tok"].decode(ids[0, :p_ + 1].tolist())[-1500:], z, instr)
+
+
+# "animal swap" presets (from scripts/animal_swap_steer.py): the animal the model is thinking about at the last token is readable in J-space; steer it to another animal
+ANIMAL_PRESETS = [("My dog loves chasing the ball in the park. Every morning, my", "dog", "shark"), ("The zookeeper fed the elephant a huge pile of", "elephant", "butterfly"),
+                  ("The cat curled up on the windowsill and", "cat", "frog"), ("In the savanna, the lion stalked its prey through the tall", "lion", "owl"),
+                  ("Deep in the ocean, the whale sang a long, low", "whale", "monkey"), ("The farmer milked the cow before sunrise, and the", "cow", "dolphin"),
+                  ("It barked at the mailman, wagged its tail, and then the", "dog", "eagle"), ("It spun a web in the corner of the room and waited for a", "spider", "dog")]
+ANIMAL_METHOD, ANIMAL_ALPHA, ANIMAL_SCOPE = "J-lens direction: h + α‖h‖·unit(v_target − v_source)", 1.0, "one position"   # best comprehensible setting in the report (40 % on target)
+
+
+def ea_animal_preset(choice):
+    i = [f"{s_} → {t_}: {x}" for x, s_, t_ in ANIMAL_PRESETS].index(choice); x, s_, t_ = ANIMAL_PRESETS[i]
+    z = f"The text is about a {s_}; the continuation will keep talking about the {s_}."; ze = z.replace(s_, t_)
+    return (x, s_, "42", True, -1, z, ze, ANIMAL_METHOD, ANIMAL_ALPHA, ANIMAL_SCOPE, s_, t_, f"the text is about a {s_}", f"the text is about a {t_}", 40,
+            f"Loaded: the model is thinking about a **{s_}** at the last token; steering it to a **{t_}** with {ANIMAL_METHOD.split(':')[0]} (α={ANIMAL_ALPHA:g}, {ANIMAL_SCOPE}). "
+            f"Click **Read J-space** to see the {s_} in J-space before/after the edit, then **Steer**. z / z′ are templated sentences (used by the AR / flow methods); "
+            f"verbalize the last position for a real z. Stronger but less fluent: α=0.5 with scope 'this position + every generated position' (68 % on target in the report); "
+            f"most animal-like continuations when the animal is only implied (71 % vs 29 % when named).")
 
 
 def build_every_activation_tab(gr):
@@ -504,7 +522,7 @@ def build_every_activation_tab(gr):
     with gr.Row():
         orig_prop = gr.Textbox(lines=2, label="original proposition (for the judge)"); target_prop = gr.Textbox(lines=2, label="target proposition (for the judge)")
     with gr.Row():
-        method = gr.Dropdown(EA_METHODS, value=EA_METHODS[0], label="how z → z′ becomes an activation change"); alpha = gr.Slider(0.0, 4.0, value=1.0, step=0.25, label="α (push strength in units of ‖h_i‖)")
+        method = gr.Dropdown(EA_METHODS, value=EA_METHODS[0], label="how z → z′ becomes an activation change"); alpha = gr.Slider(0.0, 4.0, value=1.0, step=0.05, label="α (push strength in units of ‖h_i‖)")
         scope = gr.Radio(EA_SCOPES, value=EA_SCOPES[0], label="scope")
     with gr.Row():
         flow = gr.Dropdown(list(FLOWS), value=list(FLOWS)[0], label="flow model (bridge Δ / inversion / SDEdit; one loaded at a time, switching takes ~2 min)"); critic = gr.Dropdown(list(CRITICS), value=list(CRITICS)[0], label="MSE reconstructor (AR methods)")
@@ -519,6 +537,11 @@ def build_every_activation_tab(gr):
     with gr.Row():
         out_b = gr.Markdown(label="baseline"); out_s = gr.Markdown(label="steered")
     rbo = gr.Markdown()
+    gr.Markdown("### Preset: make the model think about a different animal\nPick a prompt: fills the text, the J-lens watch/source/target words, templated z / z′ and the best comprehensible steering recipe from the report (§ animal swap).")
+    with gr.Row():
+        apre = gr.Dropdown([f"{s_} → {t_}: {x}" for x, s_, t_ in ANIMAL_PRESETS], value=f"{ANIMAL_PRESETS[0][1]} → {ANIMAL_PRESETS[0][2]}: {ANIMAL_PRESETS[0][0]}", label="animal-swap preset")
+        apb = gr.Button("Load animal-swap preset")
+    apb.click(ea_animal_preset, [apre], [text, jwatch, jlayer, jshow, pos, z, z_edit, method, alpha, scope, jsrc, jtgt, orig_prop, target_prop, ntok, meta])
     loadb.click(ea_load_row, [row], [text, meta]); tokb.click(ea_tokenize, [text], [toks, meta])
     verb.click(ea_verbalize, [text, spec, av, vtemp, vmax, cache], [vmeta, cache, vtable])
     usep.click(ea_use_position, [text, pos, av, vtemp, cache], [z, z_edit, pmeta])
