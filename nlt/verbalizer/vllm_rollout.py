@@ -90,14 +90,15 @@ def rollout(llm, spec, acts: torch.Tensor, group_size: int, max_new_tokens: int,
 
 
 def chat_generate(llm, tok, user_texts, system: str | None = None, temperature: float = 0.7, max_tokens: int = 96, seed: int | None = None):
-    """plain (un-steered) chat generation on any vLLM engine, e.g. the paraphraser. Returns list[str]."""
+    """plain (un-steered) chat generation on any vLLM engine, e.g. the paraphraser. One SamplingParams PER request with its own seed
+    (a shared seeded SamplingParams gives every request the same RNG stream -> identical samples). Returns list[str]."""
     from vllm import SamplingParams, TokensPrompt
-    prompts = []
-    for u in user_texts:
+    prompts, params = [], []
+    for k, u in enumerate(user_texts):
         msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": u}]
         kw = {"enable_thinking": False} if "qwen" in getattr(tok, "name_or_path", "").lower() else {}
         text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, **kw)
         prompts.append(TokensPrompt(prompt_token_ids=tok.encode(text, add_special_tokens=False)))
-    sp = SamplingParams(temperature=temperature, max_tokens=max_tokens, top_p=0.95, **({"seed": seed} if seed is not None else {}))
-    outs = llm.generate(prompts, sp, use_tqdm=False)
+        params.append(SamplingParams(temperature=temperature, max_tokens=max_tokens, top_p=0.95, **({"seed": seed * 1_000_003 + k} if seed is not None else {})))
+    outs = llm.generate(prompts, params, use_tqdm=False)
     return [o.outputs[0].text.strip() for o in outs]
