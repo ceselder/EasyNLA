@@ -114,7 +114,7 @@ def main():
     ev_acts = torch.stack([store_val.gather(ev_rows, ev_i), store_val.gather(ev_rows, ev_j)], 1).float()
     # ---- policy + engine
     policy = load_policy(a.base, a.init, r=a.lora_r, alpha=a.lora_alpha, device=dev); policy.train()
-    inj = TwoMarkerInjector(policy, spec.marker_id)
+    inj = TwoMarkerInjector(policy, spec.marker_id, positions=(spec.pos_i, spec.pos_j))
     params = [p for p in policy.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
     llm = make_engine(a.base, tokenizer=a.base, gpu_mem=a.vllm_gpu_mem, max_len=a.vllm_max_len, seed=a.seed)

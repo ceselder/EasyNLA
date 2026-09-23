@@ -19,6 +19,7 @@ def main():
     p.add_argument("--epochs", type=float, default=1.0); p.add_argument("--lr", type=float, default=3e-5); p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--batch", type=int, default=32); p.add_argument("--micro", type=int, default=8); p.add_argument("--max-resp-tokens", type=int, default=96)
     p.add_argument("--max-rows", type=int, default=None); p.add_argument("--one-per-pair", action="store_true"); p.add_argument("--copy-thresh", type=float, default=0.05)
+    p.add_argument("--verbosity", default=None, help="comma list of verbosity levels to keep (default all)"); p.add_argument("--sources", default=None, help="comma list of source names to keep")
     p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16); p.add_argument("--train-store-device", default="cpu")
     p.add_argument("--eval-every", type=int, default=50); p.add_argument("--save-every", type=int, default=200); p.add_argument("--val-rows", type=int, default=512)
     p.add_argument("--wandb-project", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--no-wandb", action="store_true"); p.add_argument("--seed", type=int, default=0)
@@ -34,7 +35,12 @@ def main():
     dev = "cuda"; tok = load_tokenizer(a.base); spec = build_prompt(tok, a.question or DEFAULT_QUESTION); pad = tok.pad_token_id
 
     def load_rows(paths, split, store):
-        df = load_text_pairs(paths.split(","), os.path.join(a.data_dir, f"pairs_{split}.parquet")); df = df[df["pos_idx"].isin(store.row_of)]
+        import glob as _glob
+        files = sorted(sum([_glob.glob(x) if any(c in x for c in "*?[") else [x] for x in paths.split(",")], []))
+        assert files, f"no text files match {paths}"
+        verb = [int(v) for v in a.verbosity.split(",")] if a.verbosity else None
+        df = load_text_pairs(files, os.path.join(a.data_dir, f"pairs_{split}.parquet"), verbosity=verb); df = df[df["pos_idx"].isin(store.row_of)]
+        if a.sources: df = df[df["source"].isin(a.sources.split(","))]
         n0 = len(df); df = df[~df["text"].astype(str).map(lambda t: bool(hard_hits(t)))]; n1 = len(df)
         docs = store.load_docs(a.data_dir); keep = []
         if not docs: print(f"[sft:{split}] WARNING no docs parquet in {a.data_dir}/{split}: copy filter skipped", flush=True)
@@ -51,7 +57,7 @@ def main():
     store_val = dfv = None
     if a.val_text:
         store_val = ActStore(a.data_dir, "val", device="cpu"); dfv = load_rows(a.val_text, "val", store_val).iloc[: a.val_rows]
-    policy = load_policy(a.base, a.init, r=a.lora_r, alpha=a.lora_alpha, device=dev); policy.train(); inj = TwoMarkerInjector(policy, spec.marker_id)
+    policy = load_policy(a.base, a.init, r=a.lora_r, alpha=a.lora_alpha, device=dev); policy.train(); inj = TwoMarkerInjector(policy, spec.marker_id, positions=(spec.pos_i, spec.pos_j))
     params = [q for q in policy.parameters() if q.requires_grad]; opt = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0)
     n_steps = int(math.ceil(len(df) * a.epochs / a.batch)); print(f"[sft] {len(df)} rows, {n_steps} steps of {a.batch}", flush=True)
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"sft_{a.tag}", group="sft", config=vars(a))

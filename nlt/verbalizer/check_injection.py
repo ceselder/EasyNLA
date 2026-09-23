@@ -36,7 +36,7 @@ def main():
     acts = torch.stack([store.gather(rows, I), store.gather(rows, J)], 1).float()          # [N, 2, d]
     print(f"[check] {len(vp)} pairs, gaps {sorted(set((J - I).tolist()))}", flush=True)
     policy = load_policy(a.base, a.init, device=dev); policy.eval()
-    inj = TwoMarkerInjector(policy, spec.marker_id)
+    inj = TwoMarkerInjector(policy, spec.marker_id, positions=(spec.pos_i, spec.pos_j))
     llm = make_engine(a.base, tokenizer=a.base, gpu_mem=a.vllm_gpu_mem, max_len=a.vllm_max_len, seed=a.seed)
     base_samples = {}
     if a.base_samples > 0:                       # vLLM still holds the plain base here

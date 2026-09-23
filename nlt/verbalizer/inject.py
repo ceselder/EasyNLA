@@ -32,8 +32,12 @@ def _decoder(model):
 
 
 class TwoMarkerInjector:
-    def __init__(self, model, marker_id: int, layer: int = 1, strict: bool = True):
+    """positions: the two marker positions in the (constant, right-padded) prompt, e.g. (spec.pos_i, spec.pos_j). With positions given,
+    the hook injects EXACTLY there after checking the token is the marker; without them it scans the whole row for exactly two markers,
+    which breaks as soon as a response contains ' ?' (seen with lens-diff texts) -- always pass positions in training code."""
+    def __init__(self, model, marker_id: int, layer: int = 1, strict: bool = True, positions=None):
         self.marker_id, self.layer, self.strict = int(marker_id), int(layer), strict
+        self.positions = tuple(int(p) for p in positions) if positions is not None else None
         self.ref: list = [None]          # ref[0] = [B, 2, d] (or [B, d]) fp32/bf16 tensor, or None = no injection
         self.n_writes = 0                # marker writes since the last reset (explicit injection check)
         self._ids = None
@@ -60,10 +64,16 @@ class TwoMarkerInjector:
         assert vec.shape[0] == B, f"injection slot has {vec.shape[0]} rows for a batch of {B}"
         bidx, pidx, vrows = [], [], []
         for b in range(B):
-            pos = (ids[b] == self.marker_id).nonzero(as_tuple=False).flatten().tolist()
-            if len(pos) != 2:
-                if self.strict: raise RuntimeError(f"row {b}: expected 2 marker tokens, found {len(pos)}")
-                continue
+            if self.positions is not None:
+                pos = list(self.positions)
+                if ids.shape[1] <= pos[1] or any(int(ids[b, p]) != self.marker_id for p in pos):
+                    if self.strict: raise RuntimeError(f"row {b}: marker token not at the fixed prompt positions {pos}")
+                    continue
+            else:
+                pos = (ids[b] == self.marker_id).nonzero(as_tuple=False).flatten().tolist()
+                if len(pos) != 2:
+                    if self.strict: raise RuntimeError(f"row {b}: expected 2 marker tokens, found {len(pos)}")
+                    continue
             vb = vec[b]
             if vb.dim() == 1: vb = vb.unsqueeze(0).expand(2, -1)
             for k, p in enumerate(pos): bidx.append(b); pidx.append(p); vrows.append(vb[k])
