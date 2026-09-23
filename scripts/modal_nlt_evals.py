@@ -69,6 +69,21 @@ def build_manifest(extra: str = "", data: str = DATA):
     return _run(cmd)
 
 
+@app.function(timeout=1800, volumes={"/vol": vol}, cpu=4, memory=16 * 1024)
+def concat(extra: str = ""):
+    """--glob '/vol/evals/causal_val_s*.parquet' --out /vol/evals/causal_val.parquet : concatenate shard parquets (+ merged summary json)"""
+    import glob, json, pandas as pd
+    args = extra.split(); g = args[args.index("--glob") + 1]; out = args[args.index("--out") + 1]
+    vol.reload(); files = sorted(glob.glob(g)); assert files, g
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True).drop_duplicates("pair_id"); df.to_parquet(out, index=False)
+    summ = {"n": int(len(df)), "files": files}
+    if "kl_skip" in df.columns:
+        summ.update(kl_skip_mean=float(df.kl_skip.mean()), kl_skip_median=float(df.kl_skip.median()), kl_skip_by_gap={str(k): float(v) for k, v in df.groupby(df.j - df.i).kl_skip.mean().items()},
+                    kl_skip_by_j={str(k): float(v) for k, v in df.groupby("j").kl_skip.mean().items()}, lens_top1_changes_share=float((df.lens_i_top.str[0] != df.lens_j_top.str[0]).mean()),
+                    final_top1_is_next_share=float((df.final_top1 == df.next_token).mean()))
+    json.dump(summ, open(out + ".summary.json", "w"), indent=1); vol.commit(); print(json.dumps({k: v for k, v in summ.items() if k != "files"}, indent=1)); print("->", out)
+
+
 @app.function(timeout=1800, volumes={"/vol": vol}, cpu=2, memory=8 * 1024)
 def cat(path: str):
     vol.reload(); print(open(f"/vol/{path}").read())
@@ -87,6 +102,7 @@ def main(task: str = "text", extra: str = "", data: str = DATA, path: str = ""):
     elif task == "naturalness": print("rc", naturalness.remote(extra, data))
     elif task == "build-manifest": print("rc", build_manifest.remote(extra, data))
     elif task == "cat": cat.remote(path)
+    elif task == "concat": concat.remote(extra)
     elif task == "ls": ls.remote(path)
     else: raise SystemExit(task)
     print("done.")
