@@ -110,7 +110,9 @@ def main():
     p.add_argument("--warmup", type=int, default=100); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-decay", default="cosine", choices=["none", "cosine"])
     p.add_argument("--p-uncond", type=float, default=0.3); p.add_argument("--null-reg", type=float, default=1.0); p.add_argument("--null-frac", type=float, default=0.25)
     p.add_argument("--groups", type=int, default=1, help="G noise draws (t, eps) per text row in ONE trunk forward (block-diagonal mask; each group == a single forward). Multiplies the FM samples per step at ~1.3x the compute; condition dropout is per group")
-    p.add_argument("--contrast", type=float, default=0.0); p.add_argument("--contrast-tau", type=float, default=0.005); p.add_argument("--contrast-margin", type=float, default=0.005)
+    p.add_argument("--contrast", type=float, default=0.0, help="BANNED by DECISIONS v1.16 (one-sided hinge Goodharts by destroying the density under wrong text); kept for the record, do not use")
+    p.add_argument("--contrast-tau", type=float, default=0.005); p.add_argument("--contrast-margin", type=float, default=0.005)
+    p.add_argument("--null-dm", type=float, default=0.0, help="DECISIONS v1.16 NULL-DM: weight of ||v(x_t | z_dm) - v(x_t | empty)||^2 with z_dm = the depth-matched WRONG text (same (i,j) / same j), shared noise -> PMI(z_dm) -> 0 by construction; applied on the same rows as --null-reg")
     p.add_argument("--data-device", default="cpu"); p.add_argument("--val-device", default="cuda"); p.add_argument("--max-train-pos", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--save-every", type=int, default=500); p.add_argument("--max-hours", type=float, default=10.0)
     p.add_argument("--wandb", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--seed", type=int, default=0); p.add_argument("--resume", default=None)
@@ -189,22 +191,28 @@ def main():
             if gap.numel():
                 con_loss = torch.nn.functional.softplus((gap + a.contrast_margin) / a.contrast_tau).mean() * a.contrast_tau
                 con_acc = float((gap < 0).float().mean()); loss = loss + a.contrast * con_loss
-        if a.null_reg > 0:
+        dm_loss = torch.zeros((), device=dev)
+        if a.null_reg > 0 or a.null_dm > 0:
             Bn = max(2, int(a.batch * a.null_frac)); sl = slice(0, Bn)
             eps_n = torch.randn_like(x0[sl]); t_n = torch.rand(Bn, device=dev); x_tn = (1 - t_n)[:, None] * x0[sl] + t_n[:, None] * eps_n
-            rp = torch.roll(torch.arange(Bn, device=dev), Bn // 2)                                          # another pair's text (same batch)
             with torch.no_grad(): v_null = model(x_tn, t_n, h_i[sl], log_s=log_s[sl])
-            v_rp = model(x_tn, t_n, h_i[sl], enc=TextIDs(ids[sl][rp]), enc_mask=mask[sl][rp], log_s=log_s[sl])
-            null_loss = ((v_rp - v_null.detach()) ** 2).mean(); loss = loss + a.null_reg * null_loss
+            if a.null_reg > 0:                                                                                # batch-roll null: a random other pair's text -> the empty-prefix velocity
+                rp = torch.roll(torch.arange(Bn, device=dev), Bn // 2)
+                v_rp = model(x_tn, t_n, h_i[sl], enc=TextIDs(ids[sl][rp]), enc_mask=mask[sl][rp], log_s=log_s[sl])
+                null_loss = ((v_rp - v_null.detach()) ** 2).mean(); loss = loss + a.null_reg * null_loss
+            if a.null_dm > 0:                                                                                 # v1.16 null-dm: the depth-matched WRONG text (same (i,j)) -> the empty-prefix velocity
+                perm_dm = dm_perm(i, j).to(dev)[sl]
+                v_dm = model(x_tn, t_n, h_i[sl], enc=TextIDs(ids[perm_dm]), enc_mask=mask[perm_dm], log_s=log_s[sl])
+                dm_loss = ((v_dm - v_null.detach()) ** 2).mean(); loss = loss + a.null_dm * dm_loss
         opt.zero_grad(set_to_none=True); loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(ad_params + lora_params, a.grad_clip); opt.step()
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
         if step % 25 == 0:
-            log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/null_loss": float(null_loss), "train/contrast_loss": float(con_loss), "train/contrast_acc": con_acc, "train/lr_mult": m, "train/grad_norm": float(gn),
+            log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/null_loss": float(null_loss), "train/null_dm_loss": float(dm_loss), "train/contrast_loss": float(con_loss), "train/contrast_acc": con_acc, "train/lr_mult": m, "train/grad_norm": float(gn),
                    "train/step_s": (time.time() - t0) / max(1, step - step0 + 1), "train/loss_cond": float(loss_vec[kept].mean()) if kept.any() else float("nan"), "train/loss_uncond": float(loss_vec[~kept].mean()) if (~kept).any() else float("nan"),
                    "train/n_text_tokens": float(mask.sum(1).float().mean()), "train/delta_rms": getattr(model, "last_delta_rms", float("nan"))}
             wandb.log(log, step=step)
-            if step % 50 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} null {float(null_loss):.5f} con {float(con_loss):.4f} P(z>dm) {con_acc:.2f} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step T {log['train/n_text_tokens']:.0f} dRMS {log['train/delta_rms']:.4f}", flush=True)
+            if step % 50 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} null {float(null_loss):.5f} nulldm {float(dm_loss):.5f} con {float(con_loss):.4f} P(z>dm) {con_acc:.2f} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step T {log['train/n_text_tokens']:.0f} dRMS {log['train/delta_rms']:.4f}", flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             if sets:
                 te = time.time(); out, br = evaluate(model, store_val, norm, space, sets, dev, eps_bank)
