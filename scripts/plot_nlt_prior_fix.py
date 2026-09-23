@@ -101,7 +101,7 @@ def main():
         out["ode_sweep"]["pooled_full"] = {"label": "pooled Δ, 1.89B, 20k steps", "gain_by_steps": {64: dp[0]["exact_gain_bits"]}, "sem": dp[0]["sem"], "source": "data/info_budget.json"}
     ax4.set_xscale("log", base=2); ax4.set_xticks([8, 16, 32, 64, 128]); ax4.set_xticklabels(["8", "16", "32", "64", "128"]); ax4.axhline(BOUND, color=INK, lw=1.2, ls=(0, (4, 2)))
     ax4.text(128, BOUND + 2, f"bound {BOUND}", ha="right", fontsize=10, color=INK); ax4.set_xlabel("Heun steps in the probability-flow ODE"); ax4.set_ylabel("told-depth exact gain, bits per pair")
-    ax4.set_ylim(0, max(80, ax4.get_ylim()[1])); ax4.legend(frameon=False, loc="upper right", fontsize=9)
+    ax4.set_ylim(0, 118); ax4.set_yticks([0, 20, 40, 60, 80]); ax4.legend(frameon=False, loc="upper right", fontsize=9)
     ax4.set_title("(d) The depth gain is estimator-sensitive (judge it at ≥ 64\nsteps); the blind density itself is flat across step counts", loc="left", fontsize=12.5)
     fig.suptitle("\n".join(textwrap.wrap("The critic's target parameterisation was the bug, not the likelihood code: dividing the target by rms(h_i) inflated deep, "
                                           "large-gap targets to ~26σ per dimension; the pooled affine fixes the density; the radial squash halves the depth hedging at small scale (28 vs 60 bits) "
