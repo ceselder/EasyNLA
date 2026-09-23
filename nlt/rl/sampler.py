@@ -37,6 +37,28 @@ class StratifiedSampler:
             out[p] = others[torch.randperm(others.numel(), generator=gen)[:n_dist]]
         return out
 
+    def same_doc_partners(self, rows: torch.Tensor, gen: torch.Generator | None = None) -> torch.Tensor:
+        """for each store row, another row of the SAME document (redteam #228 H1a: topic/source words cancel); falls back to a random other row
+        when the document has no other stored position. Builds a doc -> rows index once from store.meta."""
+        if not hasattr(self, "_doc_rows"):
+            import collections
+            self._doc_rows = collections.defaultdict(list); docs = self.store.meta["doc_id"].values
+            for r_, d_ in enumerate(docs): self._doc_rows[int(d_)].append(r_)
+            self._docs = docs
+        out = []
+        for r in rows.tolist():
+            cands = [q for q in self._doc_rows[int(self._docs[r])] if q != r]
+            out.append(cands[int(torch.randint(0, len(cands), (1,), generator=gen))] if cands else self.same_class_partner(0, 0, r, gen))
+        return torch.tensor(out)
+
+    @staticmethod
+    def wrong_j(I: torch.Tensor, J: torch.Tensor, j_hi: int = J_HI, gen: torch.Generator | None = None) -> torch.Tensor:
+        """another target layer j' != j in {i+1 .. j_hi} for each pair (redteam #228 H1c; OPTIONAL: pays for depth cues)"""
+        out = []
+        for i, j in zip(I.tolist(), J.tolist()):
+            c = [q for q in range(i + 1, j_hi + 1) if q != j]; out.append(c[int(torch.randint(0, len(c), (1,), generator=gen))] if c else j)
+        return torch.tensor(out)
+
     def same_class_partner(self, i: int, j: int, exclude_row: int | None, gen: torch.Generator | None = None):
         """a random store row != exclude_row, used as a depth-matched distractor for replay-pool rows (same (i, j), other position)."""
         while True:

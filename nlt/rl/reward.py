@@ -102,6 +102,11 @@ def referential_score(scorer, h_i_pairs, h_j_pairs, texts, groups, dist_idx, see
     banks, and a distractor pair is passed as its own group id, so its unconditional term is computed once and shared by every text
     scored against it. Returns own [n], dist [n, K], content [n] = own - mean_k dist (all exact bits)."""
     groups = torch.as_tensor(groups, dtype=torch.long); n = groups.numel(); K = dist_idx.shape[1]
+    inner = getattr(scorer, "inner", scorer)
+    if hasattr(inner, "score_cross"):                       # fused path (infra / trunk): one unconditional cache for own + distractor pairs
+        out = inner.score_cross(h_i_pairs, h_j_pairs, texts, groups.tolist(), dist_idx[groups].tolist(), seed)
+        own = torch.as_tensor(out["exact_bits_own"]).float().cpu(); dist = torch.as_tensor(out["exact_bits_distractors"]).float().cpu().reshape(n, K)
+        return own, dist, own - dist.mean(1)
     own = scorer.score(h_i_pairs[groups], h_j_pairs[groups], texts, groups.tolist(), seed=seed)["exact_bits"].float()
     dist = torch.zeros(n, K)
     for k in range(K):
