@@ -25,7 +25,7 @@ def collect(d, tag):
     out = {"tag": tag, "verdicts": {}, "numbers": {}}
     t = _load(f"{d}/text_{tag}.json")
     if t:
-        out["verdicts"].update(t.get("verdicts", {}))
+        out["verdicts"].update({k.replace("verdict_", ""): v for k, v in t.get("verdicts", {}).items()})
         out["numbers"].update(hard_per_1000=t["regex"]["hard_hits_per_1000_z"], soft_per_z=t["regex"]["soft_hits_per_z"], tokens_median=t["diversity"]["tokens_median"], distinct4=t["diversity"]["distinct_4gram_ratio"],
                               self_bleu=t["diversity"]["self_bleu4"], n_texts=t["n"])
         if "depth" in t: out["numbers"].update(mi_z_j_bits=t["depth"]["j"].get("mi_bits"), gap_mae_ratio=t["depth"]["gap"].get("ratio"))
