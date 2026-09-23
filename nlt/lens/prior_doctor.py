@@ -97,6 +97,58 @@ def fixed_val(store_val, data_dir, n):
     return store_val.rows_for(vp["pos_idx"].values), torch.tensor(vp["i"].values.astype(np.int64)), torch.tensor(vp["j"].values.astype(np.int64))
 
 
+def exact_eval(a, models, noise_net, norm, store_val, v_rows, v_i, v_j, ode_steps, probes, t0=0.0, hist=None):
+    """exact log p of every model on the fixed pairs, converted to the pooled-affine h_j space; paired probes; -> result dict"""
+    d = store_val.d; dev = "cuda"
+    for m in models.values(): m.eval()
+    if noise_net: noise_net.eval()
+    g = torch.Generator().manual_seed(a.seed); bank = make_probe_bank(ode_steps, probes, d, g)
+    lps = {c_: [] for c_ in models}; ref = []; gaps = []; js = []
+    with torch.no_grad():
+        for s_ in range(0, len(v_rows), a.eval_batch):
+            sl = slice(s_, s_ + a.eval_batch)
+            h_i = store_val.gather(v_rows[sl], v_i[sl], dev).float(); h_j = store_val.gather(v_rows[sl], v_j[sl], dev).float()
+            nj = norm.normalize(h_j)
+            ref.append((-0.5 * (nj ** 2).sum(-1) - 0.5 * d * math.log(2 * math.pi)).cpu())          # log N(n(h_j); 0, I): the ruler
+            gaps.append((v_j[sl] - v_i[sl]).numpy()); js.append(v_j[sl].numpy())
+            hi, x0, log_s, logdet, _ = build_x0(a.variant, norm, h_i, h_j, a.c, noise_net)
+            for c_, m in models.items():
+                depth = torch.stack([v_i[sl], v_j[sl]], 1).to(dev) if c_ == "depth" else None
+                lp = exact_logp(m, x0, hi, depth=depth, n_steps=ode_steps, probes=probes, probe_bank=bank, log_s=log_s)
+                lps[c_].append((lp + logdet).cpu())
+            print(f"[pd-eval] ode {ode_steps} probes {probes}: {min(s_ + a.eval_batch, len(v_rows))}/{len(v_rows)} ({time.time()-t0:.0f}s)", flush=True)
+    ref = torch.cat(ref).numpy(); gaps = np.concatenate(gaps); js = np.concatenate(js)
+    res = {"variant": a.variant, "c": a.c, "n": int(len(ref)), "ode_steps": ode_steps, "probes": probes, "steps": a.steps, "batch": a.batch,
+           "max_pos": a.max_pos, "n_params": models["none"].n_params(), "gauss_nll_bits_dim": float(-ref.mean() / (d * math.log(2))), "hist": hist or []}
+    for c_ in lps:
+        lp = torch.cat(lps[c_]).numpy(); nll = -lp / (d * math.log(2)); vs = (lp - ref) / (d * math.log(2))
+        res[c_] = {"nll_bits_dim": float(nll.mean()), "nll_bits_dim_sem": float(nll.std() / math.sqrt(len(nll))), "vs_gauss_bits_dim": float(vs.mean()),
+                   "vs_gauss_by_band": band_means(vs, gaps, js), "logp_nats": lp.tolist()}
+        print(f"[pd-eval] {a.variant} {c_} (ode {ode_steps}): exact NLL {res[c_]['nll_bits_dim']:.4f} bits/dim (pooled space); vs N(0,I) {res[c_]['vs_gauss_bits_dim']:+.4f} bits/dim; "
+              f"bands { {b: round(v['mean'], 3) for b, v in res[c_]['vs_gauss_by_band'].items()} }", flush=True)
+    if "depth" in lps:
+        gain = (torch.cat(lps["depth"]) - torch.cat(lps["none"])).numpy() / math.log(2)
+        res["depth_gain_bits"] = {"mean": float(gain.mean()), "sem": float(gain.std() / math.sqrt(len(gain))), "median": float(np.median(gain)),
+                                  "frac_positive": float((gain > 0).mean()), "by_band": band_means(gain, gaps, js)}
+        print(f"[pd-eval] {a.variant} told-depth exact gain (ode {ode_steps}) {gain.mean():+.1f} +- {gain.std()/math.sqrt(len(gain)):.1f} bits/pair (median {np.median(gain):+.1f}, "
+              f"{100*(gain>0).mean():.0f}% positive); bands { {b: round(v['mean'], 1) for b, v in res['depth_gain_bits']['by_band'].items()} }", flush=True)
+    return res
+
+
+def load_ckpts(a, dev):
+    """eval-only: load ckpt_none.pt / ckpt_depth.pt of a finished run"""
+    models = {}; noise_net = None
+    for c_ in ("none", "depth"):
+        p_ = os.path.join(a.ckpt_dir, f"ckpt_{c_}.pt")
+        if not os.path.exists(p_): continue
+        ck = torch.load(p_, map_location="cpu"); cfg = ck["config"]
+        m = PairDenoiser(cfg["d"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"], cfg["cond"], target="delta").to(dev); m.load_state_dict(ck["model"]); models[c_] = m
+        a.variant = cfg["variant"]; a.c = cfg.get("c", 1.0); a.steps = ck["step"]
+        if ck.get("noise_net") and noise_net is None:
+            noise_net = NoiseScale(cfg["d"]).to(dev); noise_net.load_state_dict(ck["noise_net"])
+    return models, noise_net
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", default="/vol/data/qwen3_8b"); p.add_argument("--data-device", default="cpu")
@@ -108,9 +160,19 @@ def main():
     p.add_argument("--eval-n", type=int, default=1024); p.add_argument("--eval-every", type=int, default=1000); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ode-steps", type=int, default=32); p.add_argument("--probes", type=int, default=1); p.add_argument("--eval-batch", type=int, default=128)
     p.add_argument("--skip-depth", action="store_true")
+    p.add_argument("--eval-only", action="store_true"); p.add_argument("--ckpt-dir", default=None); p.add_argument("--ode-sweep", default="16,32,64,128")
     a = p.parse_args()
     dev = "cuda"; torch.manual_seed(a.seed); torch.backends.cuda.matmul.allow_tf32 = True
     norm = GlobalNorm.load(os.path.join(a.data_dir, "stats.pt"), "affine").to(dev)
+    if a.eval_only:                                   # (i) ODE-step sweep on a finished run's blind + depth checkpoints
+        store_val = ActStore(a.data_dir, "val", device=a.data_device, max_pos=a.max_val_pos)
+        v_rows, v_i, v_j = fixed_val(store_val, a.data_dir, a.eval_n)
+        models, noise_net = load_ckpts(a, dev); t0 = time.time(); sweep = {}
+        for n_ode in [int(x) for x in a.ode_sweep.split(",")]:
+            r = exact_eval(a, models, noise_net, norm, store_val, v_rows, v_i, v_j, n_ode, a.probes, t0)
+            sweep[str(n_ode)] = {k: v for k, v in r.items() if k != "hist"}
+        os.makedirs(a.res_dir, exist_ok=True); out = os.path.join(a.res_dir, f"{a.tag}_odesweep.json"); json.dump(sweep, open(out, "w"), indent=1)
+        print("[pd-eval] wrote", out, flush=True); return
     store = ActStore(a.data_dir, "train", device=a.data_device, max_pos=a.max_pos)
     store_val = ActStore(a.data_dir, "val", device=a.data_device, max_pos=a.max_val_pos)
     d = store.d
@@ -171,39 +233,7 @@ def main():
                     "config": m.config() | {"variant": a.variant, "c": a.c}}, os.path.join(out_dir, f"ckpt_{c_}.pt"))
     print(f"[pd] saved {out_dir}/ckpt_*.pt ({time.time()-t0:.0f}s); exact eval on {len(v_rows)} fixed pairs", flush=True)
 
-    # ---------------------------------------------------------------- exact log p on the common ruler (paired probes)
-    for m in models.values(): m.eval()
-    if noise_net: noise_net.eval()
-    g = torch.Generator().manual_seed(a.seed); bank = make_probe_bank(a.ode_steps, a.probes, d, g)
-    lps = {c_: [] for c_ in models}; ref = []; gaps = []; js = []
-    with torch.no_grad():
-        for s_ in range(0, len(v_rows), a.eval_batch):
-            sl = slice(s_, s_ + a.eval_batch)
-            h_i = store_val.gather(v_rows[sl], v_i[sl], dev).float(); h_j = store_val.gather(v_rows[sl], v_j[sl], dev).float()
-            nj = norm.normalize(h_j)
-            ref.append((-0.5 * (nj ** 2).sum(-1) - 0.5 * d * math.log(2 * math.pi)).cpu())          # log N(n(h_j); 0, I): the ruler
-            gaps.append((v_j[sl] - v_i[sl]).numpy()); js.append(v_j[sl].numpy())
-            hi, x0, log_s, logdet, _ = build_x0(a.variant, norm, h_i, h_j, a.c, noise_net)
-            for c_, m in models.items():
-                depth = torch.stack([v_i[sl], v_j[sl]], 1).to(dev) if c_ == "depth" else None
-                lp = exact_logp(m, x0, hi, depth=depth, n_steps=a.ode_steps, probes=a.probes, probe_bank=bank, log_s=log_s)
-                lps[c_].append((lp + logdet).cpu())
-            print(f"[pd-eval] {min(s_ + a.eval_batch, len(v_rows))}/{len(v_rows)} ({time.time()-t0:.0f}s)", flush=True)
-    ref = torch.cat(ref).numpy(); gaps = np.concatenate(gaps); js = np.concatenate(js)
-    res = {"variant": a.variant, "c": a.c, "n": int(len(ref)), "ode_steps": a.ode_steps, "probes": a.probes, "steps": a.steps, "batch": a.batch,
-           "max_pos": a.max_pos, "n_params": models["none"].n_params(), "gauss_nll_bits_dim": float(-ref.mean() / (d * math.log(2))), "hist": hist}
-    for c_ in lps:
-        lp = torch.cat(lps[c_]).numpy(); nll = -lp / (d * math.log(2)); vs = (lp - ref) / (d * math.log(2))
-        res[c_] = {"nll_bits_dim": float(nll.mean()), "nll_bits_dim_sem": float(nll.std() / math.sqrt(len(nll))), "vs_gauss_bits_dim": float(vs.mean()),
-                   "vs_gauss_by_band": band_means(vs, gaps, js)}
-        print(f"[pd-eval] {a.variant} {c_}: exact NLL {res[c_]['nll_bits_dim']:.4f} bits/dim (pooled space); vs N(0,I) {res[c_]['vs_gauss_bits_dim']:+.4f} bits/dim; "
-              f"bands { {b: round(v['mean'], 3) for b, v in res[c_]['vs_gauss_by_band'].items()} }", flush=True)
-    if "depth" in lps:
-        gain = (torch.cat(lps["depth"]) - torch.cat(lps["none"])).numpy() / math.log(2)
-        res["depth_gain_bits"] = {"mean": float(gain.mean()), "sem": float(gain.std() / math.sqrt(len(gain))), "median": float(np.median(gain)),
-                                  "frac_positive": float((gain > 0).mean()), "by_band": band_means(gain, gaps, js)}
-        print(f"[pd-eval] {a.variant} told-depth exact gain {gain.mean():+.1f} +- {gain.std()/math.sqrt(len(gain)):.1f} bits/pair (median {np.median(gain):+.1f}, "
-              f"{100*(gain>0).mean():.0f}% positive); bands { {b: round(v['mean'], 1) for b, v in res['depth_gain_bits']['by_band'].items()} }", flush=True)
+    res = exact_eval(a, models, noise_net, norm, store_val, v_rows, v_i, v_j, a.ode_steps, a.probes, t0, hist)
     os.makedirs(a.res_dir, exist_ok=True); out = os.path.join(a.res_dir, f"{a.tag}.json"); json.dump(res, open(out, "w"), indent=1)
     print("[pd-eval] wrote", out, flush=True)
 
