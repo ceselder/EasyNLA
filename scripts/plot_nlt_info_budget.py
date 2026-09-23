@@ -34,7 +34,7 @@ def main():
     for f in a.bits:
         if not os.path.exists(f): print("skip missing", f); continue
         J = json.load(open(f))
-        for name, res in J["critics"].items(): critics[name] = res | {"_file": f, "_n": J["n"], "_ode_steps": J["ode_steps"]}
+        for name, res in J["critics"].items(): critics[name] = res | {"_file": f, "_n": res.get("n_rows", J.get("n", J.get("n_per_set"))), "_ode_steps": J["ode_steps"]}
     mse = {}
     for spec in a.mse:
         path, label = spec.rsplit(":", 1)
