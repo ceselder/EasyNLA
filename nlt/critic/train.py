@@ -168,6 +168,7 @@ def main():
     p.add_argument("--proj-k", type=int, default=32); p.add_argument("--proj-sigma", type=float, default=0.1); p.add_argument("--proj-mode", default="random", choices=["random", "pca"], help="T5 directions: random orthonormal or top-PCA of the flow target (from 16k sampled pairs)")
     p.add_argument("--contrast", type=float, default=0.0, help="DECISIONS v1.10 T4: weight of the contrastive hinge softplus((L(z) - L(z_dm) + margin)/tau) with z_dm = a depth-matched WRONG text (another row of the batch with the same j, same (i,j) when available), at the SAME (x_t, t, eps)")
     p.add_argument("--contrast-tau", type=float, default=0.005, help="logistic temperature in per-dim FM-loss units (0.005 ~ 10 nats)"); p.add_argument("--contrast-margin", type=float, default=0.005)
+    p.add_argument("--null-dm", type=int, default=0, help="lens #264: null regulariser pairs each row with a DEPTH-MATCHED wrong text (same (i,j)/same j, the T4 permutation) instead of the batch roll, so p(h_j | z_dm) is pulled to p(h_j | empty) rather than pushed away")
     p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
     p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
     p.add_argument("--init-from", default=None, help="checkpoint of a trained BLIND prior (cond none): its weights are loaded into this model (text/depth extras stay zero/fresh, so at step 0 the conditional path IS the prior)")
@@ -293,15 +294,19 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss_vec, t, kept = pair_fm_loss(model, x0, h_i, t_b, eps_b, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s, vec=vec)
         loss = loss_vec.mean(); null_loss = torch.zeros((), device=dev); con_loss = torch.zeros((), device=dev); con_acc = float("nan")
-        if a.contrast > 0 and a.cond == "text":
-            # T4: depth-matched wrong text = another row's text with the same j (same (i, j) when the batch has one); hinge on the per-row FM loss at the same (x_t, t, eps)
+        perm_t = None
+        if (a.contrast > 0 or a.null_dm) and a.cond == "text":
+            # depth-matched wrong text = another row's text with the same j (same (i, j) when the batch has one)
             jj = j.tolist(); ii = i.tolist(); perm = list(range(len(jj)))
             by_ij = {}; by_j = {}
             for q, (aa_, bb_) in enumerate(zip(ii, jj)): by_ij.setdefault((aa_, bb_), []).append(q); by_j.setdefault(bb_, []).append(q)
             for q in range(len(jj)):
                 c = [r_ for r_ in by_ij[(ii[q], jj[q])] if r_ != q] or [r_ for r_ in by_j[jj[q]] if r_ != q]
                 perm[q] = c[q % len(c)] if c else (q + len(jj) // 2) % len(jj)
-            perm_t = torch.tensor(perm, device=dev); enc_dm = enc[perm_t]; mask_dm = mask[perm_t] & kept[:, None]                   # dropped rows stay dropped on both sides
+            perm_t = torch.tensor(perm, device=dev)
+        if a.contrast > 0 and a.cond == "text":
+            # T4: hinge on the per-row FM loss at the same (x_t, t, eps)
+            enc_dm = enc[perm_t]; mask_dm = mask[perm_t] & kept[:, None]                   # dropped rows stay dropped on both sides
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss_dm, _, _ = pair_fm_loss(model, x0, h_i, t_b, eps_b, enc=enc_dm, enc_mask=mask_dm, log_s=log_s)
             gap = (loss_vec - loss_dm)[kept]                                                                                           # < 0 = the true text wins
@@ -311,7 +316,7 @@ def main():
         if a.null_reg > 0 and a.cond == "text":
             # NULL regulariser: under ANOTHER pair's text (batch rolled by B/2) the velocity must equal the no-text velocity (the frozen prior)
             Bn = x0.shape[0]; eps_n = torch.randn_like(x0); t_n = torch.rand(Bn, device=dev); x_tn = (1 - t_n)[:, None] * x0 + t_n[:, None] * eps_n
-            enc_rp = torch.roll(enc, Bn // 2, 0); mask_rp = torch.roll(mask, Bn // 2, 0)
+            enc_rp = (enc[perm_t] if (a.null_dm and perm_t is not None) else torch.roll(enc, Bn // 2, 0)); mask_rp = (mask[perm_t] if (a.null_dm and perm_t is not None) else torch.roll(mask, Bn // 2, 0))
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 with torch.no_grad(): v_null = model(x_tn, t_n, h_i, enc=enc_rp, enc_mask=torch.zeros_like(mask_rp), log_s=log_s)
                 v_rp = model(x_tn, t_n, h_i, enc=enc_rp, enc_mask=mask_rp, log_s=log_s)
