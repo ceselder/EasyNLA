@@ -25,6 +25,8 @@ def parse():
     p.add_argument("--enc-model", default=None); p.add_argument("--enc-layer", type=int, default=None)
     p.add_argument("--lam", type=float, default=0.1, help="bits per token"); p.add_argument("--floor", type=float, default=-5.0)
     p.add_argument("--copy-thresh", type=float, default=0.05); p.add_argument("--adv-std", action="store_true", help="divide advantages by the group std (default Dr.GRPO: no)")
+    p.add_argument("--adv-mode", choices=["group", "batch"], default="group", help="batch = centre per group, one batch-level std (ScaleRL / 27B recipe)"); p.add_argument("--zero-var-filter", action="store_true")
+    p.add_argument("--frozen-critic-eval", action="store_true", help="with --cotrain: also score the held-out eval with a FROZEN copy of the warm-start critic (live up + frozen flat = private code)")
     # paraphrase
     p.add_argument("--paraphrase-p", type=float, default=0.3); p.add_argument("--paraphrase-model", default="NousResearch/Meta-Llama-3.1-8B-Instruct")
     p.add_argument("--paraphrase-gpu-mem", type=float, default=0.25)
@@ -120,6 +122,7 @@ def main():
     scorer = make_scorer(a, cdev)
     para = Paraphraser(a.paraphrase_model, gpu_mem=a.paraphrase_gpu_mem, gpu_index=cidx, seed=a.seed) if a.paraphrase_p > 0 else None
     cot = CriticCotrainer(scorer, a.cotrain_lr, a.cotrain_p_uncond, a.replay, a.data_dir, store) if (a.cotrain and not a.stub_critic and a.critic) else None
+    frozen = make_scorer(a, cdev) if (cot is not None and a.frozen_critic_eval) else None
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"rl_{a.tag}", group="rl", config=vars(a))
     gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id
     meta_pos = store.meta["pos_idx"].values; meta_next = store.meta["next_token_id"].values
@@ -146,7 +149,7 @@ def main():
         sc = scorer.score(h_i[groups], h_j[groups], [z if not viol["empty"][k] else None for k, z in enumerate(scored)], groups.tolist(), seed=step)
         bits, proxy = sc["exact_bits"].float(), sc["proxy_bits"].float(); t_score = time.time() - t2
         rewards, bad = shape_rewards(bits, n_tok, a.lam, viol["any"], groups, a.floor)
-        adv = group_advantages(rewards, groups, std_norm=a.adv_std)
+        adv = group_advantages(rewards, groups, std_norm=a.adv_std, mode=a.adv_mode, zero_var_filter=a.zero_var_filter)
         # ---- update + sync
         t3 = time.time(); acts_list = [acts[r["prompt_idx"]] for r in res]
         loss, gn, um = grpo_update(policy, optim, res, acts_list, adv, inj, ref_ids, dev, pad_id, micro_batch=a.micro_batch, kl_beta=a.kl_beta,
@@ -194,6 +197,9 @@ def main():
             for bname in ("pre", "workspace", "motor"):
                 m = torch.tensor([band(int(j_)) == bname for j_ in ev_j.tolist()])
                 if m.any(): log[f"eval/bits_{bname}"] = float(eb[m].mean())
+            if frozen is not None:
+                fb = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
+                log.update({"eval/bits_frozen_mean": float(fb.mean()), "eval/bits_live_minus_frozen": float((eb - fb).mean())})
             print(f"   eval: bits {log['eval/bits_mean']:+.3f} (med {log['eval/bits_median']:+.3f}, /tok {log['eval/bits_per_token']:+.3f}) tok {log['eval/tokens_mean']:.1f} viol {log['eval/viol_any']:.2f} nonpos {log['eval/frac_nonpos']:.2f}", flush=True)
         if run is not None: run.log({k: v for k, v in log.items() if not isinstance(v, (list, dict))}, step=step)
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
