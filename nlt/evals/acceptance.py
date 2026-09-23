@@ -29,13 +29,19 @@ def main():
                    "A1b_orig_ws_gt_0": bool(ws["bits_mean"] > 0) if ws else None,        # absolute anchor (board #263): the true text must beat the blind prior, else the critic is a discriminator
                    "A3_rp_within_3x_noise": bool(all(abs(v) <= 3 * max(noise, 0.5) for v in rp_by_band.values())) if rp_by_band else None}
             row["ACCEPT"] = bool(row["A1_content_ws_ge_5"] and row["A1b_orig_ws_gt_0"] and row["A2_P_ge_0.70"] and row["A3_rp_within_3x_noise"])
+            # A4 (proposed, board #285): P(z > twin) >= 0.65 from this critic's paraphrase/twin summary of the same source, if scored
+            for tf in glob.glob(os.path.join(a.scored_dir, f"*para_{src}.summary.json")):
+                ts = json.load(open(tf)); tw = ts.get("twin", {})
+                if tw.get("p_orig_preferred") is not None:
+                    row["twin"] = {"p_orig_gt_twin": tw["p_orig_preferred"], "retention_median": tw.get("retention_median"), "delta_bits_mean": tw.get("delta_bits_mean"), "file": os.path.basename(tf)}
+                    row["A4_P_gt_twin_ge_0.65"] = bool(tw["p_orig_preferred"] >= 0.65); row["ACCEPT_with_A4"] = bool(row["ACCEPT"] and row["A4_P_gt_twin_ge_0.65"])
             res["sources"][src] = row
         else:                                                    # paraphrase / twin / mask summary
             src = re.sub(r"^scored_[^_]+_(para|mask|twinnext)_", "", stem); kind = re.sub(r"^scored_[^_]+_", "", stem).split("_")[0]
             res["edits"].setdefault(src, {})[kind] = {k: v for k, v in s.items() if isinstance(v, dict) or k in ("n_pairs", "orig_bits_mean")}
     json.dump(res, open(a.out, "w"), indent=1, default=str)
     for src, r in res["sources"].items():
-        print(f"{src:22s} content ws {r['content_workspace']:6.2f} | all {r['content_all']:5.2f} | P(z>dm) {r['p_orig_gt_dm']:.2f} | rp by band {({b: round(v, 1) for b, v in r['rp_by_band'].items()})} | A1 {r['A1_content_ws_ge_5']} A1b {r['A1b_orig_ws_gt_0']} A2 {r['A2_P_ge_0.70']} A3 {r['A3_rp_within_3x_noise']} -> {'ACCEPT' if r['ACCEPT'] else 'REJECT'}")
+        print(f"{src:22s} content ws {r['content_workspace']:6.2f} | all {r['content_all']:5.2f} | P(z>dm) {r['p_orig_gt_dm']:.2f} | rp by band {({b: round(v, 1) for b, v in r['rp_by_band'].items()})} | A1 {r['A1_content_ws_ge_5']} A1b {r['A1b_orig_ws_gt_0']} A2 {r['A2_P_ge_0.70']} A3 {r['A3_rp_within_3x_noise']} -> {'ACCEPT' if r['ACCEPT'] else 'REJECT'}" + (f" | twin P {r['twin']['p_orig_gt_twin']:.2f} A4 {'PASS' if r.get('A4_P_gt_twin_ge_0.65') else 'FAIL'}" if r.get("twin") else ""))
     for src, e in res["edits"].items():
         for kind, d in e.items():
             keys = [k for k in d if k in ("para_light", "para_strong", "twin", "mask_next", "twin_next")]
