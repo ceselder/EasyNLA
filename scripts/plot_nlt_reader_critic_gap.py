@@ -32,7 +32,7 @@ def main():
             csem = 0.5 * (s["orig"]["ci95"][1] - s["orig"]["ci95"][0]) / 1.96; note = f"{crit}: n={s['orig']['n']}"
         rows.append(dict(label=label, top1=r.get("top1"), posmatch=r.get("posmatch"), content_bits=content, content_sem=csem, p_z_gt_dm=p_dm, colour=col, note=note))
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2})
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6.6), dpi=150, gridspec_kw={"wspace": 0.3}); x = np.arange(len(rows)); w = 0.38
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 7.2), dpi=150, gridspec_kw={"wspace": 0.3}); x = np.arange(len(rows)); w = 0.38
     ax1.bar(x - w / 2, [100 * (r["top1"] or 0) for r in rows], w, color=[r["colour"] for r in rows], label="final top-1 among 4 (chance 25%)")
     ax1.bar(x + w / 2, [100 * (r["posmatch"] or 0) for r in rows], w, color=[r["colour"] for r in rows], alpha=0.45, hatch="//", edgecolor=SURFACE, label="position among 5 cuts (chance 20%)")
     for xi, r in zip(x, rows): ax1.text(xi - w / 2, 100 * (r["top1"] or 0) + 1.5, f"{100*(r['top1'] or 0):.0f}", ha="center", fontsize=10); ax1.text(xi + w / 2, 100 * (r["posmatch"] or 0) + 1.5, f"{100*(r['posmatch'] or 0):.0f}", ha="center", fontsize=10, color=INK2)
@@ -50,7 +50,7 @@ def main():
         ax.grid(True, axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s_ in ("top", "right"): ax.spines[s_].set_visible(False)
     fig.text(0.01, 0.003, "Fixed 4,096-pair eval set (Qwen3-8B, layer pairs 9-34). teacher = Sonnet-5 shown the passage (+ lens readouts, + final top-10); J-lens diff = describer of two lens readouts; V0 = SFT verbalizer reading the two activations only. Reader = Sonnet-5 with the sentence alone (512 pairs/source). Critic = exact ODE likelihood (Heun 32, paired probes), null-regularised union adapter on the pooled prior, ~1000 pairs/source, 95% CI.", fontsize=9, color=INK2, ha="left", va="bottom", wrap=True)
-    fig.tight_layout(rect=(0, 0.09, 1, 1)); os.makedirs(a.out_dir, exist_ok=True)
+    fig.tight_layout(rect=(0, 0.11, 1, 1)); os.makedirs(a.out_dir, exist_ok=True)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.out_dir, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"rows": [{k: v for k, v in r.items() if k != "colour"} for r in rows], "chance": {"top1": 0.25, "posmatch": 0.20}}, open(os.path.join(a.out_dir, "data", f"{a.stem}.json"), "w"), indent=1, default=str)
     print("saved", os.path.join(a.out_dir, f"{a.stem}.png"))
