@@ -83,6 +83,19 @@ def dump(tag: str, extra: str = "", data: str = DATA):
     return _run([sys.executable, "-m", "nlt.rl.dump_rollouts", "--data-dir", data, "--source", tag, "--out", f"/vol/z/{tag}/val/part_0000000_0004096.parquet"] + extra.split())
 
 
+@app.function(timeout=3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=32 * 1024)
+def prep(extra: str = ""):
+    """CPU: build SFT row files on the volume (e.g. nlt.verbalizer.build_v0b_rows)"""
+    import subprocess
+    os.chdir(REPO_REMOTE); os.environ["HF_HOME"] = "/vol/hf_cache"; os.environ["HF_HUB_DISABLE_XET"] = "1"
+    try: vol.reload()
+    except Exception: pass
+    rc = subprocess.call([sys.executable, "-m", "nlt.verbalizer.build_v0b_rows"] + extra.split(), cwd=REPO_REMOTE)
+    try: vol.commit()
+    except Exception as e: print(f"[modal] vol.commit: {e}", flush=True)
+    return rc
+
+
 @app.function(timeout=1800, volumes={"/vol": vol}, cpu=2, memory=8 * 1024)
 def cat(path: str):
     vol.reload(); print(open(f"/vol/{path}").read())
@@ -92,5 +105,6 @@ def cat(path: str):
 def main(task: str = "check", tag: str = "dev", extra: str = "", data: str = DATA, path: str = ""):
     fn = {"check": check, "sft": sft, "rl": rl, "step0": step0, "dump": dump}.get(task)
     if task == "cat": cat.remote(path); return
+    if task == "prep": print("rc", prep.remote(extra)); return
     if fn is None: raise SystemExit(f"unknown task {task}")
     print("rc", fn.remote(tag, extra, data)); print("done.")
