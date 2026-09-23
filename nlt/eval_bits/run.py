@@ -48,7 +48,7 @@ def summarize(vals, gaps, js, name):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="bits")
-    p.add_argument("--ckpts", required=True, help="comma list name:path"); p.add_argument("--n", type=int, default=1024); p.add_argument("--batch", type=int, default=64)
+    p.add_argument("--ckpts", required=True, help="comma list name:path"); p.add_argument("--n", type=int, default=1024, help="rows scored PER SET (common rows first)"); p.add_argument("--n-fixed", type=int, default=4096, help="size of the fixed eval set = first rows of pairs_val"); p.add_argument("--batch", type=int, default=64)
     p.add_argument("--ode-steps", type=int, default=32); p.add_argument("--probes", type=int, default=1); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default=None, help="default: the text critic's own encoder (from its args)"); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--enc-max-len", type=int, default=None)
     p.add_argument("--skip-exact", action="store_true"); p.add_argument("--data-device", default="cuda"); p.add_argument("--stats", default=None, help="stats.pt (default <data-dir>/stats.pt; must match the critics')")
@@ -58,6 +58,11 @@ def main():
     norm = GlobalNorm.load(a.stats or os.path.join(a.data_dir, "stats.pt"), "affine").to(dev); d = store_val.d
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas(); vp = vp[vp["pos_idx"].isin(store_val.row_of)]
     from nlt.critic.train import load_text_pairs
+    # ---- the FIXED eval set = the first a.n_fixed rows of pairs_val (in file order) that are in the store; every set is scored on ITS OWN rows of it
+    vp = vp.iloc[: a.n_fixed].reset_index(drop=True); NF = len(vp)
+    rows_all = store_val.rows_for(vp["pos_idx"].values); I_all = torch.tensor(vp["i"].values.astype(np.int64)); J_all = torch.tensor(vp["j"].values.astype(np.int64))
+    g = torch.Generator().manual_seed(a.seed + 1); eps_all = [torch.randn(NF, d, generator=g) for _ in T_GRID]          # eps / probes fixed per fixed-set row -> paired across sets
+    probe_bank = make_probe_bank(a.ode_steps, a.probes, d, torch.Generator().manual_seed(a.seed + 2))
     text_sets = {}                                   # label -> {pair_id: text}
     if a.text_parquet:
         for item in a.text_parquet.split(","):
@@ -66,73 +71,82 @@ def main():
             if "@" in path: path, v_ = path.rsplit("@", 1); verb = [int(v_)]          # label:path@2 -> only verbosity 2 rows of that file
             tdf = load_text_pairs([path], os.path.join(a.data_dir, "pairs_val.parquet"), verbosity=verb).drop_duplicates("pair_id").set_index("pair_id")
             text_sets[label] = tdf["text"].to_dict(); print(f"[bits] set {label}: {len(tdf)} pairs with text ({path}{'@'+str(verb[0]) if verb else ''})", flush=True)
-        common = set.intersection(*[set(v) for v in text_sets.values()])
-        vp = vp[vp["pair_id"].isin(common)]
-        print(f"[bits] text sets {list(text_sets)}: {len(vp)} val pairs have text in ALL sets", flush=True)
-    vp = vp.iloc[: a.n]; n = len(vp)
-    rows = store_val.rows_for(vp["pos_idx"].values); I = torch.tensor(vp["i"].values); J = torch.tensor(vp["j"].values); gaps = (J - I).numpy(); js = J.numpy()
+    pid_all = vp["pair_id"].tolist()
+    common = [k for k, pid in enumerate(pid_all) if all(pid in tm for tm in text_sets.values())] if text_sets else list(range(NF))
+    print(f"[bits] fixed set {NF} pairs; {len(common)} have text in ALL {len(text_sets)} sets (paired subset)", flush=True)
 
-    def shuffle_dm(texts):
-        """depth-matched shuffle: another val pair's text with the same (i, j)"""
-        out = list(texts)
-        for key, grp in vp.reset_index(drop=True).groupby(["i", "j"]).groups.items():
-            idx = np.asarray(list(grp)); perm = np.roll(idx, 1) if len(idx) > 1 else idx
-            for src, dst in zip(idx, perm): out[dst] = texts[src]
+    def set_indices(tm):
+        """rows of the fixed set scored for this set: the common (paired) rows first, then the set's own rows, up to a.n"""
+        own = [k for k, pid in enumerate(pid_all) if pid in tm]; cs = set(common)
+        return (common[: a.n] + [k for k in own if k not in cs])[: a.n]
+
+    def dm_partner(idx):
+        """depth-matched shuffle partner within the scored rows: another row with the same (i, j) (falls back to the same j, then any)"""
+        by_ij = {}; by_j = {}
+        for k in idx: by_ij.setdefault((int(I_all[k]), int(J_all[k])), []).append(k); by_j.setdefault(int(J_all[k]), []).append(k)
+        out = {}
+        for k in idx:
+            c = [q for q in by_ij[(int(I_all[k]), int(J_all[k]))] if q != k] or [q for q in by_j[int(J_all[k])] if q != k] or [q for q in idx if q != k]
+            out[k] = c[(idx.index(k) + 1) % len(c)] if c else k
         return out
 
-    def shuffle_rp(texts):
-        """random-pair control: another val pair's text, any (i, j)"""
-        return [texts[k] for k in np.roll(np.arange(len(texts)), len(texts) // 2)]
-    g = torch.Generator().manual_seed(a.seed + 1); eps_bank = [torch.randn(n, d, generator=g) for _ in T_GRID]
-    probe_bank = make_probe_bank(a.ode_steps, a.probes, d, torch.Generator().manual_seed(a.seed + 2))
     encoder = None
     ckpts = [c.split(":", 1) for c in a.ckpts.split(",")]
-    jobs = []                                         # (result name, ckpt path, texts or None, shuf_texts or None)
+    jobs = []                                          # (result name, ckpt path, set label or None)
     for name, path in ckpts:
         cond = torch.load(path, map_location="cpu")["config"]["cond"]
         if cond == "text" and text_sets:
-            for label, tm in text_sets.items():
-                texts = [tm[x] for x in vp["pair_id"]]; jobs.append((f"{name}@{label}", path, texts, shuffle_dm(texts), shuffle_rp(texts)))
-        else: jobs.append((name, path, None, None, None))
+            for label in text_sets: jobs.append((f"{name}@{label}", path, label))
+        else: jobs.append((name, path, None))
     if any(j[2] is not None for j in jobs):
         from nlt.critic.text_encoder import TextEncoder
         ta = next(torch.load(j[1], map_location="cpu")["args"] for j in jobs if j[2] is not None)          # the text critic's training args
         encoder = TextEncoder(a.enc_model or ta.get("enc_model", "Qwen/Qwen3-0.6B"), a.enc_layer if a.enc_layer is not None else ta.get("enc_layer", 20), dev,
                               a.enc_max_len or ta.get("enc_max_len", 128))
-    results = {"n": n, "ode_steps": a.ode_steps, "probes": a.probes, "t_grid": list(T_GRID), "critics": {}}
-    _cache = {}
-    for name, path, texts, shuf_texts, rp_texts in jobs:
+    results = {"n_fixed": NF, "n_per_set": a.n, "n_common": len(common), "ode_steps": a.ode_steps, "probes": a.probes, "t_grid": list(T_GRID), "critics": {}}
+    _cache = {}; _uncond = {}                          # _uncond[(path, k)] = (L_u [T], lp_u, ruler)  shared by every set of the same critic
+    for name, path, label in jobs:
         if path not in _cache: _cache[path] = load_critic(path, dev, d_enc_override=(encoder.d_enc if encoder else None))
         model, aa, step = _cache[path]; cond = model.cond; target = model.target; src_rms = bool(aa.get("src_rms", 0))
-        print(f"[bits] critic {name}: cond={cond} target={target} step={step} params {model.n_params()/1e6:.0f}M", flush=True)
+        idx = set_indices(text_sets[label]) if label else list(range(min(a.n, NF))); n = len(idx)
+        texts = [text_sets[label][pid_all[k]] for k in idx] if label else None
+        if texts:
+            dmp = dm_partner(idx); shuf_texts = [text_sets[label][pid_all[dmp[k]]] for k in idx]
+            rp_texts = [texts[(q + n // 2) % n] for q in range(n)]
+        print(f"[bits] critic {name}: cond={cond} target={target} step={step} params {model.n_params()/1e6:.0f}M; {n} rows ({sum(1 for k in idx if k in set(common))} paired)", flush=True)
+        gaps = (J_all[idx] - I_all[idx]).numpy(); js = J_all[idx].numpy()
         L_u = torch.zeros(len(T_GRID), n); L_c = torch.zeros(len(T_GRID), n); L_s = torch.zeros(len(T_GRID), n); L_r = torch.zeros(len(T_GRID), n)
         lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); lp_r = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
         for s in range(0, n, a.batch):
-            r, i, j = rows[s:s + a.batch], I[s:s + a.batch], J[s:s + a.batch]
+            kk = idx[s:s + a.batch]; r = rows_all[kk]; i = I_all[kk]; j = J_all[kk]; B = len(kk)
             h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target, src_rms)
-            x_aff = norm.normalize(store_val.gather(r, j, dev))                 # the target in the pooled-affine space (for the Gaussian ruler)
+            x_aff = norm.normalize(store_val.gather(r, j, dev))
             depth = torch.stack([i, j], 1).to(dev) if cond == "depth" else None
             enc = mask = enc_s = mask_s = enc_r = mask_r = None
-            if cond == "text" and texts:
+            if texts:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    enc, mask = encoder(texts[s:s + a.batch]); enc_s, mask_s = encoder(shuf_texts[s:s + a.batch]); enc_r, mask_r = encoder(rp_texts[s:s + a.batch])
-            eb = [e[s:s + a.batch] for e in eps_bank]
-            L_u[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, log_s=log_s)
+                    enc, mask = encoder(texts[s:s + B]); enc_s, mask_s = encoder(shuf_texts[s:s + B]); enc_r, mask_r = encoder(rp_texts[s:s + B])
+            eb = [e[kk] for e in eps_all]
+            need = [k for k in kk if (path, k) not in _uncond]
+            if need:                                   # unconditional term once per (critic, fixed-set row)
+                Lu_b = proxy_losses(model, x0, h_i, T_GRID, eb, log_s=log_s)
+                lu_b = (exact_logp(model, x0, h_i, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det) if not a.skip_exact else torch.zeros(B, device=dev)
+                ru_b = bits_vs_gaussian(lu_b, x_aff) if not a.skip_exact else torch.zeros(B, device=dev)
+                for q, k in enumerate(kk): _uncond[(path, k)] = (Lu_b[:, q].clone(), float(lu_b[q]), float(ru_b[q]))
+            for q, k in enumerate(kk): L_u[:, s + q] = _uncond[(path, k)][0]; lp_u[s + q] = _uncond[(path, k)][1]; ruler[s + q] = _uncond[(path, k)][2]
             if cond != "none":
-                L_c[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, depth=depth, enc=enc, enc_mask=mask, log_s=log_s)
-                if cond == "text":
-                    L_s[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_s, enc_mask=mask_s, log_s=log_s)
-                    L_r[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_r, enc_mask=mask_r, log_s=log_s)
-            if not a.skip_exact:
-                lu = exact_logp(model, x0, h_i, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_u[s:s + a.batch] = lu.cpu()
-                ruler[s:s + a.batch] = bits_vs_gaussian(lu, x_aff).cpu()          # both sides in the pooled-affine space
-                if cond != "none":
-                    lc = exact_logp(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_c[s:s + a.batch] = lc.cpu()
-                    if cond == "text":
-                        ls = exact_logp(model, x0, h_i, enc=enc_s, enc_mask=mask_s, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_s[s:s + a.batch] = ls.cpu()
-                        lr_ = exact_logp(model, x0, h_i, enc=enc_r, enc_mask=mask_r, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_r[s:s + a.batch] = lr_.cpu()
+                L_c[:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, depth=depth, enc=enc, enc_mask=mask, log_s=log_s)
+                if texts:
+                    L_s[:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_s, enc_mask=mask_s, log_s=log_s)
+                    L_r[:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_r, enc_mask=mask_r, log_s=log_s)
+                if not a.skip_exact:
+                    lp_c[s:s + B] = (exact_logp(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
+                    if texts:
+                        lp_s[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_s, enc_mask=mask_s, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
+                        lp_r[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_r, enc_mask=mask_r, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
             print(f"[bits] {name}: {min(n, s + a.batch)}/{n} rows, {time.time() - t0:.0f}s", flush=True)
-        res = {"cond": cond, "target": target, "src_rms": src_rms, "step": step, "ckpt": path,
+        paired = np.array([k in set(common) for k in idx])
+        res = {"cond": cond, "target": target, "src_rms": src_rms, "step": step, "ckpt": path, "n_rows": n, "n_paired": int(paired.sum()),
                "proxy_fm_loss_uncond": float(L_u.mean()), "proxy_fm_loss_uncond_by_t": L_u.mean(1).tolist(),
                "uncond_bits_per_dim_vs_gaussian": summarize(ruler.numpy(), gaps, js, "ruler") if not a.skip_exact else None,
                "uncond_nll_bits_per_dim": float(-lp_u.mean() / (d * math.log(2))) if not a.skip_exact else None}
@@ -141,12 +155,14 @@ def main():
             if not a.skip_exact:
                 pe = (lp_c - lp_u).numpy() / math.log(2); res["exact_pmi_bits"] = summarize(pe, gaps, js, "exact")
                 res["exact_pmi_bits"]["frac_positive"] = float((pe > 0).mean()); res["proxy_over_exact_ratio"] = float(pmi_p.mean() / max(1e-9, pe.mean()))
-            if cond == "text":
+                if paired.any(): res["exact_pmi_bits_paired"] = summarize(pe[paired], gaps[paired], js[paired], "exact_paired")
+            if texts:
                 res["shuffle_proxy_pmi_bits"] = summarize(proxy_pmi_bits(L_u, L_s, d).numpy(), gaps, js, "shuf")
                 res["rp_proxy_pmi_bits"] = summarize(proxy_pmi_bits(L_u, L_r, d).numpy(), gaps, js, "rp")
                 if not a.skip_exact:
-                    res["shuffle_exact_pmi_bits"] = summarize((lp_s - lp_u).numpy() / math.log(2), gaps, js, "shuf_exact")
-                    res["rp_exact_pmi_bits"] = summarize((lp_r - lp_u).numpy() / math.log(2), gaps, js, "rp_exact")
+                    ps_ = (lp_s - lp_u).numpy() / math.log(2); pr_ = (lp_r - lp_u).numpy() / math.log(2)
+                    res["shuffle_exact_pmi_bits"] = summarize(ps_, gaps, js, "shuf_exact"); res["rp_exact_pmi_bits"] = summarize(pr_, gaps, js, "rp_exact")
+                    if paired.any(): res["shuffle_exact_pmi_bits_paired"] = summarize(ps_[paired], gaps[paired], js[paired], "shuf_paired"); res["rp_exact_pmi_bits_paired"] = summarize(pr_[paired], gaps[paired], js[paired], "rp_paired")
                     res["n_tokens_mean"] = float(np.mean([len(encoder.tok(z, add_special_tokens=False)["input_ids"]) for z in texts]))
                     res["exact_bits_per_token"] = res["exact_pmi_bits"]["mean"] / max(1e-9, res["n_tokens_mean"])
         results["critics"][name] = res
