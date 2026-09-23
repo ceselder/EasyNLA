@@ -89,27 +89,35 @@ def main():
     df = pd.DataFrame(rows)
     enc = tok(df["text"].tolist(), add_special_tokens=False)["input_ids"]
     df["n_tokens"] = [len(e) for e in enc]
-    os.makedirs(args.out, exist_ok=True)
     suffix = f"_part{args.part:02d}" if args.n_parts > 1 else ""
-    df.to_parquet(f"{args.out}/{args.split}{suffix}.parquet", index=False)
-    pd.DataFrame(feats).to_parquet(f"{args.out}/{args.split}{suffix}_feats.parquet", index=False)
+    # infra layout (#31): {out}/{split}/L{k}.parquet for the primary (J-lens) source, {out}_{kind}/... for the others
+    for kind in kinds:
+        d = args.out if kind == "jlens" else f"{args.out}_{kind}"
+        os.makedirs(f"{d}/{args.split}", exist_ok=True)
+        for lvl in (0, 1, 2, 3):
+            sub = df[(df.source == f"lensdiff-{args.version}-{kind}") & (df.verbosity == lvl)][["pair_id", "text", "n_tokens", "verbosity", "source", "sample_idx"]]
+            sub.to_parquet(f"{d}/{args.split}/L{lvl}{suffix}.parquet", index=False)
+    os.makedirs(f"{args.out}_all", exist_ok=True)
+    df.to_parquet(f"{args.out}_all/{args.split}{suffix}.parquet", index=False)
+    pd.DataFrame(feats).to_parquet(f"{args.out}_all/{args.split}{suffix}_feats.parquet", index=False)
     stats = {"n_pairs": int(len(pairs)), "n_rows": int(len(df)), "sources": kinds,
              "leak_violations": int(sum(not leak_check(t) for t in df["text"])),
              "n_tokens_mean_by_level": {str(l): float(df[(df.verbosity == l) & (df.source != f'lensdiff-{args.version}-null')]["n_tokens"].mean()) for l in (0, 1, 2, 3)}}
-    # copy-rate check against the context window (docs parquet, if present)
+    # copy-rate check against the preceding context (docs parquet: token_ids of the doc / window; ctx = token_ids[:pos+1])
     try:
-        docs = pd.concat([pd.read_parquet(p) for p in sorted(__import__("glob").glob(f"{args.root}/{args.split}/docs_*.parquet"))], ignore_index=True)
+        import glob as _glob
+        docs = pd.concat([pd.read_parquet(p) for p in sorted(_glob.glob(f"{args.root}/{args.split}/docs_*.parquet"))], ignore_index=True)
         meta = store.meta.set_index("pos_idx")
-        key = "window_start" if "window_start" in docs.columns else None
-        doc_text = {(r.doc_id, getattr(r, "window_start", 0)): r.text for r in docs.itertuples()}
+        windowed = "window_start" in docs.columns
+        doc_ids = {((r.doc_id, r.window_start) if windowed else r.doc_id): list(r.token_ids) for r in docs.itertuples()}
         sample = df[(df.source == f"lensdiff-{args.version}-{kinds[0]}")].sample(min(args.copy_check, len(df)), random_state=0)
         cs = []
         for r in sample.itertuples():
             pos_idx = int(r.pair_id.split(":")[1]); m = meta.loc[pos_idx]
-            txt = doc_text.get((int(m["doc_id"]), int(m.get("window_start", 0)) if key else 0))
-            if txt is None:
+            ids = doc_ids.get((int(m["doc_id"]), int(m["window_start"])) if windowed else int(m["doc_id"]))
+            if ids is None:
                 continue
-            ctx_ids = tok(txt, add_special_tokens=False)["input_ids"][: int(m["pos"]) + 1]
+            ctx_ids = [int(t) for t in ids[: int(m["pos"]) + 1]][-256:]
             c = copy_stats(r.text, ctx_ids, tok); c["verbosity"] = int(r.verbosity); cs.append(c)
         if cs:
             cdf = pd.DataFrame(cs)
@@ -117,14 +125,14 @@ def main():
                                       "frac_with_shared_3gram": float((g["shared_ngrams"] > 0).mean()), "n": int(len(g))} for l, g in cdf.groupby("verbosity")}
     except Exception as e:
         stats["copy_error"] = repr(e)
-    with open(f"{args.out}/{args.split}{suffix}_stats.json", "w") as f:
+    with open(f"{args.out}_all/{args.split}{suffix}_stats.json", "w") as f:
         json.dump(stats, f, indent=1)
     print("[make_z] stats", json.dumps(stats, indent=1), flush=True)
     for kind in kinds:
         ex = df[(df.source == f"lensdiff-{args.version}-{kind}")].head(8)
         for r in ex.itertuples():
             print(f"[example {kind} L{r.verbosity} {r.pair_id}] {r.text}", flush=True)
-    print(f"[make_z] wrote {args.out}/{args.split}{suffix}.parquet ({len(df)} rows)", flush=True)
+    print(f"[make_z] wrote {args.out}_all/{args.split}{suffix}.parquet ({len(df)} rows) + per-level files under {args.out}[_kind]/{args.split}/", flush=True)
 
 
 if __name__ == "__main__":
