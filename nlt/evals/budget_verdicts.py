@@ -54,6 +54,22 @@ def row_from_critic(name, c):
     return r
 
 
+def rows_from_budget(path):
+    """infra's data/info_budget.json (schema board #192): text{critic: {ckpt, step, space, sets{label: {n, n_tokens_mean, frac_z_beats_*, bands{all|pre<=13|workspace14-32|motor>=33: {bits, sem, z_dm, z_rp, shuf_words, mask_next, content, vs_mix}}}}}}"""
+    d = json.load(open(path)); rows = []
+    for critic, cd in (d.get("text") or {}).items():
+        for label, sd in (cd.get("sets") or {}).items():
+            b = (sd.get("bands") or {}).get("all") or {}
+            c = {"cond": "text", "step": cd.get("step"), "n_rows": sd.get("n"), "n_tokens_mean": sd.get("n_tokens_mean"),
+                 "exact_pmi_bits": {"mean": b.get("bits", float("nan")), "sem": b.get("sem", float("nan"))}, "shuffle_exact_pmi_bits": {"mean": b.get("z_dm", float("nan"))},
+                 "rp_exact_pmi_bits": {"mean": b.get("z_rp", float("nan"))}, "shuf_words_exact_pmi_bits": {"mean": b.get("shuf_words", float("nan"))}, "mask_next_exact_pmi_bits": {"mean": b.get("mask_next", float("nan"))},
+                 "frac_z_beats_dm": sd.get("frac_z_beats_dm", float("nan")), "frac_z_beats_rp": sd.get("frac_z_beats_rp", float("nan")), "frac_z_beats_shuf_words": sd.get("frac_z_beats_shuf_words", float("nan"))}
+            r = row_from_critic(f"{critic}@{label}", c); r["space"] = cd.get("space"); r["vs_mix"] = b.get("vs_mix"); r["source_file"] = os.path.basename(path)
+            r["by_band"] = {bn: {k: bv.get(k) for k in ("bits", "sem", "n", "z_dm", "z_rp", "content", "content_sem", "vs_mix") if k in bv} for bn, bv in (sd.get("bands") or {}).items() if bn != "all" and isinstance(bv, dict)}
+            rows.append(r)
+    return rows
+
+
 def load_rows(paths):
     rows = []
     for p in paths:
@@ -75,7 +91,9 @@ def to_markdown(rows):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("--json", action="append", required=True); ap.add_argument("--out", required=True); ap.add_argument("--md")
-    a = ap.parse_args(); rows = load_rows(a.json)
+    ap = argparse.ArgumentParser(); ap.add_argument("--json", action="append", default=[]); ap.add_argument("--budget", help="data/info_budget.json (new schema)"); ap.add_argument("--critic", action="append", help="keep only these critics")
+    ap.add_argument("--out", required=True); ap.add_argument("--md")
+    a = ap.parse_args(); rows = load_rows(a.json) + (rows_from_budget(a.budget) if a.budget else [])
+    if a.critic: rows = [r for r in rows if r["critic"] in a.critic]
     json.dump({"rows": rows, "sources": a.json}, open(a.out, "w"), indent=1, default=str); md = to_markdown(rows); print(md)
     if a.md: open(a.md, "w").write(md + "\n")
