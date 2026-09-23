@@ -17,8 +17,8 @@ KIND_COLORS = {"jlens": "#55A868", "logit": "#4C72B0", "tuned": "#DD8452"}
 
 
 def plot_a(paths, out):
-    plt.rcParams.update({"font.size": 12, "axes.titlesize": 14})
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5.2))
+    plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "legend.fontsize": 11})
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6.8))
     for ax, target in zip(axes, ("delta", "h_j")):
         rows = []
         for p in paths:
@@ -44,8 +44,8 @@ def plot_a(paths, out):
 
 def plot_b(path, out):
     d = json.load(open(path))
-    plt.rcParams.update({"font.size": 12, "axes.titlesize": 14})
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "legend.fontsize": 11})
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6.8))
     keys = sorted(d)
     srcs = sorted({k.split("|")[0].split("-")[-1] for k in keys}); w = 0.8 / max(1, len(srcs)); xs = np.arange(4)
     for n, src in enumerate(srcs):

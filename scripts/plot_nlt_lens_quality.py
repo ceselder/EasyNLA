@@ -22,8 +22,8 @@ def main():
     args = ap.parse_args()
     ev = json.load(open(args.eval))
     layers = ev["layers"]
-    plt.rcParams.update({"font.size": 12, "axes.titlesize": 14})
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+    plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "legend.fontsize": 11})
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6.8))
     for kind in ev["kl"]:
         axes[0].plot(layers, ev["kl"][kind], "o-", color=COLORS.get(kind), label=NAMES.get(kind, kind), ms=4)
         axes[1].plot(layers, [100 * v for v in ev["top1"][kind]], "o-", color=COLORS.get(kind), label=NAMES.get(kind, kind), ms=4)
@@ -36,7 +36,7 @@ def main():
     axes[1].set_ylabel("top-1 agreement with the model, %")
     axes[1].set_title("All lenses collapse onto next-token prediction\nonly in the last few layers")
     axes[1].legend(loc="upper left", fontsize=10)
-    fig.suptitle(f"Qwen3-8B lens quality on held-out pile-10k ({ev['n_tokens']} tokens); grey = workspace band 14-32", fontsize=12)
+    fig.suptitle(f"Three lenses for Qwen3-8B: the tuned lens tracks the output best, the J-lens reads the workspace (held-out pile-10k, {ev['n_tokens']} tokens; grey = workspace band 14-32)", fontsize=12.5, wrap=True)
     fig.tight_layout()
     os.makedirs(f"{args.out}/data", exist_ok=True)
     fig.savefig(f"{args.out}/lens_quality.png", dpi=150); fig.savefig(f"{args.out}/lens_quality.pdf")
