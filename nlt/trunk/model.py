@@ -60,7 +60,8 @@ class FreshAttnBlock(nn.Module):
         q = self.q(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         k = self.k(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        att = F.scaled_dot_product_attention(q, k, v)
+        # explicit attention (T = K+1 <= 8 tokens): the fused SDPA kernels fail on these shapes on B200 (cuDNN: mha_graph.execute; flash/efficient: 'invalid argument' at batch*groups 1024)
+        att = torch.softmax((q @ k.transpose(-1, -2)) * (self.d_head ** -0.5), -1) @ v
         return h + self.out(att.transpose(1, 2).reshape(B, T, -1)).to(h.dtype)
 
 
