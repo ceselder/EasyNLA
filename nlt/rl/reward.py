@@ -94,3 +94,24 @@ def corr(a, b):
     a = np.asarray(a, np.float64); b = np.asarray(b, np.float64); m = np.isfinite(a) & np.isfinite(b)
     if m.sum() < 3 or a[m].std() == 0 or b[m].std() == 0: return float("nan")
     return float(np.corrcoef(a[m], b[m])[0, 1])
+
+
+def referential_score(scorer, h_i_pairs, h_j_pairs, texts, groups, dist_idx, seed: int = 0):
+    """DECISIONS v1.13 item 2. h_i_pairs / h_j_pairs [P, d] per PAIR (raw); texts [n] per rollout; groups [n] -> pair index of each
+    rollout; dist_idx [P, K] -> K depth-matched distractor pair indices per pair. Every conditional solve uses the seed-keyed eps / probe
+    banks, and a distractor pair is passed as its own group id, so its unconditional term is computed once and shared by every text
+    scored against it. Returns own [n], dist [n, K], content [n] = own - mean_k dist (all exact bits)."""
+    groups = torch.as_tensor(groups, dtype=torch.long); n = groups.numel(); K = dist_idx.shape[1]
+    own = scorer.score(h_i_pairs[groups], h_j_pairs[groups], texts, groups.tolist(), seed=seed)["exact_bits"].float()
+    dist = torch.zeros(n, K)
+    for k in range(K):
+        d = dist_idx[groups, k]
+        dist[:, k] = scorer.score(h_i_pairs[d], h_j_pairs[d], texts, d.tolist(), seed=seed)["exact_bits"].float()
+    content = own - dist.mean(1)
+    return own, dist, content
+
+
+def referential_accuracy(own: torch.Tensor, dist: torch.Tensor):
+    """P(PMI_own > PMI_distractor) over rollouts x distractors (finite rows only)"""
+    m = torch.isfinite(own)[:, None] & torch.isfinite(dist)
+    return float((own[:, None] > dist)[m].float().mean()) if m.any() else float("nan")

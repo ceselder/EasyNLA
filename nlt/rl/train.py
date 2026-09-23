@@ -47,6 +47,17 @@ def parse():
     p.add_argument("--loss", choices=["reinforce", "cispo"], default="reinforce"); p.add_argument("--cispo-eps", type=float, default=5.0)
     p.add_argument("--mismatch-thresh", type=float, default=0.1); p.add_argument("--length-normalizer", type=float, default=None, help="Dr.GRPO constant token normaliser (default: mean over the response)")
     p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16)
+    # referential co-training (DECISIONS v1.13): stratified (i,j) classes, content reward vs depth-matched distractors, contrastive listener, iterated learning
+    p.add_argument("--referential", action=argparse.BooleanOptionalAction, default=True, help="stratified batches + content reward = PMI(own) - mean_k PMI(distractor_k); off = plain bits reward")
+    p.add_argument("--n-classes", type=int, default=16, help="distinct (i,j) classes per step"); p.add_argument("--per-class", type=int, default=8, help="pairs (positions) per class; distractors come from the class")
+    p.add_argument("--n-dist", type=int, default=2, help="distractor pairs scored per rollout (<= per-class - 1)")
+    p.add_argument("--cotrain-contrast", type=float, default=1.0, help="weight of the listener's hinge softplus((L(z|own) - L(z|distractor) + margin)/tau)*tau at shared (t, eps)")
+    p.add_argument("--cotrain-tau", type=float, default=0.005); p.add_argument("--cotrain-margin", type=float, default=0.005)
+    p.add_argument("--cotrain-replay-frac", type=float, default=0.333, help="share of each listener batch drawn from the teacher/lens pool")
+    p.add_argument("--cotrain-paraphrase-p", type=float, default=0.5, help="share of the listener's rollout texts replaced by a non-Qwen paraphrase (anti private code)")
+    p.add_argument("--cotrain-guard", action=argparse.BooleanOptionalAction, default=True, help="co-train only on group winners whose content reward is > 0 (redteam: else best-of-group selects register)")
+    p.add_argument("--iterated-every", type=int, default=100, help="iterated learning: every k steps reset the listener's adapter to the pre-RL critic and re-fit on the recent-rollout buffer + pool (0 = off)")
+    p.add_argument("--iterated-steps", type=int, default=60); p.add_argument("--iterated-batch", type=int, default=192); p.add_argument("--buffer-steps", type=int, default=50)
     # critic co-training hook (best-of-group + replay)
     p.add_argument("--cotrain", action="store_true"); p.add_argument("--cotrain-lr", type=float, default=2e-5, help="adapter lr; the text adapter is ~0.6B params and sees ~100 rows/step, so keep it small (infra #112: adapters overfit in a few epochs)")
     p.add_argument("--cotrain-every", type=int, default=1, help="co-train the critic every k RL steps"); p.add_argument("--replay", default=None, help="comma list / globs of text parquet files (pool) for critic replay")
@@ -66,50 +77,133 @@ def lr_at(step, base_lr, warmup):
     return base_lr * min(1.0, (step + 1) / max(1, warmup))
 
 
-class CriticCotrainer:
-    """optional: one FM step per RL step on the best-of-group (h_i, h_j, z) rollouts + replay rows from the pool (DECISIONS D5)."""
-    def __init__(self, scorer, lr, p_uncond, replay_paths, data_dir, store, null_reg: float = 1.0):
+class Listener:
+    """The contrastive co-trained critic (DECISIONS v1.13 items 3-4). Adapter params only (prior frozen). Loss on rows (z, own pair, distractor pair):
+         FM(z | own) + contrast * softplus((L(z|own) - L(z|distractor) + margin)/tau) * tau   at SHARED (t, eps)   + null_reg * ||v(x_t, z_rp) - v(x_t, none)||^2
+       with 1/3 of every batch from the teacher/lens pool (distractor = same (i,j), other position) and a share of the rollout texts paraphrased by a
+       non-Qwen model. Keeps a buffer of recent winners for ITERATED LEARNING: reset the adapter to the pre-RL critic and re-fit briefly on buffer + pool."""
+    def __init__(self, scorer, a, store, sampler, paraphraser=None):
+        import collections
         from nlt.critic.train import load_text_pairs
-        self.sc = scorer.inner; self.model = self.sc.model; self.enc = self.sc.encoder; self.p_uncond = p_uncond; self.store = store; self.null_reg = null_reg
-        # train ONLY the conditioning (text adapter) parameters, exactly infra's --freeze-prior selection: the unconditional path stays the
-        # blind prior, so the bits baseline log p(h_j|h_i) never drifts under co-training (DECISIONS D3).
+        self.sc = scorer.inner; self.model = self.sc.model; self.enc = self.sc.encoder; self.store, self.sampler, self.para, self.a = store, sampler, paraphraser, a
         self.cond_names = {n for n, _ in self.model.named_parameters() if (".read." in n or ".gate_mod." in n)}
         assert self.cond_names, "text critic has no adapter parameters (.read./.gate_mod.) to co-train"
-        self.params = [p for n, p in self.model.named_parameters() if n in self.cond_names]
-        self.model.requires_grad_(False)
-        self.opt = torch.optim.AdamW(self.params, lr=lr, betas=(0.9, 0.95), weight_decay=0.0)
-        print(f"[cotrain] {sum(p.numel() for p in self.params)/1e6:.1f}M adapter params trainable, prior frozen", flush=True)
+        self.named = [(n, q) for n, q in self.model.named_parameters() if n in self.cond_names]; self.params = [q for _, q in self.named]
+        self.start_state = {n: q.detach().clone() for n, q in self.named}
+        self.model.requires_grad_(False); self._new_opt()
         self.replay = None
-        if replay_paths:
+        if a.replay:
             import glob as _glob
-            files = sorted(sum([_glob.glob(x) if any(c in x for c in "*?[") else [x] for x in replay_paths.split(",")], [])); assert files, f"no replay files match {replay_paths}"
-            df = load_text_pairs(files, os.path.join(data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of)]
-            self.replay = df.reset_index(drop=True); print(f"[cotrain] replay pool {len(self.replay)} rows", flush=True)
+            files = sorted(sum([_glob.glob(x) if any(c in x for c in "*?[") else [x] for x in a.replay.split(",")], [])); assert files, f"no replay files match {a.replay}"
+            df = load_text_pairs(files, os.path.join(a.data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of)]
+            self.replay = df.reset_index(drop=True); print(f"[listener] replay pool {len(self.replay)} rows", flush=True)
+        self.buffer = collections.deque(maxlen=a.buffer_steps); self.last = {}
+        print(f"[listener] {sum(q.numel() for q in self.params)/1e6:.1f}M adapter params trainable, prior frozen; contrast {a.cotrain_contrast} (tau {a.cotrain_tau}, margin {a.cotrain_margin}), null {a.cotrain_null_reg}, lr {a.cotrain_lr}", flush=True)
 
-    def step(self, h_i, h_j, texts, n_replay, gen):
+    def _new_opt(self):
+        self.opt = torch.optim.AdamW(self.params, lr=self.a.cotrain_lr, betas=(0.9, 0.95), weight_decay=0.0)
+
+    def _replay_rows(self, n, gen):
+        if self.replay is None or n <= 0: return None
+        idx = torch.randint(0, len(self.replay), (n,), generator=gen).tolist(); sub = self.replay.iloc[idx]
+        rows = self.store.rows_for(sub["pos_idx"].values); I = torch.as_tensor(sub["i"].values).long(); J = torch.as_tensor(sub["j"].values).long()
+        drows = torch.tensor([self.sampler.same_class_partner(int(i_), int(j_), int(r_), gen) for i_, j_, r_ in zip(I.tolist(), J.tolist(), rows.tolist())])
+        return {"h_i": self.store.gather(rows, I).float(), "h_j": self.store.gather(rows, J).float(), "h_i_d": self.store.gather(drows, I).float(), "h_j_d": self.store.gather(drows, J).float(), "texts": sub["text"].tolist()}
+
+    @staticmethod
+    def _cat(parts):
+        parts = [q for q in parts if q is not None and len(q["texts"])]
+        return {k: (torch.cat([q[k] for q in parts]) if k != "texts" else sum([q["texts"] for q in parts], [])) for k in parts[0]} if parts else None
+
+    def _loss(self, rows, grad=True):
         from nlt.critic.model import make_x0, pair_fm_loss
-        if self.replay is not None and n_replay > 0:
-            idx = torch.randint(0, len(self.replay), (n_replay,), generator=gen).tolist(); sub = self.replay.iloc[idx]
-            rows = self.store.rows_for(sub["pos_idx"].values)
-            h_i = torch.cat([h_i, self.store.gather(rows, torch.as_tensor(sub["i"].values).long()).float()]); h_j = torch.cat([h_j, self.store.gather(rows, torch.as_tensor(sub["j"].values).long()).float()])
-            texts = list(texts) + sub["text"].tolist()
-        dev = self.sc.dev; self.model.train()
-        for p in self.params: p.requires_grad_(True)
-        hi, x0, log_s, _ = make_x0(self.sc.norm, h_i.to(dev), h_j.to(dev), self.sc.target, self.sc.src_rms)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = self.enc(texts)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, _, _ = pair_fm_loss(self.model, x0, hi, enc=enc, enc_mask=mask, p_uncond=self.p_uncond, log_s=log_s)
-        loss = loss.mean(); null_loss = torch.zeros((), device=dev)
-        if self.null_reg > 0:                        # infra's null regulariser (nlt/critic/train.py): under ANOTHER row's text the velocity must equal the no-text velocity
-            Bn = x0.shape[0]; eps_n = torch.randn_like(x0); t_n = torch.rand(Bn, device=dev); x_tn = (1 - t_n)[:, None] * x0 + t_n[:, None] * eps_n
-            enc_rp = torch.roll(enc, Bn // 2, 0); mask_rp = torch.roll(mask, Bn // 2, 0)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+        a = self.a; dev = self.sc.dev
+        hi, x0, log_s, _ = make_x0(self.sc.norm, rows["h_i"].to(dev), rows["h_j"].to(dev), self.sc.target, self.sc.src_rms)
+        hid, x0d, log_sd, _ = make_x0(self.sc.norm, rows["h_i_d"].to(dev), rows["h_j_d"].to(dev), self.sc.target, self.sc.src_rms)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = self.enc(rows["texts"])
+        B = x0.shape[0]; t = torch.rand(B, device=dev); eps = torch.randn_like(x0)                     # shared (t, eps): own vs distractor
+        ctx = torch.enable_grad() if grad else torch.no_grad()
+        with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
+            l_own, _, kept = pair_fm_loss(self.model, x0, hi, t, eps, enc=enc, enc_mask=mask, p_uncond=a.cotrain_p_uncond, log_s=log_s)
+            l_dist, _, _ = pair_fm_loss(self.model, x0d, hid, t, eps, enc=enc, enc_mask=mask & kept[:, None], log_s=log_sd)
+        gap = (l_own.float() - l_dist.float())[kept]                                                    # < 0 = the own pair wins
+        con = torch.nn.functional.softplus((gap + a.cotrain_margin) / a.cotrain_tau).mean() * a.cotrain_tau if gap.numel() else torch.zeros((), device=dev)
+        con_acc = float((gap < 0).float().mean()) if gap.numel() else float("nan")
+        loss = l_own.float().mean() + a.cotrain_contrast * con
+        null = torch.zeros((), device=dev)
+        if a.cotrain_null_reg > 0:
+            eps_n = torch.randn_like(x0); t_n = torch.rand(B, device=dev); x_tn = (1 - t_n)[:, None] * x0 + t_n[:, None] * eps_n
+            enc_rp = torch.roll(enc, B // 2, 0); mask_rp = torch.roll(mask, B // 2, 0)
+            with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
                 with torch.no_grad(): v_null = self.model(x_tn, t_n, hi, enc=enc_rp, enc_mask=torch.zeros_like(mask_rp), log_s=log_s)
                 v_rp = self.model(x_tn, t_n, hi, enc=enc_rp, enc_mask=mask_rp, log_s=log_s)
-            null_loss = ((v_rp.float() - v_null.float().detach()) ** 2).mean(); loss = loss + self.null_reg * null_loss
-        self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
-        self.model.eval(); self.model.requires_grad_(False); self.last_null = float(null_loss.detach())
-        return float(loss.detach())
+            null = ((v_rp.float() - v_null.float().detach()) ** 2).mean(); loss = loss + a.cotrain_null_reg * null
+        return loss, {"fm": float(l_own.float().mean()), "contrast": float(con), "contrast_acc": con_acc, "null": float(null), "n": B}
+
+    def _augment(self, rows, gen, seed):
+        """paraphrase a share of the rollout texts (non-Qwen model) so the listener can only learn meaning"""
+        if self.para is None or self.a.cotrain_paraphrase_p <= 0: return rows
+        m = torch.rand(len(rows["texts"]), generator=gen) < self.a.cotrain_paraphrase_p
+        idx = m.nonzero().flatten().tolist()
+        if idx:
+            out = self.para([rows["texts"][k] for k in idx], seed=seed); texts = list(rows["texts"])
+            for k, z in zip(idx, out): texts[k] = z
+            rows = dict(rows, texts=texts)
+        return rows
+
+    def step(self, rows, gen, seed):
+        """one listener update on this step's winners (+ replay); rows = {h_i, h_j, h_i_d, h_j_d [m, d] cpu, texts}"""
+        self.buffer.append({k: (v.half() if torch.is_tensor(v) else v) for k, v in rows.items()})
+        rows = self._augment(rows, gen, seed); frac = self.a.cotrain_replay_frac
+        rep = self._replay_rows(int(round(len(rows["texts"]) * frac / max(1e-6, 1 - frac))), gen)
+        batch = self._cat([rows, rep])
+        self.model.train()
+        for q in self.params: q.requires_grad_(True)
+        loss, m = self._loss(batch); self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
+        self.model.eval(); self.model.requires_grad_(False); m["loss"] = float(loss.detach()); self.last = m
+        return m
+
+    def _buffer_sample(self, n, gen):
+        allrows = self._cat([{k: (v.float() if torch.is_tensor(v) else v) for k, v in b.items()} for b in self.buffer])
+        if allrows is None: return None
+        N = len(allrows["texts"]); idx = torch.randperm(N, generator=gen)[: min(n, N)]
+        return {k: (v[idx] if torch.is_tensor(v) else [v[int(q)] for q in idx]) for k, v in allrows.items()}
+
+    @torch.no_grad()
+    def learnability(self, rows, ts=(0.3, 0.6), seed=0):
+        """referential accuracy P(L(z|own) < L(z|distractor)) of the CURRENT adapter on given rows at shared eps (no grad, fixed t levels)"""
+        from nlt.critic.model import make_x0, pair_fm_loss
+        if rows is None: return float("nan")
+        dev = self.sc.dev; g = torch.Generator(device=dev).manual_seed(seed); acc = []
+        hi, x0, log_s, _ = make_x0(self.sc.norm, rows["h_i"].to(dev), rows["h_j"].to(dev), self.sc.target, self.sc.src_rms)
+        hid, x0d, log_sd, _ = make_x0(self.sc.norm, rows["h_i_d"].to(dev), rows["h_j_d"].to(dev), self.sc.target, self.sc.src_rms)
+        with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = self.enc(rows["texts"])
+        for tv in ts:
+            t = torch.full((x0.shape[0],), tv, device=dev); eps = torch.randn(x0.shape, device=dev, generator=g)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                lo, _, _ = pair_fm_loss(self.model, x0, hi, t, eps, enc=enc, enc_mask=mask, log_s=log_s); ld, _, _ = pair_fm_loss(self.model, x0d, hid, t, eps, enc=enc, enc_mask=mask, log_s=log_sd)
+            acc.append(float((lo < ld).float().mean()))
+        return float(np.mean(acc))
+
+    def reset_and_refit(self, gen, seed):
+        """ITERATED LEARNING: adapter <- pre-RL critic; re-fit for a fixed short budget on buffer (2/3, paraphrase-augmented) + pool (1/3).
+        Returns (acc_before, acc_after, acc_prev_listener) on a held buffer sample: how learnable the recent descriptions are for a fresh listener."""
+        a = self.a; held = self._buffer_sample(256, gen)
+        acc_prev = self.learnability(held, seed=seed)
+        with torch.no_grad():
+            for n, q in self.named: q.copy_(self.start_state[n])
+        self._new_opt(); acc_before = self.learnability(held, seed=seed); t0 = time.time()
+        for k in range(a.iterated_steps):
+            rows = self._buffer_sample(int(a.iterated_batch * 2 / 3), gen)
+            if rows is None: break
+            rows = self._augment(rows, gen, seed * 1000 + k); rep = self._replay_rows(a.iterated_batch - len(rows["texts"]), gen); batch = self._cat([rows, rep])
+            self.model.train()
+            for q in self.params: q.requires_grad_(True)
+            loss, _ = self._loss(batch); self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
+            self.model.eval(); self.model.requires_grad_(False)
+        acc_after = self.learnability(held, seed=seed)
+        print(f"   [iterated] listener reset to pre-RL adapter; refit {a.iterated_steps} steps x {a.iterated_batch} in {time.time() - t0:.0f}s: referential acc on held recent winners prev-listener {acc_prev:.3f} -> fresh {acc_before:.3f} -> refit {acc_after:.3f}", flush=True)
+        return acc_before, acc_after, acc_prev
 
     def prepare_score(self):
         self.model.requires_grad_(False)
@@ -126,7 +220,8 @@ def main():
     from nlt.verbalizer.inject import TwoMarkerInjector
     from nlt.verbalizer.vllm_rollout import make_engine, rollout
     from nlt.rl.filters import ViolationChecker, summarize_violations
-    from nlt.rl.reward import make_scorer, shape_rewards, group_advantages, within_group_std, corr
+    from nlt.rl.reward import make_scorer, shape_rewards, group_advantages, within_group_std, corr, referential_score, referential_accuracy
+    from nlt.rl.sampler import StratifiedSampler
     from nlt.rl.paraphrase import Paraphraser, choose_paraphrase_rows
     from nlt.rl.update import grpo_update
     from nla.train_rl_vllm import sync_actor_to_vllm
@@ -162,7 +257,8 @@ def main():
     # ---- critic + paraphraser
     scorer = make_scorer(a, cdev)
     para = Paraphraser(a.paraphrase_model, gpu_mem=a.paraphrase_gpu_mem, gpu_index=cidx, seed=a.seed) if a.paraphrase_p > 0 else None
-    cot = CriticCotrainer(scorer, a.cotrain_lr, a.cotrain_p_uncond, a.replay, a.data_dir, store, null_reg=a.cotrain_null_reg) if (a.cotrain and not a.stub_critic and a.critic) else None
+    sampler = StratifiedSampler(store, a.n_classes, a.per_class)
+    cot = Listener(scorer, a, store, sampler, paraphraser=para) if (a.cotrain and not a.stub_critic and a.critic) else None
     frozen = make_scorer(a, cdev) if (cot is not None and a.frozen_critic_eval) else None
     cross = {}
     if frozen is not None: cross["frozen"] = frozen
@@ -180,7 +276,10 @@ def main():
     for step in range(a.steps):
         t0 = time.time(); B, G = a.batch_prompts, a.group
         for g in optim.param_groups: g["lr"] = lr_at(step, a.lr, a.lr_warmup)
-        rows, I, J = store.sample_pairs(B, gen)
+        if a.referential:
+            rows, I, J, cls = sampler.sample(gen); dist_idx = sampler.distractors(cls, a.n_dist, gen); B = len(rows)
+        else:
+            rows, I, J = store.sample_pairs(B, gen); dist_idx = None
         h_i = store.gather(rows, I, out_device="cpu").float(); h_j = store.gather(rows, J, out_device="cpu").float(); acts = torch.stack([h_i, h_j], 1)
         res, info = rollout(llm, spec, acts, G, a.max_new_tokens, a.temperature, seed=a.seed * 1000 + step); t_gen = time.time() - t0
         n = len(res); groups = torch.tensor([r["prompt_idx"] for r in res]); texts = [r["text"].strip() for r in res]
@@ -197,14 +296,22 @@ def main():
         # ---- exact bits
         t2 = time.time()
         if cot is not None: cot.prepare_score()
-        sc = scorer.score(h_i[groups], h_j[groups], [z if not viol["empty"][k] else None for k, z in enumerate(scored)], groups.tolist(), seed=step)
-        bits, proxy = sc["exact_bits"].float(), sc["proxy_bits"].float(); t_score = time.time() - t2
+        texts_for_score = [z if not viol["empty"][k] else None for k, z in enumerate(scored)]
+        if a.referential:
+            own_b, dist_b, bits = referential_score(scorer, h_i, h_j, texts_for_score, groups, dist_idx, seed=step); proxy = torch.full_like(bits, float("nan"))
+        else:
+            sc = scorer.score(h_i[groups], h_j[groups], texts_for_score, groups.tolist(), seed=step); bits, proxy = sc["exact_bits"].float(), sc["proxy_bits"].float(); own_b = bits; dist_b = None
+        t_score = time.time() - t2
         if lam is None:                                     # DECISIONS v1.5 lambda rule on the first batch, workspace band, honest rollouts
             okb = torch.isfinite(bits) & ~torch.as_tensor(viol["any"]); wsm = torch.tensor([band(int(J[g_])) == "workspace" for g_ in groups.tolist()]) & okb
             wg_b = within_group_std(bits[wsm], groups[wsm]) if wsm.sum() > 8 else float("nan"); wg_t = within_group_std(n_tok[wsm], groups[wsm]) if wsm.sum() > 8 else float("nan")
-            lam = 0.25 * wg_b / wg_t if (np.isfinite(wg_b) and np.isfinite(wg_t) and wg_t > 0 and wg_b > 0) else a.lam_fallback
-            print(f"[rl] lambda auto = {lam:.4f} bits/token (workspace within-group std bits {wg_b:.2f} / tokens {wg_t:.2f}; fallback {a.lam_fallback})", flush=True)
-            json.dump({"lambda": lam, "wg_std_bits_workspace": wg_b, "wg_std_tokens_workspace": wg_t}, open(os.path.join(a.out, "lambda.json"), "w"))
+            if a.referential:                               # #214: scale by the CONTENT signal (the reward IS content here): 0.25 x mean content / wg std tokens
+                cm = float(bits[wsm].mean()) if wsm.sum() > 8 else float("nan")
+                lam = 0.25 * cm / wg_t if (np.isfinite(cm) and np.isfinite(wg_t) and wg_t > 0 and cm > 0) else a.lam_fallback
+            else:
+                lam = 0.25 * wg_b / wg_t if (np.isfinite(wg_b) and np.isfinite(wg_t) and wg_t > 0 and wg_b > 0) else a.lam_fallback
+            print(f"[rl] lambda auto = {lam:.4f} bits/token (workspace: mean reward-bits {float(bits[wsm].mean()) if wsm.sum() > 8 else float('nan'):.3f}, within-group std bits {wg_b:.2f} / tokens {wg_t:.2f}; fallback {a.lam_fallback})", flush=True)
+            json.dump({"lambda": lam, "wg_std_bits_workspace": wg_b, "wg_std_tokens_workspace": wg_t, "referential": a.referential}, open(os.path.join(a.out, "lambda.json"), "w"))
         rewards, bad = shape_rewards(bits, n_tok, lam, viol["any"], groups, a.floor)
         adv = group_advantages(rewards, groups, std_norm=a.adv_std, mode=a.adv_mode, zero_var_filter=a.zero_var_filter, std_floor=a.adv_std_floor)
         # ---- update + sync
@@ -214,17 +321,36 @@ def main():
                                    length_normalizer=a.length_normalizer, n_total=n)
         t_upd = time.time() - t3; t4 = time.time(); sync(); t_sync = time.time() - t4
         # ---- critic co-training on best-of-group (honest members only) + replay
-        cot_loss = float("nan")
-        if cot is not None and step % a.cotrain_every == 0:
+        cot_loss = float("nan"); cot_m = {}; t_cot = 0.0
+        if cot is not None:
             best = []
             for g_ in groups.unique().tolist():
                 m = (groups == g_) & ~bad
-                if m.any(): best.append(int((rewards.masked_fill(~m, -1e9)).argmax()))
-            if best: cot_loss = cot.step(h_i[groups[best]], h_j[groups[best]], [texts[k] for k in best], a.cotrain_replay_n, gen)
+                if m.any():
+                    k_best = int((rewards.masked_fill(~m, -1e9)).argmax())
+                    if (not a.cotrain_guard) or float(bits[k_best]) > 0: best.append(k_best)          # redteam: only winners that beat their distractors
+            if best:
+                gb = groups[best]; d0 = dist_idx[gb, 0] if dist_idx is not None else gb[torch.randperm(len(gb))]
+                win_rows = {"h_i": h_i[gb], "h_j": h_j[gb], "h_i_d": h_i[d0], "h_j_d": h_j[d0], "texts": [texts[k] for k in best]}
+                tcs = time.time()
+                if step % a.cotrain_every == 0: cot_m = cot.step(win_rows, gen, seed=step); cot_loss = cot_m.get("loss", float("nan"))
+                else: cot.buffer.append({k: (v.half() if torch.is_tensor(v) else v) for k, v in win_rows.items()})
+                t_cot = time.time() - tcs
+            if a.iterated_every > 0 and step > 0 and step % a.iterated_every == 0:
+                ti = time.time(); acc_b, acc_a, acc_p = cot.reset_and_refit(gen, seed=step); cot_m.update({"iterated_acc_fresh": acc_b, "iterated_acc_refit": acc_a, "iterated_acc_prev": acc_p, "iterated_s": time.time() - ti})
         # ---- logging
         ok = ~bad; b_ok = bits[ok] if ok.any() else bits
         fin = torch.isfinite(bits)
-        log = {"step": step, "lr": optim.param_groups[0]["lr"], "loss": loss, "grad_norm": gn, "reward/mean": float(rewards.mean()), "reward/within_group_std": within_group_std(rewards, groups),
+        ref = {}
+        if a.referential and dist_b is not None:
+            okf = ok & torch.isfinite(own_b) & torch.isfinite(dist_b).all(1)
+            ref = {"ref/own_bits": float(own_b[okf].mean()), "ref/dist_bits": float(dist_b[okf].mean()), "ref/content": float(bits[okf].mean()), "ref/content_median": float(bits[okf].median()),
+                   "ref/acc": referential_accuracy(own_b[okf], dist_b[okf]), "ref/frac_content_pos": float((bits[okf] > 0).float().mean()), "ref/n_winners_cotrained": len(best) if cot is not None else 0}
+            for bname in ("pre", "workspace", "motor"):
+                m = torch.tensor([band(int(J[g_])) == bname for g_ in groups.tolist()]) & okf
+                if m.any(): ref[f"ref/acc_{bname}"] = referential_accuracy(own_b[m], dist_b[m]); ref[f"ref/content_{bname}"] = float(bits[m].mean()); ref[f"ref/own_{bname}"] = float(own_b[m].mean())
+        log = {"step": step, "lr": optim.param_groups[0]["lr"], "loss": loss, "grad_norm": gn, "reward/mean": float(rewards.mean()), "reward/within_group_std": within_group_std(rewards, groups), **ref,
+               **{f"listener/{k}": v for k, v in cot_m.items()}, "time/cotrain": t_cot,
                "bits/mean": float(b_ok.mean()), "bits/median": float(b_ok.median()), "bits/within_group_std": within_group_std(bits.masked_fill(~fin, 0), groups),
                "bits/frac_pos": float((b_ok > 0).float().mean()), "bits/frac_nonpos_all": float((bits <= 0).float().mean()), "proxy/mean": float(proxy[ok].mean()) if ok.any() else float("nan"),
                "proxy/over_exact": float(proxy[ok].mean() / b_ok.mean()) if ok.any() and float(b_ok.mean()) != 0 else float("nan"),
@@ -233,7 +359,7 @@ def main():
                "corr/reward_tokens": corr(rewards, n_tok), "corr/bits_tokens": corr(bits, n_tok), "paraphrase/frac": float(pmask.float().mean()),
                "paraphrase/bits_mean": float(bits[pmask & ok].mean()) if (pmask & ok).any() else float("nan"), "paraphrase/bits_mean_unparaphrased": float(bits[~pmask & ok].mean()) if (~pmask & ok).any() else float("nan"),
                "kl": um["kl_mean"], "entropy": um["entropy"], "sampler/absdiff_mean": um["sampler_logp_absdiff_mean"], "sampler/absdiff_max": um["sampler_logp_absdiff_max"], "sampler/masked": um["sampler_mismatch_masked"],
-               "steer/written": info["steer_written"], "steer/expected": info["steer_expected"], "cotrain/loss": cot_loss, "cotrain/null_loss": getattr(cot, "last_null", float("nan")) if cot is not None else float("nan"),
+               "steer/written": info["steer_written"], "steer/expected": info["steer_expected"], "cotrain/loss": cot_loss,
                "time/gen": t_gen, "time/para": t_para, "time/score": t_score, "time/update": t_upd, "time/sync": t_sync, "time/step": time.time() - t0, "gen_tok_per_s": info["tok_per_s"], **summarize_violations(viol)}
         log["lambda"] = lam
         for bname in ("pre", "workspace", "motor"):
@@ -245,9 +371,13 @@ def main():
             log["div/distinct4"] = float(distinct_n(resp_ids, 4)); log["div/self_bleu"] = float(self_bleu(resp_ids, n_sample=64, seed=step))
         except Exception as e_: log["div/error"] = str(e_)[:80]
         if cross and step % a.cross_every == 0:             # DECISIONS v1.6: re-score a subsample of THIS step's rollouts under the frozen start critic + the teacher-only critic
-            tc = time.time(); sub = list(range(min(a.cross_n, n))); sg = groups[sub]; live_b = bits[sub]
+            tc = time.time(); sub = list(range(min(a.cross_n, n))); sg = groups[sub]; live_b = bits[sub]; sub_txt = [scored[k] if not viol["empty"][k] else None for k in sub]
             for cname, csc in cross.items():
-                cb = csc.score(h_i[sg], h_j[sg], [scored[k] if not viol["empty"][k] else None for k in sub], sg.tolist(), seed=step)["exact_bits"].float()
+                if a.referential:
+                    c_own, c_dist, cb = referential_score(csc, h_i, h_j, sub_txt, sg, dist_idx, seed=step)
+                    log[f"cross/{cname}/ref_acc"] = referential_accuracy(c_own, c_dist); log[f"cross/{cname}/own_bits"] = float(c_own[torch.isfinite(c_own)].mean())
+                else:
+                    cb = csc.score(h_i[sg], h_j[sg], sub_txt, sg.tolist(), seed=step)["exact_bits"].float()
                 okc = torch.isfinite(cb) & torch.isfinite(live_b)
                 log[f"cross/{cname}/bits_mean"] = float(cb[okc].mean()); log[f"cross/{cname}/within_group_std"] = within_group_std(cb[okc], sg[okc])
                 log[f"cross/{cname}/corr_live"] = corr(cb[okc], live_b[okc]); log[f"cross/{cname}/live_minus_cross"] = float((live_b[okc] - cb[okc]).mean())
@@ -255,8 +385,8 @@ def main():
                     m = torch.tensor([band(int(J[g_])) == bname for g_ in sg.tolist()]) & okc
                     if m.any(): log[f"cross/{cname}/bits_{bname}"] = float(cb[m].mean())
             log["cross/live_bits_mean_subsample"] = float(live_b[torch.isfinite(live_b)].mean()); log["time/cross"] = time.time() - tc
-            print("   cross: " + " | ".join(f"{c}: {log[f'cross/{c}/bits_mean']:+.2f} (corr live {log[f'cross/{c}/corr_live']:.2f}, ws {log.get(f'cross/{c}/bits_workspace', float('nan')):+.1f})" for c in cross) + f" | live {log['cross/live_bits_mean_subsample']:+.2f}", flush=True)
-        print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | bits {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} ws {log.get('bits/workspace', float('nan')):+.2f} | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | d4 {log.get('div/distinct4', float('nan')):.2f} | gn {gn:.2f} | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} sync {t_sync:.0f})", flush=True)
+            print("   cross (" + ("content" if a.referential else "bits") + "): " + " | ".join(f"{c}: {log[f'cross/{c}/bits_mean']:+.2f} (corr live {log[f'cross/{c}/corr_live']:.2f}, ws {log.get(f'cross/{c}/bits_workspace', float('nan')):+.1f}" + (f", ref acc {log[f'cross/{c}/ref_acc']:.3f}" if f"cross/{c}/ref_acc" in log else "") + ")" for c in cross) + f" | live {log['cross/live_bits_mean_subsample']:+.2f}", flush=True)
+        print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | {'content' if a.referential else 'bits'} {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} ws {log.get('bits/workspace', float('nan')):+.2f}" + (f" | own {ref['ref/own_bits']:+.2f} dist {ref['ref/dist_bits']:+.2f} acc {ref['ref/acc']:.3f}" if ref else "") + f" | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | d4 {log.get('div/distinct4', float('nan')):.2f} | lam {lam:.4f} | gn {gn:.2f}" + (f" | listener fm {cot_m['fm']:.3f} con {cot_m['contrast']:.4f} acc {cot_m['contrast_acc']:.2f} null {cot_m['null']:.4f}" if cot_m and 'fm' in cot_m else "") + f" | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} cot {t_cot:.0f})", flush=True)
         if step % a.eval_every == 0:
             order = rewards.argsort(); pick = [int(order[0]), int(order[len(order) // 2]), int(order[-1])]
             for k in pick: print(f"   [{int(I[groups[k]])}->{int(J[groups[k]])}] r={float(rewards[k]):+.2f} bits={float(bits[k]):+.2f} tok={int(n_tok[k])} viol={bool(bad[k])} :: {texts[k][:200]!r}", flush=True)
