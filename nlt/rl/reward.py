@@ -68,15 +68,15 @@ def shape_rewards(bits: torch.Tensor, n_tokens: torch.Tensor, lam: float, viol: 
     return out, bad
 
 
-def group_advantages(rewards: torch.Tensor, groups: torch.Tensor, std_norm: bool = False, eps: float = 1e-6, mode: str = "group", zero_var_filter: bool = False):
-    """group-centred advantages. mode 'group': optionally / the group std (vanilla GRPO); mode 'batch' (ScaleRL / the Sep-2026 27B recipe):
-    centre per group, divide by ONE batch-level std. zero_var_filter: groups whose rewards are all equal get advantage 0 (they already do
-    after centring; the flag also excludes them from the batch std)."""
+def group_advantages(rewards: torch.Tensor, groups: torch.Tensor, std_norm: bool = False, eps: float = 1e-6, mode: str = "group", zero_var_filter: bool = False, std_floor: float = 0.0):
+    """group-centred advantages. mode 'group' + std_norm (DECISIONS v1.4: the default for exact bits, whose scale differs ~30x across bands):
+    (r - mean_g) / max(std_g, std_floor) -- std_floor (in reward units, set ~ the scoring noise) stops a near-tied group from having its
+    noise amplified. mode 'batch': centre per group, divide by ONE batch-level std (ScaleRL). zero_var_filter: all-equal groups -> 0."""
     adv = torch.zeros_like(rewards); keep = torch.ones_like(rewards, dtype=torch.bool)
     for g in groups.unique().tolist():
         m = groups == g; r = rewards[m]; a = r - r.mean()
         if zero_var_filter and (m.sum() < 2 or float(r.std()) < 1e-8): keep[m] = False; a = torch.zeros_like(a)
-        elif mode == "group" and std_norm and m.sum() > 1: a = a / (r.std() + eps)
+        elif mode == "group" and std_norm and m.sum() > 1: a = a / max(float(r.std()), std_floor, eps)
         adv[m] = a
     if mode == "batch":
         sd = float(adv[keep].std()) if keep.sum() > 1 else 1.0

@@ -25,7 +25,8 @@ def parse():
     p.add_argument("--enc-model", default=None); p.add_argument("--enc-layer", type=int, default=None)
     p.add_argument("--lam", type=float, default=0.1, help="bits per token"); p.add_argument("--floor", type=float, default=-5.0)
     p.add_argument("--copy-thresh", type=float, default=0.05); p.add_argument("--adv-std", action="store_true", help="divide advantages by the group std (default Dr.GRPO: no)")
-    p.add_argument("--adv-mode", choices=["group", "batch"], default="group", help="batch = centre per group, one batch-level std (ScaleRL / 27B recipe)"); p.add_argument("--zero-var-filter", action="store_true")
+    p.add_argument("--adv-mode", choices=["group", "batch"], default="group", help="group (DECISIONS v1.4) | batch = centre per group, one batch-level std (ScaleRL)"); p.add_argument("--zero-var-filter", action="store_true")
+    p.add_argument("--adv-std-floor", type=float, default=1.0, help="with --adv-std: divide by max(group std, floor) [reward units ~ bits]; set near the scoring noise")
     p.add_argument("--frozen-critic-eval", action="store_true", help="with --cotrain: also score the held-out eval with a FROZEN copy of the warm-start critic (live up + frozen flat = private code)")
     # paraphrase
     p.add_argument("--paraphrase-p", type=float, default=0.3); p.add_argument("--paraphrase-model", default="NousResearch/Meta-Llama-3.1-8B-Instruct")
@@ -166,7 +167,7 @@ def main():
         sc = scorer.score(h_i[groups], h_j[groups], [z if not viol["empty"][k] else None for k, z in enumerate(scored)], groups.tolist(), seed=step)
         bits, proxy = sc["exact_bits"].float(), sc["proxy_bits"].float(); t_score = time.time() - t2
         rewards, bad = shape_rewards(bits, n_tok, a.lam, viol["any"], groups, a.floor)
-        adv = group_advantages(rewards, groups, std_norm=a.adv_std, mode=a.adv_mode, zero_var_filter=a.zero_var_filter)
+        adv = group_advantages(rewards, groups, std_norm=a.adv_std, mode=a.adv_mode, zero_var_filter=a.zero_var_filter, std_floor=a.adv_std_floor)
         # ---- update + sync
         t3 = time.time(); acts_list = [acts[r["prompt_idx"]] for r in res]
         loss, gn, um = grpo_update(policy, optim, res, acts_list, adv, inj, ref_ids, dev, pad_id, micro_batch=a.micro_batch, kl_beta=a.kl_beta,
@@ -196,7 +197,9 @@ def main():
                "time/gen": t_gen, "time/para": t_para, "time/score": t_score, "time/update": t_upd, "time/sync": t_sync, "time/step": time.time() - t0, "gen_tok_per_s": info["tok_per_s"], **summarize_violations(viol)}
         for bname in ("pre", "workspace", "motor"):
             m = torch.tensor([band(int(J[g_])) == bname for g_ in groups.tolist()]) & ok
-            if m.any(): log[f"bits/{bname}"] = float(bits[m].mean())
+            if m.any():
+                log[f"bits/{bname}"] = float(bits[m].mean()); log[f"reward/{bname}"] = float(rewards[m].mean()); log[f"bits_per_token/{bname}"] = float(bits[m].sum() / max(1.0, float(n_tok[m].sum())))
+                log[f"bits/{bname}_within_group_std"] = within_group_std(bits[m], groups[m]); log[f"tokens/{bname}"] = float(n_tok[m].mean())
         print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | bits {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | gn {gn:.2f} | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} sync {t_sync:.0f})", flush=True)
         if step % a.eval_every == 0:
             order = rewards.argsort(); pick = [int(order[0]), int(order[len(order) // 2]), int(order[-1])]

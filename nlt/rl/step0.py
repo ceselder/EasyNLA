@@ -93,17 +93,24 @@ def main():
     out = {"init": a.init, "n_pairs": N, "group": a.group, "dm_exact_partners": int(N - n_approx), "critic": a.critic or "stub", "ode_steps": a.ode_steps, "probes": a.probes, "score_s_per_row": t_score / n,
            "all": stats(np.ones(n, bool)), "bands": {b: stats(bands[gl] == b) for b in ("pre", "workspace", "motor")}, "rollout": info}
     ws = out["bands"].get("workspace", {})
-    # signal: within-group std >= 3x scoring noise AND the paired content gain over the depth-matched shuffle is > 3 SEM; critic health: the
-    # random-pair text must buy ~nothing (|bits(z_rp)| within 5x the scoring noise) -- a presence offset means the adapter is reading form
-    out["critic_healthy_workspace"] = bool(ws and ws["critic_presence_offset_over_noise"] <= 5)
-    out["pass_workspace"] = bool(ws and ws["std_over_noise"] >= 3 and ws["bits_minus_dm"] > 3 * ws["bits_minus_dm_sem"] and ws["mention_next"] < 0.2 and out["critic_healthy_workspace"])
+    # critic health (DECISIONS v1.5): per band with n >= 100 rows, |bits(z_rp)| AND |bits(z_dm)| within 3x the scoring noise (text about
+    # another pair must buy ~nothing); signal: within-group std >= 3x noise AND paired gain over the depth-matched shuffle > 3 SEM.
+    health = {}
+    for bname, st in out["bands"].items():
+        if st and st["n"] >= 100 and st["scoring_noise"] > 0:
+            health[bname] = {"rp_over_noise": abs(st["bits_rp"]) / st["scoring_noise"], "dm_over_noise": abs(st["bits_dm"]) / st["scoring_noise"]}
+            health[bname]["ok"] = bool(health[bname]["rp_over_noise"] <= 3 and health[bname]["dm_over_noise"] <= 3)
+    out["critic_health"] = health; out["critic_healthy_workspace"] = bool(health.get("workspace", {}).get("ok", False)); out["critic_healthy_all"] = bool(health) and all(h["ok"] for h in health.values())
+    out["signal_workspace"] = bool(ws and ws["std_over_noise"] >= 3 and ws["bits_minus_dm"] > 3 * ws["bits_minus_dm_sem"] and ws["mention_next"] < 0.2)
+    out["pass_workspace"] = bool(out["signal_workspace"] and out["critic_healthy_workspace"])
+    out["lambda_recommended"] = ws.get("lambda_wg") if ws else None            # DECISIONS v1.5: 0.25 x wg std(bits) / wg std(tokens), WORKSPACE band
     samp = []
     for k in np.argsort(-b0.numpy())[:8].tolist() + np.argsort(b0.numpy())[:4].tolist():
         g = gl[k]; samp.append({"i": int(I[g]), "j": int(J[g]), "bits": float(b0[k]), "bits_dm": float(b_dm[k]), "tokens": int(n_tok[k]), "text": texts[k][:300]})
     out["samples"] = samp
     print(json.dumps({k: v for k, v in out.items() if k != "samples"}, indent=1), flush=True)
     for s in samp: print(f"  [{s['i']}->{s['j']}] bits {s['bits']:+.2f} (dm {s['bits_dm']:+.2f}) tok {s['tokens']}: {s['text']!r}", flush=True)
-    os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out, "w"), indent=1); print(f"[step0] PASS(workspace)={out['pass_workspace']} critic_healthy={out['critic_healthy_workspace']} -> {a.out}", flush=True)
+    os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out, "w"), indent=1); print(f"[step0] PASS(workspace)={out['pass_workspace']} signal={out['signal_workspace']} critic_healthy(ws)={out['critic_healthy_workspace']} all={out['critic_healthy_all']} lambda_rec={out['lambda_recommended']} -> {a.out}", flush=True)
 
 
 if __name__ == "__main__":
