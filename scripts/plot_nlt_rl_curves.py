@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 STEP = re.compile(r"^step\s+(\d+) \| R ([-+\d.]+) \(wg std ([-+\d.]+)\) \| bits ([-+\d.]+) med ([-+\d.]+) ws ([-+\d.]+) \| tok ([\d.]+) \| viol ([\d.]+) \| kl ([\d.]+) \| ent ([\d.]+) \| d4 ([\d.]+) \| gn ([\d.]+) \| (\d+)s")
+REF = re.compile(r"^step\s+(\d+) \| R ([-+\d.]+) \(wg std ([-+\d.]+)\) \| content ([-+\d.]+) med ([-+\d.]+) ws ([-+\d.]+) \| own ([-+\d.]+) dist ([-+\d.]+) acc ([\d.]+) \| tok ([\d.]+) \| viol ([\d.]+) \| kl ([\d.]+) \| ent ([\d.]+) \| d4 ([\d.]+) \| lam ([\d.]+) \| gn ([\d.]+) \| listener fm ([\d.]+) con ([\d.]+) acc ([\d.]+) null ([\d.]+) \| (\d+)s")
 EVAL = re.compile(r"eval: bits ([-+\d.]+) \(med ([-+\d.]+), /tok ([-+\d.]+); random-pair control ([-+\d.]+); frozen critic ([-+\d.]+) \(live-frozen ([-+\d.]+)\)\) by band pre=([-+\d.]+) workspace=([-+\d.]+) motor=([-+\d.]+) \| tok ([\d.]+) viol ([\d.]+) nonpos ([\d.]+)")
 
 
@@ -27,6 +28,12 @@ def style():
 def parse(path):
     steps, evals, last = [], [], None
     for line in open(path, errors="replace"):
+        r = REF.match(line.strip())
+        if r:
+            v = r.groups(); last = int(v[0])
+            steps.append({"step": last, "reward": float(v[1]), "within_group_std": float(v[2]), "content": float(v[3]), "content_median": float(v[4]), "content_workspace": float(v[5]), "own_pmi": float(v[6]), "distractor_pmi": float(v[7]),
+                          "ref_acc": float(v[8]), "tokens": float(v[9]), "violations": float(v[10]), "kl": float(v[11]), "entropy": float(v[12]), "distinct4": float(v[13]), "lambda": float(v[14]), "grad_norm": float(v[15]),
+                          "listener_fm": float(v[16]), "listener_con": float(v[17]), "listener_acc": float(v[18]), "listener_null": float(v[19]), "seconds": int(v[20]), "referential": True}); continue
         m = STEP.match(line.strip())
         if m:
             v = m.groups(); last = int(v[0])
@@ -47,6 +54,30 @@ def main():
     if not steps: print("no steps parsed"); return
     S = {k: [s[k] for s in steps] for k in steps[0]}; E = {k: [e[k] for e in evals] for k in evals[0]} if evals else {}
     style(); fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.5), dpi=150, gridspec_kw={"hspace": 0.45, "wspace": 0.28}); (ax1, ax2), (ax3, ax4) = axes
+    referential = bool(steps[0].get("referential"))
+    if referential:
+        ax1.plot(S["step"], S["content"], marker="o", ms=4, lw=2, color=CAT[0], label="content = PMI(own) − mean PMI(distractors)")
+        ax1.plot(S["step"], S["content_workspace"], marker="s", ms=4, lw=2, color=CAT[1], label="content, workspace band")
+        ax1.plot(S["step"], S["own_pmi"], lw=1.5, color=CAT[6], alpha=0.8, label="PMI(own) vs the blind prior")
+        ax1.axhline(0, color=INK2, lw=0.8); ax1.set_xlabel("RL step"); ax1.set_ylabel("exact bits per rollout (live listener)"); ax1.legend(frameon=False, fontsize=10)
+        ax1.set_title("(a) Referential content and absolute PMI per step", loc="left", fontsize=12.5)
+        ax2.plot(S["step"], S["ref_acc"], marker="o", ms=5, lw=2, color=CAT[0], label="P(own pair beats a same-(i, j) distractor)")
+        ax2.plot(S["step"], S["listener_acc"], marker="s", ms=4, lw=1.5, color=CAT[2], alpha=0.8, label="listener's own contrast accuracy (diagnostic)")
+        ax2.axhline(0.5, color=INK2, lw=0.9, ls=(0, (4, 2))); ax2.text(S["step"][-1], 0.51, "chance", ha="right", fontsize=9.5, color=INK2); ax2.set_ylim(0, 1)
+        ax2.set_xlabel("RL step"); ax2.set_ylabel("referential accuracy"); ax2.legend(frameon=False, fontsize=10); ax2.set_title("(b) Does the listener pick the right pair from the sentence?", loc="left", fontsize=12.5)
+        ax3.plot(S["step"], S["tokens"], marker="o", ms=4, lw=2, color=CAT[0]); ax3.set_xlabel("RL step"); ax3.set_ylabel("tokens per sentence (mean)"); ax3.set_ylim(0, max(S["tokens"]) * 1.15)
+        ax3.set_title(f"(c) Sentence length (λ = {S['lambda'][-1]:.3f} bits/token, content rule)", loc="left", fontsize=12.5)
+        ax4.plot(S["step"], S["kl"], marker="o", ms=4, lw=2, color=CAT[1]); ax4.set_xlabel("RL step"); ax4.set_ylabel("KL(policy ‖ text-only base), nats per token"); ax4.set_ylim(0, max(S["kl"]) * 1.15)
+        ax4.set_title("(d) Distance from the natural-language reference", loc="left", fontsize=12.5)
+        n = S["step"][-1]
+        fig.suptitle("\n".join(textwrap.wrap(f"PRELIMINARY referential RL ({n} steps so far, {a.label}): reward = content + 0.2·PMI(own) − λ·tokens with same-(i, j) distractors; "
+                                              f"content moved {S['content'][0]:+.2f} → {S['content'][-1]:+.2f} bits, referential accuracy {S['ref_acc'][0]:.2f} → {S['ref_acc'][-1]:.2f}", 108)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
+        fig.text(0.01, 0.005, f"Run {a.tag}: 12 (i, j) classes × 8 pairs × 8 samples per step (768 rollouts); same-document and cross-document distractors; null-dm listener co-trained at lr 5e-6 every 2 steps with paraphrase augmentation; iterated reset every 100 steps; "
+                 "KL β 0.01 to Qwen3-8B on a text-only prompt; paraphrase-scored reward p = 0.3. Parsed from the trainer log.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
+        fig.subplots_adjust(left=0.08, right=0.985, top=0.86, bottom=0.10, hspace=0.5, wspace=0.28)
+        for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
+        json.dump({"tag": a.tag, "log": a.log, "label": a.label, "referential": True, "steps": steps, "evals": evals}, open(os.path.join(a.report, "data", f"{stem}.json"), "w"), indent=1)
+        print("saved", os.path.join(a.report, f"{stem}.png"), "| referential steps", len(steps)); return
     ax1.plot(S["step"], S["bits"], marker="o", ms=4, lw=2, color=CAT[0], label="mean exact bits, all rollouts")
     ax1.plot(S["step"], S["bits_workspace"], marker="s", ms=4, lw=2, color=CAT[1], label="mean exact bits, workspace band")
     ax1.plot(S["step"], S["bits_median"], lw=1.5, color=CAT[6], alpha=0.8, label="median exact bits")
