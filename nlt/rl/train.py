@@ -23,7 +23,10 @@ def parse():
     p.add_argument("--critic", default=None, help="text critic ckpt (nlt.eval_bits.scorer.CriticScorer)"); p.add_argument("--stub-critic", action="store_true")
     p.add_argument("--ode-steps", type=int, default=32); p.add_argument("--probes", type=int, default=1); p.add_argument("--score-batch", type=int, default=64)
     p.add_argument("--enc-model", default=None); p.add_argument("--enc-layer", type=int, default=None)
-    p.add_argument("--lam", type=float, default=0.1, help="bits per token"); p.add_argument("--floor", type=float, default=-5.0)
+    p.add_argument("--lam", default="0.1", help="bits per token, or 'auto' = 0.25 x within-group std(bits) / within-group std(tokens) over the WORKSPACE-band groups of the first batch (DECISIONS v1.5), then fixed")
+    p.add_argument("--lam-fallback", type=float, default=0.1); p.add_argument("--floor", type=float, default=-5.0)
+    p.add_argument("--cross-critics", default=None, help="comma list name:ckpt of extra critics that re-score a subsample of the step's rollouts every --cross-every steps (private-code / critic-hacking check; DECISIONS v1.6); 'frozen' = a frozen copy of the starting critic is always included when --frozen-critic-eval")
+    p.add_argument("--cross-every", type=int, default=20); p.add_argument("--cross-n", type=int, default=256)
     p.add_argument("--copy-thresh", type=float, default=0.05); p.add_argument("--adv-std", action="store_true", help="divide advantages by the group std (default Dr.GRPO: no)")
     p.add_argument("--adv-mode", choices=["group", "batch"], default="group", help="group (DECISIONS v1.4) | batch = centre per group, one batch-level std (ScaleRL)"); p.add_argument("--zero-var-filter", action="store_true")
     p.add_argument("--adv-std-floor", type=float, default=1.0, help="with --adv-std: divide by max(group std, floor) [reward units ~ bits]; set near the scoring noise")
@@ -150,6 +153,16 @@ def main():
     para = Paraphraser(a.paraphrase_model, gpu_mem=a.paraphrase_gpu_mem, gpu_index=cidx, seed=a.seed) if a.paraphrase_p > 0 else None
     cot = CriticCotrainer(scorer, a.cotrain_lr, a.cotrain_p_uncond, a.replay, a.data_dir, store) if (a.cotrain and not a.stub_critic and a.critic) else None
     frozen = make_scorer(a, cdev) if (cot is not None and a.frozen_critic_eval) else None
+    cross = {}
+    if frozen is not None: cross["frozen"] = frozen
+    if a.cross_critics:
+        from nlt.rl.reward import ExactScorer
+        for item in a.cross_critics.split(","):
+            name, path = item.split(":", 1)
+            cross[name] = ExactScorer(path, a.data_dir, device=cdev, ode_steps=a.ode_steps, probes=a.probes, batch=a.score_batch)
+            print(f"[cross] critic {name} = {path}", flush=True)
+    from nlt.evals.diversity import distinct_n, self_bleu
+    lam = None if str(a.lam).strip().lower() == "auto" else float(a.lam)
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"rl_{a.tag}", group="rl", config=vars(a))
     gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id
     meta_pos = store.meta["pos_idx"].values; meta_next = store.meta["next_token_id"].values
@@ -175,7 +188,13 @@ def main():
         if cot is not None: cot.prepare_score()
         sc = scorer.score(h_i[groups], h_j[groups], [z if not viol["empty"][k] else None for k, z in enumerate(scored)], groups.tolist(), seed=step)
         bits, proxy = sc["exact_bits"].float(), sc["proxy_bits"].float(); t_score = time.time() - t2
-        rewards, bad = shape_rewards(bits, n_tok, a.lam, viol["any"], groups, a.floor)
+        if lam is None:                                     # DECISIONS v1.5 lambda rule on the first batch, workspace band, honest rollouts
+            okb = torch.isfinite(bits) & ~torch.as_tensor(viol["any"]); wsm = torch.tensor([band(int(J[g_])) == "workspace" for g_ in groups.tolist()]) & okb
+            wg_b = within_group_std(bits[wsm], groups[wsm]) if wsm.sum() > 8 else float("nan"); wg_t = within_group_std(n_tok[wsm], groups[wsm]) if wsm.sum() > 8 else float("nan")
+            lam = 0.25 * wg_b / wg_t if (np.isfinite(wg_b) and np.isfinite(wg_t) and wg_t > 0 and wg_b > 0) else a.lam_fallback
+            print(f"[rl] lambda auto = {lam:.4f} bits/token (workspace within-group std bits {wg_b:.2f} / tokens {wg_t:.2f}; fallback {a.lam_fallback})", flush=True)
+            json.dump({"lambda": lam, "wg_std_bits_workspace": wg_b, "wg_std_tokens_workspace": wg_t}, open(os.path.join(a.out, "lambda.json"), "w"))
+        rewards, bad = shape_rewards(bits, n_tok, lam, viol["any"], groups, a.floor)
         adv = group_advantages(rewards, groups, std_norm=a.adv_std, mode=a.adv_mode, zero_var_filter=a.zero_var_filter, std_floor=a.adv_std_floor)
         # ---- update + sync
         t3 = time.time(); acts_list = [acts[r["prompt_idx"]] for r in res]
@@ -204,12 +223,28 @@ def main():
                "kl": um["kl_mean"], "entropy": um["entropy"], "sampler/absdiff_mean": um["sampler_logp_absdiff_mean"], "sampler/absdiff_max": um["sampler_logp_absdiff_max"], "sampler/masked": um["sampler_mismatch_masked"],
                "steer/written": info["steer_written"], "steer/expected": info["steer_expected"], "cotrain/loss": cot_loss,
                "time/gen": t_gen, "time/para": t_para, "time/score": t_score, "time/update": t_upd, "time/sync": t_sync, "time/step": time.time() - t0, "gen_tok_per_s": info["tok_per_s"], **summarize_violations(viol)}
+        log["lambda"] = lam
         for bname in ("pre", "workspace", "motor"):
             m = torch.tensor([band(int(J[g_])) == bname for g_ in groups.tolist()]) & ok
             if m.any():
                 log[f"bits/{bname}"] = float(bits[m].mean()); log[f"reward/{bname}"] = float(rewards[m].mean()); log[f"bits_per_token/{bname}"] = float(bits[m].sum() / max(1.0, float(n_tok[m].sum())))
                 log[f"bits/{bname}_within_group_std"] = within_group_std(bits[m], groups[m]); log[f"tokens/{bname}"] = float(n_tok[m].mean())
-        print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | bits {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | gn {gn:.2f} | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} sync {t_sync:.0f})", flush=True)
+        try:                                                # template drift (EVALS 7e): distinct-4-gram ratio and self-BLEU over this step's rollouts
+            log["div/distinct4"] = float(distinct_n(resp_ids, 4)); log["div/self_bleu"] = float(self_bleu(resp_ids, n_sample=64, seed=step))
+        except Exception as e_: log["div/error"] = str(e_)[:80]
+        if cross and step % a.cross_every == 0:             # DECISIONS v1.6: re-score a subsample of THIS step's rollouts under the frozen start critic + the teacher-only critic
+            tc = time.time(); sub = list(range(min(a.cross_n, n))); sg = groups[sub]; live_b = bits[sub]
+            for cname, csc in cross.items():
+                cb = csc.score(h_i[sg], h_j[sg], [scored[k] if not viol["empty"][k] else None for k in sub], sg.tolist(), seed=step)["exact_bits"].float()
+                okc = torch.isfinite(cb) & torch.isfinite(live_b)
+                log[f"cross/{cname}/bits_mean"] = float(cb[okc].mean()); log[f"cross/{cname}/within_group_std"] = within_group_std(cb[okc], sg[okc])
+                log[f"cross/{cname}/corr_live"] = corr(cb[okc], live_b[okc]); log[f"cross/{cname}/live_minus_cross"] = float((live_b[okc] - cb[okc]).mean())
+                for bname in ("pre", "workspace", "motor"):
+                    m = torch.tensor([band(int(J[g_])) == bname for g_ in sg.tolist()]) & okc
+                    if m.any(): log[f"cross/{cname}/bits_{bname}"] = float(cb[m].mean())
+            log["cross/live_bits_mean_subsample"] = float(live_b[torch.isfinite(live_b)].mean()); log["time/cross"] = time.time() - tc
+            print("   cross: " + " | ".join(f"{c}: {log[f'cross/{c}/bits_mean']:+.2f} (corr live {log[f'cross/{c}/corr_live']:.2f}, ws {log.get(f'cross/{c}/bits_workspace', float('nan')):+.1f})" for c in cross) + f" | live {log['cross/live_bits_mean_subsample']:+.2f}", flush=True)
+        print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | bits {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} ws {log.get('bits/workspace', float('nan')):+.2f} | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | d4 {log.get('div/distinct4', float('nan')):.2f} | gn {gn:.2f} | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} sync {t_sync:.0f})", flush=True)
         if step % a.eval_every == 0:
             order = rewards.argsort(); pick = [int(order[0]), int(order[len(order) // 2]), int(order[-1])]
             for k in pick: print(f"   [{int(I[groups[k]])}->{int(J[groups[k]])}] r={float(rewards[k]):+.2f} bits={float(bits[k]):+.2f} tok={int(n_tok[k])} viol={bool(bad[k])} :: {texts[k][:200]!r}", flush=True)
