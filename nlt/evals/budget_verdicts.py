@@ -27,7 +27,8 @@ def row_from_critic(name, c):
     if math.isnan(dm): dm = c.get("dm_shuffle_exact_bits_mean") if c.get("dm_shuffle_exact_bits_mean") is not None else float("nan")
     rp = _mean(c, "rp_exact_pmi_bits"); sh = _mean(c, "shuf_words_exact_pmi_bits"); mk = _mean(c, "mask_next_exact_pmi_bits")
     p_dm = c.get("frac_z_beats_dm", float("nan")); p_sh = c.get("frac_z_beats_shuf_words", float("nan")); p_rp = c.get("frac_z_beats_rp", float("nan"))
-    ntok = c.get("n_tokens_mean", float("nan")); n = c.get("n_rows", c.get("n"))
+    ntok = c.get("n_tokens_mean"); ntok = float("nan") if ntok is None else ntok; n = c.get("n_rows", c.get("n"))
+    z = float("nan") if z is None else z; dm = float("nan") if dm is None else dm
     r = {"critic": name.split("@")[0], "set": name.split("@")[-1], "n": n, "step": c.get("step"), "cond": c.get("cond"), "z": z, "z_sem": zs, "dm": dm, "rp": rp, "shuf_words": sh, "mask_next": mk,
          "form": dm - sh, "depth_generic": dm - rp, "content": z - dm, "p_z_gt_dm": p_dm, "p_z_gt_rp": p_rp, "p_z_gt_shuf": p_sh, "n_tokens": ntok,
          "bits_per_token": (z / ntok) if ntok and not math.isnan(ntok) and ntok > 0 else float("nan"),
@@ -59,11 +60,12 @@ def rows_from_budget(path):
     d = json.load(open(path)); rows = []
     for critic, cd in (d.get("text") or {}).items():
         for label, sd in (cd.get("sets") or {}).items():
-            b = (sd.get("bands") or {}).get("all") or {}
+            b = {k: (float("nan") if v is None else v) for k, v in ((sd.get("bands") or {}).get("all") or {}).items()}
             c = {"cond": "text", "step": cd.get("step"), "n_rows": sd.get("n"), "n_tokens_mean": sd.get("n_tokens_mean"),
                  "exact_pmi_bits": {"mean": b.get("bits", float("nan")), "sem": b.get("sem", float("nan"))}, "shuffle_exact_pmi_bits": {"mean": b.get("z_dm", float("nan"))},
                  "rp_exact_pmi_bits": {"mean": b.get("z_rp", float("nan"))}, "shuf_words_exact_pmi_bits": {"mean": b.get("shuf_words", float("nan"))}, "mask_next_exact_pmi_bits": {"mean": b.get("mask_next", float("nan"))},
-                 "frac_z_beats_dm": sd.get("frac_z_beats_dm", float("nan")), "frac_z_beats_rp": sd.get("frac_z_beats_rp", float("nan")), "frac_z_beats_shuf_words": sd.get("frac_z_beats_shuf_words", float("nan"))}
+                 "frac_z_beats_dm": sd.get("frac_z_beats_dm") if sd.get("frac_z_beats_dm") is not None else float("nan"), "frac_z_beats_rp": sd.get("frac_z_beats_rp") if sd.get("frac_z_beats_rp") is not None else float("nan"),
+                 "frac_z_beats_shuf_words": sd.get("frac_z_beats_shuf_words") if sd.get("frac_z_beats_shuf_words") is not None else float("nan")}
             r = row_from_critic(f"{critic}@{label}", c); r["space"] = cd.get("space"); r["vs_mix"] = b.get("vs_mix"); r["source_file"] = os.path.basename(path)
             r["by_band"] = {bn: {k: bv.get(k) for k in ("bits", "sem", "n", "z_dm", "z_rp", "content", "content_sem", "vs_mix") if k in bv} for bn, bv in (sd.get("bands") or {}).items() if bn != "all" and isinstance(bv, dict)}
             rows.append(r)
