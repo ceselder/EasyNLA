@@ -115,8 +115,9 @@ def main():
 
     def load(split, n):
         st = ActStore(args.root, split)
-        f = pd.read_parquet(f"{args.z}/{split}_feats.parquet"); f = f[f.source == args.source].iloc[:n].reset_index(drop=True)
-        pr = st.pairs(); pr = pr.set_index("pair_id").loc[f["pair_id"]].reset_index()
+        f = pd.read_parquet(f"{args.z}/{split}_feats.parquet"); f = f[f.source == args.source].drop_duplicates("pair_id").iloc[:n].reset_index(drop=True)
+        pr = st.pairs().drop_duplicates("pair_id").set_index("pair_id").loc[f["pair_id"]].reset_index()
+        assert len(pr) == len(f), (len(pr), len(f))
         hi, hj = [], []
         order = []
         for sub, a, b in st.gather(pr, device="cpu"):
