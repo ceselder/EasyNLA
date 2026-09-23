@@ -123,6 +123,7 @@ def main():
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=128)
     p.add_argument("--wandb", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
+    p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
     p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
     p.add_argument("--init-from", default=None, help="checkpoint of a trained BLIND prior (cond none): its weights are loaded into this model (text/depth extras stay zero/fresh, so at step 0 the conditional path IS the prior)")
     p.add_argument("--freeze-prior", type=int, default=0, help="1 = train only the conditioning modules (cross-reads, gate_mod, depth embeddings); the unconditional path stays exactly the loaded prior")
@@ -210,11 +211,20 @@ def main():
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss_vec, t, kept = pair_fm_loss(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s)
-        loss = loss_vec.mean(); opt.zero_grad(set_to_none=True); loss.backward()
+        loss = loss_vec.mean(); null_loss = torch.zeros((), device=dev)
+        if a.null_reg > 0 and a.cond == "text":
+            # NULL regulariser: under ANOTHER pair's text (batch rolled by B/2) the velocity must equal the no-text velocity (the frozen prior)
+            Bn = x0.shape[0]; eps_n = torch.randn_like(x0); t_n = torch.rand(Bn, device=dev); x_tn = (1 - t_n)[:, None] * x0 + t_n[:, None] * eps_n
+            enc_rp = torch.roll(enc, Bn // 2, 0); mask_rp = torch.roll(mask, Bn // 2, 0)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.no_grad(): v_null = model(x_tn, t_n, h_i, enc=enc_rp, enc_mask=torch.zeros_like(mask_rp), log_s=log_s)
+                v_rp = model(x_tn, t_n, h_i, enc=enc_rp, enc_mask=mask_rp, log_s=log_s)
+            null_loss = ((v_rp - v_null.detach()) ** 2).mean(); loss = loss + a.null_reg * null_loss
+        opt.zero_grad(set_to_none=True); loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip); opt.step()
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
         if step % 25 == 0:
-            log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/step_s": (time.time() - t0) / max(1, step - step0 + 1)}
+            log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/null_loss": float(null_loss), "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/step_s": (time.time() - t0) / max(1, step - step0 + 1)}
             if a.cond != "none":
                 log["train/loss_cond"] = float(loss_vec[kept].mean()) if kept.any() else float("nan"); log["train/loss_uncond"] = float(loss_vec[~kept].mean()) if (~kept).any() else float("nan")
             wandb.log(log, step=step)
