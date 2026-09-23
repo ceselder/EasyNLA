@@ -10,6 +10,7 @@ Given pairs_val (pair_id, pos_idx, i, j) and a z table (pair_id, text), write ON
     wrong_i     the pair's own z scored against (h_i', h_j), i' != i                                               EVALS 3d
     src_desc    the same proposer describing h_i ALONE (optional --src-desc table), scored on the pair            'about the change' vs 'about the source'
     shuf_words  the pair's own z with its words randomly permuted (same tokens, no syntax)                       form vs content (template reading)
+    dm_doc      another position of the SAME document (same j, nearest i) -- topic/source-matched distractor      content beyond the document topic (#228 H1)
     empty       the empty string (the no-text baseline row, so every variant shares eps / probes with it)
 The scorer must use the SAME Hutchinson probe / eps for every variant of a pair (paired estimates); bits(variant) = log p - log p(empty).
 
@@ -21,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 
-def build_manifest(pairs: pd.DataFrame, z: pd.DataFrame, prefix_store=None, seed: int = 0, copy_n: int = 32, variants=("orig", "dm", "rp", "copy", "wrong_j", "wrong_i", "empty", "src_desc", "shuf_words"), src_desc: pd.DataFrame | None = None) -> pd.DataFrame:
+def build_manifest(pairs: pd.DataFrame, z: pd.DataFrame, prefix_store=None, seed: int = 0, copy_n: int = 32, variants=("orig", "dm", "rp", "copy", "wrong_j", "wrong_i", "empty", "src_desc", "shuf_words", "dm_doc"), src_desc: pd.DataFrame | None = None) -> pd.DataFrame:
     """src_desc (optional): table [pair_id, text] = the SAME proposer describing h_i ALONE (AO(h_i), teacher with only the source lens, ...);
     scored on the pair it separates 'about the change' from 'about the source' (redteam #22 item 1). Skipped when not given."""
     rng = np.random.default_rng(seed)
@@ -34,6 +35,9 @@ def build_manifest(pairs: pd.DataFrame, z: pd.DataFrame, prefix_store=None, seed
     for r in P.itertuples(): by_ij.setdefault((int(r.i), int(r.j)), []).append(r.pair_id)
     by_j = {}
     for r in P.itertuples(): by_j.setdefault(int(r.j), []).append(r.pair_id)
+    by_doc = {}
+    if doc_of:
+        for r in P.itertuples(): by_doc.setdefault(doc_of[r.pair_id], []).append(r)
     rows = []
     for r in P.itertuples():
         pid, pos, i, j = r.pair_id, int(r.pos_idx), int(r.i), int(r.j)
@@ -53,6 +57,13 @@ def build_manifest(pairs: pd.DataFrame, z: pd.DataFrame, prefix_store=None, seed
         if "copy" in variants and prefix_store is not None:
             rows.append(dict(base, variant="copy", text=prefix_store.text(pos, last_n=copy_n), src_pair_id=pid))
         if "src_desc" in variants and pid in smap: rows.append(dict(base, variant="src_desc", text=smap[pid], src_pair_id=pid))
+        if "dm_doc" in variants and doc_of:
+            # SAME-DOCUMENT distractor (redteam #228 H1): another position of the same document, same j (nearest i), else same doc any (i, j).
+            # Topic / source words cancel against it; only position- and change-specific content survives: content_doc = orig - dm_doc.
+            cands = [q for q in by_doc.get(doc_of[pid], []) if q.pair_id != pid and int(q.pos_idx) != pos]
+            same_j = sorted([q for q in cands if int(q.j) == j], key=lambda q: abs(int(q.i) - i))
+            pick = same_j[0] if same_j else (sorted(cands, key=lambda q: abs(int(q.j) - j) + abs(int(q.i) - i))[0] if cands else None)
+            if pick is not None: rows.append(dict(base, variant="dm_doc", text=zmap[pick.pair_id], src_pair_id=pick.pair_id))
         if "shuf_words" in variants:
             w = zmap[pid].split()
             if len(w) > 2: rows.append(dict(base, variant="shuf_words", text=" ".join(str(x) for x in rng.permutation(w)), src_pair_id=pid))
@@ -110,6 +121,10 @@ def summarize_scores(scored: pd.DataFrame) -> dict:
         p = out["wrong_i"]["p_orig_higher"]; out["verdict_3d"] = "PASS" if p >= 0.60 else ("WARN" if p >= 0.50 else "FAIL")
     if "copy" in out: out["verdict_5c"] = verdict(out["copy"]["ratio_to_orig"], 0.10, 0.50)
     if "src_desc" in out: out["verdict_src"] = verdict(out["src_desc"]["ratio_to_orig"], 0.25, 0.50)     # a source-only description should not earn the change's bits
+    if "dm_doc" in out and "dm" in out:
+        # topic-matched content: how much of orig - dm survives when the distractor shares the document
+        out["content_bits"] = float(out["orig"]["bits_mean"] - out["dm"]["bits_mean"]); out["content_doc_bits"] = float(out["orig"]["bits_mean"] - out["dm_doc"]["bits_mean"])
+        out["topic_share_of_content"] = float(1 - out["content_doc_bits"] / out["content_bits"]) if out["content_bits"] else float("nan")
     if "orig" in out:
         nonpos = float(np.mean(orig.values <= 0)) if len(orig) else float("nan"); out["orig"]["share_nonpositive"] = nonpos
         out["verdict_7d_bits"] = "PASS" if nonpos <= 0.10 else ("WARN" if nonpos <= 0.25 else "FAIL")
