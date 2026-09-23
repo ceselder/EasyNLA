@@ -81,12 +81,12 @@ class ActStore:
 
     def gather(self, rows, k, out_device=None):
         """rows [B] (store rows), k [B] layer indices in K_LO..K_HI -> fp16 [B, d] on out_device (default: the store's device)"""
-        rows = torch.as_tensor(rows); k = torch.as_tensor(k)
+        rows = torch.as_tensor(rows).long(); k = torch.as_tensor(k).long()          # pair lists may carry int8 i/j
         x = self.acts[rows.to(self.acts.device), (k - K_LO).to(self.acts.device)]
         return x if out_device is None else x.to(out_device, non_blocking=True)
 
     def gather_all_layers(self, rows):
-        return self.acts[torch.as_tensor(rows).to(self.acts.device)]         # [B, L, d]
+        return self.acts[torch.as_tensor(rows).long().to(self.acts.device)]  # [B, L, d]
 
     def load_docs(self, data_dir):
         """doc_id -> (source, text, token_ids) for this split (reads the docs_*.parquet sidecars once)"""
