@@ -43,3 +43,44 @@ def sample_subset(claims, K, rng=random):
     if not claims: return []
     k = rng.randint(1, min(K, len(claims)))
     sub = rng.sample(claims, k); rng.shuffle(sub); return sub
+
+
+# ---------------------------------------------------------------- one claim per training activation (sample BEFORE generating)
+# Every training anchor keeps exactly ONE claim. Its family is drawn deterministically from the anchor id (crc32), so extraction, the text
+# step, the Sonnet step and the trainer agree on it without coordination: only the drawn family is generated for training anchors. Val
+# anchors (is_val) keep every family and every claim (gates / composition evals need them).
+import zlib as _zlib
+
+FAMILY_SHARES = {"internal": 0.40, "text": 0.40, "semantic": 0.20}   # semantic share sized to the $3k Sonnet budget at ~$0.0021 / anchor over ~7M anchors
+INTERNAL_TYPES = {"next_token": 1.0, "top_candidates": 1.0, "entropy": 1.0, "jlens": 1.0, "greedy": 1.0}
+TEXT_TYPE_WEIGHTS = {"unfinished_word": 2.0, "last_word": 2.0, "sentence_so_far": 1.5, "position": 1.5}   # others 1.0; types drawn among those available
+
+
+def _u(anchor_id, salt):
+    return (_zlib.crc32(f"{salt}:{anchor_id}".encode()) % 1_000_003) / 1_000_003
+
+
+def draw_family(anchor_id, shares=None):
+    """deterministic family of a training anchor: internal / text / semantic (FAMILY_SHARES)"""
+    shares = shares or FAMILY_SHARES; u = _u(anchor_id, "fam"); acc = 0.0
+    for f, w in shares.items():
+        acc += w / sum(shares.values())
+        if u < acc: return f
+    return list(shares)[-1]
+
+
+def draw_internal_type(anchor_id):
+    u = _u(anchor_id, "int"); tot = sum(INTERNAL_TYPES.values()); acc = 0.0
+    for t, w in INTERNAL_TYPES.items():
+        acc += w / tot
+        if u < acc: return t
+    return "greedy"
+
+
+def pick_one(claims, types, rng, weights=None):
+    """one claim: draw a TYPE among the available ones (P ~ weights[type], default 1), then a uniform claim of that type -> index"""
+    by = {}
+    for j, t in enumerate(types): by.setdefault((t or "").split("/")[0], []).append(j)
+    ks = list(by); ws = [(weights or {}).get(k, 1.0) for k in ks]
+    k = rng.choices(ks, weights=ws)[0]
+    return rng.choice(by[k])

@@ -104,11 +104,16 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--root", default="/vol_glp/claims"); ap.add_argument("--dup-cos", type=float, default=0.95)
     ap.add_argument("--cap-frac", type=float, default=0.005); ap.add_argument("--sample", type=int, default=50000); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--min-claims", type=int, default=2)
+    ap.add_argument("--names", default="*", help="glob over anchor-file names (e.g. 'v2_*'): finalize only these (streaming shards)")
+    ap.add_argument("--skip-done", action="store_true", help="skip anchor files whose final_<name>.parquet exists")
+    ap.add_argument("--stats-tag", default="", help="write stats_<tag>.json / examples_<tag>.json (stats.json is written only when absent or tag empty)")
     a = ap.parse_args(); rng = random.Random(a.seed); t0 = time.time()
-    names = sorted(os.path.basename(f)[8:-8] for f in glob.glob(f"{a.root}/anchors/anchors_*.parquet"))
+    names = sorted(os.path.basename(f)[8:-8] for f in glob.glob(f"{a.root}/anchors/anchors_{a.names}.parquet"))
+    if a.skip_done: names = [n for n in names if not os.path.exists(f"{a.root}/final/final_{n}.parquet")]
+    if not names: print("[final] nothing to do", flush=True); return
     fam = {f: {} for f in FAMILIES}
     for f in FAMILIES:
-        for p in glob.glob(f"{a.root}/claims/{f}_*.parquet") + glob.glob(f"{a.root}/semantic/{f}_*.parquet"):
+        for p in [x for n in names for x in (f"{a.root}/claims/{f}_{n}.parquet", f"{a.root}/semantic/{f}_{n}.parquet") if os.path.exists(x)]:
             cols = ["anchor_id", "claims", "types"] + (["twins"] if "twins" in pq.read_schema(p).names else [])
             for r in pq.read_table(p, columns=cols).to_pylist(): fam[f][r["anchor_id"]] = r
     print(f"[final] {len(names)} anchor files; claims for {[len(fam[f]) for f in FAMILIES]} anchors per family ({time.time() - t0:.0f}s)", flush=True)
@@ -185,7 +190,9 @@ def main():
              "claims_per_family": dict(fam_ct), "claims_per_type": dict(type_ct.most_common()), "twin_coverage": dict(tw_ct),
              "anchors_per_source": dict(src_n), "claims_per_anchor_by_source_family": {s_: {f: v / src_n[s_] for f, v in c_.items()} for s_, c_ in src_fam.items()},
              "words_per_claim_hist": {f: {str(k): v for k, v in sorted(c_.items())} for f, c_ in words.items()}, "top_repeated_claims": sorted(over.items(), key=lambda x: -x[1])[:30]}
-    json.dump(stats, open(f"{a.root}/final/stats.json", "w"), indent=1); json.dump(rng.sample(examples, min(50, len(examples))), open(f"{a.root}/final/examples.json", "w"), indent=1)
+    sfx = f"_{a.stats_tag}" if a.stats_tag else ""
+    json.dump(stats, open(f"{a.root}/final/stats{sfx}.json", "w"), indent=1); json.dump(rng.sample(examples, min(50, len(examples))), open(f"{a.root}/final/examples{sfx}.json", "w"), indent=1)
+    if sfx and not os.path.exists(f"{a.root}/final/stats.json"): json.dump(stats, open(f"{a.root}/final/stats.json", "w"), indent=1)
     print(json.dumps({k: v for k, v in stats.items() if k not in ("claims_per_type", "top_repeated_claims")}, indent=1), flush=True)
 
 

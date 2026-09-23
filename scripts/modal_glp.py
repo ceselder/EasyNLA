@@ -185,6 +185,33 @@ def eval_cond(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_
     rc = subprocess.call(cmd, cwd=REPO_REMOTE); vol_glp.commit(); return rc
 
 
+@app.function(gpu="B200:8", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=64, memory=1024 * 1024, ephemeral_disk=600 * 1024)
+def train_cond_ddp(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = "", nproc: int = 8):
+    """Stage 2, replicated-adapter DDP over 8 B200 (torchrun; frozen prior; adapter + encoder LoRA grads all-reduced every step; rank-disjoint data)."""
+    return _ddp(tag, prior_tag, prior_ckpt, extra, nproc)
+
+
+@app.function(gpu="B200:2", timeout=3 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=512 * 1024, ephemeral_disk=600 * 1024)
+def train_cond_ddp2(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = ""):
+    """2-rank smoke of train_cond_ddp"""
+    return _ddp(tag, prior_tag, prior_ckpt, extra, 2)
+
+
+def _ddp(tag, prior_tag, prior_ckpt, extra, nproc):
+    import subprocess
+    from playground_app import resolve_base
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    out = f"/vol_glp/cond/{tag}"
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={nproc}", "-m", "nla.flow.train_cond", "--prior", f"/vol_glp/{prior_tag}/ckpts/{prior_ckpt}",
+           "--stats", f"/vol_glp/{prior_tag}/rep_statistics.pt", "--base", base, "--train-parquet", "/vol_q36/data/sft/av_sft_train.parquet", "--val-parquet", "/vol_q36/data/sft/av_sft_val.parquet",
+           "--out", out, "--tag", tag, "--mined-acts-parquet", "/vol_q36/data/rl/rl_shuf.parquet"] + extra.split()
+    env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+    os.makedirs(out, exist_ok=True); logf = open(os.path.join(out, "train.log"), "ab")
+    proc = subprocess.Popen(cmd, cwd=REPO_REMOTE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in proc.stdout: sys.stdout.buffer.write(line); sys.stdout.flush(); logf.write(line); logf.flush()
+    rc = proc.wait(); logf.close(); vol_glp.commit(); return rc
+
+
 @app.function(gpu="B200:4", timeout=23 * 3600, **COMMON)
 def train_cond_g4(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = ""):
     """Stage 2 with the prior CO-TRAINED (FSDP2 over 4 GPUs, torchrun); each rank holds its own encoder copy."""
@@ -216,9 +243,10 @@ def _claims(args, commit=True):
 
 
 @app.function(timeout=8 * 3600, volumes=VOLS, secrets=SECRETS, cpu=4, memory=16 * 1024)
-def claims_docs(source: str, n_docs: int, root: str, tag: str = "v1", slice_: str = "0/1"):
+def claims_docs(source: str, n_docs: int, root: str, tag: str = "v1", slice_: str = "0/1", extra: str = ""):
     """synthetic claims: stream one slice of one source of the corpus mix -> {root}/docs (scripts/claims_extract.py docs)"""
-    return _claims([f"{REPO_REMOTE}/scripts/claims_extract.py", "docs", "--source", source, "--n-docs", str(n_docs), "--root", root, "--tag", tag, "--slice", slice_])
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_extract.py", "docs", "--source", source, "--n-docs", str(n_docs), "--root", root, "--tag", tag, "--slice", slice_] + extra.split())
 
 
 @app.function(gpu="B200", timeout=8 * 3600, **COMMON)
@@ -232,10 +260,29 @@ def claims_anchors(root: str, shard: int = 0, nshards: int = 1, tag: str = "v1",
 
 
 @app.function(image=image_claims, timeout=6 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=64 * 1024)
-def claims_text(root: str, shard: int = 0, nshards: int = 1, extra: str = ""):
-    """synthetic claims: family 2 (text-grounded, rule-based + spaCy) -> {root}/claims/text_*.parquet"""
+def claims_text(root: str, shard: int = 0, nshards: int = 1, extra: str = "", finalize_name: str = ""):
+    """synthetic claims: family 2 (text-grounded, rule-based + spaCy) -> {root}/claims/text_*.parquet; finalize_name: then finalize that one
+    streaming shard on CPU (one-claim shards: --min-claims 1)"""
     vol_glp.reload()
-    return _claims([f"{REPO_REMOTE}/scripts/claims_text.py", "--root", root, "--shard", str(shard), "--nshards", str(nshards), "--procs", "30"] + extra.split())
+    rc = _claims([f"{REPO_REMOTE}/scripts/claims_text.py", "--root", root, "--shard", str(shard), "--nshards", str(nshards), "--procs", "30"] + extra.split())
+    if finalize_name:
+        rc = rc or _claims([f"{REPO_REMOTE}/scripts/claims_finalize.py", "--root", root, "--names", finalize_name, "--min-claims", "1", "--stats-tag", finalize_name])
+    return rc
+
+
+@app.function(gpu="B200", timeout=8 * 3600, max_containers=14, **COMMON)
+def claims_anchors_v2(root: str, shard: int, nshards: int, tag: str = "v2", extra: str = ""):
+    """streaming one-claim extraction: anchors + state for docs shard i of n (at most 14 containers at once: + 8 training + 2 baselines = 24 B200), then (non-blocking) the text
+    claims + per-shard finalize of this shard on a CPU container, so training can consume shards as they land"""
+    from modal_nla_exp import _prep
+    from playground_app import resolve_base
+    os.environ.update({"NLA_VLLM_EAGER": "1", "VLLM_ATTENTION_BACKEND": "FLASH_ATTN"}); _prep(patch_lens=True)
+    vol_glp.reload(); base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    rc = _claims([f"{REPO_REMOTE}/scripts/claims_extract.py", "anchors", "--root", root, "--shard", str(shard), "--nshards", str(nshards), "--tag", tag, "--base", base,
+                  "--one-claim", "--min-anchors", "2", "--max-anchors", "3", "--docs-glob", f"docs_*_{tag}_*.parquet"] + extra.split())
+    if rc == 0:
+        name = f"{tag}_{shard:03d}"; claims_text.spawn(root, 0, 1, f"--names {name}", name)
+    return rc
 
 
 @app.function(gpu="B200", timeout=8 * 3600, **COMMON)
@@ -286,6 +333,9 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", [c.get() for c in calls])
     elif task == "train_cond_g4":
         print("rc", train_cond_g4.remote(tag or "cond_cotrain", prior_tag, ckpt, extra))
+    elif task == "train_cond_ddp":   # 8 ranks on B200:8 (--nshards 2 -> the B200:2 smoke function)
+        f_ = train_cond_ddp2 if nshards == 2 else train_cond_ddp
+        print("rc", (f_.remote(tag or "cond_ddp", prior_tag, ckpt, extra) if nshards == 2 else f_.remote(tag or "cond_ddp", prior_tag, ckpt, extra, nproc=min(nshards, 8))))
     elif task == "train_cond":
         print("rc", train_cond.remote(tag or "cond_smoke", prior_tag, ckpt, extra))
     elif task == "sample_diag":
@@ -294,10 +344,14 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", bnoise.remote(tag, ckpt, extra))
     elif task == "claims_docs":   # one CPU container per source, in parallel; --n-docs = total docs over the mix
         K = {"ffw": 22, "code": 3, "chat": 4, "math": 3, "fiction": 6, "multi": 8} if n_docs >= 50000 else {}   # parallel slices per source at scale
-        calls = [claims_docs.spawn(s_, n_docs, root, tag or "v1", f"{i}/{K.get(s_, 1)}") for s_ in ("ffw", "code", "chat", "math", "fiction", "multi") for i in range(K.get(s_, 1))]   # = claims_extract.SOURCES
+        if n_docs >= 1000000: K = {"ffw": 66, "code": 8, "chat": 8, "math": 8, "fiction": 12, "multi": 24}
+        calls = [claims_docs.spawn(s_, n_docs, root, tag or "v1", f"{i}/{K.get(s_, 1)}", extra) for s_ in ("ffw", "code", "chat", "math", "fiction", "multi") for i in range(K.get(s_, 1))]   # = claims_extract.SOURCES
         print("rc", [c.get() for c in calls])
     elif task == "claims_anchors":   # all shards in parallel, one B200 each
         calls = [claims_anchors.spawn(root, i, nshards, tag or "v1", extra) for i in range(nshards)]
+        print("rc", [c.get() for c in calls])
+    elif task == "claims_anchors_v2":   # one call per shard, queued; Modal runs <= 14 at a time; returns when all are done
+        calls = [claims_anchors_v2.spawn(root, i, nshards, tag or "v2", extra) for i in range(nshards)]
         print("rc", [c.get() for c in calls])
     elif task == "claims_text":
         calls = [claims_text.spawn(root, i, nshards, extra) for i in range(nshards)]

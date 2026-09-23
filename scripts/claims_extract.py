@@ -60,29 +60,30 @@ def _gen_source(src, n, rng, sl=(0, 1)):
         k = max(1, math.ceil(n / len(FFW_DOMAINS)))
         for d in FFW_DOMAINS[si::sk]:
             if not per[d]: continue
-            f = rng.choice(per[d][: 20]); stride = rng.randint(1, 4); got = 0
-            for j, ex in enumerate(_hf("m-a-p/FineFineWeb", data_files={"train": f}, split="train")):
-                if j % stride: continue
-                if len(ex.get("text") or "") < 400: continue
-                yield "ffw", d, ex.get("lang") or "en", ex["text"], f"{os.path.basename(f)}:{j}"; got += 1
+            files_d = per[d][:]; rng.shuffle(files_d); got = 0
+            for f in files_d:                                                  # as many files of the domain as it takes
+                for j, ex in enumerate(_hf("m-a-p/FineFineWeb", data_files={"train": f}, split="train")):
+                    if len(ex.get("text") or "") < 400: continue
+                    yield "ffw", d, ex.get("lang") or "en", ex["text"], f"{os.path.basename(f)}:{j}"; got += 1
+                    if got >= k: break
                 if got >= k: break
     elif src == "code":
         k = int(n * 0.4)                                                 # whole Python files
         for j, ex in enumerate(_hf("codeparrot/codeparrot-clean", split="train")):
-            if j % (3 * sk) != 3 * si or len(ex["content"]) < 800: continue
+            if j % sk != si or len(ex["content"]) < 800: continue
             yield "code", "python_file", "Python", ex["content"], f"cp:{j}"; k -= 1
             if k <= 0: break
         langs = ["go", "java", "javascript", "php", "python", "ruby"]; k = max(1, math.ceil((n - int(n * 0.4)) / len(langs)))
         for lg in langs:                                                 # single functions with docstrings, six languages
             got = 0
             for j, ex in enumerate(_hf("code-search-net/code_search_net", lg, split="train")):
-                if j % (7 * sk) != 7 * si or len(ex["whole_func_string"]) < 700: continue
+                if j % sk != si or len(ex["whole_func_string"]) < 700: continue
                 yield "code", f"function_{lg}", {"go": "Go", "java": "Java", "javascript": "JavaScript", "php": "PHP", "python": "Python", "ruby": "Ruby"}[lg], ex["whole_func_string"], f"csn:{lg}:{j}"; got += 1
                 if got >= k: break
     elif src == "chat":
         k = n // 2
         for j, ex in enumerate(_hf("lmsys/lmsys-chat-1m", split="train")):
-            if j % (5 * sk) != 5 * si: continue
+            if j % sk != si: continue
             if any(m.get("flagged") for m in (ex.get("openai_moderation") or [])): continue
             turns = [(m["role"], m["content"]) for m in ex["conversation"] if m.get("content")]
             txt = _chat_render(turns, rng)
@@ -91,22 +92,23 @@ def _gen_source(src, n, rng, sl=(0, 1)):
             if k <= 0: break
         k = n - n // 2
         for j, ex in enumerate(_hf("HuggingFaceH4/ultrachat_200k", split="train_sft")):
-            if j % (3 * sk) != 3 * si: continue
+            if j % sk != si: continue
             txt = _chat_render([(m["role"], m["content"]) for m in ex["messages"]], rng)
             if len(txt) < 500: continue
             yield "chat", "ultrachat", "English", txt, f"uc:{j}"; k -= 1
             if k <= 0: break
     elif src == "math":
         for j, ex in enumerate(_hf("open-web-math/open-web-math", split="train")):
-            if j % (5 * sk) != 5 * si or len(ex["text"]) < 500: continue
+            if j % sk != si or len(ex["text"]) < 500: continue
             yield "math", "open_web_math", "English", ex["text"], f"owm:{j}"; n -= 1
             if n <= 0: break
     elif src == "fiction":
+        n0 = n
         for j, ex in enumerate(_hf("emozilla/pg19", split="train")):
             if j % sk != si: continue
             t = ex["text"]
             if len(t) < 3 * MAX_CHARS: continue
-            for w in range(2):                                          # two windows per book, starting at a paragraph break
+            for w in range(max(2, min(12, math.ceil(n0 * sk / 28000) + 1))):   # windows per book so the slice reaches its target (PG-19 train ~28k books)
                 s = rng.randint(len(t) // 10, len(t) - MAX_CHARS - 1); s = t.find("\n\n", s) + 2 if t.find("\n\n", s) > 0 else s
                 yield "fiction", "pg19", "English", t[s: s + MAX_CHARS], f"pg19:{j}:{w}"; n -= 1
             if n <= 0: break
@@ -115,7 +117,7 @@ def _gen_source(src, n, rng, sl=(0, 1)):
         for cfg, name in list(FW2_LANGS.items())[si::sk]:
             got = 0
             for j, ex in enumerate(_hf("HuggingFaceFW/fineweb-2", cfg, split="train")):
-                if j % 3 or len(ex["text"]) < 300: continue
+                if len(ex["text"]) < 300: continue
                 yield "multi", cfg, name, ex["text"], f"fw2:{cfg}:{j}"; got += 1
                 if got >= k: break
 
@@ -125,15 +127,21 @@ def cmd_docs(a):
     n_src = max(1, round(a.n_docs * SOURCES[a.source]))
     if a.source not in ("ffw", "multi"): n_src = max(1, math.ceil(n_src / sk))          # sliced sub-stream lists keep the per-sub-stream count
     os.makedirs(f"{a.root}/docs", exist_ok=True); rows, part, t0 = [], 0, time.time()
+    seen = set()
+    for f in (sorted(glob.glob(f"{a.root}/docs/docs_{a.source}_*.parquet")) if a.dedupe_existing else []):   # never re-use an earlier tag's documents
+        if f"_{a.tag}_" not in os.path.basename(f): seen.update(pq.read_table(f, columns=["doc_id"]).column(0).to_pylist())
+    n_dup = 0
     def flush():
         nonlocal rows, part
         if rows:
             pq.write_table(pa.Table.from_pylist(rows), f"{a.root}/docs/docs_{a.source}_{a.tag}_s{si:02d}_{part:03d}.parquet", compression="zstd"); part += 1; rows = []
-    for i, (s, d, lang, text, uid) in enumerate(_gen_source(a.source, n_src, rng, (si, sk))):
+    for i, (s, d, lang, text, uid) in enumerate(_gen_source(a.source, n_src + (len(seen) // sk if seen else 0), rng, (si, sk))):
+        if f"{s}:{d}:{uid}" in seen: n_dup += 1; continue
+        if i - n_dup >= n_src: break
         rows.append({"doc_id": f"{s}:{d}:{uid}", "source": s, "domain": d, "lang": lang, "text": text[:MAX_CHARS]})
         if len(rows) >= a.part_size: flush()
         if i % 2000 == 0: print(f"[docs {a.source}] {i} docs ({time.time() - t0:.0f}s)", flush=True)
-    flush(); print(f"[docs {a.source}] done: {part} parts, target {n_src}", flush=True)
+    flush(); print(f"[docs {a.source}] done: {part} parts, target {n_src}, skipped {n_dup} documents of earlier tags", flush=True)
     sys.stdout.flush(); os._exit(0)                                        # streaming readers' threads abort the interpreter at exit otherwise
 
 
@@ -171,7 +179,7 @@ def cmd_anchors(a):
     base = a.base
     tok = AutoTokenizer.from_pretrained(base); V = len(tok)
     piece = tok.batch_decode([[i] for i in range(V)])                                    # vocab-level decode table (anchor typing, J-lens words)
-    files = sorted(glob.glob(f"{a.root}/docs/docs_*.parquet"))[a.shard::a.nshards]
+    files = sorted(glob.glob(f"{a.root}/docs/{a.docs_glob}"))[a.shard::a.nshards]
     docs = pa.concat_tables([pq.read_table(f) for f in files]).to_pylist() if files else []
     if a.limit_docs: docs = docs[: a.limit_docs]
     rng = random.Random(a.seed * 100_003 + a.shard); t0 = time.time()
@@ -179,7 +187,7 @@ def cmd_anchors(a):
     W = []
     for d in docs:
         ids = tok(d["text"], add_special_tokens=False)["input_ids"][: MAX_PREFIX + N_CONT + 1]
-        anc = pick_anchors([piece[i] for i in ids], rng, rng.randint(2, 4))
+        anc = pick_anchors([piece[i] for i in ids], rng, rng.randint(a.min_anchors, a.max_anchors))
         if not anc: continue
         W.append({"doc": d, "ids": ids[: anc[-1][0] + 1 + N_CONT], "anchors": anc})
     n_anc = sum(len(w["anchors"]) for w in W)
@@ -218,17 +226,25 @@ def cmd_anchors(a):
     hnd.remove(); t_fwd = time.time() - t0
     print(f"[anchors {a.shard}] HF forward done: {n_anc} anchors, {sum(len(w['ids']) for w in W)} tokens in {t_fwd:.0f}s", flush=True)
     del model, WU, J42, norm, layers, inner, owner; import gc; gc.collect(); torch.cuda.empty_cache()
-    # ---- vLLM greedy 16-token continuation of every anchor prefix ----
+    # ---- vLLM greedy 16-token continuation of every anchor prefix (with --one-claim: only where the claim will be used) ----
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
     from nla.utils.vllm_steer import vllm_attn_kwargs
     llm = LLM(**vllm_attn_kwargs(), model=base, tokenizer=base, dtype="bfloat16", gpu_memory_utilization=0.85, max_model_len=MAX_PREFIX + N_GREEDY + 8,
               tensor_parallel_size=1, enforce_eager=(os.environ.get("NLA_VLLM_EAGER", "1") == "1"), disable_log_stats=True, enable_prefix_caching=False, seed=0)
     keys = [(wi, p) for wi, w in enumerate(W) for p, _ in w["anchors"]]
+    if a.one_claim:   # sample BEFORE generating: the greedy continuation only for val anchors and training anchors that drew internal:greedy
+        from nla.flow.claims import draw_family, draw_internal_type
+        def _need(wi, p):
+            d = W[wi]["doc"]; aid = f"{d['doc_id']}@{p}"
+            return is_val_doc(d["doc_id"], 20) or (draw_family(aid) == "internal" and draw_internal_type(aid) == "greedy")
+        keys = [k for k in keys if _need(*k)]
     outs = llm.generate([TokensPrompt(prompt_token_ids=W[wi]["ids"][: p + 1]) for wi, p in keys], SamplingParams(temperature=0.0, max_tokens=N_GREEDY), use_tqdm=False)
     greedy = {k: list(o.outputs[0].token_ids) for k, o in zip(keys, outs)}
+    for wi, w in enumerate(W):
+        for p, _ in w["anchors"]: greedy.setdefault((wi, p), [])
     t_gen = time.time() - t0 - t_fwd
-    agree = float(np.mean([greedy[k][0] == rec[k][2][0] for k in keys if greedy[k]]))
+    agree = float(np.mean([greedy[k][0] == rec[k][2][0] for k in keys if greedy[k]])) if keys else float("nan")
     print(f"[anchors {a.shard}] vLLM greedy done in {t_gen:.0f}s; HF top-1 == vLLM greedy first token on {100 * agree:.1f}% of anchors", flush=True)
     # ---- write ----
     out, txt = [], []
@@ -236,7 +252,7 @@ def cmd_anchors(a):
         d = w["doc"]
         for j, (p, ty) in enumerate(w["anchors"]):
             h, ent, ti, tp, ji, jp = rec[(wi, p)]; aid = f"{d['doc_id']}@{p}"
-            r = {"anchor_id": aid, "doc_id": d["doc_id"], "source": d["source"], "domain": d["domain"], "lang": d["lang"], "is_val": is_val_doc(d["doc_id"], 20),
+            r = {"anchor_id": aid, "doc_id": d["doc_id"], "source": d["source"], "domain": d["domain"], "lang": d["lang"], "is_val": is_val_doc(d["doc_id"], 20), "one_claim": bool(a.one_claim),
                  "pos": p, "anchor_type": ty, "n_raw_tokens": p + 1, "prefix_text": tok.decode(w["ids"][: p + 1]), "cont_text": tok.decode(w["ids"][p + 1: p + 1 + N_CONT]),
                  "cont_ids": w["ids"][p + 1: p + 1 + N_CONT], "greedy_ids": greedy[(wi, p)], "greedy_text": tok.decode(greedy[(wi, p)]),
                  "top10_ids": ti, "top10_tokens": [piece[t] for t in ti], "top10_probs": [round(x, 5) for x in tp], "entropy": round(ent, 4),
@@ -315,9 +331,15 @@ def internal_claims(r, rng, dec):
 
 
 def write_internal(rows, path, dec, seed=0):
+    from nla.flow.claims import draw_family, draw_internal_type
     rng = random.Random(seed); ids, cl, ty = [], [], []
     for r in rows:
-        c = internal_claims(r, rng, dec); ids.append(r["anchor_id"]); cl.append([x for _, x in c]); ty.append([t for t, _ in c])
+        if r.get("one_claim") and not r["is_val"]:
+            if draw_family(r["anchor_id"]) != "internal": continue
+            c = internal_claims(r, rng, dec); want = draw_internal_type(r["anchor_id"])
+            pick = [x for x in c if x[0] == want] or [x for x in c if x[0] == "next_token"]
+            c = pick[:1]
+        else: c = internal_claims(r, rng, dec); ids.append(r["anchor_id"]); cl.append([x for _, x in c]); ty.append([t for t, _ in c])
     os.makedirs(os.path.dirname(path), exist_ok=True)
     pq.write_table(pa.table({"anchor_id": ids, "claims": cl, "types": ty}), path, compression="zstd")
 
@@ -333,9 +355,11 @@ def cmd_internal(a):
 def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("docs"); d.add_argument("--source", required=True, choices=list(SOURCES)); d.add_argument("--n-docs", type=int, required=True)
-    d.add_argument("--part-size", type=int, default=5000); d.add_argument("--tag", default="v1"); d.add_argument("--slice", default="0/1", help="i/k: this worker's slice")
+    d.add_argument("--part-size", type=int, default=5000); d.add_argument("--tag", default="v1"); d.add_argument("--slice", default="0/1", help="i/k: this worker's slice"); d.add_argument("--dedupe-existing", action="store_true")
     x = sub.add_parser("anchors"); x.add_argument("--base", default=BASE); x.add_argument("--layer", type=int, default=42); x.add_argument("--shard", type=int, default=0)
     x.add_argument("--nshards", type=int, default=1); x.add_argument("--tok-budget", type=int, default=24576); x.add_argument("--limit-docs", type=int, default=0); x.add_argument("--tag", default="v1")
+    x.add_argument("--docs-glob", default="docs_*.parquet"); x.add_argument("--min-anchors", type=int, default=2); x.add_argument("--max-anchors", type=int, default=4)
+    x.add_argument("--one-claim", action="store_true", help="sample the claim family/type per anchor BEFORE generating (nla.flow.claims.draw_family): greedy only where needed, family-1 claims only for internal-drawn training anchors (val keeps all)")
     i = sub.add_parser("internal"); i.add_argument("--base", default=BASE)
     for q in (d, x, i): q.add_argument("--root", default=ROOT); q.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); {"docs": cmd_docs, "anchors": cmd_anchors, "internal": cmd_internal}[a.cmd](a)

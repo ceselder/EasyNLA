@@ -13,6 +13,7 @@ run: submits every chunk (<= --chunk requests) up front, polls every --poll-s, s
 (<out>/raw/chunk_XXXX.jsonl: custom_id, text, usage) so nothing is lost, resubmits chunks with 0 completed after --stall-h hours, and keeps a
 running token / cost tally (<out>/usage.json; input, cache-write, cache-read, output tokens; batch price = 50 %)."""
 import argparse, glob, gzip, json, os, random, re, sys, time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ASPECTS = ["topic", "entities", "numbers", "stance", "register", "genre", "intent", "discourse_state", "upcoming", "world_knowledge", "narrative",
            "dialogue", "code", "math", "syntax", "style", "setting", "language"]
@@ -80,11 +81,26 @@ C: The owner blames a 40 percent increase in the cost of flour. || Q: flour has 
 C: The next sentence quotes a regular customer's reaction. || Q: said Maria Lopez, who has shopped there || P: Coming up: what a long-time customer thinks of the change. || F: The next sentence quotes the city mayor's reaction.
 C: The price change takes effect on the first of March. || Q: starting March 1 || P: - || F: The price change takes effect on the first of June."""
 
+# --one-claim (one claim per training activation, sampled before generating): only anchors whose drawn family is 'semantic' (and val anchors)
+# are sent, with ONE aspect, 1-2 claims (val: 3), no paraphrases, a shorter context (last 1500 chars). The system prompt stays > 1024 tokens so
+# it is cached.
+SYSTEM_SHORT = SYSTEM.split("Paraphrases:")[0] + """False twin: for EVERY claim add F: a minimal edit of the claim that makes it clearly FALSE for this text (swap one entity, number, word, attribute or direction; keep the wording and length otherwise). The false twin must be contradicted by the text or plainly unsupported by it, and must still be a plausible claim about some other text.
+
+Output format: one claim per line and nothing else, no numbering, no preamble:
+C: <claim> || Q: <exact quote> || F: <false twin>
+
+Example (aspect: numbers | granularity: sentence | style: plain), for a prefix about a bakery raising prices:
+C: The price of a loaf of sourdough is going up to $7.50. || Q: sourdough will cost $7.50 || F: The price of a loaf of sourdough is going up to $5.50.
+C: The owner blames a 40 percent increase in the cost of flour. || Q: flour has gone up 40 percent || F: The owner blames a 40 percent increase in the cost of butter.
+
+Example (aspect: upcoming | granularity: label | style: label):
+C: Next: a customer's reaction || Q: said Maria Lopez, who has shopped there || F: Next: the mayor's reaction"""
+
 SRC_DESC = {"ffw": "web page", "code": "source code ({lang})", "chat": "conversation transcript", "math": "web page with mathematical content",
             "fiction": "book excerpt (Project Gutenberg)", "multi": "web page in {lang}"}
 
 
-def sample_request(r, rng):
+def sample_request(r, rng, one_claim=False):
     w = dict(BASE_W); w.update(SRC_W.get(r["source"], {}))
     names = [a for a in ASPECTS if w[a] > 0]; ws = [w[a] for a in names]
     asp = rng.choices(names, weights=ws, k=1)
@@ -92,6 +108,7 @@ def sample_request(r, rng):
         b = rng.choices(names, weights=ws, k=1)[0]
         if b != asp[0]: asp.append(b)
     g = rng.choices(list(GRAN), weights=list(GRAN.values()))[0]; s = rng.choices(list(STYLE), weights=list(STYLE.values()))[0]
+    if one_claim: return {"aspects": asp[:1], "gran": g, "style": s, "n": 3 if r.get("is_val") else rng.randint(1, 2), "short": True}
     return {"aspects": asp, "gran": g, "style": s, "n": rng.randint(5, 10)}
 
 
@@ -102,12 +119,12 @@ def shown_prefix(r, n=3000):
 
 def user_msg(r, q):
     src = SRC_DESC.get(r["source"], "document").format(domain=r["domain"].replace("_", " "), lang=r["lang"])
-    return (f"Aspects: {', '.join(q['aspects'])} | Granularity: {q['gran']} | Style: {q['style']} | Number of claims: {q['n']}\nSource: {src}\n\n"
-            f"PREFIX (the model has read up to its last character):\n<<<\n{shown_prefix(r)}\n>>>\n\n"
+    return (f"{'Aspect' if q.get('short') else 'Aspects'}: {', '.join(q['aspects'])} | Granularity: {q['gran']} | Style: {q['style']} | Number of claims: {q['n']}\nSource: {src}\n\n"
+            f"PREFIX (the model has read up to its last character):\n<<<\n{shown_prefix(r, 1500 if q.get('short') else 3000)}\n>>>\n\n"
             f"CONTINUATION (the true next ~64 tokens, not yet read by the model):\n<<<\n{r['cont_text']}\n>>>")
 
 
-def load_rows(text_glob, limit=0, subsample=1.0):
+def load_rows(text_glob, limit=0, subsample=1.0, one_claim=False):
     """subsample < 1: a deterministic crc32(anchor_id) share of the anchors, plus EVERY held-out (is_val) anchor, so the conditioner's synthetic
     eval set always carries all three claim families"""
     import zlib
@@ -116,6 +133,9 @@ def load_rows(text_glob, limit=0, subsample=1.0):
         name = os.path.basename(f)[5:-9]
         for l in gzip.open(f, "rt"):
             r = json.loads(l)
+            if one_claim and not r.get("is_val"):
+                from nla.flow.claims import draw_family
+                if draw_family(r["anchor_id"]) != "semantic": continue
             if subsample < 1 and not r.get("is_val") and (zlib.crc32(r["anchor_id"].encode()) % 100000) >= subsample * 100000: continue
             r["_shard"] = name; rows.append(r)
     return rows[:limit] if limit else rows
@@ -128,16 +148,17 @@ def _client():
 
 
 def cmd_run(a):
-    cl = _client(); rows = load_rows(a.text_glob, a.limit, a.subsample); rng = random.Random(a.seed)
+    cl = _client(); rows = load_rows(a.text_glob, a.limit, a.subsample, a.one_claim); rng = random.Random(a.seed)
     os.makedirs(f"{a.out}/raw", exist_ok=True); sp = f"{a.out}/batches.json"; up = f"{a.out}/usage.json"
     state = json.load(open(sp)) if os.path.exists(sp) else {}
     usage = json.load(open(up)) if os.path.exists(up) else {"in": 0, "cache_write": 0, "cache_read": 0, "out": 0, "ok": 0, "fail": 0}
     reqf = f"{a.out}/requests.jsonl"
     if not os.path.exists(reqf):                                              # the sampled request specs are fixed once, so resubmits are identical
         with open(reqf, "w") as f:
-            for i, r in enumerate(rows): f.write(json.dumps({"i": i, "anchor_id": r["anchor_id"], "shard": r["_shard"], **sample_request(r, rng)}) + "\n")
+            for i, r in enumerate(rows): f.write(json.dumps({"i": i, "anchor_id": r["anchor_id"], "shard": r["_shard"], **sample_request(r, rng, a.one_claim)}) + "\n")
     specs = [json.loads(l) for l in open(reqf)]; assert len(specs) == len(rows)
-    system = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    system = [{"type": "text", "text": SYSTEM_SHORT if a.one_claim else SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    if a.max_requests and len(rows) > a.max_requests: print(f"[sem] budget cap: {len(rows)} requests -> first {a.max_requests}", flush=True); rows, specs = rows[: a.max_requests], specs[: a.max_requests]
     chunks = [(ci, list(range(cs, min(cs + a.chunk, len(rows))))) for ci, cs in enumerate(range(0, len(rows), a.chunk))]
 
     def submit(ci, idx):
@@ -192,13 +213,13 @@ def cmd_sync(a):
     """same requests as `run` (requests.jsonl, created if missing) through the synchronous Messages API with --workers threads (list price);
     writes the same raw/chunk_XXXX.jsonl files, so `parse` is unchanged. For small jobs when the batch queue stalls."""
     import concurrent.futures as cf
-    cl = _client(); rows = load_rows(a.text_glob, a.limit, a.subsample); rng = random.Random(a.seed)
+    cl = _client(); rows = load_rows(a.text_glob, a.limit, a.subsample, a.one_claim); rng = random.Random(a.seed)
     os.makedirs(f"{a.out}/raw", exist_ok=True); reqf = f"{a.out}/requests.jsonl"; up = f"{a.out}/usage.json"
     if not os.path.exists(reqf):
         with open(reqf, "w") as f:
-            for i, r in enumerate(rows): f.write(json.dumps({"i": i, "anchor_id": r["anchor_id"], "shard": r["_shard"], **sample_request(r, rng)}) + "\n")
+            for i, r in enumerate(rows): f.write(json.dumps({"i": i, "anchor_id": r["anchor_id"], "shard": r["_shard"], **sample_request(r, rng, a.one_claim)}) + "\n")
     specs = [json.loads(l) for l in open(reqf)]; assert len(specs) == len(rows)
-    system = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    system = [{"type": "text", "text": SYSTEM_SHORT if a.one_claim else SYSTEM, "cache_control": {"type": "ephemeral"}}]
     usage = {"in": 0, "cache_write": 0, "cache_read": 0, "out": 0, "ok": 0, "fail": 0}
     def one(i):
         for _ in range(4):
@@ -253,7 +274,8 @@ def parse_text(txt):
 
 def cmd_parse(a):
     import pyarrow as pa, pyarrow.parquet as pq
-    rows = load_rows(a.text_glob, a.limit, a.subsample); specs = [json.loads(l) for l in open(f"{a.out}/requests.jsonl")]
+    rows = load_rows(a.text_glob, a.limit, a.subsample, a.one_claim); specs = [json.loads(l) for l in open(f"{a.out}/requests.jsonl")]
+    if len(specs) < len(rows): rows = rows[: len(specs)]                             # a --max-requests budget cap
     assert len(specs) == len(rows) and all(s_["anchor_id"] == r["anchor_id"] for s_, r in zip(specs, rows)), "requests.jsonl does not match --text-glob/--limit/--subsample"
     raw = {}
     for f in sorted(glob.glob(f"{a.out}/raw/chunk_*.jsonl")):
@@ -264,7 +286,7 @@ def cmd_parse(a):
                     "too_short": 0, "by_aspect": {}, "by_source": {}, "claims_per_anchor": [], "words_per_claim": []}
     for i, r in enumerate(rows):
         if i not in raw: continue
-        P, C = _norm(shown_prefix(r)), _norm(r["cont_text"]); asp = specs[i]["aspects"]; cl, ty, qs, wh, tw = [], [], [], [], []
+        P, C = _norm(shown_prefix(r, 1500 if specs[i].get("short") else 3000)), _norm(r["cont_text"]); asp = specs[i]["aspects"]; cl, ty, qs, wh, tw = [], [], [], [], []
         for c, q, p_, f_ in parse_text(raw[i]):
             st["claims_raw"] += 1; qn = _norm(q)
             where = "prefix" if qn and qn in P else "continuation" if qn and qn in C else None
@@ -291,7 +313,8 @@ def main():
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
     for n in ("run", "parse", "sync"):
         q = sub.add_parser(n); q.add_argument("--text-glob", required=True); q.add_argument("--out", required=True); q.add_argument("--limit", type=int, default=0)
-        q.add_argument("--seed", type=int, default=0); q.add_argument("--subsample", type=float, default=1.0)
+        q.add_argument("--seed", type=int, default=0); q.add_argument("--subsample", type=float, default=1.0); q.add_argument("--one-claim", action="store_true")
+        q.add_argument("--max-requests", type=int, default=0, help="budget cap: only the first N requests (after the one-claim / subsample filters)")
         if n in ("run", "sync"):
             q.add_argument("--model", default="claude-sonnet-5"); q.add_argument("--chunk", type=int, default=10000); q.add_argument("--max-tokens", type=int, default=1200)
             q.add_argument("--poll-s", type=int, default=180); q.add_argument("--stall-h", type=float, default=2.0)

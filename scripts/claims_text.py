@@ -11,6 +11,7 @@ reads {root}/text/text_<name>.jsonl.gz, writes {root}/claims/text_<name>.parquet
 at most --max-per-anchor claims per anchor (types drawn without replacement, so every anchor mixes several kinds)."""
 import argparse, glob, gzip, json, os, random, re, sys, time
 import pyarrow as pa, pyarrow.parquet as pq
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MAX_PER_ANCHOR = 10
 ENT = {"PERSON": ["a person", "someone"], "ORG": ["an organization"], "GPE": ["a place", "a location"], "LOC": ["a place", "a location"],
@@ -174,14 +175,24 @@ def claims_cont(r, rng, doc_c):
 
 
 def text_claims(rows, nlp, seed=0, max_per=MAX_PER_ANCHOR):
-    rng = random.Random(seed); en = [i for i, r in enumerate(rows) if is_english(r)]
+    """-> per row a list of (type, claim). Rows written with --one-claim (sample before generating): training anchors whose drawn family is not
+    'text' get [] (no spaCy pass), text-drawn training anchors get ONE claim (type drawn among the available ones by TEXT_TYPE_WEIGHTS), val
+    anchors keep up to max_per."""
+    from nla.flow.claims import draw_family, pick_one, TEXT_TYPE_WEIGHTS
+    rng = random.Random(seed)
+    want = [not (r.get("one_claim") and not r["is_val"]) or draw_family(r["anchor_id"]) == "text" for r in rows]
+    one = [bool(r.get("one_claim") and not r["is_val"]) for r in rows]
+    en = [i for i, r in enumerate(rows) if is_english(r) and want[i]]
     dp, dc = {}, {}
     if nlp is not None and en:
         for i, d in zip(en, nlp.pipe((rows[i]["prefix_text"][-2000:] for i in en), batch_size=64)): dp[i] = d
         for i, d in zip(en, nlp.pipe((rows[i]["cont_text"] for i in en), batch_size=128)): dc[i] = d
     out = []
     for i, r in enumerate(rows):
+        if not want[i]: out.append([]); continue
         c = claims_prefix(r, rng, dp.get(i)) + claims_cont(r, rng, dc.get(i))
+        if one[i]:
+            out.append([c[pick_one([x for _, x in c], [t for t, _ in c], rng, TEXT_TYPE_WEIGHTS)]] if c else []); continue
         by = {}
         for t, x in c: by.setdefault(t, []).append(x)
         types = list(by); rng.shuffle(types); pick = []
@@ -198,7 +209,8 @@ def _work(args):
     nlp = spacy.load("en_core_web_sm", disable=["lemmatizer"])
     name = os.path.basename(f)[5:-9]; rows = [json.loads(l) for l in gzip.open(f, "rt")]
     res = text_claims(rows, nlp, seed=seed, max_per=max_per)
-    tbl = pa.table({"anchor_id": [r["anchor_id"] for r in rows], "claims": [[x for _, x in c] for c in res], "types": [[t for t, _ in c] for c in res]})
+    keep = [i for i, c in enumerate(res) if c]
+    tbl = pa.table({"anchor_id": [rows[i]["anchor_id"] for i in keep], "claims": [[x for _, x in res[i]] for i in keep], "types": [[t for t, _ in res[i]] for i in keep]})
     os.makedirs(f"{root}/claims", exist_ok=True); pq.write_table(tbl, f"{root}/claims/text_{name}.parquet", compression="zstd")
     return name, len(rows), sum(len(c) for c in res)
 
@@ -206,9 +218,9 @@ def _work(args):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--root", default="/vol_glp/claims"); ap.add_argument("--shard", type=int, default=0); ap.add_argument("--nshards", type=int, default=1)
     ap.add_argument("--procs", type=int, default=8); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--max-per-anchor", type=int, default=MAX_PER_ANCHOR)
-    ap.add_argument("--skip-done", action="store_true")
+    ap.add_argument("--skip-done", action="store_true"); ap.add_argument("--names", default="*", help="glob over text-file names (e.g. v2_017)")
     a = ap.parse_args()
-    files = sorted(glob.glob(f"{a.root}/text/text_*.jsonl.gz"))[a.shard::a.nshards]
+    files = sorted(glob.glob(f"{a.root}/text/text_{a.names}.jsonl.gz"))[a.shard::a.nshards]
     if a.skip_done: files = [f for f in files if not os.path.exists(f"{a.root}/claims/text_{os.path.basename(f)[5:-9]}.parquet")]
     t0 = time.time(); print(f"[text] {len(files)} files, {a.procs} procs", flush=True)
     from multiprocessing import Pool
