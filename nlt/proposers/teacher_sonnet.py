@@ -67,6 +67,24 @@ Later snapshot leanings: {lens_j}
 
 JSON only."""
 NO_FINAL = False          # set by --no-final: the teacher never sees the model's final next-token leanings
+NO_LENS = False           # set by --no-lens: ABLATION, context only (no lens readouts, no final top-10); source suffix -nolens
+USER_TMPL_NOLENS = """Passage so far (the model is at its last word):
+<<<
+{context}
+>>>
+
+JSON only."""
+SYSTEM_NOLENS = """You are helping to interpret a language model (an LLM) while it reads a passage. Two snapshots of the model's internal state were taken at the same word of the passage: an EARLIER snapshot and a LATER snapshot of the same reading (the later one has done more processing of that word). You are NOT shown any readout of the snapshots: from the passage alone, infer what the model most plausibly WORKED OUT between the earlier and the later snapshot at that word: what it settled, disambiguated, retrieved, inferred, or committed to; what it is now tracking that it was not before. Make bare, specific, checkable claims about the model's internal computation, in plain English, as if explaining a colleague's reasoning.
+
+Rules:
+- Never quote, copy or paraphrase the passage. Refer to its content abstractly (roles, entities, structure), not by repeating its words.
+- Never mention layers, depth, stages, blocks, snapshots being early or late in the network, how far along processing is, or any readout mechanism.
+- Do not write "the next word is X" as a bare prediction; describe what has been worked out that makes an outcome likely.
+- No hedging boilerplate, no meta commentary about your task.
+- Inside the JSON strings use single quotes if you must quote a word; never use double quotes inside the text.
+
+Answer with JSON only, exactly this shape:
+{"short": "<a phrase of at most 8 words>", "sentence": "<one sentence>", "long": "<two or three sentences>"}"""
 
 
 def fmt_tokens(toks):
@@ -74,6 +92,8 @@ def fmt_tokens(toks):
 
 
 def build_messages(row):
+    if NO_LENS:
+        return [{"role": "user", "content": USER_TMPL_NOLENS.format(context=row["context_text"])}]
     if NO_FINAL:
         user = USER_TMPL_NOFINAL.format(context=row["context_text"], lens_i=fmt_tokens(row["lens_i_top10"]), lens_j=fmt_tokens(row["lens_j_top10"]))
     else:
@@ -83,7 +103,13 @@ def build_messages(row):
 
 
 def system_text():
+    if NO_LENS:
+        return SYSTEM_NOLENS
     return SYSTEM.replace(" You also get the model's final leanings for the next token.", "") if NO_FINAL else SYSTEM
+
+
+def source_name():
+    return SOURCE + ("-nolens" if NO_LENS else ("-nofinal" if NO_FINAL else ""))
 
 
 _FIELD = {k: re.compile(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % k, re.S) for k in VERBOSITY}
@@ -231,7 +257,7 @@ def make_rows(features: pd.DataFrame, answers: dict, tok):
                 stats["hard_regex"] += 1; rejects.append(dict(pair_id=r["pair_id"], reason=f"regex:{hh[:2]}", text=text)); continue
             if cr > COPY_MAX:
                 stats["copy"] += 1; rejects.append(dict(pair_id=r["pair_id"], reason=f"copy:{cr:.2f}", text=text)); continue
-            keep.append(dict(pair_id=r["pair_id"], text=text, n_tokens=len(z_ids), verbosity=verb, source=SOURCE + ("-nofinal" if NO_FINAL else ""), sample_idx=0, copy_rate=cr))
+            keep.append(dict(pair_id=r["pair_id"], text=text, n_tokens=len(z_ids), verbosity=verb, source=source_name(), sample_idx=0, copy_rate=cr))
             stats["kept"] += 1
     return pd.DataFrame(keep), pd.DataFrame(rejects), stats
 
@@ -245,9 +271,11 @@ def main():
     ap.add_argument("--concurrency", type=int, default=24)
     ap.add_argument("--stall-min", type=int, default=20)
     ap.add_argument("--no-final", action="store_true", help="teacher does not see the model's final next-token top-10 (DECISIONS v1.2 ablation)")
+    ap.add_argument("--no-lens", action="store_true", help="ABLATION (DECISIONS v1.3): context only, no lens readouts, no final top-10")
     a = ap.parse_args()
-    global NO_FINAL
+    global NO_FINAL, NO_LENS
     NO_FINAL = a.no_final
+    NO_LENS = a.no_lens
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
     feats = pd.concat([pq.read_table(f).to_pandas() for f in a.features], ignore_index=True)
