@@ -41,6 +41,7 @@ class TextKV:
     T: int
     lengths: torch.Tensor        # [B] real text lengths
     ids: torch.Tensor            # [B, T] (kept for n_tokens / debugging)
+    pool: torch.Tensor = None    # [B, H] masked mean of the trunk's final text states (text_pool critics), zeros for empty texts
 
 
 class FreshAttnBlock(nn.Module):
@@ -68,7 +69,7 @@ class FreshAttnBlock(nn.Module):
 class TrunkCritic(nn.Module):
     def __init__(self, prior, trunk_id: str = "Qwen/Qwen3-8B", n_layers: int = 24, lora_r: int = 64, lora_alpha: int = 16, n_act_tokens: int = 4,
                  fresh_every: int = 4, fresh_heads: int = 8, fresh_dhead: int = 128, grad_ckpt: bool = True, max_len: int = 256, device="cuda",
-                 space: dict | None = None, dtype=torch.bfloat16, readout_rank: int = 0):
+                 space: dict | None = None, dtype=torch.bfloat16, readout_rank: int = 0, text_pool: bool = False):
         super().__init__()
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, inject_adapter_in_model
@@ -119,11 +120,13 @@ class TrunkCritic(nn.Module):
         self._n_act = n_act_tokens + 1
         for blk, i in zip(self.fresh, self.fresh_layers): owner.layers[i].register_forward_hook(self._make_hook(blk), with_kwargs=True)
         # ---- readout
-        self.readout_ln = nn.LayerNorm(hidden); self.readout_rank = readout_rank
+        self.readout_ln = nn.LayerNorm(hidden); self.readout_rank = readout_rank; self.text_pool = text_pool
+        n_in = (n_act_tokens + 1 + (1 if text_pool else 0)) * hidden       # text_pool: + the masked mean of the trunk's final states over the TEXT tokens (a direct text -> velocity path from step 1; zero for the empty prefix)
+        if text_pool: self.pool_ln = nn.LayerNorm(hidden)
         if readout_rank > 0:     # low-rank readout: far fewer effective parameters per output dim -> resolves a ~0.2%-variance text signal from ~100x fewer rows
-            self.readout = nn.Sequential(nn.Linear((n_act_tokens + 1) * hidden, readout_rank, bias=False), nn.Linear(readout_rank, self.d)); nn.init.zeros_(self.readout[1].weight); nn.init.zeros_(self.readout[1].bias)
+            self.readout = nn.Sequential(nn.Linear(n_in, readout_rank, bias=False), nn.Linear(readout_rank, self.d)); nn.init.zeros_(self.readout[1].weight); nn.init.zeros_(self.readout[1].bias)
         else:
-            self.readout = nn.Linear((n_act_tokens + 1) * hidden, self.d); nn.init.zeros_(self.readout.weight); nn.init.zeros_(self.readout.bias)
+            self.readout = nn.Linear(n_in, self.d); nn.init.zeros_(self.readout.weight); nn.init.zeros_(self.readout.bias)
         for m_ in self.adapter_modules(): m_.to(device).float()
         self.slots.data = self.slots.data.to(device).float()
         n_lora = sum(p_.numel() for p_ in self.lora_parameters())
@@ -173,10 +176,17 @@ class TrunkCritic(nn.Module):
         was = self.owner.training; self.owner.eval()
         try:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                self.owner(inputs_embeds=self.owner.embed_tokens(ids), position_ids=pos, past_key_values=cache, use_cache=True, trunk_n_act=0, trunk_groups=1)   # no activation positions -> fresh hooks are no-ops
+                out = self.owner(inputs_embeds=self.owner.embed_tokens(ids), position_ids=pos, past_key_values=cache, use_cache=True, trunk_n_act=0, trunk_groups=1).last_hidden_state   # no activation positions -> fresh hooks are no-ops
         finally:
             if was: self.owner.train()
-        return TextKV(cache=cache, T=T, lengths=mask.sum(1), ids=ids), mask
+        pool = self._pool(out, mask) if self.text_pool else None
+        return TextKV(cache=cache, T=T, lengths=mask.sum(1), ids=ids, pool=pool), mask
+
+    @staticmethod
+    def _pool(text_states, key_mask):
+        """masked mean over real text tokens -> [B, H] fp32 (zeros where the row has no text)"""
+        m = key_mask.to(text_states.dtype)[..., None]
+        return (text_states.float() * m.float()).sum(1) / m.float().sum(1).clamp_min(1.0)
 
     def n_tokens(self, texts):
         return [len(self.tok(z, add_special_tokens=False)["input_ids"]) for z in texts]
@@ -199,6 +209,7 @@ class TrunkCritic(nn.Module):
         toks = self.act_tokens(x_t, t, h_i, log_s).to(self.dtype_)
         B, Kp, H = toks.shape; dev = x_t.device
         ar = torch.arange(Kp, device=dev)[None]
+        pool = torch.zeros(B, H, device=dev) if self.text_pool else None
         if enc is None or (enc_mask is not None and not bool(enc_mask.any())):
             hs = self._run(toks, None, ar.expand(B, -1), cache=None)                                        # null path: activation tokens alone
         elif isinstance(enc, TextKV):
@@ -206,6 +217,7 @@ class TrunkCritic(nn.Module):
             pos = key_mask.sum(1)[:, None] + ar
             am = torch.cat([key_mask, torch.ones(B, Kp, dtype=torch.bool, device=dev)], 1)                  # dropped rows: all text keys masked -> null
             hs = self._run(toks, am, pos, cache=enc.cache, T=enc.T)
+            if self.text_pool: pool = enc.pool * key_mask.any(1)[:, None].float()
         else:
             ids = enc.ids if isinstance(enc, TextIDs) else enc
             key_mask = enc_mask if enc_mask is not None else (ids != self.pad_id)
@@ -216,11 +228,15 @@ class TrunkCritic(nn.Module):
                 emb = self.owner.embed_tokens(ids[sel])
                 pos = torch.cat([(km.long().cumsum(1) - 1).clamp(min=0), L[:, None] + ar], 1)
                 am = torch.cat([km, torch.ones(len(sel), Kp, dtype=torch.bool, device=dev)], 1)
-                hs[sel] = self._run(torch.cat([emb, toks[sel]], 1), am, pos, cache=None)
+                full = self._run(torch.cat([emb, toks[sel]], 1), am, pos, cache=None, return_all=True)
+                hs[sel] = full[:, -Kp:]
+                if self.text_pool: pool[sel] = self._pool(full[:, :-Kp], km)
             if bool((~has).any()):                                                                         # dropped rows: the null path (no fully-masked query rows anywhere)
                 sel = (~has).nonzero().squeeze(1)
                 hs[sel] = self._run(toks[sel], None, ar.expand(len(sel), -1), cache=None)
-        delta = self.readout(self.readout_ln(hs.float()).reshape(B, Kp * H))
+        feats = self.readout_ln(hs.float()).reshape(B, Kp * H)
+        if self.text_pool: feats = torch.cat([feats, self.pool_ln(pool)], -1)
+        delta = self.readout(feats)
         self.last_delta_rms = float(delta.detach().float().pow(2).mean().sqrt())                            # diagnostic: how far the readout has moved off zero
         return v_prior + delta.float()
 
@@ -253,12 +269,17 @@ class TrunkCritic(nn.Module):
             print(f"[trunk] multi_forward B={B} G={G} T={T} S={S} ids={tuple(ids.shape)} x_in={tuple(x_in.shape)} mask={tuple(m.shape)} grad_ckpt={self.grad_ckpt} training={self.owner.training}: "
                   f"mem before {mem0:.1f} GiB, peak during trunk {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB, after {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
         hs = out[:, T:].float().reshape(B * G, Kp, H)
-        delta = self.readout(self.readout_ln(hs).reshape(B * G, Kp * H)).view(B, G, d)
+        feats = self.readout_ln(hs).reshape(B * G, Kp * H)
+        if self.text_pool:
+            pool = self._pool(out[:, :T], key_mask)                                                          # [B, H]
+            pool = (pool[:, None, :] * keep[:, :, None].float()).reshape(B * G, H)                          # dropped groups see no text -> zero pool
+            feats = torch.cat([feats, self.pool_ln(pool)], -1)
+        delta = self.readout(feats).view(B, G, d)
         self.last_delta_rms = float(delta.detach().float().pow(2).mean().sqrt())
         return v_prior + delta
 
-    def _run(self, x_in, am, pos, cache=None, T=0):
-        """trunk forward -> hidden states of the LAST K+1 positions [B, K+1, H] (bf16). am: key mask [B, T_total] or None (= causal only)."""
+    def _run(self, x_in, am, pos, cache=None, T=0, return_all=False):
+        """trunk forward -> hidden states of the LAST K+1 positions [B, K+1, H] (bf16; all positions with return_all). am: key mask [B, T_total] or None (= causal only)."""
         Kp = self._n_act
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if cache is None:
@@ -271,12 +292,13 @@ class TrunkCritic(nn.Module):
                 finally:
                     for layer in cache.layers: layer.crop(T)                                                # the prefix cache is reusable
                     if was: self.owner.train()
-        return out[:, -Kp:]
+        return out if return_all else out[:, -Kp:]
 
     # ---- parameters / checkpoints -------------------------------------------------------------------------------------------------
     def named_adapter_modules(self):
         yield "src_in", self.src_in; yield "act_in", self.act_in; yield "time_mlp", self.time_mlp; yield "fresh", self.fresh
         yield "readout_ln", self.readout_ln; yield "readout", self.readout
+        if self.text_pool: yield "pool_ln", self.pool_ln
 
     def adapter_modules(self):
         for _, m_ in self.named_adapter_modules(): yield m_
@@ -312,7 +334,7 @@ class TrunkCritic(nn.Module):
 
     def config(self):
         return {"trunk_id": self.trunk_id, "n_layers": self.n_layers_kept, "lora_r": self.lora_r, "lora_alpha": self.lora_alpha, "n_act_tokens": self.K,
-                "fresh_every": self.fresh_every, "fresh_heads": self.fresh_heads, "fresh_dhead": self.fresh_dhead, "max_len": self.max_len, "d": self.d, "space": self.space, "readout_rank": self.readout_rank}
+                "fresh_every": self.fresh_every, "fresh_heads": self.fresh_heads, "fresh_dhead": self.fresh_dhead, "max_len": self.max_len, "d": self.d, "space": self.space, "readout_rank": self.readout_rank, "text_pool": self.text_pool}
 
 
 def load_prior(path, device, dtype=torch.bfloat16):
@@ -340,7 +362,7 @@ def build_trunk_critic(ckpt_path, device="cuda", prior_path=None, grad_ckpt=Fals
     ck = torch.load(ckpt_path, map_location="cpu"); cfg = ck["config"]
     prior, space, _ = load_prior(prior_path or cfg["space"]["prior_ckpt"], device)
     m = TrunkCritic(prior, cfg["trunk_id"], cfg["n_layers"], cfg["lora_r"], cfg["lora_alpha"], cfg["n_act_tokens"], cfg["fresh_every"], cfg["fresh_heads"], cfg["fresh_dhead"],
-                    grad_ckpt=grad_ckpt, max_len=cfg["max_len"], device=device, space=space, readout_rank=cfg.get("readout_rank", 0))
+                    grad_ckpt=grad_ckpt, max_len=cfg["max_len"], device=device, space=space, readout_rank=cfg.get("readout_rank", 0), text_pool=cfg.get("text_pool", False))
     m.load_state(ck["state"]); m.eval()
     for p_ in m.parameters(): p_.requires_grad_(False)
     if merge: merge_lora(m)

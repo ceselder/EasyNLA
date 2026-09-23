@@ -81,6 +81,17 @@ def main():
     m3 = TrunkCritic(prior, tmp, n_layers=4, lora_r=4, lora_alpha=8, n_act_tokens=2, fresh_every=2, fresh_heads=2, fresh_dhead=8, grad_ckpt=False, device=dev, space=m.space, dtype=torch.float32, readout_rank=16)
     with torch.no_grad(): v3 = m3(x_t, t, h_i, enc=TextIDs(ids), enc_mask=mask); assert (v3 - prior(x_t, t, h_i)).abs().max() < 1e-6, "low-rank readout must start as the prior"
     m3.load_state(m3.state()); print("low-rank readout ok")
+    # text-pool variant: cached == full == multi, empty == null, nonzero text dependence
+    mp = TrunkCritic(prior, tmp, n_layers=4, lora_r=4, lora_alpha=8, n_act_tokens=2, fresh_every=2, fresh_heads=2, fresh_dhead=8, grad_ckpt=False, device=dev, space=m.space, dtype=torch.float32, readout_rank=16, text_pool=True)
+    with torch.no_grad():
+        mp.readout[1].weight.normal_(0, 0.05)
+        vpf = mp(x_t, t, h_i, enc=TextIDs(ids), enc_mask=mask); kvp, maskp = mp.encode(texts); vpk = mp(x_t, t, h_i, enc=kvp, enc_mask=maskp); vpn = mp(x_t, t, h_i)
+        vpm = mp.multi_forward(xg, tg, h_i, ids, mask, keep)
+        for g in range(G):
+            vs = mp(xg[:, g], tg[:, g], h_i, enc=TextIDs(ids), enc_mask=mask & keep[:, g][:, None]); assert (vpm[:, g] - vs).abs().max() < 1e-4, "pool multi != single"
+    print("text-pool: cached vs full", (vpf - vpk).abs().max().item(), "empty vs null", (vpf[2] - vpn[2]).abs().max().item(), "text vs null", (vpf[0] - vpn[0]).abs().max().item())
+    assert (vpf - vpk).abs().max() < 1e-4 and (vpf[2] - vpn[2]).abs().max() < 1e-5 and (vpf[0] - vpn[0]).abs().max() > 1e-3
+    mp.load_state(mp.state()); print("text-pool ok")
     st = m.state(); m2 = TrunkCritic(prior, tmp, n_layers=4, lora_r=4, lora_alpha=8, n_act_tokens=2, fresh_every=2, fresh_heads=2, fresh_dhead=8, grad_ckpt=False, device=dev, space=m.space, dtype=torch.float32); m2.load_state(st); m2.eval()
     with torch.no_grad(): v2 = m2(x_t, t, h_i, enc=TextIDs(ids), enc_mask=mask)
     print("state round-trip max|diff|", (v2 - v_full).abs().max().item()); assert (v2 - v_full).abs().max() < 1e-5
