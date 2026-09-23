@@ -326,6 +326,17 @@ def main():
             if a.cross_offload: _place(self.sc, "cpu")
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"rl_{a.tag}", group="rl", config=vars(a))
     gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id; lam_hist = []; lr_mult = 1.0; ent0 = None; last_brake = -10**9; brakes_n = 0; last_dump_dir = None
+    def dump_val(step_label):
+        """the current policy's samples on the first --dump-val-pairs fixed pairs, board #31 format -> <dump_root>/<tag>_<step_label>/val/"""
+        import pyarrow as pa
+        td = time.time(); dres, dinfo = rollout(llm, spec, dump_acts, 1, a.max_new_tokens, 0.7, seed=777 + int(step_label))
+        src = f"{a.tag}_{step_label}"; dd = os.path.join(a.dump_root, src, "val"); os.makedirs(dd, exist_ok=True)
+        tbl = pa.table({"pair_id": [dump_vp["pair_id"][r["prompt_idx"]] for r in dres], "text": [r["text"].strip() for r in dres], "n_tokens": pa.array([int(r["n_resp"]) for r in dres], pa.int32()),
+                        "verbosity": pa.array([1] * len(dres), pa.int32()), "source": [src] * len(dres), "sample_idx": pa.array([0] * len(dres), pa.int32())})
+        pq.write_table(tbl, os.path.join(dd, f"part_0000000_{len(dres):07d}.parquet"))
+        print(f"[dump] {len(dres)} val rollouts -> {dd} ({time.time() - td:.0f}s, {dinfo['tok_per_s']:.0f} tok/s)", flush=True)
+        return dd
+    if dump_vp is not None: last_dump_dir = dump_val(0)                       # step-0 dump = the warm start's samples (redteam's Y2 bar)
     meta_pos = store.meta["pos_idx"].values; meta_next = store.meta["next_token_id"].values
     for step in range(a.steps):
         t0 = time.time(); B, G = a.batch_prompts, a.group
@@ -528,14 +539,7 @@ def main():
             if cot is not None: torch.save({"model": cot.model.state_dict(), "step": step + 1, "args": cot.sc.aa, "config": cot.model.config(), "d_enc": getattr(cot.model, "d_enc_", 0)}, os.path.join(d, "critic.pt"))
             print(f"[save] {d}", flush=True)
             n_save = (step + 1) // a.save_every
-            if dump_vp is not None and (n_save % a.dump_val_every == 0 or step + 1 == a.steps):
-                import pyarrow as pa
-                td = time.time(); dres, dinfo = rollout(llm, spec, dump_acts, 1, a.max_new_tokens, 0.7, seed=777 + step)
-                src = f"{a.tag}_{step + 1}"; dd = os.path.join(a.dump_root, src, "val"); os.makedirs(dd, exist_ok=True)
-                tbl = pa.table({"pair_id": [dump_vp["pair_id"][r["prompt_idx"]] for r in dres], "text": [r["text"].strip() for r in dres], "n_tokens": pa.array([int(r["n_resp"]) for r in dres], pa.int32()),
-                                "verbosity": pa.array([1] * len(dres), pa.int32()), "source": [src] * len(dres), "sample_idx": pa.array([0] * len(dres), pa.int32())})
-                pq.write_table(tbl, os.path.join(dd, f"part_0000000_{len(dres):07d}.parquet")); last_dump_dir = dd
-                print(f"[dump] {len(dres)} val rollouts -> {dd} ({time.time() - td:.0f}s, {dinfo['tok_per_s']:.0f} tok/s)", flush=True)
+            if dump_vp is not None and (n_save % a.dump_val_every == 0 or step + 1 == a.steps): last_dump_dir = dump_val(step + 1)
     if run is not None: run.finish()
     print("done.", flush=True)
 
