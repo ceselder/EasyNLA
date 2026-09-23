@@ -49,6 +49,8 @@ def parse():
     # data / eval / logging
     p.add_argument("--train-store-device", default="cpu"); p.add_argument("--max-train-pos", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=10); p.add_argument("--eval-pairs", type=int, default=128); p.add_argument("--save-every", type=int, default=25)
+    p.add_argument("--dump-val-every", type=int, default=0, help="at every k-th save, write 1 rollout (T=0.7) per pair for the first --dump-val-pairs pairs_val rows in the board #31 text format to /vol/z/<tag>_<step>/val/ (redteam's pipeline); 0 = off")
+    p.add_argument("--dump-val-pairs", type=int, default=4096); p.add_argument("--dump-root", default="/vol/z")
     p.add_argument("--wandb-project", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -124,6 +126,12 @@ def main():
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas(); vp = vp[vp["pos_idx"].isin(store_val.row_of)].iloc[: a.eval_pairs]
     ev_rows = store_val.rows_for(vp["pos_idx"].values); ev_i = torch.as_tensor(vp["i"].values).long(); ev_j = torch.as_tensor(vp["j"].values).long()
     ev_acts = torch.stack([store_val.gather(ev_rows, ev_i), store_val.gather(ev_rows, ev_j)], 1).float()
+    dump_vp = dump_acts = None
+    if a.dump_val_every > 0:
+        dump_vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas(); dump_vp = dump_vp[dump_vp["pos_idx"].isin(store_val.row_of)].iloc[: a.dump_val_pairs].reset_index(drop=True)
+        dr = store_val.rows_for(dump_vp["pos_idx"].values)
+        dump_acts = torch.stack([store_val.gather(dr, torch.as_tensor(dump_vp["i"].values).long()), store_val.gather(dr, torch.as_tensor(dump_vp["j"].values).long())], 1).float()
+        print(f"[rl] val dump set: {len(dump_vp)} pairs every {a.dump_val_every} saves -> {a.dump_root}/{a.tag}_<step>/val/", flush=True)
     # ---- policy + engine
     policy = load_policy(a.base, a.init, r=a.lora_r, alpha=a.lora_alpha, device=dev); policy.train()
     inj = TwoMarkerInjector(policy, spec.marker_id, positions=(spec.pos_i, spec.pos_j))
@@ -232,6 +240,15 @@ def main():
             json.dump({"step": step + 1, "prompt": spec.text, "ref_prompt_len": len(ref_ids), "init": a.init}, open(os.path.join(d, "meta.json"), "w"))
             if cot is not None: torch.save({"model": cot.model.state_dict(), "step": step + 1, "args": cot.sc.aa, "config": cot.model.config(), "d_enc": getattr(cot.model, "d_enc_", 0)}, os.path.join(d, "critic.pt"))
             print(f"[save] {d}", flush=True)
+            n_save = (step + 1) // a.save_every
+            if dump_vp is not None and (n_save % a.dump_val_every == 0 or step + 1 == a.steps):
+                import pyarrow as pa
+                td = time.time(); dres, dinfo = rollout(llm, spec, dump_acts, 1, a.max_new_tokens, 0.7, seed=777 + step)
+                src = f"{a.tag}_{step + 1}"; dd = os.path.join(a.dump_root, src, "val"); os.makedirs(dd, exist_ok=True)
+                tbl = pa.table({"pair_id": [dump_vp["pair_id"][r["prompt_idx"]] for r in dres], "text": [r["text"].strip() for r in dres], "n_tokens": pa.array([int(r["n_resp"]) for r in dres], pa.int32()),
+                                "verbosity": pa.array([1] * len(dres), pa.int32()), "source": [src] * len(dres), "sample_idx": pa.array([0] * len(dres), pa.int32())})
+                pq.write_table(tbl, os.path.join(dd, f"part_0000000_{len(dres):07d}.parquet"))
+                print(f"[dump] {len(dres)} val rollouts -> {dd} ({time.time() - td:.0f}s, {dinfo['tok_per_s']:.0f} tok/s)", flush=True)
     if run is not None: run.finish()
     print("done.", flush=True)
 
