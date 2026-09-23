@@ -31,7 +31,7 @@ def style():
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--report", default=os.path.expanduser("~/shared/reports/natural-language-transcoder")); ap.add_argument("--controls", default="verdicts_union_pooled_null_controls_table.json")
-    ap.add_argument("--stem", default="headline_critic_controls"); ap.add_argument("--critic-label", default="all-sources adapter + null regulariser on the pooled blind prior")
+    ap.add_argument("--stem", default="headline_critic_controls"); ap.add_argument("--critic-label", default="the headline critic (all-sources adapter + null regulariser on the pooled blind prior)")
     a = ap.parse_args(); D = os.path.join(a.report, "data"); C = json.load(open(os.path.join(D, a.controls)))
     rows = sorted(C["rows"], key=lambda r: -r["content"]); x = np.arange(len(rows)); w = 0.8 / len(VARIANTS)
     style(); fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13.5, 11), dpi=150)
@@ -44,16 +44,25 @@ def main():
     for xi, r in zip(x, rows): ax1.text(xi, max(r["orig"], r["dm"], r["rp"], 0) + 0.4, f"P {r['p_orig_gt_dm']:.2f}", ha="center", va="bottom", fontsize=9.5, color=INK2)
     ax1.set_ylim(min(-3.5, ax1.get_ylim()[0]) - 3.5, top * 1.3)
     cmin, cmax = min(r["content"] for r in rows), max(r["content"] for r in rows)
-    ax1.set_title(f"Every source's own sentence beats a depth-matched other sentence by only {cmin:.1f}–{cmax:.1f} bits (P = P(z beats z_dm)); a random\npair's sentence still scores +4–7 bits (residual register offset); permuting the words costs 3–9 bits (the critic reads syntax, not a bag of words)", loc="left", fontsize=12)
+    rp = [r["rp"] for r in rows if r.get("rp") is not None]; fm = [r["form"] for r in rows if r.get("form") is not None]
+    ax1.set_title(f"Every source's own text beats a depth-matched other text by {cmin:.1f}–{cmax:.1f} bits (P = P(z beats z_dm)); a random pair's text\nstill scores {min(rp):+.0f} to {max(rp):+.0f} bits (residual register offset); permuting the words costs {min(fm):.0f}–{max(fm):.0f} bits (the critic reads syntax, not a bag of words)", loc="left", fontsize=12)
     wb = 0.8 / len(BANDS)
     for bi, (bk, blab, col) in enumerate(BANDS):
         vals = [(r.get("content_by_band") or {}).get(bk, np.nan) for r in rows]
         ax2.bar(x + bi * wb - 0.4 + wb / 2, vals, wb * 0.92, color=col, label=blab)
     ax2.axhline(0, color=INK2, lw=0.8); ax2.set_xticks(x); ax2.set_xticklabels([LABEL.get(r["source"], r["source"]) for r in rows], fontsize=9.5); ax2.grid(axis="x", visible=False)
     ax2.set_ylabel("content bits = bits(z) − bits(z_dm), by band"); ax2.legend(frameon=False, loc="upper right", fontsize=10)
-    ax2.set_title("Content grows toward the output: motor-band sentences (j ≥ 33) earn 1–4 bits, workspace 0.8–2.5, pre-workspace ≈ 0–1.4", loc="left", fontsize=12)
-    fig.suptitle("\n".join(textwrap.wrap(f"Controls on the headline critic ({a.critic_label}): the critic is a real density over h_j (own sentence scored against h_j from a wrong layer: −1400 to −1900 bits; "
-                                          f"the passage as text: −22 bits) but pays each source about a bit of pair-specific content", 112)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
+    def rng(key):
+        v = [(r.get("content_by_band") or {}).get(key) for r in rows]; v = [x for x in v if x is not None]
+        return (min(v), max(v)) if v else (float("nan"), float("nan"))
+    pre, ws, mo = rng("pre"), rng("workspace"), rng("motor")
+    ax2.set_title(f"Content grows toward the output: motor-band texts (j ≥ 33) earn {mo[0]:.1f}–{mo[1]:.1f} bits, workspace {ws[0]:.1f}–{ws[1]:.1f}, pre-workspace {pre[0]:.1f}–{pre[1]:.1f}", loc="left", fontsize=12)
+    wj = [r["wrong_j"] for r in rows if r.get("wrong_j") is not None]; cp = [r["copy"] for r in rows if r.get("copy") is not None]
+    n_pass = sum(1 for r in rows if r["p_orig_gt_dm"] >= 0.75); pmin, pmax = min(r["p_orig_gt_dm"] for r in rows), max(r["p_orig_gt_dm"] for r in rows)
+    verdict = (f"pays each source about a bit of pair-specific content (P(z beats z_dm) {pmin:.2f}–{pmax:.2f}, none over the 0.75 gate)" if n_pass == 0 else
+               f"pays {n_pass} of {len(rows)} sources over the 0.75 content gate (P(z beats z_dm) {pmin:.2f}–{pmax:.2f}); the verbalizer's and teacher's sentences are not among them")
+    fig.suptitle("\n".join(textwrap.wrap(f"Controls on {a.critic_label}: the critic is a real density over h_j (own text scored against h_j from a wrong layer: {min(wj):.0f} to {max(wj):.0f} bits; "
+                                          f"the passage as text: {np.mean(cp):.0f} bits) and {verdict}", 112)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
     fig.text(0.01, 0.005, f"Fixed held-out set; n = {min(r['n'] for r in rows)}–{max(r['n'] for r in rows)} pairs per source x 8 variants, every variant of a pair scored with the same probes (exact Heun 32). Table: data/{a.controls} (redteam nlt/evals/controls_table.py). PRELIMINARY: D3 gate not passed.",
              fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
     fig.subplots_adjust(left=0.08, right=0.985, top=0.87, bottom=0.09, hspace=0.5)
