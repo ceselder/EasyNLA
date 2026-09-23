@@ -37,7 +37,7 @@ def _run(cmd, cwd=REPO_REMOTE):
     return rc
 
 
-@app.function(gpu=GPU, timeout=4 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=96 * 1024, ephemeral_disk=256 * 1024)
+@app.function(gpu=GPU, timeout=4 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=96 * 1024, ephemeral_disk=512 * 1024)
 def extract(index: int, n_producers: int, target_train: int, target_val: int, extra: str = "", out: str = DATA):
     _local_hf()
     from huggingface_hub import snapshot_download
@@ -68,9 +68,9 @@ def cat(path: str):
 @app.local_entrypoint()
 def main(task: str = "smoke", n_producers: int = 4, target_train: int = 80000, target_val: int = 3000, extra: str = "", path: str = "data/qwen3_8b", out: str = DATA):
     if task == "smoke":
-        rc = extract.remote(0, 1, 2000, 200, "--docs-per-batch 16 --shard-size 1024 --max-minutes 20 " + extra, out=f"{DATA}_smoke")
+        rc = extract.remote(0, 1, 6000, 400, "--docs-per-batch 32 --shard-size 2048 --max-minutes 20 " + extra, out=f"{DATA}_smoke2")
         print("smoke extract rc", rc)
-        print("finalize rc", finalize.remote("--max-stats-pos 4000 " + extra, data=f"{DATA}_smoke"))
+        print("finalize rc", finalize.remote("--max-stats-pos 8000 " + extra, data=f"{DATA}_smoke2"))
     elif task == "extract":
         rcs = list(extract.starmap([(i, n_producers, target_train, target_val, extra, out) for i in range(n_producers)]))
         print("extract rcs", rcs)

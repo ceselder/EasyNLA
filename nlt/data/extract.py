@@ -122,14 +122,29 @@ def main():
             src_counts[src] = src_counts.get(src, 0) + 1
         for s in splits.values(): s.flush()
 
+    # ---- prefetch + tokenise in a background thread so the hub streams never stall the GPU
+    import queue, threading
+    q = queue.Queue(maxsize=1024); STOP = object(); stop_flag = threading.Event()
+    def feeder():
+        try:
+            for src, text in stream:
+                if stop_flag.is_set(): break
+                split = "val" if is_val_doc(text) else "train"
+                t_ids = tok(text, add_special_tokens=False, truncation=True, max_length=a.max_len)["input_ids"]
+                if len(t_ids) < a.min_len: continue
+                text_run = tok.decode(t_ids) if len(t_ids) == a.max_len else text
+                q.put((split, src, text_run, t_ids))
+        except Exception as e:
+            print(f"[prod{a.index}] feeder died: {type(e).__name__}: {e}", flush=True)
+        q.put(STOP)
+    threading.Thread(target=feeder, daemon=True).start()
     batch = []
-    for src, text in stream:
-        if all(s.done() for s in splits.values()) or (time.time() - t0) / 60 > a.max_minutes: break
-        split = "val" if is_val_doc(text) else "train"
+    while True:
+        item = q.get()
+        if item is STOP: break
+        if all(s.done() for s in splits.values()) or (time.time() - t0) / 60 > a.max_minutes: stop_flag.set(); break
+        split, src, text_run, t_ids = item
         if splits[split].done(): continue
-        t_ids = tok(text, add_special_tokens=False, truncation=True, max_length=a.max_len)["input_ids"]
-        if len(t_ids) < a.min_len: continue
-        text_run = tok.decode(t_ids) if len(t_ids) == a.max_len else text
         batch.append((split, src, text_run, t_ids))
         if len(batch) >= a.docs_per_batch:
             run_batch(batch); batch = []
