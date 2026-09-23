@@ -53,6 +53,15 @@ def finalize(extra: str = "", data: str = DATA):
     return _run(cmd)
 
 
+@app.function(gpu=GPU, timeout=4 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=96 * 1024, ephemeral_disk=512 * 1024)
+def skip(extra: str = "", data: str = DATA):
+    """skip-patch KL + final top-16 log-probs for the val pairs (nlt.data.skip_patch) -> <data>/val_skip.parquet"""
+    _local_hf(); vol.reload()
+    from huggingface_hub import snapshot_download
+    snapshot_download("Qwen/Qwen3-8B", token=os.environ.get("HF_TOKEN"), allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "tokenizer*"])
+    return _run([sys.executable, "-m", "nlt.data.skip_patch", "--data-dir", data, "--out", f"{data}/val_skip.parquet"] + extra.split())
+
+
 @app.function(timeout=600, volumes={"/vol": vol}, cpu=2, memory=4 * 1024)
 def ls(path: str = "data/qwen3_8b"):
     import subprocess
@@ -76,6 +85,8 @@ def main(task: str = "smoke", n_producers: int = 4, target_train: int = 80000, t
         print("extract rcs", rcs)
     elif task == "finalize":
         print("finalize rc", finalize.remote(extra, data=out))
+    elif task == "skip":
+        print("skip rc", skip.remote(extra, data=out))
     elif task == "ls":
         ls.remote(path)
     elif task == "cat":
