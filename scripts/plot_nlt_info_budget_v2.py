@@ -17,9 +17,9 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 # critic key in the json -> human label (no codenames), in display order
-CRITICS = [("lensmine", "J-lens-text-only adapter\n2000 steps, rms space"), ("lens_es", "J-lens-text-only adapter\nearly-stopped, rms space"),
-           ("union_es", "all-sources adapter\nrms space"), ("union_null", "all-sources adapter\n+ null regulariser, rms space"),
-           ("union_pooled_null", "all-sources adapter + null reg.\nPOOLED space (headline)"), ("union_c", "all-sources + null reg.\n+ contrastive (T4), pooled")]
+CRITICS = [("lensmine", "J-lens text only\n2000 steps\nrms space"), ("lens_es", "J-lens text only\nearly-stopped\nrms space"), ("lensmine_pooled", "J-lens text only\n+ null reg.\nPOOLED space"),
+           ("union_es", "all sources\nplain FM\nrms space"), ("union_null", "all sources\n+ null reg.\nrms space"),
+           ("union_pooled_null", "all sources\n+ null reg.\nPOOLED (headline)"), ("union_c", "all sources + null\n+ contrastive (T4)\npooled"), ("critic_v3a", "critic v3a\n(all levers, prior\nunfrozen), pooled")]
 SETS = [("teacher_v1", "Sonnet teacher, 1 sentence (41 tok)", CAT[0]), ("lens_L1", "J-lens change description, 1 sentence (40 tok)", CAT[1]),
         ("lens_L2", "J-lens change description, 3 sentences (57 tok)", CAT[2]), ("lens_L3", "J-lens change description, lists (137 tok)", CAT[6])]
 
@@ -57,7 +57,7 @@ def main():
             if p is not None and not np.isnan(c): ax2.text(xi, c + e + 0.12, f"{p:.2f}", ha="center", va="bottom", fontsize=9, color=INK2, rotation=90)
     for ax in (ax1, ax2):
         ax.set_xticks(x); ax.set_xticklabels([l for _, l in crits], fontsize=10); ax.axhline(0, color=INK2, lw=0.8); ax.grid(axis="x", visible=False)
-    ax1.set_yscale("symlog", linthresh=10); ax1.set_yticks([-5, 0, 5, 10, 20, 50, 100]); ax1.set_yticklabels(["−5", "0", "5", "10", "20", "50", "100"]); ax1.set_ylabel("form bits = bits(z_dm) − bits(words permuted)")
+    ax1.set_yscale("symlog", linthresh=10); ax1.set_yticks([-5, 0, 5, 10, 20, 50, 100]); ax1.set_yticklabels(["−5", "0", "5", "10", "20", "50", "100"]); ax1.set_ylim(-8, 200); ax1.set_ylabel("form bits = bits(z_dm) − bits(words permuted)")
     ax1.set_title("Form: a well-formed sentence in the training register is worth ~60 bits to a single-register adapter;\nthe null regulariser (score a random pair's text as the empty text) cuts it to ~7", loc="left", fontsize=12.5)
     ax1.legend(frameon=False, loc="upper right", ncol=1)
     ax2.set_ylabel("content bits = bits(z) − bits(z_dm), workspace band"); ax2.set_ylim(min(-0.5, ax2.get_ylim()[0]), ax2.get_ylim()[1] * 1.18)

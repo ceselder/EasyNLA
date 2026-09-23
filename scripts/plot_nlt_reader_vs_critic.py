@@ -1,14 +1,15 @@
-"""Headline figure for the NLT report: the reader/critic gap.
+"""Headline figure for the NLT report: the reader/critic gap, per text source, on the headline critic.
 
-Left: what an outside reader (Sonnet 5, sees ONE sentence and nothing else) recovers about the forward pass from the
-verbalizer's sentence, vs chance. Right: how many exact bits the flow critic credits sentences with, beyond a
-depth-matched generic sentence (content bits = bits(z) - bits(z_dm)), workspace band.
+Left: what an outside reader (Sonnet 5, sees ONE sentence and nothing else) recovers about the forward pass, per source.
+Right: exact content bits the headline flow critic credits the same sources with, beyond a depth-matched other sentence
+(content = bits(z) - bits(z_dm), paired), with P(z beats z_dm). Sources are ordered by critic content so the reversal of the
+ranking is visible: the reader likes passage-grounded sentences, the critic likes lens-space change descriptions.
 
-Inputs: data/reader_evals_v1.json (redteam), data/info_budget.json (infra merge), plus the verbalizer's step-0 content
-numbers posted by rl on the board (#169), which are copied into the output json with their provenance.
+Inputs: data/reader_evals_v1.json (redteam readers), data/verdicts_union_pooled_null_controls_table.json (redteam's controls table
+built from infra's scoring of the control manifests on the headline critic). Stem `headline_reader_vs_critic` (the stem
+`reader_vs_critic_gap` belongs to redteam's own plotter and is left alone).
 
   python scripts/plot_nlt_reader_vs_critic.py --report ~/shared/reports/natural-language-transcoder
-Writes reader_vs_critic_gap.png/.pdf + data/reader_vs_critic_gap.json.
 """
 from __future__ import annotations
 import argparse, json, os, textwrap
@@ -19,71 +20,61 @@ import matplotlib.pyplot as plt
 
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
-
-# verbalizer (first supervised version) content bits from rl's step-0 test (board #169): 512 fixed val pairs x 8 samples,
-# exact ODE Heun 32, paired z - z_dm in the workspace band.
-V0_STEP0 = {
-    "null-reg all-sources critic (rms space)": {"content": 0.61, "sem": 0.10, "critic": "text_union_v1n/ckpt_best.pt", "provenance": "board #169", "frac_nonpos": 0.51},
-    "plain all-sources critic (rms space)": {"content": 1.66, "sem": 0.18, "critic": "text_union_v1s/ckpt_best.pt", "provenance": "board #169", "frac_nonpos": 0.56},
-}
-TASKS = [("top1", "final top-1\n(4 choices)", 25), ("posmatch", "doc position\n(5 cuts)", 20),
-         ("direction", "direction of\nchange (j vs i)", 50), ("category", "next-token\ncategory (5)", 30)]
+# controls-table source -> (reader key, short label, colour slot). Colours fixed per source across every figure of the report.
+SOURCES = {"teacher_v1": ("reader_teacher_v1", "Sonnet teacher\n+ lens + final", CAT[0]), "teacher_nofinal_v1": ("reader_teacher_nofinal_v1", "Sonnet teacher\n+ lens", CAT[1]),
+           "teacher_nolens_v1": ("reader_teacher_nolens_v1", "Sonnet teacher\npassage only", CAT[2]), "lensdiff_L1": ("reader_lensdiff_jlens_L1", "J-lens change\ndescription", CAT[6]),
+           "v0_ao_tsv1": ("reader_v0_ao_tsv1", "VERBALIZER\nactivations only", CAT[7])}
 
 
 def style():
-    plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "axes.labelsize": 12, "legend.fontsize": 11, "xtick.labelsize": 11, "ytick.labelsize": 11,
+    plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "axes.labelsize": 12, "legend.fontsize": 10.5, "xtick.labelsize": 10.5, "ytick.labelsize": 11,
                          "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2,
                          "axes.edgecolor": GRID, "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8, "axes.axisbelow": True,
                          "axes.spines.top": False, "axes.spines.right": False})
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--report", default=os.path.expanduser("~/shared/reports/natural-language-transcoder")); ap.add_argument("--stem", default="reader_vs_critic_gap")
+    ap = argparse.ArgumentParser(); ap.add_argument("--report", default=os.path.expanduser("~/shared/reports/natural-language-transcoder")); ap.add_argument("--stem", default="headline_reader_vs_critic")
+    ap.add_argument("--controls", default="verdicts_union_pooled_null_controls_table.json")
     a = ap.parse_args(); D = os.path.join(a.report, "data")
-    R = json.load(open(os.path.join(D, "reader_evals_v1.json")))["reader_v0_ao_tsv1"]
-    B = json.load(open(os.path.join(D, "info_budget.json")))
-    style()
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 7.6), dpi=150, gridspec_kw={"wspace": 0.42, "width_ratios": [1, 1.2]})
-    # ---- left: reader accuracy on the verbalizer's sentences
-    x = np.arange(len(TASKS)); acc = [100 * R[t] for t, _, _ in TASKS]; ch = [c for _, _, c in TASKS]
-    ax1.bar(x, acc, width=0.56, color=CAT[0], label="reader given the verbalizer's sentence only")
-    ax1.scatter(x, ch, marker="_", s=900, color=INK, lw=2.2, zorder=3, label="chance")
-    for xi, v in zip(x, acc): ax1.text(xi, v + 1.5, f"{v:.0f}%", ha="center", va="bottom", fontsize=12, color=INK)
-    ax1.set_xticks(x); ax1.set_xticklabels([l for _, l, _ in TASKS], fontsize=10.5); ax1.set_xlim(-0.6, len(TASKS) - 0.4); ax1.set_ylim(0, 100); ax1.set_ylabel("reader accuracy, %")
-    ax1.set_title("An outside reader, shown ONE sentence written from\nthe two activations alone, recovers measured facts\nabout the forward pass far above chance", loc="left", fontsize=12.5)
-    ax1.legend(frameon=False, loc="upper right", fontsize=10.5); ax1.grid(axis="x", visible=False)
-    # ---- right: content bits per sentence under the flow critics
+    R = json.load(open(os.path.join(D, "reader_evals_v1.json"))); C = json.load(open(os.path.join(D, a.controls)))
+    by_src = {r["source"]: r for r in C["rows"]}
     rows = []
-    SHORT = {"null-reg all-sources critic (rms space)": "null-reg critic, rms", "plain all-sources critic (rms space)": "plain critic, rms", "null-reg all-sources critic (pooled space)": "null-reg critic, pooled"}
-    for lab, v in V0_STEP0.items(): rows.append(("verbalizer sentences\n" + SHORT[lab], v["content"], v["sem"], None, CAT[0]))
-    for crit, lab, col in [("union_null", "null-reg all-sources critic (rms space)", CAT[1]), ("union_pooled_null", "null-reg all-sources critic (pooled space)", CAT[2])]:
-        for st, sl in [("teacher_v1", "Sonnet teacher sentence"), ("lens_L1", "J-lens description, 1 sentence"), ("lens_L3", "J-lens description, lists")]:
-            s = B["text"].get(crit, {}).get("sets", {}).get(st)
-            if not s or "workspace14-32" not in s["bands"]: continue
-            b = s["bands"]["workspace14-32"]
-            if b.get("content") is None: continue
-            rows.append((f"{sl}\n{SHORT[lab]}", b["content"], b["content_sem"], s.get("frac_z_beats_dm"), col))
-    y = np.arange(len(rows))[::-1]
-    ax2.barh(y, [r[1] for r in rows], xerr=[r[2] for r in rows], height=0.6, color=[r[4] for r in rows], error_kw={"ecolor": INK2, "capsize": 3, "lw": 1})
-    for yi, r in zip(y, rows):
-        txt = f"{r[1]:+.2f} bits" + (f"\nP(z beats z_dm) {r[3]:.2f}" if r[3] is not None else "")
-        ax2.text(max(r[1] + r[2], 0) + 0.08, yi, txt, va="center", fontsize=10, color=INK2)
-    ax2.set_yticks(y); ax2.set_yticklabels([r[0] for r in rows], fontsize=10); ax2.axvline(0, color=INK2, lw=0.8)
-    ax2.set_xlim(-0.3, max(r[1] + r[2] for r in rows) + 1.9); ax2.set_xlabel("content bits = bits(z) − bits(z_dm), workspace band (j 14–32)")
-    ax2.set_title("The flow critic credits the same kind of sentence with\nabout one exact bit over a depth-matched generic\nsentence; no source passes the 0.75 gate on P(z beats z_dm)", loc="left", fontsize=12.5)
-    ax2.grid(axis="y", visible=False)
-    fig.suptitle("\n".join(textwrap.wrap("The reader–critic gap: from the verbalizer's sentence alone a reader picks the model's next token 73% of the time "
-                                          "(chance 25%), yet the flow critic pays the same sentences about 1 exact bit — the critic, not the text, is the bottleneck", 105)),
-                 fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
-    fig.text(0.01, 0.005, "Left: Sonnet 5 reads one sentence (no passage, no activations); 512 fixed held-out pairs; accuracy on parsed answers. Right: exact probability-flow-ODE log-likelihood "
-             "differences (Heun 32, paired probes), 512 pairs per set; verbalizer rows = 512 pairs x 8 samples; all critics PRELIMINARY (D3 gate not passed).", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
-    fig.subplots_adjust(left=0.07, right=0.985, top=0.80, bottom=0.14, wspace=0.55)
+    for src, (rk, lab, col) in SOURCES.items():
+        c = by_src.get(src); r = R.get(rk)
+        if not c or not r: continue
+        sem = (c["orig_ci"][1] - c["orig_ci"][0]) / (2 * 1.96) if c.get("orig_ci") else 0.0
+        rows.append({"source": src, "label": lab, "colour": col, "top1": r["top1"], "posmatch": r["posmatch"], "direction": r.get("direction"), "content": c["content"], "content_sem": sem, "p_dm": c["p_orig_gt_dm"],
+                     "content_ws": (c.get("content_by_band") or {}).get("workspace"), "n_critic": c["n"], "n_reader_top1": r.get("top1_n_parsed"), "bits_per_token": c.get("bits_per_token"), "orig": c["orig"], "dm": c["dm"], "rp": c["rp"]})
+    rows.sort(key=lambda r: -r["content"])
+    style(); x = np.arange(len(rows)); w = 0.38
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 7.8), dpi=150)
+    cols = [r["colour"] for r in rows]
+    ax1.bar(x - w / 2, [100 * r["top1"] for r in rows], w, color=cols, label="model's final top-1 among 4 (chance 25%)")
+    ax1.bar(x + w / 2, [100 * r["posmatch"] for r in rows], w, color=cols, alpha=0.45, label="document position among 5 cuts (chance 20%)")
+    for xi, r in zip(x, rows):
+        ax1.text(xi - w / 2, 100 * r["top1"] + 1.2, f"{100 * r['top1']:.0f}", ha="center", va="bottom", fontsize=10.5, color=INK)
+        ax1.text(xi + w / 2, 100 * r["posmatch"] + 1.2, f"{100 * r['posmatch']:.0f}", ha="center", va="bottom", fontsize=10.5, color=INK2)
+    ax1.axhline(25, color=INK, lw=1.1, ls=(0, (4, 2))); ax1.text(len(rows) - 0.5, 26.5, "chance 25% / 20%", ha="right", fontsize=9.5, color=INK2)
+    ax1.axhline(20, color=INK2, lw=0.9, ls=(0, (2, 2)))
+    ax1.set_ylim(0, 112); ax1.set_yticks([0, 20, 40, 60, 80, 100]); ax1.set_ylabel("reader accuracy, %"); ax1.set_xticks(x); ax1.set_xticklabels([r["label"] for r in rows], fontsize=9.5); ax1.grid(axis="x", visible=False)
+    ax1.legend(frameon=False, loc="upper left", fontsize=9.5)
+    ax1.set_title("What an outside reader recovers from ONE sentence:\nthe verbalizer's sentence, written from the two activations\nalone, gives the next token 73% and the position 72%", loc="left", fontsize=12.5)
+    ax2.bar(x, [r["content"] for r in rows], 0.6, color=cols, yerr=[r["content_sem"] for r in rows], error_kw={"ecolor": INK2, "capsize": 3, "lw": 1})
+    for xi, r in zip(x, rows): ax2.text(xi, r["content"] + r["content_sem"] + 0.08, f"{r['content']:.1f} bits\nP = {r['p_dm']:.2f}", ha="center", va="bottom", fontsize=10, color=INK2)
+    ax2.axhline(0, color=INK2, lw=0.8); ax2.set_ylim(0, max(4.0, max(r["content"] + r["content_sem"] for r in rows) * 1.55)); ax2.set_ylabel("exact content bits = bits(z) − bits(z_dm), paired;  P = P(z beats z_dm)")
+    ax2.set_xticks(x); ax2.set_xticklabels([r["label"] for r in rows], fontsize=9.5); ax2.grid(axis="x", visible=False)
+    ax2.set_title("What the headline flow critic pays for the same sentences:\n1–2.5 exact bits over another pair's sentence at the same (i, j);\nP(z beats z_dm) 0.59–0.71 against a 0.75 gate — and the ranking flips", loc="left", fontsize=12.5)
+    fig.suptitle("\n".join(textwrap.wrap("The reader–critic gap: sentences that let a reader recover the model's next token 3× above chance are worth about one exact bit to the flow critic, "
+                                          "and the two channels rank the text sources in opposite order — the critic, not the text, is the bottleneck", 112)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
+    fig.text(0.01, 0.005, "Sonnet teacher = Sonnet 5 shown the passage (+ J-lens readouts at i and j, + the model's final top-10), never the continuation. Qwen3-8B, layer pairs 9–34, fixed held-out set. Reader = Sonnet 5 given the sentence only (512 pairs per source, accuracy on parsed answers). Critic = all-sources adapter with the null regulariser on the "
+             "pooled blind prior (the headline critic), exact probability-flow-ODE bits (Heun 32, paired probes), ~1000 pairs per source, 95% CI. z_dm = another held-out pair's sentence with the same (i, j). All critic numbers PRELIMINARY (D3 gate not passed).",
+             fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
+    fig.subplots_adjust(left=0.065, right=0.985, top=0.79, bottom=0.2, wspace=0.28)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
-    out = {"reader_v0": {t: R[t] for t, _, _ in TASKS} | {"n_parsed": {t: R[f"{t}_n_parsed"] for t, _, _ in TASKS}, "chance": {t: c / 100 for t, _, c in TASKS}, "source": "data/reader_evals_v1.json::reader_v0_ao_tsv1"},
-           "content_bits_workspace": [{"label": r[0].replace("\n", " "), "content_bits": r[1], "sem": r[2], "frac_z_beats_dm": r[3]} for r in rows],
-           "verbalizer_step0": V0_STEP0, "band": "workspace14-32", "critics_note": "all critics preliminary: D3 gate (told-depth <= 7 exact bits) not passed by any prior tonight"}
-    json.dump(out, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)
-    print("saved", os.path.join(a.report, f"{a.stem}.png"))
+    json.dump({"critic": C.get("critic"), "rows": [{k: v for k, v in r.items() if k != "colour"} for r in rows], "chance": {"top1": 0.25, "posmatch": 0.20, "direction": 0.5},
+               "sources": {"reader": "data/reader_evals_v1.json", "critic": f"data/{a.controls}"}}, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)
+    print("saved", os.path.join(a.report, f"{a.stem}.png"), [r["source"] for r in rows])
 
 
 if __name__ == "__main__":
