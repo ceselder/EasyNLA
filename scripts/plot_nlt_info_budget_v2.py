@@ -34,7 +34,9 @@ def style():
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--report", default=os.path.expanduser("~/shared/reports/natural-language-transcoder")); ap.add_argument("--stem", default="info_budget_content")
     a = ap.parse_args(); D = os.path.join(a.report, "data"); B = json.load(open(os.path.join(D, "info_budget.json")))["text"]
-    crits = [(k, l) for k, l in CRITICS if k in B and any(s in B[k]["sets"] for s, _, _ in SETS)]
+    def collided(k):  # infra's merge key 'union_null' is shared by the rms null-reg critic and the pooled mask-next table -> skip until renamed
+        return k == "union_null" and "text_union_pooled_n" in (B[k].get("ckpt") or "")
+    crits = [(k, l) for k, l in CRITICS if k in B and not collided(k) and any(s in B[k]["sets"] for s, _, _ in SETS)]
     style()
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10.5), dpi=150, gridspec_kw={"hspace": 0.55})
     w = 0.8 / len(SETS); x = np.arange(len(crits)); out = {"critics": {}, "sets": {s: l for s, l, _ in SETS}, "band_content": "workspace14-32"}
