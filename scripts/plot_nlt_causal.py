@@ -23,7 +23,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--table", required=True); ap.add_argument("--out-dir", required=True); ap.add_argument("--stem", default="kl_skip_by_gap_band")
     a = ap.parse_args(); df = pd.read_parquet(a.table); df["gap"] = df.j - df.i; df["band"] = df.j.map(band); df["gap_bin"] = df.gap.map(gap_bin)
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2})
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.8), dpi=150)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 5.2), dpi=150, gridspec_kw={"wspace": 0.35})
     # --- panel 1: heatmap of median KL by gap bin x band (sequential single hue)
     piv = df.pivot_table(index="band", columns="gap_bin", values="kl_skip", aggfunc="median").reindex(index=BAND_ORDER, columns=GAP_ORDER)
     cnt = df.pivot_table(index="band", columns="gap_bin", values="kl_skip", aggfunc="count").reindex(index=BAND_ORDER, columns=GAP_ORDER)
@@ -35,7 +35,7 @@ def main():
             if np.isfinite(v): ax1.text(c, r, f"{v:.2g}\n(n={int(n)})", ha="center", va="center", fontsize=10, color=("white" if M[r, c] > -0.6 else INK))
     ax1.set_xticks(range(len(GAP_ORDER))); ax1.set_xticklabels(GAP_ORDER); ax1.set_yticks(range(len(BAND_ORDER))); ax1.set_yticklabels(BAND_ORDER)
     ax1.set_xlabel("gap j − i (blocks skipped at the position)"); ax1.set_ylabel("depth band of j")
-    ax1.set_title("Skipping blocks at one position barely moves the next token\nunless the skip is long or ends in the motor band (median KL, nats)")
+    ax1.set_title("Skipping blocks at one position barely moves the\nnext token unless the skip is long or ends late\n(median KL in nats, by gap and depth band)", loc="left")
     cb = fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.03); cb.set_label("log10 median KL (nats)", color=INK2); cb.ax.yaxis.set_tick_params(color=INK2)
     for s in ax1.spines.values(): s.set_visible(False)
     # --- panel 2: distribution per band (log x), one hue stepped by band
@@ -45,7 +45,8 @@ def main():
         v = df.loc[df.band == b, "kl_skip"].clip(lower=1e-4).values
         if len(v): ax2.hist(v, bins=bins, histtype="step", linewidth=2, color=steps[k], label=f"{b}, n={len(v)}, median {np.median(v):.2g}")
     ax2.set_xscale("log"); ax2.set_xlabel("KL(clean ‖ patched) of the final next-token distribution, nats"); ax2.set_ylabel("pairs")
-    ax2.set_title("Skip-patch effect is heavy-tailed: most pairs < 0.1 nat,\nlate-band pairs reach several nats"); ax2.legend(frameon=False, fontsize=10)
+    ax2.set_title("The effect is heavy-tailed: most pairs move the\nnext token by < 0.1 nat, late-band pairs by several nats\n(distribution per band)", loc="left"); ax2.legend(frameon=False, fontsize=9, loc="upper left")
+    ax2.set_ylim(0, ax2.get_ylim()[1] * 1.45)
     ax2.grid(True, color=GRID, linewidth=0.8); ax2.set_axisbelow(True)
     for s in ("top", "right"): ax2.spines[s].set_visible(False)
     fig.tight_layout(); os.makedirs(a.out_dir, exist_ok=True)
