@@ -11,9 +11,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
-SOURCES = [("reader_teacher_v1", "teacher v1\n(passage + lens\n+ final top-10)", "#2a78d6"), ("reader_teacher_nofinal_v1", "teacher no-final\n(passage + lens)", "#eb6834"),
-           ("reader_teacher_nolens_v1", "teacher no-lens\n(passage only)", "#1baf7a"), ("reader_lensdiff_jlens_L1", "J-lens diff L1\n(two readouts)", "#4a3aa7"),
-           ("reader_v0_ao_tsv1", "V0 verbalizer\n(activations only)", "#e34948")]
+SOURCES = [("reader_teacher_v1", "teacher\npassage+lens\n+final", "#2a78d6"), ("reader_teacher_nofinal_v1", "teacher\npassage+lens", "#eb6834"),
+           ("reader_teacher_nolens_v1", "teacher\npassage only", "#1baf7a"), ("reader_lensdiff_jlens_L1", "J-lens diff\ntwo readouts", "#4a3aa7"),
+           ("reader_v0_ao_tsv1", "V0 verbalizer\nactivations only", "#e34948")]
 TASKS = [("top1", "model's final top-1 among 4", 25), ("posmatch", "position among 5 cuts of the doc", 20), ("direction", "direction of change (lens j vs i)", 50), ("category", "next-token category (5 classes)", 30)]
 
 
@@ -21,14 +21,14 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--data", required=True); ap.add_argument("--out-dir", required=True); ap.add_argument("--stem", default="reader_usefulness")
     a = ap.parse_args(); d = json.load(open(a.data)); srcs = [(k, l, c) for k, l, c in SOURCES if k in d]
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2})
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8.6), dpi=150); axes = axes.ravel()
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9), dpi=150, gridspec_kw={"wspace": 0.22, "hspace": 0.5}); axes = axes.ravel()
     x = np.arange(len(srcs))
     for ax, (task, title, chance) in zip(axes, TASKS):
         vals = [100 * (d[k].get(task) or 0) for k, _, _ in srcs]
-        ax.bar(x, vals, color=[c for _, _, c in srcs], width=0.62)
+        ax.bar(x, vals, color=[c for _, _, c in srcs], width=0.58)
         for xi, v in zip(x, vals): ax.text(xi, v + 1.2, f"{v:.0f}%", ha="center", va="bottom", fontsize=11, color=INK)
         ax.axhline(chance, color="#b91c1c", lw=1.2, ls="--"); ax.text(len(srcs) - 0.5, chance + 1.5, f"chance {chance}%", color="#b91c1c", fontsize=10, ha="right")
-        ax.set_xticks(x); ax.set_xticklabels([l for _, l, _ in srcs], fontsize=9); ax.set_ylim(0, 100); ax.set_ylabel("reader accuracy, %")
+        ax.set_xticks(x); ax.set_xticklabels([l for _, l, _ in srcs], fontsize=9.5); ax.set_ylim(0, 100); ax.set_ylabel("reader accuracy, %")
         ax.set_title(f"Reader given the text only: {title}", loc="left")
         ax.grid(True, axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s in ("top", "right"): ax.spines[s].set_visible(False)
