@@ -42,6 +42,19 @@ def manifest(extra: str = "", data: str = DATA):
 
 
 @app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
+def batch_gpu(specs_json: str = "", data: str = DATA):
+    """ONE GPU container, many manifests: specs = JSON list of {"ckpt": ..., "manifest": ..., "out": ..., "n": 7000, "ode_steps": 32}; each -> infra's score_manifest then summarize_scored"""
+    import json
+    rcs = []
+    for sp in json.loads(specs_json):
+        cmd = [sys.executable, "-m", "nlt.eval_bits.score_manifest", "--data-dir", data, "--ckpt", sp["ckpt"], "--manifest", sp["manifest"], "--out", sp["out"], "--n", str(sp.get("n", 7000)), "--ode-steps", str(sp.get("ode_steps", 32))] + sp.get("extra", "").split()
+        rc = _run(cmd)
+        if rc == 0: rc = _run([sys.executable, "-m", "nlt.evals.summarize_scored", "--scored", sp["out"], "--out", sp["out"] + ".summary.json"])
+        rcs.append(rc); print(f"[batch-gpu] rc={rc} :: {sp['manifest']}", flush=True)
+    print("[batch-gpu] rcs", rcs, flush=True); return max(rcs) if rcs else 0
+
+
+@app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
 def causal(extra: str = "", data: str = DATA):
     return _run([sys.executable, "-m", "nlt.evals.causal", "--data-dir", data] + extra.split())
 
@@ -124,6 +137,7 @@ def main(task: str = "text", extra: str = "", data: str = DATA, path: str = ""):
     elif task == "cat": cat.remote(path)
     elif task == "concat": concat.remote(extra)
     elif task == "batch-cpu": print("rc", batch_cpu.remote(extra, data))
+    elif task == "batch-gpu": print("rc", batch_gpu.remote(extra, data))
     elif task == "ls": ls.remote(path)
     else: raise SystemExit(task)
     print("done.")
