@@ -54,10 +54,12 @@ def build_vocab_view(tok, V: int | None = None):
             s = ""
         core = s.strip()
         ok = False
+        word_start = s.startswith(" ") or s.startswith("\n")
         if core in SPECIAL_NAMES and s == core or s in SPECIAL_NAMES:
             core = SPECIAL_NAMES.get(s, SPECIAL_NAMES.get(core)); ok = True
         elif WORD_RE.match(core) and (len(core) > 1 or core in ("a", "I")) and not FORBIDDEN.search(core):
-            ok = True
+            # word-start tokens always; tokens without a leading space only if they look like a whole word (Capitalised / ALLCAPS / long)
+            ok = word_start or core[0].isupper() or len(core) >= 6
         elif NUM_RE.match(core):
             ok = True
         display.append(core if ok else s)
@@ -134,8 +136,9 @@ class LensDiffDescriber:
         for b in range(B):
             f = PairFeatures(top1_i=self._disp(int(a_i[b])), top1_j=self._disp(int(a_j[b])), p1_i=float(p1_i[b]), p1_j=float(p1_j[b]),
                              ent_i=float(ent_i[b]), ent_j=float(ent_j[b]), cos=float(cos[b]), top1_i_id=int(a_i[b]), top1_j_id=int(a_j[b]))
-            f.risers = self._dedupe(risers[b].tolist(), risers_d[b].tolist(), self.k_list, min_delta=0.0)
-            f.fallers = self._dedupe(fallers[b].tolist(), fallers_d[b].tolist(), self.k_list, max_delta=0.0)
+            skip = {self.lower[int(a_i[b])], self.lower[int(a_j[b])]} - {""}
+            f.risers = self._dedupe(risers[b].tolist(), risers_d[b].tolist(), self.k_list, min_delta=0.0, skip=skip)
+            f.fallers = self._dedupe(fallers[b].tolist(), fallers_d[b].tolist(), self.k_list, max_delta=0.0, skip=skip)
             f.top_j = self._dedupe(pool_j[b, :40].tolist(), None, self.k_top)
             f.top_i = self._dedupe(pool_i[b, :40].tolist(), None, self.k_top)
             s50_i = {self.lower[t] for t in top50_i[b].tolist()}; s50_j = {self.lower[t] for t in top50_j[b].tolist()}
@@ -147,8 +150,8 @@ class LensDiffDescriber:
     def _disp(self, t: int) -> str:
         return self.display[t] if self.readable[t] else repr(self.tok.decode([t]))
 
-    def _dedupe(self, ids, deltas, k, min_delta=None, max_delta=None):
-        seen, out = set(), []
+    def _dedupe(self, ids, deltas, k, min_delta=None, max_delta=None, skip=()):
+        seen, out = set(skip), []
         for n, t in enumerate(ids):
             if not self.readable[t]:
                 continue
@@ -208,11 +211,13 @@ class LensDiffDescriber:
         elif level == 1:
             r, fl = self._join(f.risers, 3), self._join(f.fallers, 2)
             s = f"{self._move(f)} and {self._conf_change(f)}"
-            if r: s += f"; {r} gain ground"
-            if fl: s += f" while {fl} fade"
+            if r: s += f"; {r} {'gains' if len(f.risers) == 1 else 'gain'} ground"
+            if fl: s += f" while {fl} {'fades' if len(f.fallers) == 1 else 'fade'}"
             s = s[0].upper() + s[1:] + "."
         elif level == 2:
-            s1 = f"{self._move(f)}; it {self._conf_change(f)}, going from {_bucket(f.p1_i, CONF_EDGES, CONF_NAMES)} to {_bucket(f.p1_j, CONF_EDGES, CONF_NAMES)}."
+            b_i, b_j = _bucket(f.p1_i, CONF_EDGES, CONF_NAMES), _bucket(f.p1_j, CONF_EDGES, CONF_NAMES)
+            conf = f"going from {b_i} to {b_j}" if b_i != b_j else f"staying {b_j}"
+            s1 = f"{self._move(f)}; it {self._conf_change(f)}, {conf}."
             s1 = s1[0].upper() + s1[1:]
             em = self._join(f.emerging, 5) or self._join(f.risers, 5)
             s2 = self.rng.choice([f"Gaining ground: {em}.", f"Newly prominent are {em}.", f"Coming to the fore: {em}."]) if em else "Little new comes to the fore."
