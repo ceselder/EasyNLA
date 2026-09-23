@@ -54,6 +54,12 @@ def manifest(tag: str, extra: str = "", data: str = DATA):
 
 
 @app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
+def winners(tag: str, extra: str = "", data: str = DATA):
+    """critic-selected best-of-K per train pair (nlt.eval_bits.select_winners); extra carries --ckpt and --text-parquet"""
+    return _run([sys.executable, "-m", "nlt.eval_bits.select_winners", "--data-dir", data, "--out", f"/vol/z/winners_{tag}/train.parquet"] + extra.split())
+
+
+@app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
 def script(path: str, extra: str = ""):
     """run any repo script on a GPU with the volume mounted: --task script --path scripts/foo.py --extra '...'"""
     return _run([sys.executable, f"{REPO_REMOTE}/{path}"] + extra.split())
@@ -70,6 +76,7 @@ def main(task: str = "train", tag: str = "dev", extra: str = "", data: str = DAT
     elif task == "mse": print("rc", mse.remote(tag, extra, data))
     elif task == "bits": print("rc", bits.remote(tag, extra, data))
     elif task == "manifest": print("rc", manifest.remote(tag, extra, data))
+    elif task == "winners": print("rc", winners.remote(tag, extra, data))
     elif task == "script": print("rc", script.remote(path, extra))
     elif task == "cat": cat.remote(path)
     else: raise SystemExit(task)
