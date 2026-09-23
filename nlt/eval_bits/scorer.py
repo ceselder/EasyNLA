@@ -23,7 +23,7 @@ class CriticScorer:
     def __init__(self, ckpt: str, data_dir: str, device="cuda", ode_steps: int = 32, probes: int = 1, t_grid=T_GRID, enc_model: str | None = None, enc_layer: int | None = None,
                  batch: int = 64, stats_path: str | None = None):
         self.dev, self.ode_steps, self.probes, self.t_grid, self.batch = device, ode_steps, probes, tuple(t_grid), batch
-        self.model, self.aa, self.step = load_critic(ckpt, device); self.src_rms = bool(self.aa.get("src_rms", 0)); self.target = self.model.target
+        self.model, self.aa, self.step = load_critic(ckpt, device); self.src_rms = bool(self.aa.get("src_rms", 0)); self.squash = float(self.aa.get("squash", 0.0) or 0.0); self.target = self.model.target
         self.norm = GlobalNorm.load(stats_path or os.path.join(data_dir, "stats.pt"), "affine").to(device); self.d = self.norm.mean.numel()
         self.encoder = None
         if self.model.cond == "text":
@@ -46,7 +46,7 @@ class CriticScorer:
         rep = torch.tensor(first, dtype=torch.long, device=dev)
         lp_u_g = torch.zeros(len(uniq), device=dev); L_u_g = torch.zeros(len(self.t_grid), len(uniq))
         for s in range(0, len(uniq), self.batch):
-            r = rep[s:s + self.batch]; hi, x0, log_s, log_det = make_x0(self.norm, h_i[r], h_j[r], self.target, self.src_rms)
+            r = rep[s:s + self.batch]; hi, x0, log_s, log_det = make_x0(self.norm, h_i[r], h_j[r], self.target, self.src_rms, self.squash)
             L_u_g[:, s:s + self.batch] = proxy_losses(self.model, x0, hi, self.t_grid, [e.expand(len(r), self.d) for e in eps_bank], log_s=log_s)
             if want_exact: lp_u_g[s:s + self.batch] = exact_logp(self.model, x0, hi, n_steps=self.ode_steps, probes=self.probes, probe_bank=probe_bank, log_s=log_s) + log_det
         gidx = torch.tensor(np.searchsorted(uniq, gids), dtype=torch.long)
@@ -55,7 +55,7 @@ class CriticScorer:
         lp_c = torch.zeros(B, device=dev); L_c = torch.zeros(len(self.t_grid), B); ntok = torch.zeros(B, dtype=torch.long)
         for s in range(0, B, self.batch):
             sl = slice(s, min(B, s + self.batch)); n = sl.stop - sl.start
-            hi, x0, log_s, log_det = make_x0(self.norm, h_i[sl], h_j[sl], self.target, self.src_rms)
+            hi, x0, log_s, log_det = make_x0(self.norm, h_i[sl], h_j[sl], self.target, self.src_rms, self.squash)
             enc = mask = None
             if self.encoder is not None:
                 with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = self.encoder(texts[sl])

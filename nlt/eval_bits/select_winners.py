@@ -34,7 +34,7 @@ def main():
     if a.max_pairs: pairs = pairs[: a.max_pairs]; df = df[df["pair_id"].isin(set(pairs))].reset_index(drop=True)
     print(f"[winners] {len(df)} candidates over {len(pairs)} pairs; sources {df['source'].value_counts().to_dict()}", flush=True)
     norm = GlobalNorm.load(a.stats or os.path.join(a.data_dir, "stats.pt"), "affine").to(dev); d = store.d
-    model, aa, step = load_critic(a.ckpt, dev); src_rms = bool(aa.get("src_rms", 0)); assert model.cond == "text"
+    model, aa, step = load_critic(a.ckpt, dev); src_rms = bool(aa.get("src_rms", 0)); squash = float(aa.get("squash", 0.0) or 0.0); assert model.cond == "text"
     from nlt.critic.text_encoder import TextEncoder
     encoder = TextEncoder(aa.get("enc_model", "Qwen/Qwen3-0.6B"), aa.get("enc_layer", 20), dev, aa.get("enc_max_len", 128))
     g = torch.Generator().manual_seed(a.seed + 1); eps_bank = [torch.randn(1, d, generator=g) for _ in T_GRID]
@@ -45,7 +45,7 @@ def main():
     for s in range(0, len(pid_list), a.batch):
         ids = pid_list[s:s + a.batch]; sub = pp.loc[ids]
         r = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values.astype(np.int64)); j = torch.tensor(sub["j"].values.astype(np.int64))
-        h_i, x0, log_s, log_det = make_x0(norm, store.gather(r, i, dev), store.gather(r, j, dev), model.target, src_rms)
+        h_i, x0, log_s, log_det = make_x0(norm, store.gather(r, i, dev), store.gather(r, j, dev), model.target, src_rms, squash)
         Lu = proxy_losses(model, x0, h_i, T_GRID, [e.expand(len(ids), d) for e in eps_bank], log_s=log_s)
         lu = exact_logp(model, x0, h_i, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det
         for k, pid in enumerate(ids): lp_u[pid] = float(lu[k]); L_u[pid] = Lu[:, k].clone()
@@ -55,7 +55,7 @@ def main():
     for s in range(0, len(df), a.batch):
         sub = df.iloc[s:s + a.batch]; n = len(sub)
         r = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values.astype(np.int64)); j = torch.tensor(sub["j"].values.astype(np.int64))
-        h_i, x0, log_s, log_det = make_x0(norm, store.gather(r, i, dev), store.gather(r, j, dev), model.target, src_rms)
+        h_i, x0, log_s, log_det = make_x0(norm, store.gather(r, i, dev), store.gather(r, j, dev), model.target, src_rms, squash)
         with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(sub["text"].tolist())
         ntok[s:s + n] = (mask.sum(-1) + 1).cpu().numpy()
         Lc = proxy_losses(model, x0, h_i, T_GRID, [e.expand(n, d) for e in eps_bank], enc=enc, enc_mask=mask, log_s=log_s)

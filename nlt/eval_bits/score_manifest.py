@@ -32,7 +32,7 @@ def main():
     m = m.reset_index(drop=True); m["text"] = m["text"].fillna("").astype(str)
     store = ActStore(a.data_dir, a.split, device=a.data_device)
     norm = GlobalNorm.load(a.stats or os.path.join(a.data_dir, "stats.pt"), "affine").to(dev); d = store.d
-    model, aa, step = load_critic(a.ckpt, dev); src_rms = bool(aa.get("src_rms", 0)); assert model.cond == "text", "score_manifest needs a text critic"
+    model, aa, step = load_critic(a.ckpt, dev); src_rms = bool(aa.get("src_rms", 0)); squash = float(aa.get("squash", 0.0) or 0.0); assert model.cond == "text", "score_manifest needs a text critic"
     from nlt.critic.text_encoder import TextEncoder
     encoder = TextEncoder(a.enc_model or aa.get("enc_model", "Qwen/Qwen3-0.6B"), a.enc_layer if a.enc_layer is not None else aa.get("enc_layer", 20), dev, aa.get("enc_max_len", 128))
     keep = m["score_pos_idx"].isin(store.row_of); print(f"[manifest] {len(m)} rows, {int((~keep).sum())} with unknown pos_idx dropped", flush=True); m = m[keep].reset_index(drop=True)
@@ -43,7 +43,7 @@ def main():
     logp = np.full(n, np.nan); gain = np.full(n, np.nan); ntok = np.zeros(n, dtype=np.int64); t0 = time.time()
     for s in range(0, n, a.batch):
         r, i, j = rows[s:s + a.batch], I[s:s + a.batch], J[s:s + a.batch]; B = len(r); texts = m["text"].iloc[s:s + a.batch].tolist()
-        h_i, x0, log_s, log_det = make_x0(norm, store.gather(r, i, dev), store.gather(r, j, dev), model.target, src_rms)
+        h_i, x0, log_s, log_det = make_x0(norm, store.gather(r, i, dev), store.gather(r, j, dev), model.target, src_rms, squash)
         with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts)
         ntok[s:s + B] = mask.sum(-1).cpu().numpy() + 1
         eb = [e.expand(B, d) for e in eps_bank]

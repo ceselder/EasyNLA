@@ -69,7 +69,7 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
     L_c = torch.zeros(len(T_GRID), n); L_u = torch.zeros(len(T_GRID), n); mse_id = torch.zeros(n); mse_x0 = torch.zeros(n); var_j = torch.zeros(n)
     for s in range(0, n, B):
         rows, i, j = val_rows[s:s + B], val_i[s:s + B], val_j[s:s + B]
-        h_i, x0, log_s, _ = make_x0(norm, store_val.gather(rows, i, dev), store_val.gather(rows, j, dev), a.target, a.src_rms)
+        h_i, x0, log_s, _ = make_x0(norm, store_val.gather(rows, i, dev), store_val.gather(rows, j, dev), a.target, a.src_rms, a.squash)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
         enc = mask = None; vec = None
         if a.cond == "text":
@@ -121,6 +121,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="critic")
     p.add_argument("--cond", default="none", choices=["none", "depth", "text", "vec"]); p.add_argument("--target", default="delta", choices=["hj", "delta"]); p.add_argument("--norm", default="affine", choices=["affine", "scalar"])
+    p.add_argument("--squash", type=float, default=0.0, help="DECISIONS v1.9: radial squash of the target y = x / sqrt(c^2 + rms(x)^2) with c = this value (0 = off); analytic log-det added in the exact eval")
     p.add_argument("--src-rms", type=int, default=1, help="DECISIONS D2: divide h_i and the target by rms(h_i) after the pooled affine (1) or not (0, ablation)")
     p.add_argument("--d-model", type=int, default=2048); p.add_argument("--d-mlp", type=int, default=8192); p.add_argument("--n-layers", type=int, default=8)
     p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
@@ -199,8 +200,8 @@ def main():
             print(f"[train] text pairs: train {len(text_df)} (verbosity {sorted(text_df['verbosity'].unique().tolist())}), val {len(keep)}/{len(pid)} with text", flush=True)
     model = PairDenoiser(d, a.d_model, a.d_mlp, a.n_layers, a.cond, d_enc=(encoder.d_enc if encoder else 0), n_slots=a.n_slots, n_heads=a.n_heads, d_head=a.d_head, gate_rank=a.gate_rank, target=a.target).to(dev)
     if encoder: model.d_enc_ = encoder.d_enc
-    model.src_rms_ = bool(a.src_rms)
-    print(f"[train] {a.cond} critic: {model.n_params()/1e6:.0f}M params, target {a.target}, norm {a.norm}, src_rms {a.src_rms}, batch {a.batch}, {a.steps} steps", flush=True)
+    model.src_rms_ = bool(a.src_rms); model.squash_ = float(a.squash)
+    print(f"[train] {a.cond} critic: {model.n_params()/1e6:.0f}M params, target {a.target}, norm {a.norm}, src_rms {a.src_rms}, squash {a.squash}, batch {a.batch}, {a.steps} steps", flush=True)
     if a.init_from:
         ck = torch.load(a.init_from, map_location="cpu"); sd = ck["model"]
         if a.cond == "text":                                  # prior blocks live under blocks.<k>.base.* in the text model
@@ -234,7 +235,7 @@ def main():
             rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values); j = torch.tensor(sub["j"].values); texts = sub["text"].tolist()
         else:
             rows, i, j = store.sample_pairs(a.batch, gen); texts = (synth_texts(a.text_synth, store, rows, i, j, tok8, lf) if a.text_synth else smoke_texts(store, rows, i, j, tok8)) if (a.cond == "text") else None
-        h_i, x0, log_s, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), a.target, a.src_rms)
+        h_i, x0, log_s, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), a.target, a.src_rms, a.squash)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
         enc = mask = None; vec = None
         if a.cond == "text":

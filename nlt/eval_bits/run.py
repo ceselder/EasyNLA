@@ -149,7 +149,7 @@ def main():
     _cache = {}; _uncond = {}                          # _uncond[(path, k)] = (L_u [T], lp_u, ruler)  shared by every set of the same critic
     for name, path, label in jobs:
         if path not in _cache: _cache[path] = load_critic(path, dev, d_enc_override=(encoder.d_enc if encoder else None))
-        model, aa, step = _cache[path]; cond = model.cond; target = model.target; src_rms = bool(aa.get("src_rms", 0))
+        model, aa, step = _cache[path]; cond = model.cond; target = model.target; src_rms = bool(aa.get("src_rms", 0)); squash = float(aa.get("squash", 0.0) or 0.0)
         idx = set_indices(text_sets[label]) if label else list(range(min(a.n, NF))); n = len(idx)
         texts = [text_sets[label][pid_all[k]] for k in idx] if label else None
         if texts:
@@ -162,7 +162,7 @@ def main():
         lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); lp_r = torch.zeros(n); lp_w = torch.zeros(n); lp_m = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
         for s in range(0, n, a.batch):
             kk = idx[s:s + a.batch]; r = rows_all[kk]; i = I_all[kk]; j = J_all[kk]; B = len(kk)
-            h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target, src_rms)
+            h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target, src_rms, squash)
             x_aff = norm.normalize(store_val.gather(r, j, dev))
             depth = torch.stack([i, j], 1).to(dev) if cond == "depth" else None
             vec = lf.vec_feats(store_val.gather(r, i), i, store_val.gather(r, j), j) if cond == "vec" else None

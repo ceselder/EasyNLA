@@ -43,7 +43,7 @@ class PairDenoiser(nn.Module):
         self.ln = nn.LayerNorm(d_model); self.out_proj = nn.Linear(d_model, d)
 
     def config(self):
-        return {k: getattr(self, k) for k in ("d", "d_model", "d_mlp", "n_layers", "cond", "target")} | {"d_enc": getattr(self, "d_enc_", 0), "src_rms": getattr(self, "src_rms_", False)}
+        return {k: getattr(self, k) for k in ("d", "d_model", "d_mlp", "n_layers", "cond", "target")} | {"d_enc": getattr(self, "d_enc_", 0), "src_rms": getattr(self, "src_rms_", False), "squash": getattr(self, "squash_", 0.0)}
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -76,7 +76,15 @@ class PairDenoiser(nn.Module):
         return self.out_proj(self.ln(h)).float()
 
 
-def make_x0(norm, h_i_raw, h_j_raw, target, src_rms=False):
+def radial_squash(x, c=1.0):
+    """DECISIONS v1.9 (lens prior-doctor): y = x / sqrt(c^2 + rms(x)^2), a j-agnostic change of variables that makes the target scale a property of
+    the target alone (RMS(y) < 1 for every gap). log|det dy/dx| per row = -(d+2)/2 log(c^2 + rms^2) + 2 log c."""
+    import math as _m
+    d = x.shape[-1]; r2 = x.pow(2).mean(-1, keepdim=True)
+    return x / (c * c + r2).sqrt(), -(d + 2) / 2 * torch.log(c * c + r2.squeeze(-1)) + 2 * _m.log(c)
+
+
+def make_x0(norm, h_i_raw, h_j_raw, target, src_rms=False, squash=0.0):
     """-> (source input, flow target x0, log_s [B], log_det [B]).
     Pooled affine n(.) first (same map for every layer). With src_rms (DECISIONS D2): both are divided by s = rms(n(h_i)) (a function of the
     source only) and log_s is fed to the critic as a scalar feature. Target: delta = n(h_j) - n(h_i) (unit Jacobian) or hj.
@@ -89,6 +97,8 @@ def make_x0(norm, h_i_raw, h_j_raw, target, src_rms=False):
         hi = hi / s; x0 = x0 / s; log_s = s.squeeze(-1).log(); log_det = -d * log_s
     else:
         log_s = torch.zeros(hi.shape[0], device=hi.device); log_det = torch.zeros_like(log_s)
+    if squash and squash > 0:                                                # radial squash of the (pooled) target; log p_pooled(x) = log p_y(y) + log_det
+        x0, ld = radial_squash(x0, float(squash)); log_det = log_det + ld
     return hi, x0, log_s, log_det
 
 
