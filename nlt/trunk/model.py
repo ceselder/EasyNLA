@@ -73,6 +73,9 @@ class TrunkCritic(nn.Module):
         from peft import LoraConfig, inject_adapter_in_model
         self.prior = prior
         for p_ in self.prior.parameters(): p_.requires_grad_(False)
+        if torch.cuda.is_available():
+            try: torch.backends.cuda.enable_cudnn_sdp(False)        # cuDNN SDPA fails ('mha_graph.execute ... is_good() false') on the fresh blocks' [B*G, 5, 8x128] shapes on B200; flash/efficient kernels stay
+            except Exception as e: print("[trunk] could not disable cuDNN sdp:", e, flush=True)
         self.space = dict(space or {})                              # {"target", "src_rms", "squash"} of the prior (critic space)
         self.d = prior.d; self.K = n_act_tokens; self.device_ = device; self.max_len = max_len
         self.trunk_id, self.n_layers_kept, self.lora_r, self.lora_alpha = trunk_id, n_layers, lora_r, lora_alpha
