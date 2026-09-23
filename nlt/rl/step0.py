@@ -11,6 +11,8 @@ mention < 20 %.
 from __future__ import annotations
 import argparse, json, os, time
 import numpy as np, torch
+from nlt.evals.common import band
+from nlt.rl.reward import make_scorer, within_group_std, corr
 
 
 def main():
@@ -26,12 +28,10 @@ def main():
     a = p.parse_args(); torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
     from nlt.data.dataset import ActStore
-    from nlt.evals.common import band
     from nlt.verbalizer.prompt import build_prompt, DEFAULT_QUESTION
     from nlt.verbalizer.model import load_tokenizer, load_policy
     from nlt.verbalizer.vllm_rollout import make_engine, rollout
     from nlt.rl.filters import ViolationChecker
-    from nlt.rl.reward import make_scorer, within_group_std, corr
     n_gpu = torch.cuda.device_count(); dev = "cuda:0"; cdev = "cuda:1" if n_gpu > 1 else "cuda:0"
     tok = load_tokenizer(a.base); spec = build_prompt(tok, a.question or DEFAULT_QUESTION)
     store = ActStore(a.data_dir, "val", device="cpu"); vc = ViolationChecker(store, a.data_dir)
