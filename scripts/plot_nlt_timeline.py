@@ -48,9 +48,13 @@ def main():
     ax1.legend(frameon=False, loc="upper right", title="board post kind", title_fontsize=10)
     ax1.set_title("Every message on the team board, by agent (one dot per post)", loc="left", fontsize=12.5)
     cum = np.arange(1, len(t) + 1); ax2.step(t, cum, where="post", color=CAT[0], lw=2); ax2.set_ylabel("posts so far"); ax2.set_xlabel("UTC time (2026-09-23 → 09-24)")
-    for h, lab in MILESTONES:
-        if h < t[-1] + 0.1: ax2.axvline(h, color=INK2, lw=0.7, ls=(0, (2, 2))); ax2.text(h, cum[-1] * 1.04, lab, rotation=60, fontsize=9, color=INK2, ha="left", va="bottom")
-    ax2.set_ylim(0, cum[-1] * 1.55); ax2.set_title("Cumulative posts, with the milestones that shaped the night", loc="left", fontsize=12.5)
+    shown = [m for m in MILESTONES if m[0] < t[-1] + 0.1]
+    for k, (h, lab) in enumerate(shown):
+        ax2.axvline(h, color=INK2, lw=0.7, ls=(0, (2, 2)))
+        ax2.text(h, cum[-1] * (1.12 if k % 2 == 0 else 1.30), str(k + 1), fontsize=9.5, color=SURFACE, ha="center", va="center", bbox={"boxstyle": "circle,pad=0.25", "fc": INK2, "ec": "none"})
+    key = "\n".join(f"{k + 1}  {lab}  ({int(h) % 24:02d}:{int(round((h % 1) * 60)):02d})" for k, (h, lab) in enumerate(shown))
+    ax2.text(23.3, cum[-1] * 1.45, key, fontsize=9.5, color=INK2, ha="left", va="top", linespacing=1.35)
+    ax2.set_ylim(0, cum[-1] * 1.5); ax2.set_title("Cumulative posts, with the milestones that shaped the night", loc="left", fontsize=12.5)
     ax2.axvline(END_H, color=INK, lw=1); ax2.text(END_H, cum[-1] * 0.1, " hard end 05:30", fontsize=9.5, color=INK, ha="left")
     ticks = np.arange(START_H, END_H + 0.1, 2); ax2.set_xticks(ticks); ax2.set_xticklabels([f"{int(h) % 24:02d}:00" for h in ticks]); ax2.set_xlim(START_H - 0.3, END_H + 0.6)
     n_res = sum(1 for p in posts if p["kind"] == "result"); n_dec = sum(1 for p in posts if p["kind"] == "decision")
