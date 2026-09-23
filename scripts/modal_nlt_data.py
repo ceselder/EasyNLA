@@ -17,7 +17,8 @@ VOL_NAME = "nlt"
 vol = modal.Volume.from_name(VOL_NAME, create_if_missing=True)
 SECRETS = [modal.Secret.from_name("nla-exp-secrets")]
 DATA = "/vol/data/qwen3_8b"
-image = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE)
+IGNORE = list(REPO_IGNORE) + ["*.log", "**/logs/**", "logs", "*.npy", "*.pt", "*.jsonl", "*.out", "wandb"]   # other agents write logs inside the repo
+image = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=IGNORE)
 app = modal.App("nlt-data", image=image)
 GPU = os.environ.get("NLT_GPU", "B200")
 
