@@ -30,43 +30,59 @@ def space_of(v):
     return "pooled+squash" if (v.get("squash") or 0) > 0 else "pooled"
 
 
-# (short name in the bits file, ckpt dir, ODE steps) -> the merge key it should carry (reporter #262: the pooled Heun-64 mask-next table re-used 'union_null')
+# MERGE KEYS (reporter #262/#308). A key names exactly ONE (checkpoint, ODE-steps) critic. The plain short name belongs to its canonical
+# owner (PIN: the checkpoint the report has used under that name since the first budget), at the highest Heun step count seen for that
+# checkpoint; every other record that arrives under the same short name is keyed '<name>[<ckpt dir>@h<steps>]' (different checkpoint) or
+# '<name>@h<steps>' (same checkpoint, fewer ODE steps). RENAME pins explicit exceptions.
+PIN = {("priors", "none"): "none_v1", ("depth", "depth"): "depth_v1", ("priors", "none_pooled"): "none_v1_pooled", ("depth", "depth_pooled"): "depth_v1_pooled",
+       ("text", "union_null"): "text_union_v1n", ("text", "union_pooled_null"): "text_union_pooled_n", ("text", "lens"): "text_lensdev_p", ("text", "teacher"): "text_teacher_p"}
 RENAME = {("union_null", "text_union_pooled_n", 64): "union_pooled_null_h64"}
+_SEEN = {}   # (branch, short name) -> {ckpt dir: max ODE steps}
+
+
+def key_for(branch, name, v, J):
+    ck = os.path.basename(os.path.dirname(v.get("ckpt") or "")); h = J.get("ode_steps")
+    if (name, ck, h) in RENAME: return RENAME[(name, ck, h)]
+    owner = PIN.get((branch, name))
+    seen = _SEEN.setdefault((branch, name), {})
+    if owner is None and not seen: owner = ck                       # first checkpoint to arrive under an unpinned name owns it
+    if owner is None: owner = _OWNER.get((branch, name), ck)
+    _OWNER.setdefault((branch, name), owner)
+    if ck != owner: return f"{name}[{ck}@h{h}]"
+    best = seen.get(ck)
+    seen[ck] = max(h or 0, best or 0)
+    return name if best is None or (h or 0) >= best else f"{name}@h{h}"
+
+
+_OWNER = {}
 
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--results", default=os.path.expanduser("~/nlt-results/results")); p.add_argument("--out", default=os.path.expanduser("~/shared/reports/natural-language-transcoder/data/info_budget.json"))
     a = p.parse_args()
     out = {"generated_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), "sources": [], "priors": {}, "depth": {}, "text": {}}
+    files = []
     for f in sorted(glob.glob(os.path.join(a.results, "bits_*.json"))):
         if any(s in os.path.basename(f) for s in SKIP): continue
-        try: J = json.load(open(f))
+        try: files.append((f, json.load(open(f))))
         except Exception as e: print("skip", f, e); continue
+    files.sort(key=lambda fj: -(fj[1].get("ode_steps") or 0))          # higher Heun step counts first, so the plain key gets the best estimator
+    for f, J in files:
         out["sources"].append(os.path.basename(f)); mix = J.get("mix_ckpt")
         for name, v in J["critics"].items():
             meta = {"ckpt": v.get("ckpt"), "step": v.get("step"), "space": space_of(v), "n_rows": v.get("n_rows"), "ode_steps": J.get("ode_steps"), "file": os.path.basename(f)}
-            def _uniq(branch, key):   # reporter #308: the same '<name>[<ckpt dir>@h<steps>]' rule for priors/depth as for text critics
-                prev = out[branch].get(key)
-                if prev is not None and ((prev.get("ckpt") or "") != (v.get("ckpt") or "") or prev.get("ode_steps") != J.get("ode_steps")):
-                    return f"{key}[{os.path.basename(os.path.dirname(v.get('ckpt') or ''))}@h{J.get('ode_steps')}]"
-                return key
             if v.get("cond") == "none":
-                r = v.get("uncond_bits_per_dim_vs_gaussian") or {}; name = _uniq("priors", name)
+                r = v.get("uncond_bits_per_dim_vs_gaussian") or {}; name = key_for("priors", name, v, J)
                 out["priors"][name] = meta | {"nll_bits_per_dim": v.get("uncond_nll_bits_per_dim"), "bits_per_dim_vs_gaussian": {"all": r.get("mean"), "by_band": {k: x["mean"] for k, x in (r.get("by_band") or {}).items()}, "by_j": {k: x["mean"] for k, x in (r.get("by_j") or {}).items()}},
                                                 "blind_vs_mix_bits": (v.get("blind_vs_mix_bits") or {}).get("mean"), "mix_ckpt": mix}
             elif v.get("cond") == "depth":
-                e = v["exact_pmi_bits"]; name = _uniq("depth", name)
+                e = v["exact_pmi_bits"]; name = key_for("depth", name, v, J)
                 out["depth"][name] = meta | {"exact_gain_bits": e["mean"], "sem": e["sem"], "median": e.get("median"), "frac_positive": e.get("frac_positive"), "by_band": {k: x["mean"] for k, x in (e.get("by_band") or {}).items()},
                                               "by_gap_coarse": {k: x["mean"] for k, x in (e.get("by_gap_coarse") or {}).items()}, "proxy_gain_bits": (v.get("proxy_pmi_bits") or {}).get("mean"),
                                               "vs_mix_bits": (v.get("exact_pmi_vs_mix_bits") or {}).get("mean"), "mix_ckpt": mix}
             elif v.get("cond") in ("text", "vec", "proj"):
                 crit, sep, label = name.partition("@"); label = label or v.get("cond")
-                # reporter #262: a merge key must name ONE (ckpt, ODE-steps) critic; when a bits file re-uses a short name for a different
-                # checkpoint or a different Heun step count, key it by '<name>[<ckpt dir>@h<steps>]' instead of overwriting/mixing sets
-                crit = RENAME.get((crit, os.path.basename(os.path.dirname(v.get("ckpt") or "")), J.get("ode_steps")), crit)
-                prev = out["text"].get(crit)
-                if prev is not None and ((prev.get("ckpt") or "") != (v.get("ckpt") or "") or prev.get("ode_steps") != J.get("ode_steps")):
-                    crit = f"{crit}[{os.path.basename(os.path.dirname(v.get('ckpt') or ''))}@h{J.get('ode_steps')}]"
+                crit = key_for("text", crit, v, J)
                 c = out["text"].setdefault(crit, meta | {"cond": v.get("cond"), "sets": {}, "mix_ckpt": mix})
                 bands = {}
                 for b in BANDS:
