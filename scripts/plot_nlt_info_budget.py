@@ -28,6 +28,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--bits", action="append", required=True); p.add_argument("--mse", action="append", default=[])
     p.add_argument("--report", default=os.path.expanduser("~/shared/reports/natural-language-transcoder")); p.add_argument("--stem", default="info_budget")
+    p.add_argument("--only", default=None, help="regex on critic[@set] names to plot (e.g. 'none|depth|union_null@'); a critic must never be plotted on registers it was not trained on")
+    p.add_argument("--title", default=None)
     a = p.parse_args()
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "axes.labelsize": 12, "legend.fontsize": 10})
     critics = {}
@@ -39,6 +41,8 @@ def main():
     for spec in a.mse:
         path, label = spec.rsplit(":", 1)
         if os.path.exists(path): mse[label] = json.load(open(path))
+    import re as _re
+    if a.only: critics = {k: v for k, v in critics.items() if _re.search(a.only, k)}
     cond = {k: v for k, v in critics.items() if "exact_pmi_bits" in v}
     text_sets = {k: v for k, v in cond.items() if v["cond"] == "text"}
     out = {"critics": {}, "mse": {}, "bands": BANDS, "n_pairs": {k: v["_n"] for k, v in critics.items()}, "ode_steps": {k: v["_ode_steps"] for k, v in critics.items()}}
@@ -71,7 +75,7 @@ def main():
         bb = cond[k]["exact_pmi_bits"].get("by_band", {})
         ax.bar(x + ki * w - 0.4 + w / 2, [bb.get({"j<=13": "pre<=13", "14-32": "workspace14-32", "j>=33": "motor>=33"}[b], {}).get("mean", np.nan) for b in bl], w, label=pretty(k))
     ax.set_xticks(x); ax.set_xticklabels(["pre-workspace j<=13", "workspace 14-32", "motor j>=33"]); ax.axhline(0, color="k", lw=0.8); ax.set_ylabel("exact bits")
-    ax.set_title("Bits by band of the target layer"); ax.legend(fontsize=8)
+    ax.set_title("Bits by band of the target layer"); ax.legend(fontsize=8, loc="upper left", ncol=1)
     # (c) by gap (coarse), per source, with the depth critic's mixture bound
     ax = axes[1, 0]
     for k in names:
@@ -84,14 +88,17 @@ def main():
     ax = axes[1, 1]; ax2 = ax.twinx()
     for k, v in critics.items():
         r = v.get("uncond_bits_per_dim_vs_gaussian")
-        if r:
+        if r and v.get("cond") in ("none", "depth", None) and "@" not in k:
             js = sorted(int(t) for t in r["by_j"]); ax.plot(js, [r["by_j"][str(j)]["mean"] for j in js], marker=".", lw=2, label=f"{pretty(k)}: log2 p(h_j|h_i) - log2 N(0,I), bits/dim")
     for label, J in mse.items():
         bj = J["breakdown"]["by_j"]; js = sorted(int(t) for t in bj); ax2.plot(js, [bj[str(j)]["fve_vs_layermean"] for j in js], ls="--", marker="x", label=f"MSE transcoder {label}: FVE")
     for lab, lo, hi in BANDS: ax.axvspan(lo - 0.5, hi + 0.5, alpha=0.05, color="k")
     ax.set_xlabel("target layer j"); ax.set_ylabel("bits/dim above isotropic Gaussian"); ax2.set_ylabel("FVE vs per-layer mean")
     ax.set_title("Blind critic density and MSE-transcoder FVE by layer"); ax.legend(fontsize=8, loc="upper left"); ax2.legend(fontsize=8, loc="lower right")
-    fig.suptitle("Qwen3-8B transcoder critic: depth is worth a few exact bits, text is priced against shuffle controls", fontsize=14)
+    dep = next((v["exact_pmi_bits"]["mean"] for k, v in cond.items() if v["cond"] == "depth"), None)
+    title = a.title or (f"Qwen3-8B transcoder critic: knowing the depth is still worth {dep:.0f} exact bits (bound ~7) -> the blind prior is under-trained; text is priced against shuffle controls" if dep is not None
+                        else "Qwen3-8B transcoder critic: exact bits of text conditioning, priced against shuffle controls")
+    fig.suptitle(title, fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     os.makedirs(os.path.join(a.report, "data"), exist_ok=True)
     fig.savefig(os.path.join(a.report, a.stem + ".png"), dpi=150); fig.savefig(os.path.join(a.report, a.stem + ".pdf"))
