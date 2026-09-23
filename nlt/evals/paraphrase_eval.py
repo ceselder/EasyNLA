@@ -37,7 +37,7 @@ def summarize(scored):
     emp = s[s.variant == "empty"].set_index("pair_id")["logp"]
     s["bits"] = [(lp - emp.get(p, np.nan)) / math.log(2) for p, lp in zip(s.pair_id, s.logp)]
     orig = s[s.variant == "orig"].set_index("pair_id")["bits"]; out = {"n_pairs": int(len(orig)), "orig_bits_mean": float(orig.mean())}
-    for v in ("para_light", "para_strong", "twin", "mask_next"):
+    for v in ("para_light", "para_strong", "twin", "mask_next", "twin_near", "twin_far"):
         b = s[s.variant == v].set_index("pair_id")["bits"]
         if not len(b): continue
         common = orig.index.intersection(b.index); o = orig.loc[common]; bb = b.loc[common]
@@ -47,7 +47,7 @@ def summarize(scored):
         m, lo, hi = bootstrap_ci((bb - o).values); d["delta_bits_ci95"] = [lo, hi]
         if v == "para_light": d["verdict_2a"] = "PASS" if d["retention_median"] >= 0.70 else ("WARN" if d["retention_median"] >= 0.50 else "FAIL"); d["verdict_2c"] = "PASS" if d["p_orig_preferred"] <= 0.65 else ("WARN" if d["p_orig_preferred"] <= 0.80 else "FAIL")
         if v == "para_strong": d["verdict_2b"] = "PASS" if d["retention_median"] >= 0.50 else ("WARN" if d["retention_median"] >= 0.30 else "FAIL")
-        if v == "twin": d["verdict_9f"] = "PASS" if d["p_orig_preferred"] >= 0.75 else ("WARN" if d["p_orig_preferred"] >= 0.60 else "FAIL")
+        if v in ("twin", "twin_near", "twin_far"): d["verdict_9f"] = "PASS" if d["p_orig_preferred"] >= 0.75 else ("WARN" if d["p_orig_preferred"] >= 0.60 else "FAIL")
         if v == "mask_next": d["drop"] = 1 - d["retention_median"]; d["continuation_reader"] = bool(d["drop"] > 0.5)
         out[v] = d
     return out
