@@ -49,6 +49,16 @@ def main():
         v_d_full = m(x_t, t, h_i, enc=TextIDs(ids), enc_mask=mask_drop); v_d_kv = m(x_t, t, h_i, enc=kv, enc_mask=mask_drop)
     print("dropped row full vs null", (v_d_full[0] - v_null[0]).abs().max().item(), " cached vs null", (v_d_kv[0] - v_null[0]).abs().max().item())
     assert (v_d_full[0] - v_null[0]).abs().max() < 1e-4 and (v_d_kv[0] - v_null[0]).abs().max() < 1e-4
+    # multi-group forward == single forwards (fp32), dropped group == null path
+    G = 3; tg = torch.rand(B, G); xg = torch.randn(B, G, d); keep = torch.ones(B, G, dtype=torch.bool); keep[1, 1] = False; keep[2, :] = False
+    with torch.no_grad():
+        vg = m.multi_forward(xg, tg, h_i, ids, mask, keep)
+        for g in range(G):
+            mk = mask & keep[:, g][:, None]
+            vs = m(xg[:, g], tg[:, g], h_i, enc=TextIDs(ids), enc_mask=mk)
+            print(f"group {g}: multi vs single max|diff| {(vg[:, g] - vs).abs().max().item():.2e}"); assert (vg[:, g] - vs).abs().max() < 1e-4
+        vn = m(xg[1, 1][None], tg[1, 1][None], h_i[1][None])
+        print("dropped group vs null", (vg[1, 1] - vn[0]).abs().max().item()); assert (vg[1, 1] - vn[0]).abs().max() < 1e-4
     # training loss + grads
     m.train(); x0 = torch.randn(B, d)
     loss, tt, kept = pair_fm_loss(m, x0, h_i, enc=TextIDs(ids), enc_mask=mask, p_uncond=0.5)

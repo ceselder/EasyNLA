@@ -107,6 +107,7 @@ def main():
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--lr-lora", type=float, default=3e-5)
     p.add_argument("--warmup", type=int, default=100); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-decay", default="cosine", choices=["none", "cosine"])
     p.add_argument("--p-uncond", type=float, default=0.3); p.add_argument("--null-reg", type=float, default=1.0); p.add_argument("--null-frac", type=float, default=0.25)
+    p.add_argument("--groups", type=int, default=1, help="G noise draws (t, eps) per text row in ONE trunk forward (block-diagonal mask; each group == a single forward). Multiplies the FM samples per step at ~1.3x the compute; condition dropout is per group")
     p.add_argument("--contrast", type=float, default=0.0); p.add_argument("--contrast-tau", type=float, default=0.005); p.add_argument("--contrast-margin", type=float, default=0.005)
     p.add_argument("--data-device", default="cpu"); p.add_argument("--val-device", default="cuda"); p.add_argument("--max-train-pos", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--save-every", type=int, default=500); p.add_argument("--max-hours", type=float, default=10.0)
@@ -164,12 +165,24 @@ def main():
         ids, mask = model.tokenize(texts); enc = TextIDs(ids)
         m = lr_mult(step)
         for g_, b_ in zip(opt.param_groups, base_lrs): g_["lr"] = b_ * m
-        t_b = torch.rand(x0.shape[0], device=dev); eps_b = torch.randn_like(x0)
-        loss_vec, t, kept = pair_fm_loss(model, x0, h_i, t_b, eps_b, enc=enc, enc_mask=mask, p_uncond=a.p_uncond, log_s=log_s)
+        B0 = x0.shape[0]
+        if a.groups > 1:
+            G = a.groups; t_b = torch.rand(B0, G, device=dev); eps_b = torch.randn(B0, G, d, device=dev); kept = torch.rand(B0, G, device=dev) >= a.p_uncond
+            x_t = (1 - t_b)[..., None] * x0[:, None] + t_b[..., None] * eps_b
+            v = model.multi_forward(x_t, t_b, h_i, ids, mask, kept, log_s=log_s)
+            loss_vec = ((v - (eps_b - x0[:, None])) ** 2).mean(-1)                                            # [B, G]
+        else:
+            t_b = torch.rand(B0, device=dev); eps_b = torch.randn_like(x0)
+            loss_vec, t, kept = pair_fm_loss(model, x0, h_i, t_b, eps_b, enc=enc, enc_mask=mask, p_uncond=a.p_uncond, log_s=log_s)
         loss = loss_vec.mean(); null_loss = torch.zeros((), device=dev); con_loss = torch.zeros((), device=dev); con_acc = float("nan")
         if a.contrast > 0:
-            perm = dm_perm(i, j).to(dev); mask_dm = mask[perm] & kept[:, None]
-            loss_dm, _, _ = pair_fm_loss(model, x0, h_i, t_b, eps_b, enc=TextIDs(ids[perm]), enc_mask=mask_dm, log_s=log_s)
+            perm = dm_perm(i, j).to(dev)
+            if a.groups > 1:
+                v_dm = model.multi_forward(x_t, t_b, h_i, ids[perm], mask[perm], kept, log_s=log_s)
+                loss_dm = ((v_dm - (eps_b - x0[:, None])) ** 2).mean(-1)
+            else:
+                mask_dm = mask[perm] & kept[:, None]
+                loss_dm, _, _ = pair_fm_loss(model, x0, h_i, t_b, eps_b, enc=TextIDs(ids[perm]), enc_mask=mask_dm, log_s=log_s)
             gap = (loss_vec - loss_dm)[kept]
             if gap.numel():
                 con_loss = torch.nn.functional.softplus((gap + a.contrast_margin) / a.contrast_tau).mean() * a.contrast_tau

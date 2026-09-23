@@ -112,7 +112,7 @@ class TrunkCritic(nn.Module):
         nL = len(owner.layers)
         self.fresh_layers = sorted({i for i in range(nL) if (i + 1) % fresh_every == 0} | {nL - 1}) if fresh_every > 0 else []
         self.fresh = nn.ModuleList([FreshAttnBlock(hidden, fresh_heads, fresh_dhead) for _ in self.fresh_layers])
-        self._n_act = n_act_tokens + 1
+        self._n_act = n_act_tokens + 1; self._groups = 1
         for blk, i in zip(self.fresh, self.fresh_layers): owner.layers[i].register_forward_hook(self._make_hook(blk))
         # ---- readout
         self.readout_ln = nn.LayerNorm(hidden)
@@ -132,10 +132,12 @@ class TrunkCritic(nn.Module):
 
     def _make_hook(self, blk):
         def hook(_mod, _inp, out):
-            n = self._n_act
+            n = self._n_act * self._groups
             if n <= 0: return out                                                                          # text-prefix pass: no activation positions
             h = out[0] if isinstance(out, tuple) else out
-            h2 = torch.cat([h[:, :-n], blk(h[:, -n:])], 1) if h.shape[1] > n else blk(h)
+            a = h[:, -n:]; Bh, _, Hh = a.shape
+            a2 = blk(a.reshape(Bh * self._groups, self._n_act, Hh)).reshape(Bh, n, Hh)                        # bidirectional WITHIN each noise group only
+            h2 = torch.cat([h[:, :-n], a2], 1) if h.shape[1] > n else a2
             return (h2,) + tuple(out[1:]) if isinstance(out, tuple) else h2
         return hook
 
@@ -212,6 +214,36 @@ class TrunkCritic(nn.Module):
                 hs[sel] = self._run(toks[sel], None, ar.expand(len(sel), -1), cache=None)
         delta = self.readout(self.readout_ln(hs.float()).reshape(B, Kp * H))
         return v_prior + delta.float()
+
+    def multi_forward(self, x_t, t, h_i, ids, key_mask, keep, log_s=None):
+        """TRAINING with G noise groups per row in ONE trunk forward: x_t [B, G, d], t [B, G], h_i [B, d], ids [B, T], key_mask [B, T] (real text
+        tokens), keep [B, G] bool (False = this group runs the null path: it sees no text). Each group = K+1 activation tokens at positions
+        L..L+K that attend to the text (if kept) and causally to their own group only (a block-diagonal 4D mask), so every group is exactly the
+        single-group forward; text queries never see activations. Returns v [B, G, d] = prior + readout per group."""
+        B, G, d = x_t.shape; Kp = self.K + 1; T = ids.shape[1]; dev = x_t.device; H = self.hidden
+        hi_rep = h_i.repeat_interleave(G, 0); ls_rep = log_s.repeat_interleave(G, 0) if log_s is not None else None
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=x_t.is_cuda):
+            v_prior = self.prior(x_t.reshape(B * G, d), t.reshape(B * G), hi_rep, log_s=ls_rep).float().view(B, G, d)
+        toks = self.act_tokens(x_t.reshape(B * G, d), t.reshape(B * G), hi_rep, ls_rep).to(self.dtype_).view(B, G * Kp, H)
+        emb = self.owner.embed_tokens(ids)
+        x_in = torch.cat([emb, toks], 1)                                                                    # [B, S, H], S = T + G*Kp
+        L = key_mask.sum(1); ar = torch.arange(Kp, device=dev)
+        pos = torch.cat([(key_mask.long().cumsum(1) - 1).clamp(min=0), (L[:, None] + ar[None]).repeat(1, G)], 1)
+        S = T + G * Kp; m = torch.zeros(B, S, S, dtype=torch.bool, device=dev)
+        tq = torch.arange(T, device=dev)
+        m[:, :T, :T] = ((tq[:, None] >= tq[None, :])[None] & key_mask[:, None, :]) | torch.eye(T, dtype=torch.bool, device=dev)[None]
+        grp = torch.arange(G * Kp, device=dev) // Kp; apos = torch.arange(G * Kp, device=dev) % Kp
+        m[:, T:, :T] = key_mask[:, None, :] & keep[:, grp][:, :, None]
+        m[:, T:, T:] = ((grp[:, None] == grp[None, :]) & (apos[:, None] >= apos[None, :]))[None]
+        self._groups = G
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = self.owner(inputs_embeds=x_in, attention_mask=m[:, None], position_ids=pos, use_cache=False).last_hidden_state
+        finally:
+            self._groups = 1
+        hs = out[:, T:].float().reshape(B * G, Kp, H)
+        delta = self.readout(self.readout_ln(hs).reshape(B * G, Kp * H)).view(B, G, d)
+        return v_prior + delta
 
     def _run(self, x_in, am, pos, cache=None, T=0):
         """trunk forward -> hidden states of the LAST K+1 positions [B, K+1, H] (bf16). am: key mask [B, T_total] or None (= causal only)."""
