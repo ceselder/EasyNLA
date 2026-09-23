@@ -26,6 +26,11 @@ PARTS = {
     ("ao-tgt-v1", "train"): f"{L}/ao_rewrite/train/*/ao-tgt-v1/part_*.parquet",
     ("ao-delta-v1", "train"): f"{L}/ao_rewrite/train/*/ao-delta-v1/part_*.parquet",
     ("twins-v1", "val"): f"{L}/twins/val/part_*.parquet",
+    ("twins-v1", "train"): f"{L}/twins/train/part_*.parquet",
+    ("para-light-v1", "train"): f"{L}/para/train/*/para-light-v1/part_*.parquet",
+    ("para-strong-v1", "train"): f"{L}/para/train/*/para-strong-v1/part_*.parquet",
+    ("para-light-v1", "heldout"): f"{L}/para/train/*/heldout/para-light-v1/part_*.parquet",
+    ("para-strong-v1", "heldout"): f"{L}/para/train/*/heldout/para-strong-v1/part_*.parquet",
 }
 # Sonnet 5 list prices (USD per 1M tokens) used for the cost estimate; batch = 50% off. Update if the price sheet differs.
 PRICE = {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_write": 3.75}
@@ -46,7 +51,7 @@ def main():
                 d = by_verb.setdefault(str(v), {"rows": 0, "tokens": 0}); d["rows"] += 1; d["tokens"] += k
         inv[f"{src}|{split}"] = {"source": src, "split": split, "parts": len(files), "rows": n, "pairs": len(pairs), "qwen_tokens": tok,
                                  "mean_tokens": round(tok / max(1, n), 1), "by_verbosity": {v: {**d, "mean_tokens": round(d["tokens"] / d["rows"], 1)} for v, d in by_verb.items()},
-                                 "remote_dir": f"/vol/z/{src}/{split}/"}
+                                 "remote_dir": (f"/vol/z/para-v1/heldout/{src}/" if split == "heldout" else f"/vol/z/{src}/{split}/")}
     usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "requests": 0}
     for f in glob.glob(f"{L}/teacher/train/batch_state*.json"):
         if "backup" in f or f.endswith("batch_state.json"):
