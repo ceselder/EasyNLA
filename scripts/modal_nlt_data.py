@@ -75,13 +75,13 @@ def cat(path: str):
 
 
 @app.local_entrypoint()
-def main(task: str = "smoke", n_producers: int = 4, target_train: int = 80000, target_val: int = 3000, extra: str = "", path: str = "data/qwen3_8b", out: str = DATA):
+def main(task: str = "smoke", n_producers: int = 4, target_train: int = 80000, target_val: int = 3000, extra: str = "", path: str = "data/qwen3_8b", out: str = DATA, start_index: int = 0):
     if task == "smoke":
         rc = extract.remote(0, 1, 6000, 400, "--docs-per-batch 32 --shard-size 2048 --max-minutes 8 " + extra, out=f"{DATA}_smoke3")
         print("smoke extract rc", rc)
         print("finalize rc", finalize.remote("--max-stats-pos 8000 " + extra, data=f"{DATA}_smoke3"))
     elif task == "extract":
-        rcs = list(extract.starmap([(i, n_producers, target_train, target_val, extra, out) for i in range(n_producers)]))
+        rcs = list(extract.starmap([(i, n_producers, target_train, target_val, extra, out) for i in range(start_index, n_producers)]))   # --start-index k resumes producers k..n-1
         print("extract rcs", rcs)
     elif task == "finalize":
         print("finalize rc", finalize.remote(extra, data=out))
