@@ -8,6 +8,7 @@ Given pairs_val (pair_id, pos_idx, i, j) and a z table (pair_id, text), write ON
     copy        last --copy-n prefix tokens (decoded) as z, scored on the pair                                     EVALS 5c
     wrong_j     the pair's own z scored against (h_i, h_j') at the same position, j' != j                          EVALS 3c
     wrong_i     the pair's own z scored against (h_i', h_j), i' != i                                               EVALS 3d
+    src_desc    the same proposer describing h_i ALONE (optional --src-desc table), scored on the pair            'about the change' vs 'about the source' 
     empty       the empty string (the no-text baseline row, so every variant shares eps / probes with it)
 The scorer must use the SAME Hutchinson probe / eps for every variant of a pair (paired estimates); bits(variant) = log p - log p(empty).
 
@@ -19,8 +20,11 @@ import numpy as np
 import pandas as pd
 
 
-def build_manifest(pairs: pd.DataFrame, z: pd.DataFrame, prefix_store=None, seed: int = 0, copy_n: int = 32, variants=("orig", "dm", "rp", "copy", "wrong_j", "wrong_i", "empty")) -> pd.DataFrame:
+def build_manifest(pairs: pd.DataFrame, z: pd.DataFrame, prefix_store=None, seed: int = 0, copy_n: int = 32, variants=("orig", "dm", "rp", "copy", "wrong_j", "wrong_i", "empty", "src_desc"), src_desc: pd.DataFrame | None = None) -> pd.DataFrame:
+    """src_desc (optional): table [pair_id, text] = the SAME proposer describing h_i ALONE (AO(h_i), teacher with only the source lens, ...);
+    scored on the pair it separates 'about the change' from 'about the source' (redteam #22 item 1). Skipped when not given."""
     rng = np.random.default_rng(seed)
+    smap = dict(zip(src_desc["pair_id"].astype(str), src_desc["text"].fillna(""))) if src_desc is not None else {}
     pairs = pairs.copy(); pairs["pair_id"] = pairs["pair_id"].astype(str); z = z.copy(); z["pair_id"] = z["pair_id"].astype(str)
     zmap = dict(zip(z["pair_id"], z["text"].fillna("")))
     P = pairs[pairs["pair_id"].isin(zmap)].reset_index(drop=True)
@@ -47,6 +51,7 @@ def build_manifest(pairs: pd.DataFrame, z: pd.DataFrame, prefix_store=None, seed
             rows.append(dict(base, variant="rp", text=zmap[q], src_pair_id=q))
         if "copy" in variants and prefix_store is not None:
             rows.append(dict(base, variant="copy", text=prefix_store.text(pos, last_n=copy_n), src_pair_id=pid))
+        if "src_desc" in variants and pid in smap: rows.append(dict(base, variant="src_desc", text=smap[pid], src_pair_id=pid))
         if "wrong_j" in variants:
             js = [v for v in range(i + 1, 35) if v != j]
             if js: rows.append(dict(base, variant="wrong_j", text=zmap[pid], src_pair_id=pid, score_j=int(rng.choice(js))))
@@ -83,13 +88,17 @@ def summarize_scores(scored: pd.DataFrame) -> dict:
     if "wrong_i" in out:
         p = out["wrong_i"]["p_orig_higher"]; out["verdict_3d"] = "PASS" if p >= 0.60 else ("WARN" if p >= 0.50 else "FAIL")
     if "copy" in out: out["verdict_5c"] = verdict(out["copy"]["ratio_to_orig"], 0.10, 0.50)
+    if "src_desc" in out: out["verdict_src"] = verdict(out["src_desc"]["ratio_to_orig"], 0.25, 0.50)     # a source-only description should not earn the change's bits
+    if "orig" in out:
+        nonpos = float(np.mean(orig.values <= 0)) if len(orig) else float("nan"); out["orig"]["share_nonpositive"] = nonpos
+        out["verdict_7d_bits"] = "PASS" if nonpos <= 0.10 else ("WARN" if nonpos <= 0.25 else "FAIL")
     return out
 
 
 if __name__ == "__main__":
     from nlt.evals.common import load_table, save_table, PrefixStore
     ap = argparse.ArgumentParser(); ap.add_argument("--pairs", required=True); ap.add_argument("--z", required=True); ap.add_argument("--meta"); ap.add_argument("--docs")
-    ap.add_argument("--out", required=True); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--copy-n", type=int, default=32)
+    ap.add_argument("--out", required=True); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--copy-n", type=int, default=32); ap.add_argument("--src-desc")
     a = ap.parse_args(); ps = PrefixStore.from_infra(load_table(a.meta), load_table(a.docs)) if (a.meta and a.docs) else None
-    m = build_manifest(load_table(a.pairs), load_table(a.z), ps, a.seed, a.copy_n); save_table(m, a.out)
+    m = build_manifest(load_table(a.pairs), load_table(a.z), ps, a.seed, a.copy_n, src_desc=load_table(a.src_desc) if a.src_desc else None); save_table(m, a.out)
     print(m.variant.value_counts().to_dict(), "->", a.out)

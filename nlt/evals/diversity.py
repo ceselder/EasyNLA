@@ -53,7 +53,7 @@ def evaluate(texts, tokenize=None) -> dict:
     toks = [tokenize(t or "") for t in texts]; L = np.asarray([len(t) for t in toks])
     med = float(np.median(L)) if len(L) else float("nan"); short = float((L < 4).mean()) if len(L) else float("nan"); empty = int((L == 0).sum())
     d4 = distinct_n(toks, 4); sb = self_bleu(toks)
-    v7d = "FAIL" if (med < 6 or short > 0.15 or empty > 0) else ("PASS" if (med >= 8 and short <= 0.05) else "WARN")
+    v7d = "FAIL" if empty > 0 else "PASS"     # length is reported, not gated (EVALS v1.1); the bits<=0 share is added by controls.summarize_scores
     v7e = "FAIL" if (d4 < 0.4 or sb > 0.6) else ("PASS" if (d4 >= 0.6 and sb <= 0.4) else "WARN")
     return {"n": int(len(L)), "tokens_median": med, "tokens_mean": float(L.mean()) if len(L) else float("nan"), "tokens_p10": float(np.percentile(L, 10)) if len(L) else float("nan"),
             "tokens_p90": float(np.percentile(L, 90)) if len(L) else float("nan"), "share_lt4_tokens": short, "n_empty": empty,
