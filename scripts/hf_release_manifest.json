@@ -1,0 +1,69 @@
+{
+  "note": "PRIVATE repos under ceselder. Volume nlt mounted at /vol. Edit paths/critic list after the team confirms (board #378). Every dataset ships parquet.",
+  "repos": [
+    {
+      "name": "nlt-qwen3-8b-lenses", "type": "model", "card": "lenses.md",
+      "files": [
+        {"src": "/vol/lens/jlens.safetensors"}, {"src": "/vol/lens/jlens_meta.json"},
+        {"src": "/vol/lens/tuned.safetensors"}, {"src": "/vol/lens/tuned_meta.json"},
+        {"src": "/vol/lens/eval.json"}
+      ],
+      "card_vars": {"layers": "9..34 (residual stream after block k = HF hidden_states[k+1])", "target_layer": "34"}
+    },
+    {
+      "name": "nlt-qwen3-8b-verbalizers", "type": "model", "card": "verbalizers.md",
+      "folders": [
+        {"src": "/vol/rl/sft/v0_ao_tsv1/lora", "dst": "v0_ao_tsv1/lora"},
+        {"src": "/vol/rl/sft/v0b_mix/lora", "dst": "v0b_mix/lora"}
+      ],
+      "files": [
+        {"src": "/vol/rl/sft/v0_ao_tsv1/meta.json", "dst": "v0_ao_tsv1"},
+        {"src": "/vol/rl/sft/v0b_mix/meta.json", "dst": "v0b_mix"}
+      ],
+      "card_vars": {}
+    },
+    {
+      "name": "nlt-qwen3-8b-critics", "type": "model", "card": "critics.md",
+      "files": [
+        {"src": "/vol/critic/none_v1_pooled/ckpt_final.pt", "dst": "blind_prior_none_v1_pooled"},
+        {"src": "/vol/critic/none_v1_pooled/eval_latest.json", "dst": "blind_prior_none_v1_pooled"},
+        {"src": "/vol/critic/depth_v1_pooled/ckpt_best.pt", "dst": "told_depth_v1_pooled"},
+        {"src": "/vol/critic/text_union_pooled_n/ckpt_best.pt", "dst": "text_union_pooled_null"},
+        {"src": "/vol/critic/text_union_pooled_big/ckpt_best.pt", "dst": "text_union_pooled_big"},
+        {"src": "/vol/critic/critic_v3a_nd/ckpt_best.pt", "dst": "critic_v3a_nd"},
+        {"src": "/vol/data/qwen3_8b/stats.pt"}, {"src": "/vol/data/qwen3_8b/stats.json"}
+      ],
+      "card_vars": {"critic_list": "TO CONFIRM with infra (board #378): blind prior none_v1_pooled, told-depth depth_v1_pooled, text adapters union_pooled_null / union_pooled_big, critic_v3a_nd (and v3b if chosen)."}
+    },
+    {
+      "name": "nlt-teacher-sonnet-v1", "type": "dataset", "card": "teacher.md",
+      "builders": [
+        {"kind": "copy_parquet", "src": ["/vol/z/teacher-sonnet-v1/train/*.parquet"], "dst": "data/train"},
+        {"kind": "copy_parquet", "src": ["/vol/z/teacher-sonnet-v1/val/*.parquet"], "dst": "data/val"},
+        {"kind": "copy_parquet", "src": ["/vol/z/teacher-sonnet-v1-nofinal/val/*.parquet"], "dst": "data/val_nofinal"},
+        {"kind": "copy_parquet", "src": ["/vol/z/teacher-sonnet-v1-nolens/val/*.parquet"], "dst": "data/val_nolens"}
+      ],
+      "card_vars": {}
+    },
+    {
+      "name": "nlt-lensdiff-v1-sample", "type": "dataset", "card": "lensdiff.md",
+      "builders": [
+        {"kind": "fixed_pairs_subset", "pairs": "/vol/data/qwen3_8b/pairs_val.parquet", "n": 4096, "dst": "data",
+         "src": ["/vol/z/lensdiff_v1/val/L0.parquet", "/vol/z/lensdiff_v1/val/L1.parquet", "/vol/z/lensdiff_v1/val/L2.parquet", "/vol/z/lensdiff_v1/val/L3.parquet", "/vol/z/lensdiff_v1/val/L2m.parquet", "/vol/z/lensdiff_v1/val/L3m.parquet",
+                 "/vol/z/lensdiff_v1_logit/val/L1.parquet", "/vol/z/lensdiff_v1_tuned/val/L1.parquet"]}
+      ],
+      "card_vars": {}
+    },
+    {
+      "name": "nlt-fixed-eval-4096", "type": "dataset", "card": "fixed_eval.md",
+      "builders": [
+        {"kind": "fixed_pairs_subset", "pairs": "/vol/data/qwen3_8b/pairs_val.parquet", "n": 4096, "dst": "data", "src": ["/vol/z/v0-ao-tsv1/val/*.parquet", "/vol/z/twins-v1/val/*.parquet"]},
+        {"kind": "copy_tree", "src": ["/vol/evals/reader_*/*.parquet"], "root": "/vol/evals", "dst": "data/readers"},
+        {"kind": "copy_tree", "src": ["/vol/evals/scored_*.parquet"], "root": "/vol/evals", "dst": "data/critic_scored"},
+        {"kind": "copy_tree", "src": ["/vol/evals/causal_val.parquet"], "root": "/vol/evals", "dst": "data"},
+        {"kind": "report_data", "dst": "report_data"}
+      ],
+      "card_vars": {}
+    }
+  ]
+}
