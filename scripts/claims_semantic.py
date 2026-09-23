@@ -188,6 +188,43 @@ def cmd_run(a):
     print(f"[sem] all {len(chunks)} chunks collected", flush=True)
 
 
+def cmd_sync(a):
+    """same requests as `run` (requests.jsonl, created if missing) through the synchronous Messages API with --workers threads (list price);
+    writes the same raw/chunk_XXXX.jsonl files, so `parse` is unchanged. For small jobs when the batch queue stalls."""
+    import concurrent.futures as cf
+    cl = _client(); rows = load_rows(a.text_glob, a.limit, a.subsample); rng = random.Random(a.seed)
+    os.makedirs(f"{a.out}/raw", exist_ok=True); reqf = f"{a.out}/requests.jsonl"; up = f"{a.out}/usage.json"
+    if not os.path.exists(reqf):
+        with open(reqf, "w") as f:
+            for i, r in enumerate(rows): f.write(json.dumps({"i": i, "anchor_id": r["anchor_id"], "shard": r["_shard"], **sample_request(r, rng)}) + "\n")
+    specs = [json.loads(l) for l in open(reqf)]; assert len(specs) == len(rows)
+    system = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    usage = {"in": 0, "cache_write": 0, "cache_read": 0, "out": 0, "ok": 0, "fail": 0}
+    def one(i):
+        for _ in range(4):
+            try:
+                m = cl.messages.create(model=a.model, max_tokens=a.max_tokens, system=system, messages=[{"role": "user", "content": user_msg(rows[i], specs[i])}])
+                u = m.usage; txt = "".join(bl.text for bl in m.content if getattr(bl, "type", None) == "text")
+                return i, txt, {"in": u.input_tokens, "cw": getattr(u, "cache_creation_input_tokens", 0) or 0, "cr": getattr(u, "cache_read_input_tokens", 0) or 0, "out": u.output_tokens}
+            except Exception as e: err = str(e)[:200]; time.sleep(5)
+        return i, None, err
+    t0 = time.time()
+    for ci, cs in enumerate(range(0, len(rows), a.chunk)):
+        if os.path.exists(f"{a.out}/raw/chunk_{ci:04d}.jsonl"): continue
+        idx = list(range(cs, min(cs + a.chunk, len(rows)))); tmp = f"{a.out}/raw/chunk_{ci:04d}.jsonl.tmp"
+        with cf.ThreadPoolExecutor(a.workers) as ex, open(tmp, "w") as f:
+            for i, txt, u in ex.map(one, idx):
+                if txt is None: usage["fail"] += 1; f.write(json.dumps({"custom_id": f"c{ci}-{i}", "error": u}) + "\n"); continue
+                usage["in"] += u["in"]; usage["cache_write"] += u["cw"]; usage["cache_read"] += u["cr"]; usage["out"] += u["out"]; usage["ok"] += 1
+                f.write(json.dumps({"custom_id": f"c{ci}-{i}", "text": txt, "usage": u}) + "\n")
+        os.replace(tmp, f"{a.out}/raw/chunk_{ci:04d}.jsonl")
+        usage["cost_usd_batch"] = cost(usage, a.price_in, a.price_out); usage["cost_usd_sync"] = 2 * usage["cost_usd_batch"]; usage["elapsed_s"] = time.time() - t0; usage["model"] = a.model; usage["mode"] = "sync"
+        json.dump(usage, open(up, "w"), indent=1)
+        print(f"[sem] chunk {ci} ended (sync): total ok {usage['ok']} fail {usage['fail']} | tokens in {usage['in'] / 1e6:.2f}M cache-read {usage['cache_read'] / 1e6:.2f}M out {usage['out'] / 1e6:.2f}M | "
+              f"cost ${usage['cost_usd_sync']:.2f} (list) | {time.time() - t0:.0f}s", flush=True)
+    print(f"[sem] all chunks collected (sync)", flush=True)
+
+
 def cost(u, pin, pout):
     """batch price = half the list price; cache writes 1.25x input, cache reads 0.1x input"""
     return 0.5 * (u["in"] * pin + u["cache_write"] * pin * 1.25 + u["cache_read"] * pin * 0.1 + u["out"] * pout) / 1e6
@@ -252,14 +289,14 @@ def cmd_parse(a):
 
 def main():
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
-    for n in ("run", "parse"):
+    for n in ("run", "parse", "sync"):
         q = sub.add_parser(n); q.add_argument("--text-glob", required=True); q.add_argument("--out", required=True); q.add_argument("--limit", type=int, default=0)
         q.add_argument("--seed", type=int, default=0); q.add_argument("--subsample", type=float, default=1.0)
-        if n == "run":
+        if n in ("run", "sync"):
             q.add_argument("--model", default="claude-sonnet-5"); q.add_argument("--chunk", type=int, default=10000); q.add_argument("--max-tokens", type=int, default=1200)
             q.add_argument("--poll-s", type=int, default=180); q.add_argument("--stall-h", type=float, default=2.0)
-            q.add_argument("--price-in", type=float, default=3.0); q.add_argument("--price-out", type=float, default=15.0)
-    a = ap.parse_args(); {"run": cmd_run, "parse": cmd_parse}[a.cmd](a)
+            q.add_argument("--price-in", type=float, default=3.0); q.add_argument("--price-out", type=float, default=15.0); q.add_argument("--workers", type=int, default=16)
+    a = ap.parse_args(); {"run": cmd_run, "parse": cmd_parse, "sync": cmd_sync}[a.cmd](a)
 
 
 if __name__ == "__main__":
