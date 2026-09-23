@@ -17,7 +17,7 @@ CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa
 CRITICS = [("text_union_pooled_n", "all-sources adapter + null reg., pooled prior (headline)", CAT[0], "o"), ("text_mine_lens_pooled", "J-lens-text-only adapter + null reg., pooled prior", CAT[6], "s"),
            ("text_union_pooled_big", "all-sources adapter, 16 slots, 4000 steps, pooled", CAT[2], "D"), ("critic_v3a", "critic v3a (every lever, prior unfrozen)", CAT[1], "^")]
 SET_SHORT = {"teacher_v0": "teacher phrase", "teacher_v1": "teacher 1 sent.", "teacher_v2": "teacher long", "teacher_nofinal_v1": "teacher no-final", "twins": "twins", "ao_src": "oracle h_i", "ao_tgt": "oracle h_j", "ao_delta": "oracle Δ",
-             "lens_L0": "J-lens phrase", "lens_L1": "J-lens 1 sent.", "lens_L2": "J-lens 3 sent.", "lens_L3": "J-lens lists", "lens_L2m": "J-lens 3 sent.+mag", "lens_L3m": "J-lens lists+mag", "logit_L1": "logit lens", "tuned_L1": "tuned lens", "v0": "verbalizer"}
+             "lens_L0": "J-lens phrase", "lens_L1": "J-lens 1 sent.", "lens_L2": "J-lens 3 sent.", "lens_L3": "J-lens lists", "lens_L2m": "J-lens 3 sent.+mag", "lens_L3m": "J-lens lists+mag", "logit_L1": "logit lens", "tuned_L1": "tuned lens", "v0": "VERBALIZER", "v0b_mix": "V0b targets (lists)"}
 
 
 def style():
@@ -50,7 +50,7 @@ def main():
         ax.errorbar(x, y, yerr=e, fmt=mk, ms=8, color=col, ecolor=col, elinewidth=1, capsize=2, alpha=0.9, label=lab, zorder=3)
         if stem in ("text_union_pooled_n", "text_union_pooled_big"):
             for p in pts:
-                if p[3] in ("lens_L1", "lens_L3", "teacher_v1", "teacher_v0", "ao_tgt"): ax.annotate(SET_SHORT.get(p[3], p[3]), (p[0], p[1]), textcoords="offset points", xytext=(6, 5 if stem == "text_union_pooled_big" else -12), fontsize=9, color=col)
+                if p[3] in ("lens_L1", "lens_L3", "teacher_v1", "teacher_v0", "ao_tgt", "v0"): ax.annotate(SET_SHORT.get(p[3], p[3]), (p[0], p[1]), textcoords="offset points", xytext=(6, 5 if stem == "text_union_pooled_big" else -12), fontsize=9, color=col)
     if t2:
         al = t2["bands"]["all"]; ax.scatter([t2["n_tokens_mean"]], [al["content"]], marker="*", s=380, color=CAT[7], zorder=4, label="raw J-lens top-20 lists written as text (not natural language)")
         ax.annotate(f"raw lens list: {al['content']:.1f} bits, P = {t2.get('frac_z_beats_dm', 0):.2f}", (t2["n_tokens_mean"], al["content"]), textcoords="offset points", xytext=(-8, 8), ha="right", fontsize=10, color=CAT[7])
