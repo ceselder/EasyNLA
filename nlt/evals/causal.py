@@ -20,9 +20,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--n-pairs", type=int, default=4096)
     p.add_argument("--model", default="Qwen/Qwen3-8B"); p.add_argument("--max-ctx", type=int, default=1024); p.add_argument("--topk", type=int, default=16); p.add_argument("--pairs", default=None)
-    a = p.parse_args(); dev = "cuda"
+    p.add_argument("--shard", default="0/1", help="k/n: process pairs k::n (run n containers in parallel, then concatenate the parquets)")
+    a = p.parse_args(); dev = "cuda"; sk, sn = (int(x) for x in a.shard.split("/"))
     store = ActStore(a.data_dir, "val", device="cpu", verbose=True); store.load_docs(a.data_dir)
-    pairs = load_table(a.pairs or os.path.join(a.data_dir, "pairs_val.parquet")); pairs = pairs[pairs["pos_idx"].isin(store.row_of)].iloc[: a.n_pairs].reset_index(drop=True)
+    pairs = load_table(a.pairs or os.path.join(a.data_dir, "pairs_val.parquet")); pairs = pairs[pairs["pos_idx"].isin(store.row_of)].iloc[: a.n_pairs]
+    pairs = pairs.sort_values("pos_idx").iloc[sk::sn].reset_index(drop=True)          # sorted by position so the clean-forward cache hits; shard = strided slice
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, attn_implementation="sdpa").to(dev).eval(); model.requires_grad_(False)
     layers = model.model.layers; W_U = model.lm_head.weight; fnorm = model.model.norm

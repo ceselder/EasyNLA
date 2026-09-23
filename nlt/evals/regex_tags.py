@@ -1,5 +1,8 @@
 """Layer-tag regex (EVALS 6). Two tiers:
   HARD  forbidden by the spec ("z never says which layer, depth or gap"): penalised in RL, <= 1 hit / 1000 z to PASS.
+        Only NETWORK-depth references: 'layer 12', 'three layers later', 'at the layer', 'deeper in the model', 'L21', '9 -> 21'.
+        Bare 'layer' / 'block' / 'depth' in their everyday senses ('a layer of complexity', 'a block of marble') are SOFT (v1.1 fix
+        after the AO smoke corpus produced 4.6 false hits / 1000).
   SOFT  natural words that can smuggle depth ("early", "final", "nearly ready"): monitored only, compared to the reference LM's rate.
 Use `penalty(text)` in the RL reward (default -5 bits per z with any hard hit), `scan(texts)` for the eval.
 
@@ -8,18 +11,21 @@ Use `penalty(text)` in the RL reward (default -5 bits per z with any hard hit), 
 from __future__ import annotations
 import re, sys, json, argparse
 
-HARD = [
-    r"\blayers?\b", r"\bblocks?\b", r"\bdepth\b", r"\bdeeper layers?\b",
-    r"\bL\d{1,2}\b", r"\b\d{1,2}(?:st|nd|rd|th)\s+(?:layer|block|stage)\b",
-    r"\bhidden[- ]states?\s*\d", r"\bresidual(?:[- ]stream)?\s+(?:at|after|from|to)\s+\d",
-    r"\b\d{1,2}\s*(?:->|→|to|through|and)\s*\d{1,2}\b",      # "9 -> 21", "from 12 to 30"
-    r"\bsteps?\s*\d", r"\bposition\s+in\s+the\s+network\b", r"\bnetwork depth\b",
-    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:transformer\s+)?(?:layers|blocks)\b",
-    r"\bmid[- ]?network\b", r"\bearly[- ]network\b", r"\blate[- ]network\b",
+HARD = [   # network-depth references only; bare 'layer' / 'block' / 'depth' are natural words ("a layer of complexity", "a block of marble") -> soft tier
+    r"\b(?:layer|block)s?\s*#?\s*\d{1,2}\b", r"\bstages?\s*#?\s*(?:9|1\\d|2\\d|3[0-4])\b", r"\b\d{1,2}\s*(?:st|nd|rd|th)?\s*(?:layer|block)s?\b",
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty)\s+(?:more\s+|later\s+|further\s+|transformer\s+)?(?:layers|blocks)\b",
+    r"\b(?:transformer|network|model|residual|hidden|attention|mlp|decoder)\W{1,3}(?:layer|block)s?\b", r"\b(?:layer|block)s?\s+(?:of|in|into|through)\s+the\s+(?:model|network|transformer|net)\b",
+    r"\b(?:early|earlier|middle|mid|late|later|deep|deeper|shallow|final|last|upper|lower|higher|top|bottom|next|previous|intermediate|subsequent)[- ](?:layer|block)s?\b",
+    r"\b(?:at|in|by|from|to|after|before|between|across|through)\s+(?:the\s+)?(?:layer|block)s?\b", r"\blayer[- ]?wise\b", r"\bL\d{1,2}\b",
+    r"\bdepth\s+(?:of|in|into|through)\s+the\s+(?:model|network|transformer|net|stack)\b", r"\bnetwork depth\b", r"\bmodel depth\b", r"\bdeeper (?:in|into) the (?:model|network)\b",
+    r"\bhidden[- ]states?\s*\d", r"\bresidual(?:[- ]stream)?\s+(?:at|after|from|to)\s+\d", r"\b(?:9|1\\d|2\\d|3[0-4])\s*(?:->|→)\s*(?:9|1\\d|2\\d|3[0-4])\b", r"\bfrom\s+(?:9|1\\d|2\\d|3[0-4])\s+to\s+(?:9|1\\d|2\\d|3[0-4])\b",
+    r"\bsteps?\s+(?:9|1\\d|2\\d|3[0-4])\s+(?:of|to|through)\b", r"\bposition\s+in\s+the\s+network\b", r"\bmid[- ]?network\b", r"\bearly[- ]network\b", r"\blate[- ]network\b",
+    r"\b(?:percent|%)\s+(?:of\s+the\s+way\s+)?through\s+the\s+(?:model|network)\b", r"\b(?:forward|processing)\s+pass\W+(?:layer|block|stage)",
 ]
 SOFT = [
+    r"\blayers?\b", r"\bblocks?\b", r"\bdepth\b", r"\bdeep\b", r"\bdeeper\b",
     r"\bearly\b", r"\bearlier\b", r"\bmid(?:dle)?\b", r"\blate\b", r"\blater\b", r"\bfinal\b", r"\blast\b",
-    r"\bshallow\b", r"\bdeep\b", r"\bdeeper\b", r"\bstage\b", r"\bphase\b", r"\bhalfway\b", r"\bbeginning\b",
+    r"\bshallow\b", r"\bstage\b", r"\bphase\b", r"\bhalfway\b", r"\bbeginning\b",
     r"\bend of (?:the )?(?:network|model|pass|processing)\b", r"\bnearly (?:ready|done|finished)\b",
     r"\boutput (?:layer|stage)\b", r"\bfar along\b", r"\bjust (?:begun|started)\b", r"\bpre-?output\b",
     r"\bcommits? to (?:the|its) (?:next|final) token\b", r"\bnext[- ]token prediction\b",
