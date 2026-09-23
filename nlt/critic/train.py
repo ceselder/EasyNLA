@@ -28,13 +28,16 @@ def load_text_pairs(paths, pairs_parquet, verbosity=None):
     """text rows joined to the fixed pair list -> DataFrame [pair_id, pos_idx, i, j, text, verbosity, source]"""
     import pandas as pd, pyarrow.parquet as pq
     pairs = pq.read_table(pairs_parquet, columns=["pair_id", "pos_idx", "i", "j"]).to_pandas()
+    import glob as _glob, re as _re
     rows = []
-    for p in paths:
-        if p.endswith(".jsonl"): rows.append(pd.read_json(p, lines=True))
-        else: rows.append(pq.read_table(p).to_pandas())
+    for pat in paths:
+        for p in (sorted(_glob.glob(pat)) or [pat]):
+            df = pd.read_json(p, lines=True) if p.endswith(".jsonl") else pq.read_table(p).to_pandas()
+            if "verbosity" not in df:                          # lens files are named L<k>.parquet
+                m = _re.search(r"[/_]L(\d)\.(parquet|jsonl)$", p); df["verbosity"] = int(m.group(1)) if m else 0
+            if "source" not in df: df["source"] = os.path.basename(os.path.dirname(os.path.dirname(p))) or "text"
+            rows.append(df)
     tx = pd.concat(rows, ignore_index=True)
-    if "verbosity" not in tx: tx["verbosity"] = 0
-    if "source" not in tx: tx["source"] = "text"
     if verbosity is not None: tx = tx[tx["verbosity"].isin(verbosity)]
     tx = tx[tx["text"].astype(str).str.strip().str.len() > 0]
     df = tx.merge(pairs, on="pair_id", how="inner")
