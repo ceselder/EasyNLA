@@ -39,7 +39,7 @@ for VAR in $VARIANTS; do
     F="$LOCAL/features_v1/$SPLIT/feat_${ct}.parquet"; OUT="$LOCAL/teacher/$SPLIT/${SRC}_part_${ct}.parquet"
     if [[ -s "$OUT" ]]; then echo "[tranche] exists $OUT"; continue; fi
     ( with-local-keys python3 -m nlt.proposers.teacher_sonnet --features "$F" --out "$OUT" --mode sync --concurrency "$CONC" $EXTRA \
-        2>&1 | grep -v "takes precedence" > "nlt/proposers/logs/teacher_${VAR}_${SPLIT}_${ct}.log" ) &
+        2>&1 | grep --line-buffered -v "takes precedence" > "nlt/proposers/logs/teacher_${VAR}_${SPLIT}_${ct}.log" ) &
     PIDS+=($!)
   done
 done

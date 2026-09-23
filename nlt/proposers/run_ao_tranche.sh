@@ -30,7 +30,7 @@ for ((s=START; s<END; s+=CHUNK)); do e=$(( s+CHUNK < END ? s+CHUNK : END )); ct=
   OUTD="$LOCAL/ao_rewrite/$SPLIT/$ct"
   if [[ -d "$OUTD/ao-tgt-v1" ]]; then echo "[ao-tranche] exists $OUTD"; continue; fi
   ( with-local-keys python3 -m nlt.proposers.rewrite_register --raw "$RAW" --features "$FEAT" --out-dir "$OUTD" --mode sync --concurrency "$CONC" --tag "part_${ct}" \
-      2>&1 | grep -v "takes precedence" > "nlt/proposers/logs/rewrite_${SPLIT}_${ct}.log" ) &
+      2>&1 | grep --line-buffered -v "takes precedence" > "nlt/proposers/logs/rewrite_${SPLIT}_${ct}.log" ) &
   PIDS+=($!)
 done
 echo "[ao-tranche] $(date -u +%H:%M:%S) launched ${#PIDS[@]} rewrite processes"
