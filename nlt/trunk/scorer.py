@@ -18,9 +18,9 @@ from nlt.trunk.model import build_trunk_critic
 
 
 class TrunkScorer:
-    def __init__(self, ckpt: str, data_dir: str, device="cuda", ode_steps: int = 32, probes: int = 1, t_grid=T_GRID, batch: int = 64, stats_path: str | None = None, prior_path: str | None = None):
+    def __init__(self, ckpt: str, data_dir: str, device="cuda", ode_steps: int = 32, probes: int = 1, t_grid=T_GRID, batch: int = 128, stats_path: str | None = None, prior_path: str | None = None, merge_lora: bool = False):
         self.dev, self.ode_steps, self.probes, self.t_grid, self.batch = device, ode_steps, probes, tuple(t_grid), batch
-        self.model, ck = build_trunk_critic(ckpt, device, prior_path=prior_path); self.step = ck.get("step"); sp = self.model.space
+        self.model, ck = build_trunk_critic(ckpt, device, prior_path=prior_path, merge=merge_lora); self.step = ck.get("step"); sp = self.model.space
         self.target, self.src_rms, self.squash = sp["target"], sp["src_rms"], sp["squash"]
         st = stats_path or (sp["stats"] if os.path.exists(sp.get("stats", "")) else os.path.join(data_dir, "stats.pt"))
         self.norm = GlobalNorm.load(st, "affine").to(device); self.d = self.norm.mean.numel()

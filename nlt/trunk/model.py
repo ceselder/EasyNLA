@@ -319,7 +319,17 @@ def load_prior(path, device, dtype=torch.bfloat16):
     return m, space, aa
 
 
-def build_trunk_critic(ckpt_path, device="cuda", prior_path=None, grad_ckpt=False):
+def merge_lora(model):
+    """fold the LoRA deltas into the (bf16) base weights for SCORING: removes ~7x24x2 small matmuls per pass (the cached exact log p is kernel-launch bound).
+    Numerics: W + BA rounded to bf16 (the delta keeps ~3 significant digits); verify on a checkpoint before relying on it for reported numbers."""
+    n = 0
+    for m_ in model.owner.modules():
+        if hasattr(m_, "merge") and hasattr(m_, "lora_A") and not getattr(m_, "merged", False):
+            m_.merge(); n += 1
+    print(f"[trunk] merged LoRA into {n} base layers", flush=True); return n
+
+
+def build_trunk_critic(ckpt_path, device="cuda", prior_path=None, grad_ckpt=False, merge: bool = False):
     """load a saved trunk critic (its prior path is stored in the ckpt; override with prior_path if the volume layout moved)"""
     ck = torch.load(ckpt_path, map_location="cpu"); cfg = ck["config"]
     prior, space, _ = load_prior(prior_path or cfg["space"]["prior_ckpt"], device)
@@ -327,4 +337,5 @@ def build_trunk_critic(ckpt_path, device="cuda", prior_path=None, grad_ckpt=Fals
                     grad_ckpt=grad_ckpt, max_len=cfg["max_len"], device=device, space=space, readout_rank=cfg.get("readout_rank", 0))
     m.load_state(ck["state"]); m.eval()
     for p_ in m.parameters(): p_.requires_grad_(False)
+    if merge: merge_lora(m)
     return m, ck

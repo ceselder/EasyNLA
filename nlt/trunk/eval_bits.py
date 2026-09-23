@@ -26,10 +26,10 @@ def main():
     p.add_argument("--text-parquet", required=True, help="label:path[@verb],... val text sets"); p.add_argument("--n", type=int, default=512); p.add_argument("--n-fixed", type=int, default=4096); p.add_argument("--batch", type=int, default=64)
     p.add_argument("--ode-steps", type=int, default=32); p.add_argument("--probes", type=int, default=1); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--mix-cache", default=None, help="infra's p_mix cache (row index -> log p_mix nats) for the vs-mixture column"); p.add_argument("--data-device", default="cuda")
-    p.add_argument("--skip-extra-controls", action="store_true"); p.add_argument("--stats", default=None)
+    p.add_argument("--skip-extra-controls", action="store_true"); p.add_argument("--stats", default=None); p.add_argument("--merge-lora", action="store_true", help="fold LoRA into the base weights before scoring (faster; check numerics once)")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
-    model, ck = build_trunk_critic(a.ckpt, dev, prior_path=a.prior); space = model.space
+    model, ck = build_trunk_critic(a.ckpt, dev, prior_path=a.prior, merge=a.merge_lora); space = model.space
     store_val = ActStore(a.data_dir, "val", device=a.data_device)
     norm = GlobalNorm.load(a.stats or (space["stats"] if os.path.exists(space["stats"]) else os.path.join(a.data_dir, "stats.pt")), "affine").to(dev); d = store_val.d
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas(); vp = vp[vp["pos_idx"].isin(store_val.row_of)].iloc[: a.n_fixed].reset_index(drop=True); NF = len(vp)
