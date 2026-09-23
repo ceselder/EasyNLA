@@ -60,11 +60,11 @@ def main():
     assert res["bad"]["copy"]["copy_rate_4gram_mean"] > 0.3 and res["clean"]["copy"]["copy_rate_4gram_mean"] < 0.05, "copy rate"
     assert res["leak"]["depth"]["j"]["mi_bits"] > res["clean"]["depth"]["j"]["mi_bits"] + 0.3, "depth clf should see the planted leak"
     # manifest
-    m = controls.build_manifest(pairs, zs["clean"], PrefixStore.from_infra(meta, docs)); assert set(m.variant) == {"orig", "empty", "dm", "rp", "copy", "wrong_j", "wrong_i"}, set(m.variant)
+    m = controls.build_manifest(pairs, zs["clean"], PrefixStore.from_infra(meta, docs)); assert set(m.variant) == {"orig", "empty", "dm", "rp", "copy", "wrong_j", "wrong_i", "shuf_words"}, set(m.variant)
     dm = m[m.variant == "dm"].merge(pairs, on="pair_id"); src = pairs.set_index("pair_id")
     assert all(src.loc[s, "j"] == j for s, j in zip(dm.src_pair_id, dm.j)), "dm partner must share j"
     # fake scores: orig +20 bits, dm +5, rp 0, copy +1, wrong_j -10, wrong_i +8 -> verdict logic
-    rng = np.random.default_rng(0); base = {"orig": 20, "dm": 5, "rp": 0, "copy": 1, "wrong_j": -10, "wrong_i": 8, "empty": 0}
+    rng = np.random.default_rng(0); base = {"orig": 20, "dm": 5, "rp": 0, "copy": 1, "wrong_j": -10, "wrong_i": 8, "empty": 0, "shuf_words": 6}
     m["logp"] = [np.log(2) * (base[v] + rng.normal(0, 1)) for v in m.variant]
     s = controls.summarize_scores(m); print("manifest verdicts:", {k: v for k, v in s.items() if k.startswith("verdict")})
     assert s["verdict_3a"] == "PASS" and s["verdict_3c"] == "PASS" and s["verdict_3d"] == "PASS" and s["verdict_5c"] == "PASS", s
