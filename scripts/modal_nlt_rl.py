@@ -77,6 +77,12 @@ def step0(tag: str, extra: str = "", data: str = DATA):
     return _run([sys.executable, "-m", "nlt.rl.step0", "--data-dir", data, "--out", f"/vol/rl/step0/{tag}.json", "--tag", tag] + extra.split())
 
 
+@app.function(gpu=f"{GPU}:1", timeout=4 * 3600, **COMMON)
+def dump(tag: str, extra: str = "", data: str = DATA):
+    """rollouts of a policy on the fixed eval pairs in the board #31 text format -> /vol/z/<tag>/val/part_0000000_0004096.parquet"""
+    return _run([sys.executable, "-m", "nlt.rl.dump_rollouts", "--data-dir", data, "--source", tag, "--out", f"/vol/z/{tag}/val/part_0000000_0004096.parquet"] + extra.split())
+
+
 @app.function(timeout=1800, volumes={"/vol": vol}, cpu=2, memory=8 * 1024)
 def cat(path: str):
     vol.reload(); print(open(f"/vol/{path}").read())
@@ -84,7 +90,7 @@ def cat(path: str):
 
 @app.local_entrypoint()
 def main(task: str = "check", tag: str = "dev", extra: str = "", data: str = DATA, path: str = ""):
-    fn = {"check": check, "sft": sft, "rl": rl, "step0": step0}.get(task)
+    fn = {"check": check, "sft": sft, "rl": rl, "step0": step0, "dump": dump}.get(task)
     if task == "cat": cat.remote(path); return
     if fn is None: raise SystemExit(f"unknown task {task}")
     print("rc", fn.remote(tag, extra, data)); print("done.")
