@@ -199,6 +199,10 @@ def main():
             ev_v = vc_val.check(ev_txt, [r["full_ids"][r["prompt_len"]:].tolist() for r in ev], vp["pos_idx"].tolist(), [[int(x)] for x in vp["next_token_id"].tolist()])
             es = scorer.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)
             eb = es["exact_bits"].float(); et = torch.tensor([r["n_resp"] for r in ev], dtype=torch.float32)
+            # control: the SAME texts on the wrong pairs (random-pair shuffle, same probes/eps) -- an under-trained text path rewards the presence of any text
+            perm = torch.randperm(len(ev), generator=torch.Generator().manual_seed(7)); rp_txt = [ev_txt[int(k)] for k in perm]
+            eb_rp = scorer.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in rp_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
+            log.update({"eval/bits_rp_mean": float(eb_rp.mean()), "eval/bits_over_rp": float(eb.mean() / eb_rp.mean()) if float(eb_rp.mean()) > 0 else float("inf")})
             log.update({"eval/bits_mean": float(eb.mean()), "eval/bits_median": float(eb.median()), "eval/bits_per_token": float(eb.sum() / max(1.0, float(et.sum()))), "eval/tokens_mean": float(et.mean()),
                         "eval/frac_nonpos": float((eb <= 0).float().mean()), "eval/viol_any": float(ev_v["any"].mean()), "eval/copy_rate": float(ev_v["copy_rate"].mean()), "eval/mention_next": float(ev_v["mention_next"].mean()), "eval/time": time.time() - te})
             for bname in ("pre", "workspace", "motor"):
@@ -207,7 +211,7 @@ def main():
             if frozen is not None:
                 fb = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
                 log.update({"eval/bits_frozen_mean": float(fb.mean()), "eval/bits_live_minus_frozen": float((eb - fb).mean())})
-            print(f"   eval: bits {log['eval/bits_mean']:+.3f} (med {log['eval/bits_median']:+.3f}, /tok {log['eval/bits_per_token']:+.3f}) tok {log['eval/tokens_mean']:.1f} viol {log['eval/viol_any']:.2f} nonpos {log['eval/frac_nonpos']:.2f}", flush=True)
+            print(f"   eval: bits {log['eval/bits_mean']:+.3f} (med {log['eval/bits_median']:+.3f}, /tok {log['eval/bits_per_token']:+.3f}; random-pair control {log['eval/bits_rp_mean']:+.3f}) tok {log['eval/tokens_mean']:.1f} viol {log['eval/viol_any']:.2f} nonpos {log['eval/frac_nonpos']:.2f}", flush=True)
         if run is not None: run.log({k: v for k, v in log.items() if not isinstance(v, (list, dict))}, step=step)
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
             d = os.path.join(a.out, f"step_{step + 1:05d}"); save_adapter(policy, os.path.join(d, "lora"))
