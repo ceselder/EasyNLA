@@ -184,7 +184,8 @@ class TrunkCritic(nn.Module):
 
     # ---- forward ----------------------------------------------------------------------------------------------------------------
     def forward(self, x_t, t, h_i, depth=None, depth_has=None, enc=None, enc_mask=None, log_s=None, vec=None, vec_has=None):
-        v_prior = self.prior(x_t, t, h_i, log_s=log_s).float()
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(x_t.is_cuda)):            # the prior is stored in bf16; callers may run without autocast
+            v_prior = self.prior(x_t, t, h_i, log_s=log_s).float()
         toks = self.act_tokens(x_t, t, h_i, log_s).to(self.dtype_)
         B, Kp, H = toks.shape; dev = x_t.device
         ar = torch.arange(Kp, device=dev)[None]
