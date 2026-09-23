@@ -21,7 +21,8 @@ from nlt.eval_bits.exact import exact_logp, make_probe_bank, proxy_losses, proxy
 def load_critic(path, dev, d_enc_override=None):
     ck = torch.load(path, map_location="cpu"); cfg = ck["config"]; d_enc = ck.get("d_enc", 0) or d_enc_override or 0
     aa = ck["args"]
-    m = PairDenoiser(cfg["d"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"], cfg["cond"], d_enc=d_enc, n_slots=aa.get("n_slots", 8), n_heads=aa.get("n_heads", 4), d_head=aa.get("d_head", 64), gate_rank=aa.get("gate_rank", 128), target=cfg["target"])
+    m = PairDenoiser(cfg["d"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"], cfg["cond"], d_enc=d_enc, n_slots=aa.get("n_slots", 8), n_heads=aa.get("n_heads", 4), d_head=aa.get("d_head", 64), gate_rank=aa.get("gate_rank", 128), target=cfg["target"],
+                     proj_k=aa.get("proj_k", 32), proj_sigma=aa.get("proj_sigma", 0.1))
     m.load_state_dict(ck["model"]); m.to(dev).eval().requires_grad_(False)
     return m, aa, ck.get("step")
 
@@ -189,13 +190,17 @@ def main():
         print(f"[bits] critic {name}: cond={cond} target={target} step={step} params {model.n_params()/1e6:.0f}M; {n} rows ({sum(1 for k in idx if k in set(common))} paired)", flush=True)
         gaps = (J_all[idx] - I_all[idx]).numpy(); js = J_all[idx].numpy()
         L_u = torch.zeros(len(T_GRID), n); L_c = torch.zeros(len(T_GRID), n); L_s = torch.zeros(len(T_GRID), n); L_r = torch.zeros(len(T_GRID), n)
-        lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); lp_r = torch.zeros(n); lp_w = torch.zeros(n); lp_m = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
+        lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); lp_r = torch.zeros(n); lp_w = torch.zeros(n); lp_m = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time(); proj_y = []
         for s in range(0, n, a.batch):
             kk = idx[s:s + a.batch]; r = rows_all[kk]; i = I_all[kk]; j = J_all[kk]; B = len(kk)
             h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target, src_rms, squash)
             x_aff = norm.normalize(store_val.gather(r, j, dev))
             depth = torch.stack([i, j], 1).to(dev) if cond == "depth" else None
             vec = lf.vec_feats(store_val.gather(r, i), i, store_val.gather(r, j), j) if cond == "vec" else None
+            if cond == "proj":
+                from nlt.critic.model import oracle_projection
+                vec = oracle_projection(model, x0, eps=eps_all[0][kk][:, : model.proj_k].to(dev))                                 # fixed noise per fixed-set row
+                proj_y.append((x0.float() @ model.proj_P.T).cpu())
             enc = mask = enc_s = mask_s = enc_r = mask_r = enc_w = mask_w = enc_m = mask_m = None
             if texts:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -234,6 +239,8 @@ def main():
                 lm = torch.tensor([logp_mix[k] for k in idx])
                 pm = (lp_c - lm).numpy() / math.log(2); res["exact_pmi_vs_mix_bits"] = summarize(pm, gaps, js, "vs_mix"); res["exact_pmi_vs_mix_bits"]["frac_positive"] = float((pm > 0).mean())
                 res["blind_vs_mix_bits"] = summarize((lp_u - lm).numpy() / math.log(2), gaps, js, "blind_vs_mix")    # how far the blind prior is below the mixture (<= 0 expected; = depth hedging)
+            if cond == "proj" and proj_y:      # T5 analytic Gaussian bound on the information in y = P x0 + sigma eps about x0: sum_k 1/2 log2(1 + var_k / sigma^2)
+                Y = torch.cat(proj_y, 0); var_k = Y.var(0); res["proj_gaussian_bound_bits"] = float((0.5 * torch.log2(1 + var_k / model.proj_sigma ** 2)).sum()); res["proj_k"] = int(model.proj_k); res["proj_sigma"] = float(model.proj_sigma); res["proj_var_k_mean"] = float(var_k.mean())
             if not a.skip_exact:
                 pe = (lp_c - lp_u).numpy() / math.log(2); res["exact_pmi_bits"] = summarize(pe, gaps, js, "exact")
                 res["exact_pmi_bits"]["frac_positive"] = float((pe > 0).mean()); res["proxy_over_exact_ratio"] = float(pmi_p.mean() / max(1e-9, pe.mean()))

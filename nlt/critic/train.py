@@ -75,6 +75,9 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
         if a.cond == "text":
             with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(val_text[s:s + B])
         if a.cond == "vec": vec = lf.vec_feats(store_val.gather(rows, i), i, store_val.gather(rows, j), j)
+        if a.cond == "proj":
+            from nlt.critic.model import oracle_projection
+            vec = oracle_projection(model, x0, eps=eps_bank[0][s:s + B, : model.proj_k].to(dev))      # fixed noise per val row
         mse_id[s:s + B] = ((x0 - (0 if a.target == "delta" else h_i)) ** 2).mean(-1).cpu()       # identity transcoder h_j := h_i
         for ti, t in enumerate(T_GRID):
             tt = torch.full((len(rows),), t, device=dev); eps = eps_bank[ti][s:s + B].to(dev)
@@ -120,7 +123,7 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="critic")
-    p.add_argument("--cond", default="none", choices=["none", "depth", "text", "vec"]); p.add_argument("--target", default="delta", choices=["hj", "delta"]); p.add_argument("--norm", default="affine", choices=["affine", "scalar"])
+    p.add_argument("--cond", default="none", choices=["none", "depth", "text", "vec", "proj"]); p.add_argument("--target", default="delta", choices=["hj", "delta"]); p.add_argument("--norm", default="affine", choices=["affine", "scalar"])
     p.add_argument("--squash", type=float, default=0.0, help="DECISIONS v1.9: radial squash of the target y = x / sqrt(c^2 + rms(x)^2) with c = this value (0 = off); analytic log-det added in the exact eval")
     p.add_argument("--src-rms", type=int, default=1, help="DECISIONS D2: divide h_i and the target by rms(h_i) after the pooled affine (1) or not (0, ablation)")
     p.add_argument("--d-model", type=int, default=2048); p.add_argument("--d-mlp", type=int, default=8192); p.add_argument("--n-layers", type=int, default=8)
@@ -139,6 +142,7 @@ def main():
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
     p.add_argument("--extra-data-dirs", default=None, help="comma list of additional activation dirs (same layout): the train store becomes a CyclingStore over ALL dirs (blind/depth modes only)")
     p.add_argument("--cycle-resident", type=int, default=200_000); p.add_argument("--cycle-refresh", type=int, default=400, help="batches between shard swaps")
+    p.add_argument("--proj-k", type=int, default=32); p.add_argument("--proj-sigma", type=float, default=0.1); p.add_argument("--proj-mode", default="random", choices=["random", "pca"], help="T5 directions: random orthonormal or top-PCA of the flow target (from 16k sampled pairs)")
     p.add_argument("--contrast", type=float, default=0.0, help="DECISIONS v1.10 T4: weight of the contrastive hinge softplus((L(z) - L(z_dm) + margin)/tau) with z_dm = a depth-matched WRONG text (another row of the batch with the same j, same (i,j) when available), at the SAME (x_t, t, eps)")
     p.add_argument("--contrast-tau", type=float, default=0.005, help="logistic temperature in per-dim FM-loss units (0.005 ~ 10 nats)"); p.add_argument("--contrast-margin", type=float, default=0.005)
     p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
@@ -200,7 +204,15 @@ def main():
             val_rows, val_i, val_j = val_rows[keep], val_i[keep], val_j[keep]; eps_bank = [e[keep] for e in eps_bank]
             val_text = [vdf.loc[pid[k], "text"] for k in keep]
             print(f"[train] text pairs: train {len(text_df)} (verbosity {sorted(text_df['verbosity'].unique().tolist())}), val {len(keep)}/{len(pid)} with text", flush=True)
-    model = PairDenoiser(d, a.d_model, a.d_mlp, a.n_layers, a.cond, d_enc=(encoder.d_enc if encoder else 0), n_slots=a.n_slots, n_heads=a.n_heads, d_head=a.d_head, gate_rank=a.gate_rank, target=a.target).to(dev)
+    model = PairDenoiser(d, a.d_model, a.d_mlp, a.n_layers, a.cond, d_enc=(encoder.d_enc if encoder else 0), n_slots=a.n_slots, n_heads=a.n_heads, d_head=a.d_head, gate_rank=a.gate_rank, target=a.target, proj_k=a.proj_k, proj_sigma=a.proj_sigma).to(dev)
+    if a.cond == "proj":                       # T5 directions (fixed, saved in the checkpoint as a buffer)
+        g_p = torch.Generator().manual_seed(777)
+        if a.proj_mode == "random":
+            P, _ = torch.linalg.qr(torch.randn(d, a.proj_k, generator=g_p)); P = P.T
+        else:
+            rows_p, i_p, j_p = store.sample_pairs(16384, g_p); _, x0_p, _, _ = make_x0(norm, store.gather(rows_p, i_p, dev), store.gather(rows_p, j_p, dev), a.target, a.src_rms, a.squash)
+            _, _, Vh = torch.linalg.svd(x0_p.float() - x0_p.float().mean(0), full_matrices=False); P = Vh[: a.proj_k].cpu()
+        model.proj_P.copy_(P.to(dev)); print(f"[train] T5 oracle projection: {a.proj_mode} k={a.proj_k} sigma={a.proj_sigma}", flush=True)
     if encoder: model.d_enc_ = encoder.d_enc
     model.src_rms_ = bool(a.src_rms); model.squash_ = float(a.squash)
     print(f"[train] {a.cond} critic: {model.n_params()/1e6:.0f}M params, target {a.target}, norm {a.norm}, src_rms {a.src_rms}, squash {a.squash}, batch {a.batch}, {a.steps} steps", flush=True)
@@ -213,7 +225,7 @@ def main():
         print(f"[train] init from {a.init_from} (step {ck.get('step')}): {len(sd)} tensors loaded, {len(res.missing_keys)} fresh (conditioning) tensors", flush=True)
     trainable = list(model.parameters())
     if a.freeze_prior:
-        cond_names = {n for n, _ in model.named_parameters() if (".read." in n or ".gate_mod." in n or n.startswith("emb_i") or n.startswith("emb_j") or n.startswith("tok_emb") or n.startswith("vec_in"))}
+        cond_names = {n for n, _ in model.named_parameters() if (".read." in n or ".gate_mod." in n or n.startswith("emb_i") or n.startswith("emb_j") or n.startswith("tok_emb") or n.startswith("vec_in") or n.startswith("proj_in"))}
         for n, p_ in model.named_parameters(): p_.requires_grad_(n in cond_names)
         trainable = [p_ for n, p_ in model.named_parameters() if n in cond_names]
         print(f"[train] prior frozen: {sum(p_.numel() for p_ in trainable)/1e6:.1f}M trainable conditioning params", flush=True)
@@ -243,6 +255,9 @@ def main():
         if a.cond == "text":
             with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts)
         if a.cond == "vec": vec = lf.vec_feats(store.gather(rows, i), i, store.gather(rows, j), j)
+        if a.cond == "proj":
+            from nlt.critic.model import oracle_projection
+            vec = oracle_projection(model, x0)
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
         t_b = torch.rand(x0.shape[0], device=dev); eps_b = torch.randn_like(x0)                      # shared (t, eps) for the positive and the contrastive negative
         with torch.autocast("cuda", dtype=torch.bfloat16):

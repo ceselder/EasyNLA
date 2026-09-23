@@ -19,9 +19,9 @@ from nlt.data.extract import K_LO, N_LAYERS
 
 class PairDenoiser(nn.Module):
     def __init__(self, d: int = 4096, d_model: int = 2048, d_mlp: int = 8192, n_layers: int = 8, cond: str = "none", d_enc: int = 0,
-                 n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, target: str = "hj", vec_k: int = 20, vec_vocab: int = 151936):
+                 n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, target: str = "hj", vec_k: int = 20, vec_vocab: int = 151936, proj_k: int = 32, proj_sigma: float = 0.1):
         super().__init__()
-        assert cond in ("none", "depth", "text", "vec")
+        assert cond in ("none", "depth", "text", "vec", "proj")
         self.d, self.d_model, self.d_mlp, self.n_layers, self.cond, self.target = d, d_model, d_mlp, n_layers, cond, target
         self.in_proj = nn.Linear(2 * d, d_model)
         self.time_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
@@ -29,6 +29,10 @@ class PairDenoiser(nn.Module):
         if cond == "depth":
             self.emb_i = nn.Embedding(N_LAYERS, d_model); self.emb_j = nn.Embedding(N_LAYERS, d_model)
             nn.init.normal_(self.emb_i.weight, std=0.02); nn.init.normal_(self.emb_j.weight, std=0.02)
+        if cond == "proj":           # T5 oracle-projection capacity test: y = P x0 + sigma*eps for k fixed directions (buffer P set by the trainer)
+            self.proj_k, self.proj_sigma = proj_k, proj_sigma
+            self.register_buffer("proj_P", torch.zeros(proj_k, d))
+            self.proj_in = nn.Sequential(nn.Linear(proj_k, d_model), nn.SiLU(), nn.Linear(d_model, d_model)); nn.init.zeros_(self.proj_in[2].weight); nn.init.zeros_(self.proj_in[2].bias)
         if cond == "vec":            # T2 vector upper bound: top-k lens tokens (ids + log-probs) at the source and at the target, as numbers
             self.vec_k, self.vec_vocab = vec_k, vec_vocab
             self.tok_emb = nn.Embedding(vec_vocab, 128); nn.init.normal_(self.tok_emb.weight, std=0.02)
@@ -66,6 +70,10 @@ class PairDenoiser(nn.Module):
             emb = emb + de
         if self.cond == "vec" and vec is not None:
             ve = self.vec_in(self.vec_features(*vec).to(emb.dtype))
+            if vec_has is not None: ve = ve * vec_has[:, None].to(ve.dtype)
+            emb = emb + ve
+        if self.cond == "proj" and vec is not None:                              # vec = the noisy projection y [B, k]
+            ve = self.proj_in(vec.to(emb.dtype))
             if vec_has is not None: ve = ve * vec_has[:, None].to(ve.dtype)
             emb = emb + ve
         h = self.in_proj(torch.cat([x_t, h_i], -1))
@@ -120,3 +128,10 @@ def pair_fm_loss(model, x0, h_i, t=None, eps=None, depth=None, enc=None, enc_mas
     x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
     v = model(x_t, t, h_i, depth=depth, depth_has=depth_has, enc=enc, enc_mask=enc_mask, log_s=log_s, vec=vec, vec_has=vec_has)
     return ((v - (eps - x0)) ** 2).mean(-1), t, keep
+
+
+def oracle_projection(model, x0, gen=None, eps=None):
+    """T5: y = P x0 + sigma * eps with the model's fixed directions P [k, d]; eps fixed per row when given (paired evals)."""
+    y = x0.float() @ model.proj_P.T
+    if eps is None: eps = torch.randn(y.shape, device=y.device, generator=gen)
+    return y + model.proj_sigma * eps
