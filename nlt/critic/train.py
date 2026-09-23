@@ -179,6 +179,7 @@ def main():
     p.add_argument("--proj-k", type=int, default=32); p.add_argument("--proj-sigma", type=float, default=0.1); p.add_argument("--proj-mode", default="random", choices=["random", "pca"], help="T5 directions: random orthonormal or top-PCA of the flow target (from 16k sampled pairs)")
     p.add_argument("--contrast", type=float, default=0.0, help="DECISIONS v1.10 T4: weight of the contrastive hinge softplus((L(z) - L(z_dm) + margin)/tau) with z_dm = a depth-matched WRONG text (another row of the batch with the same j, same (i,j) when available), at the SAME (x_t, t, eps)")
     p.add_argument("--contrast-tau", type=float, default=0.005, help="logistic temperature in per-dim FM-loss units (0.005 ~ 10 nats)"); p.add_argument("--contrast-margin", type=float, default=0.005)
+    p.add_argument("--neg-text-parquet", default="", help="v1.16 (2) 'and twins': globs of [pair_id, text] rows that are KNOWN-WRONG texts for their pair (content twins); with --null-dm a row whose pair has a twin uses the twin as its z_dm negative (pulled to the unconditional velocity) instead of the batch permutation")
     p.add_argument("--null-dm", type=int, default=0, help="lens #264: null regulariser pairs each row with a DEPTH-MATCHED wrong text (same (i,j)/same j, the T4 permutation) instead of the batch roll, so p(h_j | z_dm) is pulled to p(h_j | empty) rather than pushed away")
     p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
     p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
@@ -186,6 +187,7 @@ def main():
     p.add_argument("--prior-lr", type=float, default=2e-5, help="lr of the prior's own parameters when --init-from is given and --freeze-prior 0 (joint fine-tune); conditioning modules use --lr")
     p.add_argument("--freeze-prior", type=int, default=0, help="1 = train only the conditioning modules (cross-reads, gate_mod, depth embeddings); the unconditional path stays exactly the loaded prior")
     a = p.parse_args()
+    neg_map = {}   # pair_id -> known-wrong (twin) texts, filled when --neg-text-parquet is given
     torch.manual_seed(a.seed); np.random.seed(a.seed); dev = "cuda"; torch.backends.cuda.matmul.allow_tf32 = True
     os.makedirs(a.out, exist_ok=True); t_start = time.time()
     norm = GlobalNorm.load(a.stats or os.path.join(a.data_dir, "stats.pt"), a.norm).to(dev)
@@ -240,6 +242,13 @@ def main():
             val_rows, val_i, val_j = val_rows[keep], val_i[keep], val_j[keep]; eps_bank = [e[keep] for e in eps_bank]
             val_text = [vdf.loc[pid[k], "text"] for k in keep]
             print(f"[train] text pairs: train {len(text_df)} (verbosity {sorted(text_df['verbosity'].unique().tolist())}), val {len(keep)}/{len(pid)} with text", flush=True)
+            if a.neg_text_parquet:
+                import glob as _g, pyarrow.parquet as _pq, pandas as _pd
+                nf = [f for pat in a.neg_text_parquet.split(",") for f in (sorted(_g.glob(pat)) or [pat])]
+                ndf = _pd.concat([_pq.read_table(f, columns=["pair_id", "text"]).to_pandas() for f in nf], ignore_index=True) if nf else _pd.DataFrame(columns=["pair_id", "text"])
+                ndf = ndf[ndf["pair_id"].isin(set(text_df["pair_id"]))]
+                neg_map = ndf.groupby("pair_id")["text"].apply(list).to_dict()
+                print(f"[train] negative (twin) texts: {len(ndf)} rows for {len(neg_map)} train pairs ({len(neg_map) / max(1, text_df['pair_id'].nunique()):.1%} of pairs with text) from {len(nf)} files", flush=True)
     model = PairDenoiser(d, a.d_model, a.d_mlp, a.n_layers, a.cond, d_enc=(encoder.d_enc if encoder else 0), n_slots=a.n_slots, n_heads=a.n_heads, d_head=a.d_head, gate_rank=a.gate_rank, target=a.target, proj_k=a.proj_k, proj_sigma=a.proj_sigma, cond_path=a.cond_path, text_in_proj=a.text_in_proj).to(dev)
     if a.cond == "proj":                       # T5 directions (fixed, saved in the checkpoint as a buffer)
         g_p = torch.Generator().manual_seed(777)
@@ -284,13 +293,18 @@ def main():
     gen = torch.Generator().manual_seed(a.seed + step0)
     def save(step, name="ckpt_latest.pt"):
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "args": vars(a), "config": model.config(), "d_enc": (encoder.d_enc if encoder else 0)}, os.path.join(a.out, name))
-    t0 = time.time(); ema = None; best = None
+    t0 = time.time(); ema = None; best = None; neg_frac = 0.0
     for step in range(step0, a.steps):
         if a.cond == "text" and not a.text_smoke:
             idx = torch.randint(0, len(text_df), (a.batch,), generator=gen).numpy(); sub = text_df.iloc[idx]
             rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values); j = torch.tensor(sub["j"].values); texts = sub["text"].tolist()
+            neg_texts = None
+            if neg_map and a.null_dm and a.null_reg > 0:
+                rng_ = np.random.default_rng(a.seed * 7919 + step); pids_ = sub["pair_id"].tolist()
+                neg_texts = [(neg_map[p_][rng_.integers(len(neg_map[p_]))] if p_ in neg_map else None) for p_ in pids_]
+                if not any(t_ is not None for t_ in neg_texts): neg_texts = None
         else:
-            rows, i, j = store.sample_pairs(a.batch, gen); texts = (synth_texts(a.text_synth, store, rows, i, j, tok8, lf) if a.text_synth else smoke_texts(store, rows, i, j, tok8)) if (a.cond == "text") else None
+            neg_texts = None; rows, i, j = store.sample_pairs(a.batch, gen); texts = (synth_texts(a.text_synth, store, rows, i, j, tok8, lf) if a.text_synth else smoke_texts(store, rows, i, j, tok8)) if (a.cond == "text") else None
         h_i, x0, log_s, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), a.target, a.src_rms, a.squash)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
         enc = mask = None; vec = None
@@ -337,10 +351,20 @@ def main():
                 # unconditional velocity too, at the SAME (x_t, t, eps) as the positive -> p(h_j | h_i, z_dm) -> p(h_j | h_i, empty), so
                 # content = PMI(z) - PMI(z_dm) is bounded by PMI(z) - PMI(null) and can only grow by raising the density under the TRUE text.
                 x_tp = (1 - t_b)[:, None] * x0 + t_b[:, None] * eps_b
+                enc_neg, mask_neg = enc[perm_t], mask[perm_t]
+                if neg_texts is not None:
+                    # rows with a content TWIN (same sentence, wrong claim) use it as the negative; the rest keep the depth-matched permutation
+                    has_tw = torch.tensor([t_ is not None for t_ in neg_texts], device=dev)
+                    with torch.autocast("cuda", dtype=torch.bfloat16): enc_tw, mask_tw = encoder([t_ if t_ is not None else texts[q] for q, t_ in enumerate(neg_texts)])
+                    T_ = max(enc_tw.shape[1], enc_neg.shape[1])
+                    pad = lambda e, m: (torch.nn.functional.pad(e, (0, 0, 0, T_ - e.shape[1])), torch.nn.functional.pad(m, (0, T_ - m.shape[1])))
+                    enc_tw, mask_tw = pad(enc_tw, mask_tw); enc_neg, mask_neg = pad(enc_neg, mask_neg)
+                    enc_neg = torch.where(has_tw[:, None, None], enc_tw.to(enc_neg.dtype), enc_neg); mask_neg = torch.where(has_tw[:, None], mask_tw, mask_neg)
+                    neg_frac = float(has_tw.float().mean())
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    v_dm = model(x_tp, t_b, h_i, enc=enc[perm_t], enc_mask=mask[perm_t], log_s=log_s)
+                    v_dm = model(x_tp, t_b, h_i, enc=enc_neg, enc_mask=mask_neg, log_s=log_s)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    with torch.no_grad(): v_null_p = model(x_tp, t_b, h_i, enc=enc[perm_t], enc_mask=torch.zeros_like(mask[perm_t]), log_s=log_s)
+                    with torch.no_grad(): v_null_p = model(x_tp, t_b, h_i, enc=enc_neg, enc_mask=torch.zeros_like(mask_neg), log_s=log_s)
                 null_dm_loss = ((v_dm - v_null_p.detach()) ** 2).mean()
                 null_loss = 0.5 * (null_loss + null_dm_loss)
             loss = loss + a.null_reg * null_loss
@@ -348,7 +372,7 @@ def main():
         gn = torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip); opt.step()
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
         if step % 25 == 0:
-            log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/null_loss": float(null_loss), "train/contrast_loss": float(con_loss), "train/contrast_acc": con_acc, "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/step_s": (time.time() - t0) / max(1, step - step0 + 1)}
+            log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/null_loss": float(null_loss), "train/neg_twin_frac": neg_frac, "train/contrast_loss": float(con_loss), "train/contrast_acc": con_acc, "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/step_s": (time.time() - t0) / max(1, step - step0 + 1)}
             if a.cond != "none":
                 log["train/loss_cond"] = float(loss_vec[kept].mean()) if kept.any() else float("nan"); log["train/loss_uncond"] = float(loss_vec[~kept].mean()) if (~kept).any() else float("nan")
             wandb.log(log, step=step)
