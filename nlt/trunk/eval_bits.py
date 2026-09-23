@@ -82,7 +82,7 @@ def main():
         sw_texts = shuf_words(texts); mn_texts = mask_next(texts, idx); n_masked = sum(1 for z1, z2 in zip(texts, mn_texts) if z1 != z2)
         gaps = (J_all[idx] - I_all[idx]).numpy(); js = J_all[idx].numpy()
         variants = {"z": texts, "dm": dm_texts, "rp": rp_texts} | ({} if a.skip_extra_controls else {"sw": sw_texts, "mn": mn_texts})
-        L = {k: torch.zeros(len(T_GRID), n) for k in ["u"] + list(variants)}; lp = {k: torch.zeros(n) for k in ["u"] + list(variants)}; ruler = torch.zeros(n)
+        L = {k: torch.zeros(len(T_GRID), n) for k in ["u"] + list(variants)}; lp = {k: torch.zeros(n) for k in ["u"] + list(variants)}; ruler = torch.zeros(n); lp_prior = torch.zeros(n)
         t0 = time.time(); t_enc = 0.0; t_ode = 0.0; n_ode_rows = 0
         for s in range(0, n, a.batch):
             kk = idx[s:s + a.batch]; r = rows_all[kk]; i = I_all[kk]; j = J_all[kk]; B = len(kk)
@@ -92,10 +92,11 @@ def main():
             if need:
                 L["u"][:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, log_s=log_s)
                 te = time.time(); lu = exact_logp(model, x0, h_i, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; t_ode += time.time() - te; n_ode_rows += B
-                lp["u"][s:s + B] = lu.cpu(); ruler[s:s + B] = bits_vs_gaussian(lu, x_aff).cpu()
-                for q, k in enumerate(kk): _uncond[k] = (L["u"][:, s + q].clone(), float(lp["u"][s + q]), float(ruler[s + q]))
+                lpp = exact_logp(model.prior, x0, h_i, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det      # the FROZEN blind prior alone (the adapter critics' null)
+                lp["u"][s:s + B] = lu.cpu(); ruler[s:s + B] = bits_vs_gaussian(lu, x_aff).cpu(); lp_prior[s:s + B] = lpp.cpu()
+                for q, k in enumerate(kk): _uncond[k] = (L["u"][:, s + q].clone(), float(lp["u"][s + q]), float(ruler[s + q]), float(lp_prior[s + q]))
             else:
-                for q, k in enumerate(kk): L["u"][:, s + q] = _uncond[k][0]; lp["u"][s + q] = _uncond[k][1]; ruler[s + q] = _uncond[k][2]
+                for q, k in enumerate(kk): L["u"][:, s + q] = _uncond[k][0]; lp["u"][s + q] = _uncond[k][1]; ruler[s + q] = _uncond[k][2]; lp_prior[s + q] = _uncond[k][3]
             for vname, vtexts in variants.items():
                 te = time.time(); kv, mask = model.encode(vtexts[s:s + B]); t_enc += time.time() - te
                 L[vname][:, s:s + B] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=kv, enc_mask=mask, log_s=log_s)
@@ -113,6 +114,10 @@ def main():
                "p_z_beats_dm_by_band": {lab: float((bits["z"] > bits["dm"])[m].mean()) for lab, lo, hi in (("pre<=13", 10, 13), ("workspace14-32", 14, 32), ("motor>=33", 33, 34)) for m in [(js >= lo) & (js <= hi)] if m.sum()},
                "n_tokens_mean": float(np.mean(model.n_tokens(texts)))}
         res["exact_bits_per_token"] = res["exact_pmi_bits"]["mean"] / max(1e-9, res["n_tokens_mean"])
+        # denominators (redteam #340): PMI here is vs the trunk's OWN null path (empty prefix, reads h_i); the adapter critics' null is the blind prior.
+        res["null_vs_prior_bits"] = summarize((lp["u"] - lp_prior).numpy() / math.log(2), gaps, js, "null_vs_prior")          # how much the trunk's h_i pathway improves the frozen prior
+        res["exact_pmi_vs_prior_bits"] = summarize((lp["z"] - lp_prior).numpy() / math.log(2), gaps, js, "vs_prior") | {"frac_positive": float((lp["z"] > lp_prior).float().mean())}
+        res["per_row_logp_prior"] = lp_prior.tolist()
         rp_m, rp_sem = float(bits["rp"].mean()), float(bits["rp"].std() / math.sqrt(n))
         res["exact_bits_rp_corrected"] = float(bits["z"].mean() - rp_m); res["dm_bits_rp_corrected"] = float(bits["dm"].mean() - rp_m)
         res["ratio_to_dm_rp_corrected"] = float((bits["z"].mean() - rp_m) / (bits["dm"].mean() - rp_m)) if abs(bits["dm"].mean() - rp_m) > 1e-9 else None
@@ -129,7 +134,7 @@ def main():
         results["critics"][f"trunk@{label}"] = res
         ws = res["content_exact_bits"]["by_band"].get("workspace14-32", {}); pw = res["p_z_beats_dm_by_band"].get("workspace14-32")
         print(f"[bits] trunk@{label}: exact {res['exact_pmi_bits']['mean']:+.2f} (dm {bits['dm'].mean():+.2f}, rp {bits['rp'].mean():+.2f}) content {res['content_exact_bits']['mean']:+.2f}+-{res['content_exact_bits']['sem']:.2f} "
-              f"P(z>dm) {res['frac_z_beats_dm']:.3f} | workspace content {ws.get('mean', float('nan')):+.2f}+-{ws.get('sem', float('nan')):.2f} P {pw} | by band content " +
+              f"P(z>dm) {res['frac_z_beats_dm']:.3f} | null-vs-prior {res['null_vs_prior_bits']['mean']:+.1f} | workspace content {ws.get('mean', float('nan')):+.2f}+-{ws.get('sem', float('nan')):.2f} P {pw} | by band content " +
               json.dumps({k: round(v['mean'], 2) for k, v in res['content_exact_bits']['by_band'].items()}) + f" | {res['ms_per_row_exact']:.1f} ms/row exact, {res['n_tokens_mean']:.0f} tok", flush=True)
         os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True); json.dump(results, open(a.out, "w"), indent=1)
     print("[bits] DONE ->", a.out, flush=True)
