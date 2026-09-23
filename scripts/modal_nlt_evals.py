@@ -2,6 +2,7 @@
 
   modal run --detach scripts/modal_nlt_evals.py --task manifest --extra "--ckpt /vol/critic/text_v0/ckpt_latest.pt --manifest /vol/evals/manifest_lensL1.parquet --out /vol/evals/scored_lensL1.parquet"   (runs infra nlt.eval_bits.score_manifest, then nlt.evals.summarize_scored)
   modal run --detach scripts/modal_nlt_evals.py --task causal   --extra "--out /vol/evals/causal_val.parquet --n-pairs 4096"
+  modal run --detach scripts/modal_nlt_evals.py --task naturalness --extra "--z /vol/z/<src>/val.parquet --ref-z /vol/z/<warmstart>.parquet --out /vol/evals/natural_<tag>.json"
   modal run          scripts/modal_nlt_evals.py --task text     --extra "--z /vol/z/lensdiff_v1/val/L1.parquet --out /vol/evals/text_lensL1.json"   (CPU)
   modal run          scripts/modal_nlt_evals.py --task build-manifest --extra "--z /vol/z/lensdiff_v1/val/L1.parquet --out /vol/evals/manifest_lensL1.parquet"  (CPU)
   modal run          scripts/modal_nlt_evals.py --task cat --path evals/scored_lensL1.parquet.summary.json
@@ -43,6 +44,11 @@ def causal(extra: str = "", data: str = DATA):
     return _run([sys.executable, "-m", "nlt.evals.causal", "--data-dir", data] + extra.split())
 
 
+@app.function(gpu=GPU, timeout=3 * 3600, **COMMON)
+def naturalness(extra: str = "", data: str = DATA):
+    return _run([sys.executable, "-m", "nlt.evals.naturalness"] + extra.split())
+
+
 @app.function(timeout=2 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=32 * 1024)
 def text(extra: str = "", data: str = DATA):
     import glob
@@ -76,6 +82,7 @@ def main(task: str = "text", extra: str = "", data: str = DATA, path: str = ""):
     if task == "manifest": print("rc", manifest.remote(extra, data))
     elif task == "causal": print("rc", causal.remote(extra, data))
     elif task == "text": print("rc", text.remote(extra, data))
+    elif task == "naturalness": print("rc", naturalness.remote(extra, data))
     elif task == "build-manifest": print("rc", build_manifest.remote(extra, data))
     elif task == "cat": cat.remote(path)
     elif task == "ls": ls.remote(path)
