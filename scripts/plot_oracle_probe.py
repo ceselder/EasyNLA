@@ -38,21 +38,21 @@ summary = {"layers": d["layers"], "next_word_hit_true": hit_true, "next_word_hit
 json.dump(summary, open(f"{REP}/data/oracle_probe_summary.json", "w"), indent=1)
 
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 13})
-fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
 x = list(range(len(layers)))
 ax = axes[0, 0]
 ax.plot(x, hit_true, "o-", label="answer contains true next token")
 ax.plot(x, hit_top1, "s--", label="answer contains model's final top-1")
 ax.plot(x, empty, "x:", color="crimson", label="empty answer")
 ax.set_xticks(x); ax.set_xticklabels(layers); ax.set_ylim(0, 1); ax.set_xlabel("residual-stream layer k read by the oracle")
-ax.set_title("Oracle reads the next word as well at k=9 as at k=27\n(flat, then fails at k=34: out of its training range)")
+ax.set_title("Next-word readout is flat over k=9..27,\nthen fails at k=34 (outside the oracle's training layers)")
 ax.legend(fontsize=9)
 ax = axes[0, 1]
 ax.plot(x, copy_past, "o-", color="crimson", label='"What is the preceding text?"')
 ax.plot(x, copy_next, "s-", label='"What will the next word be?"')
 ax.plot(x, copy_think, "^-", label='"What is the model thinking about?"')
 ax.set_xticks(x); ax.set_xticklabels(layers); ax.set_ylim(0, 0.3); ax.set_xlabel("layer k")
-ax.set_title("Verbatim copying of the prefix depends on the question,\nnot the depth (share of answer trigrams found in the prefix)")
+ax.set_title("Prefix copying depends on the question, not the depth\n(share of answer trigrams found in the prefix)")
 ax.legend(fontsize=9)
 ax = axes[1, 0]
 ax.plot(x, lab_think, "o-", label='"thinking about" question')
@@ -63,7 +63,7 @@ ax.legend(fontsize=9)
 ax = axes[1, 1]
 ax.semilogy(x, norms, "o-", color="black")
 ax.set_xticks(x); ax.set_xticklabels(layers); ax.set_xlabel("layer k")
-ax.set_title("Residual norm grows 25x from k=9 to k=34\n(median over 22 positions; norm-matched injection hides it)")
+ax.set_title("Residual norm grows 25x from k=9 to k=34\n(median over 22 positions)")
 fig.suptitle("Pretrained activation oracle on Qwen3-8B: 22 positions x 5 layers, greedy answers", fontsize=14)
 fig.tight_layout()
 for ext in ("png", "pdf"):
