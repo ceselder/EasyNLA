@@ -26,7 +26,11 @@ VERDICT = ("Negative for tonight: with <= ~130k distinct (pair, text) rows (<= 1
            "The same networks learned the h_i pathway quickly: the empty-prefix null path beats the frozen prior by +33..+374 proxy bits by step 500-1000 with 8 noise "
            "groups (and -5 with 1 group), i.e. the trunk reads the source activation token but information in the text tokens does not reach the velocity readout at "
            "this sample budget. The trunk is ~100x costlier per row than the MLP cross-read adapter (56 rows/s on a B200), so the row budget that gives the adapters "
-           "their 5-12 content bits (1.8-2M rows) was out of reach.")
+           "their 5-12 content bits (1.8-2M rows) was out of reach. The depth-tag diagnostic (T1b) settles that it is not only the budget: at 768k rows "
+           "(1.5x the rows at which the 0.6B cross-read adapter recovered +38 bits from the same tag) the trunk still does not read the tag (+1.2 vs +0.8 control). "
+           "Positive by-product: the trunk's empty-prefix null path is a much better BLIND density than the 1.89B pooled prior it sits on -- +885 +- 44 exact "
+           "bits/pair at 128k rows (NLL 0.403 vs 0.742 bits/dim on the same rows; pre-workspace +1784, workspace +753, motor +442; gap 1-3 +1417, 11-25 +218), "
+           "i.e. the pooled prior under-uses the source activation, most of all at small gaps; the trunk sees the source as [h_i/rms(h_i), log rms(h_i)].")
 
 
 def wandb_runs():
