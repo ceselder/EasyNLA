@@ -14,7 +14,7 @@ SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 SOURCES = [("reader_teacher_v1", "teacher\n+lens +final", "#2a78d6"), ("reader_teacher_nofinal_v1", "teacher\n+lens", "#eb6834"),
            ("reader_teacher_nolens_v1", "teacher\npassage only", "#1baf7a"), ("reader_lensdiff_jlens_L1", "J-lens\nsentence", "#4a3aa7"),
            ("reader_v0_ao_tsv1", "verbalizer\nactivations only", "#e34948"), ("reader_lensdiff_jlens_L3", "J-lens lists\ntwo readouts", "#e87ba4"),
-           ("reader_prelim_v1n_20", "RL arm\nstep 20", "#eda100"), ("reader_prelim_v1n_40", "RL arm\nstep 40", "#008300")]
+           ("reader_prelim_v1n_20", "plain-PMI RL\nstep 20", "#eda100"), ("reader_prelim_v1n_40", "plain-PMI RL\nstep 40", "#008300"), ("reader_ref_v1_0", "list-naming\nwarm start (V0b)", "#87867F")]
 TASKS = [("top1", "model's final top-1 among 4", 25), ("posmatch", "position among 5 cuts of the doc", 20), ("direction", "direction of change (lens j vs i)", 50), ("category", "next-token category (5 classes)", 30)]
 
 

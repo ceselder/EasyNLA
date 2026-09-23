@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 STEP = re.compile(r"^step\s+(\d+) \| R ([-+\d.]+) \(wg std ([-+\d.]+)\) \| bits ([-+\d.]+) med ([-+\d.]+) ws ([-+\d.]+) \| tok ([\d.]+) \| viol ([\d.]+) \| kl ([\d.]+) \| ent ([\d.]+) \| d4 ([\d.]+) \| gn ([\d.]+) \| (\d+)s")
-REF = re.compile(r"^step\s+(\d+) \| R ([-+\d.]+) \(wg std ([-+\d.]+)\) \| content ([-+\d.]+) med ([-+\d.]+) ws ([-+\d.]+) \| own ([-+\d.]+) dist ([-+\d.]+) acc ([\d.]+) \| tok ([\d.]+) \| viol ([\d.]+) \| kl ([\d.]+) \| ent ([\d.]+) \| d4 ([\d.]+) \| lam ([\d.]+) \| gn ([\d.]+) \| listener fm ([\d.]+) con ([\d.]+) acc ([\d.]+) null ([\d.]+) \| (\d+)s")
+REF = re.compile(r"^step\s+(?P<step>\d+) \| R (?P<R>[-+\d.]+) \(wg std (?P<wg>[-+\d.]+)\) \| content (?P<content>[-+\d.]+) med (?P<med>[-+\d.]+) ws (?P<ws>[-+\d.]+) \| own (?P<own>[-+\d.]+)(?: P\(own>null\) (?P<pnull>[\d.]+))? dist (?P<dist>[-+\d.]+) acc (?P<acc>[\d.]+) \| tok (?P<tok>[\d.]+) \| viol (?P<viol>[\d.]+) \| kl (?P<kl>[\d.]+) \| ent (?P<ent>[\d.]+) \| d4 (?P<d4>[\d.]+) \| lam (?P<lam>[\d.]+) \| gn (?P<gn>[\d.]+) \|(?: listener fm (?P<lfm>[\d.]+)(?: con (?P<lcon>[\d.]+) acc (?P<lacc>[\d.]+))?(?: nulldm (?P<lnulldm>[\d.]+))? null (?P<lnull>[\d.]+)(?: own<dist (?P<lod>[\d.]+))? \|)? (?P<sec>\d+)s")
 EVAL = re.compile(r"eval: bits ([-+\d.]+) \(med ([-+\d.]+), /tok ([-+\d.]+); random-pair control ([-+\d.]+); frozen critic ([-+\d.]+) \(live-frozen ([-+\d.]+)\)\) by band pre=([-+\d.]+) workspace=([-+\d.]+) motor=([-+\d.]+) \| tok ([\d.]+) viol ([\d.]+) nonpos ([\d.]+)")
 
 
@@ -30,10 +30,10 @@ def parse(path):
     for line in open(path, errors="replace"):
         r = REF.match(line.strip())
         if r:
-            v = r.groups(); last = int(v[0])
-            steps.append({"step": last, "reward": float(v[1]), "within_group_std": float(v[2]), "content": float(v[3]), "content_median": float(v[4]), "content_workspace": float(v[5]), "own_pmi": float(v[6]), "distractor_pmi": float(v[7]),
-                          "ref_acc": float(v[8]), "tokens": float(v[9]), "violations": float(v[10]), "kl": float(v[11]), "entropy": float(v[12]), "distinct4": float(v[13]), "lambda": float(v[14]), "grad_norm": float(v[15]),
-                          "listener_fm": float(v[16]), "listener_con": float(v[17]), "listener_acc": float(v[18]), "listener_null": float(v[19]), "seconds": int(v[20]), "referential": True}); continue
+            g = r.groupdict(); f = lambda k: (float(g[k]) if g.get(k) is not None else None); last = int(g["step"])
+            steps.append({"step": last, "reward": f("R"), "within_group_std": f("wg"), "content": f("content"), "content_median": f("med"), "content_workspace": f("ws"), "own_pmi": f("own"), "p_own_gt_null": f("pnull"), "distractor_pmi": f("dist"),
+                          "ref_acc": f("acc"), "tokens": f("tok"), "violations": f("viol"), "kl": f("kl"), "entropy": f("ent"), "distinct4": f("d4"), "lambda": f("lam"), "grad_norm": f("gn"),
+                          "listener_fm": f("lfm"), "listener_con": f("lcon"), "listener_acc": f("lacc"), "listener_nulldm": f("lnulldm"), "listener_null": f("lnull"), "listener_own_lt_dist": f("lod"), "seconds": int(g["sec"]), "referential": True}); continue
         m = STEP.match(line.strip())
         if m:
             v = m.groups(); last = int(v[0])
@@ -62,7 +62,10 @@ def main():
         ax1.axhline(0, color=INK2, lw=0.8); ax1.set_xlabel("RL step"); ax1.set_ylabel("exact bits per rollout (live listener)"); ax1.legend(frameon=False, fontsize=10)
         ax1.set_title("(a) Referential content and absolute PMI per step", loc="left", fontsize=12.5)
         ax2.plot(S["step"], S["ref_acc"], marker="o", ms=5, lw=2, color=CAT[0], label="P(own pair beats a same-(i, j) distractor)")
-        ax2.plot(S["step"], S["listener_acc"], marker="s", ms=4, lw=1.5, color=CAT[2], alpha=0.8, label="listener's own contrast accuracy (diagnostic)")
+        _la = [(st, v) for st, v in zip(S["step"], S["listener_acc"]) if v is not None]
+        if _la: ax2.plot([q[0] for q in _la], [q[1] for q in _la], marker="s", ms=4, lw=1.5, color=CAT[2], alpha=0.8, label="listener's own contrast accuracy (diagnostic)")
+        _pn = [(st, v) for st, v in zip(S["step"], S["p_own_gt_null"]) if v is not None]
+        if _pn: ax2.plot([q[0] for q in _pn], [q[1] for q in _pn], marker="^", ms=4, lw=1.5, color=CAT[3], alpha=0.9, label="P(own PMI > 0): sentence beats the empty text")
         ax2.axhline(0.5, color=INK2, lw=0.9, ls=(0, (4, 2))); ax2.text(S["step"][-1], 0.51, "chance", ha="right", fontsize=9.5, color=INK2); ax2.set_ylim(0, 1)
         ax2.set_xlabel("RL step"); ax2.set_ylabel("referential accuracy"); ax2.legend(frameon=False, fontsize=10); ax2.set_title("(b) Does the listener pick the right pair from the sentence?", loc="left", fontsize=12.5)
         ax3.plot(S["step"], S["tokens"], marker="o", ms=4, lw=2, color=CAT[0]); ax3.set_xlabel("RL step"); ax3.set_ylabel("tokens per sentence (mean)"); ax3.set_ylim(0, max(S["tokens"]) * 1.15)
@@ -72,7 +75,7 @@ def main():
         n = S["step"][-1]
         fig.suptitle("\n".join(textwrap.wrap(f"PRELIMINARY referential RL ({n} steps so far, {a.label}): reward = content + 0.2·PMI(own) − λ·tokens with same-(i, j) distractors; "
                                               f"content moved {S['content'][0]:+.2f} → {S['content'][-1]:+.2f} bits, referential accuracy {S['ref_acc'][0]:.2f} → {S['ref_acc'][-1]:.2f}", 108)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
-        fig.text(0.01, 0.005, f"Run {a.tag}: 12 (i, j) classes × 8 pairs × 8 samples per step (768 rollouts); same-document and cross-document distractors; null-dm listener co-trained at lr 5e-6 every 2 steps with paraphrase augmentation; iterated reset every 100 steps; "
+        fig.text(0.01, 0.005, f"Run {a.tag}: 12 (i, j) classes × 8 pairs × 8 samples per step (768 rollouts); same-document and cross-document distractors; null-dm listener co-trained at lr 5e-6 every 2 steps on winners with paraphrase augmentation; iterated reset every 100 steps; "
                  "KL β 0.01 to Qwen3-8B on a text-only prompt; paraphrase-scored reward p = 0.3. Parsed from the trainer log.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
         fig.subplots_adjust(left=0.08, right=0.985, top=0.86, bottom=0.10, hspace=0.5, wspace=0.28)
         for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
