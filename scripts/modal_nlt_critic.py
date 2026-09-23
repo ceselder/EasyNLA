@@ -53,6 +53,12 @@ def manifest(tag: str, extra: str = "", data: str = DATA):
     return _run([sys.executable, "-m", "nlt.eval_bits.score_manifest", "--data-dir", data, "--out", f"/vol/evals/scored_{tag}.parquet"] + extra.split())
 
 
+@app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
+def script(path: str, extra: str = ""):
+    """run any repo script on a GPU with the volume mounted: --task script --path scripts/foo.py --extra '...'"""
+    return _run([sys.executable, f"{REPO_REMOTE}/{path}"] + extra.split())
+
+
 @app.function(timeout=1800, volumes={"/vol": vol}, cpu=2, memory=8 * 1024)
 def cat(path: str):
     vol.reload(); print(open(f"/vol/{path}").read())
@@ -64,6 +70,7 @@ def main(task: str = "train", tag: str = "dev", extra: str = "", data: str = DAT
     elif task == "mse": print("rc", mse.remote(tag, extra, data))
     elif task == "bits": print("rc", bits.remote(tag, extra, data))
     elif task == "manifest": print("rc", manifest.remote(tag, extra, data))
+    elif task == "script": print("rc", script.remote(path, extra))
     elif task == "cat": cat.remote(path)
     else: raise SystemExit(task)
     print("done.")
