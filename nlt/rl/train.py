@@ -82,6 +82,8 @@ def parse():
     p.add_argument("--dump-val-every", type=int, default=0, help="at every k-th save, write 1 rollout (T=0.7) per pair for the first --dump-val-pairs pairs_val rows in the board #31 text format to /vol/z/<tag>_<step>/val/ (redteam's pipeline); 0 = off")
     p.add_argument("--dump-val-pairs", type=int, default=4096); p.add_argument("--dump-root", default="/vol/z")
     p.add_argument("--wandb-project", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--start-step", type=int, default=0, help="absolute step offset for a restart (listener swap): dump names, saves and the iterated/cross/eval schedules use start_step + step")
+    p.add_argument("--swap-file", default=None, help="poll this path at every save boundary (default <out>/SWAP_CRITIC): a line '<ckpt path>' (optionally 'name <ckpt>') hot-swaps the live listener to that critic, parks the old one as a frozen cross critic 'prev_<step>', re-fits lambda")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -336,11 +338,28 @@ def main():
         pq.write_table(tbl, os.path.join(dd, f"part_0000000_{len(dres):07d}.parquet"))
         print(f"[dump] {len(dres)} val rollouts -> {dd} ({time.time() - td:.0f}s, {dinfo['tok_per_s']:.0f} tok/s)", flush=True)
         return dd
-    if dump_vp is not None: last_dump_dir = dump_val(0)                       # step-0 dump = the warm start's samples (redteam's Y2 bar)
+    if dump_vp is not None and a.start_step == 0: last_dump_dir = dump_val(0)   # step-0 dump = the warm start's samples (redteam's Y2 bar)
     meta_pos = store.meta["pos_idx"].values; meta_next = store.meta["next_token_id"].values
-    for step in range(a.steps):
+    for step_rel in range(a.steps):
+        step = a.start_step + step_rel
         t0 = time.time(); B, G = a.batch_prompts, a.group
-        for g in optim.param_groups: g["lr"] = lr_at(step, a.lr, a.lr_warmup) * lr_mult
+        # ---- in-process listener hot-swap at a save boundary (DECISIONS v1.21): <out>/SWAP_CRITIC with '<ckpt>' or '<name> <ckpt>'
+        swap_path = a.swap_file or os.path.join(a.out, "SWAP_CRITIC")
+        if step_rel > 0 and step % a.save_every == 0 and os.path.exists(swap_path):
+            try:
+                parts = open(swap_path).read().split(); new_ck = parts[-1]; new_name = parts[0] if len(parts) > 1 else os.path.basename(os.path.dirname(new_ck))
+                from nlt.rl.reward import ExactScorer
+                if cot is not None: torch.save({"model": cot.model.state_dict(), "step": step, "args": cot.sc.aa, "config": cot.model.config(), "d_enc": getattr(cot.model, "d_enc_", 0)}, os.path.join(a.out, f"critic_before_swap_{step:05d}.pt"))
+                old_sc = scorer; _place(old_sc, "cpu"); cross[f"prev_{step}"] = old_sc
+                if cot is not None: del cot.opt
+                torch.cuda.empty_cache()
+                scorer = ExactScorer(new_ck, a.data_dir, device=cdev, ode_steps=a.ode_steps, probes=a.probes, batch=a.score_batch)
+                cot = Listener(scorer, a, store, sampler, paraphraser=para) if cot is not None else None
+                a.critic = new_ck; lam = None if str(a.lam).strip().lower() == "auto" else lam; lam_hist.clear()
+                os.remove(swap_path); print(f"[swap] step {step}: live listener -> {new_name} = {new_ck}; previous listener parked as cross critic 'prev_{step}'; lambda re-fits on the next batch", flush=True)
+            except Exception as e_:
+                print(f"[swap] FAILED ({type(e_).__name__}: {str(e_)[:200]}) -- continuing with the current listener", flush=True)
+        for g in optim.param_groups: g["lr"] = lr_at(step if a.start_step == 0 else step + a.lr_warmup, a.lr, a.lr_warmup) * lr_mult
         stop_path = a.stop_file or os.path.join(a.out, "STOP")
         if os.path.exists(stop_path):
             print(f"[rl] STOP file {stop_path} found -> saving and exiting", flush=True); save_adapter(policy, os.path.join(a.out, f"step_{step:05d}_stopped", "lora")); break
@@ -533,13 +552,13 @@ def main():
             bands = " ".join(f"{b}={log[f'eval/bits_{b}']:+.1f}" for b in ("pre", "workspace", "motor") if f"eval/bits_{b}" in log)
             print(f"   eval: bits {log['eval/bits_mean']:+.3f} (med {log['eval/bits_median']:+.3f}, /tok {log['eval/bits_per_token']:+.3f}; random-pair control {log['eval/bits_rp_mean']:+.3f}{fro}) by band {bands} | tok {log['eval/tokens_mean']:.1f} viol {log['eval/viol_any']:.2f} nonpos {log['eval/frac_nonpos']:.2f}", flush=True)
         if run is not None: run.log({k: v for k, v in log.items() if not isinstance(v, (list, dict))}, step=step)
-        if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
+        if (step + 1) % a.save_every == 0 or step_rel + 1 == a.steps:
             d = os.path.join(a.out, f"step_{step + 1:05d}"); save_adapter(policy, os.path.join(d, "lora"))
             json.dump({"step": step + 1, "prompt": spec.text, "ref_prompt_len": len(ref_ids), "init": a.init}, open(os.path.join(d, "meta.json"), "w"))
             if cot is not None: torch.save({"model": cot.model.state_dict(), "step": step + 1, "args": cot.sc.aa, "config": cot.model.config(), "d_enc": getattr(cot.model, "d_enc_", 0)}, os.path.join(d, "critic.pt"))
             print(f"[save] {d}", flush=True)
             n_save = (step + 1) // a.save_every
-            if dump_vp is not None and (n_save % a.dump_val_every == 0 or step + 1 == a.steps): last_dump_dir = dump_val(step + 1)
+            if dump_vp is not None and (n_save % a.dump_val_every == 0 or step_rel + 1 == a.steps): last_dump_dir = dump_val(step + 1)
     if run is not None: run.finish()
     print("done.", flush=True)
 
