@@ -34,7 +34,7 @@ def main():
         ax.grid(True, axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s in ("top", "right"): ax.spines[s].set_visible(False)
     fig.text(0.01, 0.005, "Sonnet-5 sees ONE sentence and no activations or passage; 512 fixed-eval pairs per source; accuracy on parsed answers. Teacher rows partly read back what the teacher was shown; V0 and lens rows are uncontaminated.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
-    fig.suptitle("A verbalizer trained on activations alone writes sentences from which a reader recovers the model's next token and document position far above chance;\nthe plain-PMI RL arm loses that reader-usable content as it collapses onto fewer phrasings (steps 20, 40)", fontsize=12.5, x=0.01, ha="left")
+    fig.suptitle("A verbalizer trained on activations alone writes sentences from which a reader recovers the model's next token and document position far above chance;\nthe plain-PMI RL arm loses that content as it collapses onto fewer phrasings (steps 20, 40), and the list-naming warm start keeps the next token but loses the position", fontsize=12.5, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0.035, 1, 0.965)); os.makedirs(a.out_dir, exist_ok=True)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.out_dir, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"sources": [{"key": k, "label": l.replace("\n", " ")} | {t: d[k].get(t) for t, _, _ in TASKS} | {"claim": d[k].get("claim"), "fluency": d[k].get("fluency"), "mag_rho": d[k].get("mag_rho")} for k, l, _ in srcs],
