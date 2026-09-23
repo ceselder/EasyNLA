@@ -22,7 +22,7 @@ def load_critic(path, dev, d_enc_override=None):
     ck = torch.load(path, map_location="cpu"); cfg = ck["config"]; d_enc = ck.get("d_enc", 0) or d_enc_override or 0
     aa = ck["args"]
     m = PairDenoiser(cfg["d"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"], cfg["cond"], d_enc=d_enc, n_slots=aa.get("n_slots", 8), n_heads=aa.get("n_heads", 4), d_head=aa.get("d_head", 64), gate_rank=aa.get("gate_rank", 128), target=cfg["target"],
-                     proj_k=aa.get("proj_k", 32), proj_sigma=aa.get("proj_sigma", 0.1), cond_path=aa.get("cond_path", "gate"))
+                     proj_k=aa.get("proj_k", 32), proj_sigma=aa.get("proj_sigma", 0.1), cond_path=aa.get("cond_path", "gate"), text_in_proj=aa.get("text_in_proj", 0))
     m.load_state_dict(ck["model"]); m.to(dev).eval().requires_grad_(False)
     return m, aa, ck.get("step")
 

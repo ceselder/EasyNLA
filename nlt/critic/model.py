@@ -19,11 +19,15 @@ from nlt.data.extract import K_LO, N_LAYERS
 
 class PairDenoiser(nn.Module):
     def __init__(self, d: int = 4096, d_model: int = 2048, d_mlp: int = 8192, n_layers: int = 8, cond: str = "none", d_enc: int = 0,
-                 n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, target: str = "hj", vec_k: int = 20, vec_vocab: int = 151936, proj_k: int = 32, proj_sigma: float = 0.1, cond_path: str = "gate"):
+                 n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, target: str = "hj", vec_k: int = 20, vec_vocab: int = 151936, proj_k: int = 32, proj_sigma: float = 0.1, cond_path: str = "gate", text_in_proj: int = 0):
         super().__init__()
         assert cond in ("none", "depth", "text", "vec", "proj")
         self.d, self.d_model, self.d_mlp, self.n_layers, self.cond, self.target, self.cond_path = d, d_model, d_mlp, n_layers, cond, target, cond_path
         self.in_proj = nn.Linear(2 * d, d_model)
+        self.text_in_proj = text_in_proj                                     # text mode: a pooled cross-read (n_heads*d_head*text_in_proj slots) of the text, projected and ADDED to the in_proj output (zero-init)
+        if cond == "text" and text_in_proj > 0:
+            from nla.flow.cond_model import CrossRead
+            self.text_read0 = CrossRead(d_model, d_enc, text_in_proj, n_heads, d_head)      # queries from the in_proj output; out is zero-init inside CrossRead
         self.time_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
         self.src_embed = nn.Sequential(nn.Linear(d + 1, d_model), nn.SiLU(), nn.Linear(d_model, d_model))   # [h_i, log rms(h_i)]: the source scale is a function of h_i (allowed)
         if cond == "depth":
@@ -51,7 +55,7 @@ class PairDenoiser(nn.Module):
         self.ln = nn.LayerNorm(d_model); self.out_proj = nn.Linear(d_model, d)
 
     def config(self):
-        return {k: getattr(self, k) for k in ("d", "d_model", "d_mlp", "n_layers", "cond", "target")} | {"d_enc": getattr(self, "d_enc_", 0), "src_rms": getattr(self, "src_rms_", False), "squash": getattr(self, "squash_", 0.0), "cond_path": getattr(self, "cond_path", "gate")}
+        return {k: getattr(self, k) for k in ("d", "d_model", "d_mlp", "n_layers", "cond", "target")} | {"d_enc": getattr(self, "d_enc_", 0), "src_rms": getattr(self, "src_rms_", False), "squash": getattr(self, "squash_", 0.0), "cond_path": getattr(self, "cond_path", "gate"), "text_in_proj": getattr(self, "text_in_proj", 0)}
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -83,6 +87,8 @@ class PairDenoiser(nn.Module):
             if vec_has is not None: ve = ve * vec_has[:, None].to(ve.dtype)
             emb = emb + ve
         h = self.in_proj(torch.cat([x_t, h_i], -1))
+        if self.cond == "text" and self.text_in_proj > 0 and enc is not None:
+            h = h + self.text_read0(h, enc, enc_mask)                        # direct additive text path at the input (rows with all-False mask get 0)
         if self.cond == "text":
             for blk in self.blocks: h = blk(h, emb, enc, enc_mask)
         elif self.cond in ("vec", "proj") and self.cond_path == "block" and c_feat is not None:
