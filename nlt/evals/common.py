@@ -35,6 +35,13 @@ def decode(ids) -> str:
 
 
 def load_table(path: str) -> pd.DataFrame:
+    """one file, a comma list, or a glob (e.g. '/vol/z/teacher-sonnet-v1/val/part_*.parquet') -> one DataFrame"""
+    import glob as _glob
+    if "," in path or any(ch in path for ch in "*?["):
+        files = []
+        for p in path.split(","): files += sorted(_glob.glob(p)) if any(ch in p for ch in "*?[") else [p]
+        assert files, f"no files match {path}"
+        return pd.concat([load_table(f) for f in files], ignore_index=True)
     if path.endswith(".parquet"): return pd.read_parquet(path)
     if path.endswith(".jsonl"):
         return pd.DataFrame([json.loads(l) for l in open(path) if l.strip()])

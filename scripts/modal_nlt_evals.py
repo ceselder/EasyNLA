@@ -56,7 +56,7 @@ def text(extra: str = "", data: str = DATA):
     import glob
     meta = sorted(glob.glob(f"{data}/val/meta_*.parquet")); docs = sorted(glob.glob(f"{data}/val/docs_*.parquet"))
     cmd = [sys.executable, "-m", "nlt.evals.run_text_evals", "--pairs", f"{data}/pairs_val.parquet"] + extra.split()
-    if meta and docs and "--meta" not in extra: cmd += ["--meta", meta[0], "--docs", docs[0]]       # TODO multi-shard: concatenate
+    if meta and docs and "--meta" not in extra: cmd += ["--meta", f"{data}/val/meta_*.parquet", "--docs", f"{data}/val/docs_*.parquet"]   # load_table takes globs
     return _run(cmd)
 
 
@@ -65,7 +65,7 @@ def build_manifest(extra: str = "", data: str = DATA):
     import glob
     meta = sorted(glob.glob(f"{data}/val/meta_*.parquet")); docs = sorted(glob.glob(f"{data}/val/docs_*.parquet"))
     cmd = [sys.executable, "-m", "nlt.evals.controls", "--pairs", f"{data}/pairs_val.parquet"] + extra.split()
-    if meta and docs and "--meta" not in extra: cmd += ["--meta", meta[0], "--docs", docs[0]]
+    if meta and docs and "--meta" not in extra: cmd += ["--meta", f"{data}/val/meta_*.parquet", "--docs", f"{data}/val/docs_*.parquet"]
     return _run(cmd)
 
 

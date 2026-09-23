@@ -99,6 +99,17 @@ if __name__ == "__main__":
     from nlt.evals.common import load_table, save_table, PrefixStore
     ap = argparse.ArgumentParser(); ap.add_argument("--pairs", required=True); ap.add_argument("--z", required=True); ap.add_argument("--meta"); ap.add_argument("--docs")
     ap.add_argument("--out", required=True); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--copy-n", type=int, default=32); ap.add_argument("--src-desc")
+    ap.add_argument("--text-col"); ap.add_argument("--source"); ap.add_argument("--verbosity", type=int); ap.add_argument("--sample-idx", type=int, default=None); ap.add_argument("--max-pairs", type=int, default=0)
     a = ap.parse_args(); ps = PrefixStore.from_infra(load_table(a.meta), load_table(a.docs)) if (a.meta and a.docs) else None
-    m = build_manifest(load_table(a.pairs), load_table(a.z), ps, a.seed, a.copy_n, src_desc=load_table(a.src_desc) if a.src_desc else None); save_table(m, a.out)
+    def prep(tab):
+        from nlt.evals.run_text_evals import pick_text_col
+        tab = pick_text_col(tab, a.text_col)
+        if a.source and "source" in tab.columns: tab = tab[tab["source"] == a.source]
+        if a.verbosity is not None and "verbosity" in tab.columns: tab = tab[tab["verbosity"] == a.verbosity]
+        if a.sample_idx is not None and "sample_idx" in tab.columns: tab = tab[tab["sample_idx"] == a.sample_idx]
+        tab = tab[tab["text"].fillna("").astype(str).str.strip().str.len() > 0]
+        return tab.drop_duplicates("pair_id")            # one text per pair
+    z = prep(load_table(a.z)); pairs = load_table(a.pairs)
+    if a.max_pairs: pairs = pairs[pairs["pair_id"].astype(str).isin(set(z["pair_id"].astype(str)))].iloc[: a.max_pairs]
+    m = build_manifest(pairs, z, ps, a.seed, a.copy_n, src_desc=prep(load_table(a.src_desc)) if a.src_desc else None); save_table(m, a.out)
     print(m.variant.value_counts().to_dict(), "->", a.out)
