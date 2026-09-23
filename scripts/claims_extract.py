@@ -55,7 +55,14 @@ def _gen_source(src, n, rng, sl=(0, 1)):
     si, sk = sl
     if src == "ffw":
         from huggingface_hub import HfApi
-        files = [f for f in HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files("m-a-p/FineFineWeb", repo_type="dataset") if f.endswith(".jsonl")]
+        cache = f"{ROOT}/ffw_files.json"; files = json.load(open(cache)) if os.path.exists(cache) else None   # one listing for all workers (HF 429s on 66 parallel listings)
+        for att in range(8):
+            if files: break
+            try: files = [f for f in HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files("m-a-p/FineFineWeb", repo_type="dataset") if f.endswith(".jsonl")]
+            except Exception as e: print(f"[docs ffw] listing failed ({str(e)[:80]}), retry {att + 1}", flush=True); time.sleep(30 * (att + 1) + rng.random() * 30)
+        if files and not os.path.exists(cache):
+            try: json.dump(files, open(cache, "w"))
+            except Exception: pass
         per = {d: sorted(f for f in files if f.startswith(d + "/")) for d in FFW_DOMAINS}
         k = max(1, math.ceil(n / len(FFW_DOMAINS)))
         for d in FFW_DOMAINS[si::sk]:

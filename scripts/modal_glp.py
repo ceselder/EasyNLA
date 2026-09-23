@@ -345,7 +345,9 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
     elif task == "claims_docs":   # one CPU container per source, in parallel; --n-docs = total docs over the mix
         K = {"ffw": 22, "code": 3, "chat": 4, "math": 3, "fiction": 6, "multi": 8} if n_docs >= 50000 else {}   # parallel slices per source at scale
         if n_docs >= 1000000: K = {"ffw": 66, "code": 8, "chat": 8, "math": 8, "fiction": 12, "multi": 24}
-        calls = [claims_docs.spawn(s_, n_docs, root, tag or "v1", f"{i}/{K.get(s_, 1)}", extra) for s_ in ("ffw", "code", "chat", "math", "fiction", "multi") for i in range(K.get(s_, 1))]   # = claims_extract.SOURCES
+        todo = [(s_, i) for s_ in ("ffw", "code", "chat", "math", "fiction", "multi") for i in range(K.get(s_, 1))]   # = claims_extract.SOURCES
+        if sets: todo = [(x.split(":")[0], int(x.split(":")[1])) for x in sets.split(",")]          # --sets "ffw:3,ffw:17": re-run only these slices
+        calls = [claims_docs.spawn(s_, n_docs, root, tag or "v1", f"{i}/{K.get(s_, 1)}", extra) for s_, i in todo]
         print("rc", [c.get() for c in calls])
     elif task == "claims_anchors":   # all shards in parallel, one B200 each
         calls = [claims_anchors.spawn(root, i, nshards, tag or "v1", extra) for i in range(nshards)]
@@ -353,6 +355,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
     elif task == "claims_anchors_v2":   # one call per shard, queued; Modal runs <= 14 at a time; returns when all are done
         calls = [claims_anchors_v2.spawn(root, i, nshards, tag or "v2", extra) for i in range(nshards)]
         print("rc", [c.get() for c in calls])
+    elif task == "claims_finalize_shard":   # CPU finalize of one streaming shard (--tag = shard name, e.g. v2_017)
+        print("rc", claims_text.remote(root, 0, 1, "--names __none__", tag))
     elif task == "claims_text":
         calls = [claims_text.spawn(root, i, nshards, extra) for i in range(nshards)]
         print("rc", [c.get() for c in calls])
