@@ -61,7 +61,14 @@ class CriticCotrainer:
     def __init__(self, scorer, lr, p_uncond, replay_paths, data_dir, store):
         from nlt.critic.train import load_text_pairs
         self.sc = scorer.inner; self.model = self.sc.model; self.enc = self.sc.encoder; self.p_uncond = p_uncond; self.store = store
-        self.model.requires_grad_(True); self.opt = torch.optim.AdamW([p for p in self.model.parameters()], lr=lr, weight_decay=0.0)
+        # train ONLY the conditioning (text adapter) parameters, exactly infra's --freeze-prior selection: the unconditional path stays the
+        # blind prior, so the bits baseline log p(h_j|h_i) never drifts under co-training (DECISIONS D3).
+        self.cond_names = {n for n, _ in self.model.named_parameters() if (".read." in n or ".gate_mod." in n)}
+        assert self.cond_names, "text critic has no adapter parameters (.read./.gate_mod.) to co-train"
+        self.params = [p for n, p in self.model.named_parameters() if n in self.cond_names]
+        self.model.requires_grad_(False)
+        self.opt = torch.optim.AdamW(self.params, lr=lr, betas=(0.9, 0.95), weight_decay=0.0)
+        print(f"[cotrain] {sum(p.numel() for p in self.params)/1e6:.1f}M adapter params trainable, prior frozen", flush=True)
         self.replay = None
         if replay_paths:
             df = load_text_pairs(replay_paths.split(","), os.path.join(data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of)]
@@ -75,13 +82,14 @@ class CriticCotrainer:
             h_i = torch.cat([h_i, self.store.gather(rows, torch.as_tensor(sub["i"].values).long()).float()]); h_j = torch.cat([h_j, self.store.gather(rows, torch.as_tensor(sub["j"].values).long()).float()])
             texts = list(texts) + sub["text"].tolist()
         dev = self.sc.dev; self.model.train()
+        for p in self.params: p.requires_grad_(True)
         hi, x0, log_s, _ = make_x0(self.sc.norm, h_i.to(dev), h_j.to(dev), self.sc.target, self.sc.src_rms)
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = self.enc(texts)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, _, _ = pair_fm_loss(self.model, x0, hi, enc=enc, enc_mask=mask, p_uncond=self.p_uncond, log_s=log_s)
-        loss = loss.mean(); self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0); self.opt.step()
+        loss = loss.mean(); self.opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.params, 1.0); self.opt.step()
         self.model.eval(); self.model.requires_grad_(False)
-        return float(loss)
+        return float(loss.detach())
 
     def prepare_score(self):
         self.model.requires_grad_(False)
