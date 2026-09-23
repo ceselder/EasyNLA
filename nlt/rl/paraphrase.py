@@ -16,7 +16,13 @@ class Paraphraser:
         from nlt.verbalizer.vllm_rollout import make_engine
         self.model_id, self.temperature, self.max_tokens = model_id, temperature, max_tokens
         self.tok = AutoTokenizer.from_pretrained(model_id)
-        self.llm = make_engine(model_id, gpu_mem=gpu_mem, max_len=max_len, gpu_index=gpu_index, seed=seed)
+        try:
+            self.llm = make_engine(model_id, gpu_mem=gpu_mem, max_len=max_len, gpu_index=gpu_index, seed=seed)
+        except Exception as e:                       # an 8B paraphraser needs ~15 GB of weights: on an 80 GB GPU 0.22 leaves no KV cache
+            if "memory" not in str(e).lower() and "cache blocks" not in str(e).lower(): raise
+            g2 = min(0.9, gpu_mem + 0.12)
+            print(f"[paraphrase] engine failed at gpu_mem {gpu_mem} ({str(e)[:80]}); retrying at {g2:.2f}", flush=True)
+            self.llm = make_engine(model_id, gpu_mem=g2, max_len=max_len, gpu_index=gpu_index, seed=seed)
 
     def __call__(self, texts, seed: int | None = None):
         from nlt.verbalizer.vllm_rollout import chat_generate
