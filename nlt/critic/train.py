@@ -121,12 +121,13 @@ def main():
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=128)
     p.add_argument("--wandb", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
+    p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
     p.add_argument("--init-from", default=None, help="checkpoint of a trained BLIND prior (cond none): its weights are loaded into this model (text/depth extras stay zero/fresh, so at step 0 the conditional path IS the prior)")
     p.add_argument("--freeze-prior", type=int, default=0, help="1 = train only the conditioning modules (cross-reads, gate_mod, depth embeddings); the unconditional path stays exactly the loaded prior")
     a = p.parse_args()
     torch.manual_seed(a.seed); np.random.seed(a.seed); dev = "cuda"; torch.backends.cuda.matmul.allow_tf32 = True
     os.makedirs(a.out, exist_ok=True); t_start = time.time()
-    norm = GlobalNorm.load(os.path.join(a.data_dir, "stats.pt"), a.norm).to(dev)
+    norm = GlobalNorm.load(a.stats or os.path.join(a.data_dir, "stats.pt"), a.norm).to(dev)
     store = ActStore(a.data_dir, "train", device=a.data_device, max_pos=a.max_train_pos)
     store_val = ActStore(a.data_dir, "val", device=a.data_device)
     d = store.d
