@@ -25,7 +25,7 @@ def main():
     bottom = np.zeros(len(srcs))
     for f in fams:
         v = np.array([s["claims_per_anchor_by_source_family"][x].get(f, 0) for x in srcs]); ax[0, 0].bar(srcs, v, bottom=bottom, color=FAM_C[f], label=FAM_L[f]); bottom += v
-    ax[0, 0].set_ylabel("claims per anchor"); ax[0, 0].set_title("(a) every source gets all three claim families", fontsize=11)
+    ax[0, 0].set_ylim(0, bottom.max() * 1.45); ax[0, 0].set_ylabel("claims per anchor"); ax[0, 0].set_title("(a) every source gets all three claim families", fontsize=11)
     ax[0, 0].set_xticks(range(len(srcs))); ax[0, 0].set_xticklabels([f"{x}\n({s['anchors_per_source'][x]:,} anchors)" for x in srcs], fontsize=8); ax[0, 0].legend(fontsize=8)
     # (b)
     top = list(s["claims_per_type"].items())[:20]
