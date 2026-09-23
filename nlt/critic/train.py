@@ -180,6 +180,7 @@ def main():
     p.add_argument("--contrast", type=float, default=0.0, help="DECISIONS v1.10 T4: weight of the contrastive hinge softplus((L(z) - L(z_dm) + margin)/tau) with z_dm = a depth-matched WRONG text (another row of the batch with the same j, same (i,j) when available), at the SAME (x_t, t, eps)")
     p.add_argument("--contrast-tau", type=float, default=0.005, help="logistic temperature in per-dim FM-loss units (0.005 ~ 10 nats)"); p.add_argument("--contrast-margin", type=float, default=0.005)
     p.add_argument("--neg-text-parquet", default="", help="v1.16 (2) 'and twins': globs of [pair_id, text] rows that are KNOWN-WRONG texts for their pair (content twins); with --null-dm a row whose pair has a twin uses the twin as its z_dm negative (pulled to the unconditional velocity) instead of the batch permutation")
+    p.add_argument("--neg-weight", type=float, default=1.0, help="redteam #329: weight of the TWIN branch of the null-dm term relative to the permutation branch (twins share topic/register/direction with the true text, so pin them only partially: 0.3-0.5)")
     p.add_argument("--null-dm", type=int, default=0, help="lens #264: null regulariser pairs each row with a DEPTH-MATCHED wrong text (same (i,j)/same j, the T4 permutation) instead of the batch roll, so p(h_j | z_dm) is pulled to p(h_j | empty) rather than pushed away")
     p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
     p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
@@ -365,7 +366,9 @@ def main():
                     v_dm = model(x_tp, t_b, h_i, enc=enc_neg, enc_mask=mask_neg, log_s=log_s)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     with torch.no_grad(): v_null_p = model(x_tp, t_b, h_i, enc=enc_neg, enc_mask=torch.zeros_like(mask_neg), log_s=log_s)
-                null_dm_loss = ((v_dm - v_null_p.detach()) ** 2).mean()
+                row_w = torch.ones(x0.shape[0], device=dev)
+                if neg_texts is not None: row_w = torch.where(has_tw, torch.full_like(row_w, a.neg_weight), row_w)      # twins pinned only partially (#329)
+                null_dm_loss = (((v_dm - v_null_p.detach()) ** 2).mean(-1) * row_w).mean()
                 null_loss = 0.5 * (null_loss + null_dm_loss)
             loss = loss + a.null_reg * null_loss
         opt.zero_grad(set_to_none=True); loss.backward()
