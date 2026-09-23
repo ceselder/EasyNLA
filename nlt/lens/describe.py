@@ -40,12 +40,18 @@ WORD_RE = re.compile(r"^[A-Za-z][A-Za-z'\-]*$")
 NUM_RE = re.compile(r"^\d{1,4}$")
 
 
-def build_vocab_view(tok):
-    """Per-token display strings and a readability mask over the whole vocabulary."""
-    V = len(tok)
+def build_vocab_view(tok, V: int | None = None):
+    """Per-token display strings and a readability mask over the whole (padded) vocabulary of size V."""
+    n_tok = len(tok)
+    V = V or n_tok
     display, readable, lower = [], torch.zeros(V, dtype=torch.bool), []
     for t in range(V):
-        s = tok.decode([t])
+        if t >= n_tok:                      # padding rows of the unembedding
+            display.append(""); lower.append(""); continue
+        try:
+            s = tok.decode([t])
+        except Exception:
+            s = ""
         core = s.strip()
         ok = False
         if core in SPECIAL_NAMES and s == core or s in SPECIAL_NAMES:
@@ -86,7 +92,8 @@ class PairFeatures:
 class LensDiffDescriber:
     def __init__(self, tok, bank, seed: int = 0, k_list: int = 20, pool: int = 300, k_top: int = 10):
         self.tok, self.bank = tok, bank
-        self.display, self.readable, self.lower = build_vocab_view(tok)
+        self.V = int(bank.W_U.shape[0])
+        self.display, self.readable, self.lower = build_vocab_view(tok, self.V)
         self.readable_dev = None
         self.k_list, self.pool, self.k_top = k_list, pool, k_top
         self.rng = random.Random(seed)
@@ -101,7 +108,7 @@ class LensDiffDescriber:
             self.readable_dev = self.readable.to(dev)
         i_t = torch.full((B,), int(i), device=dev) if isinstance(i, int) else torch.as_tensor(i, device=dev)
         j_t = torch.full((B,), int(j), device=dev) if isinstance(j, int) else torch.as_tensor(j, device=dev)
-        lp_i = torch.empty(B, len(self.display), device=dev); lp_j = torch.empty_like(lp_i)
+        lp_i = torch.empty(B, self.V, device=dev); lp_j = torch.empty_like(lp_i)
         for k in i_t.unique().tolist():
             m = i_t == k; lp_i[m] = self.bank.log_probs(h_i[m], k)
         for k in j_t.unique().tolist():
