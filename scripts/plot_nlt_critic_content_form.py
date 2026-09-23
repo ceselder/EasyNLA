@@ -38,9 +38,9 @@ rows = {(c, s): load(c, s) for c, _, _ in CRITICS for s, _ in SOURCES}
 srcs = [(s, lab) for s, lab in SOURCES if any(rows[(c, s)] for c, _, _ in CRITICS)]
 x = np.arange(len(srcs)); w = 0.2
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 13})
-fig, axes = plt.subplots(1, 2, figsize=(12, 5.6))
+fig, axes = plt.subplots(1, 2, figsize=(13, 6.0))
 fig.suptitle("The wider adapter reads more content from lens sentences, but from the verbalizer's text mostly more form\n"
-             "(exact ODE, ~1000 held-out pairs per source; content = bits(z) - bits(depth-matched z), form = bits(depth-matched z) - bits(shuffled words))", fontsize=12.5)
+             "(exact ODE, ~1000 held-out pairs per source; content = bits(z) - bits(depth-matched z); form = bits(depth-matched z) - bits(shuffled words))", fontsize=12)
 
 ax = axes[0]
 for k, (c, clab, col) in enumerate(CRITICS):
@@ -50,10 +50,10 @@ for k, (c, clab, col) in enumerate(CRITICS):
     for xi, y, p in zip(x + (k - 0.5) * w * 1.1, ys, ps):
         if np.isfinite(y):
             ax.text(xi, y + 0.12, f"{y:.1f}\nP {p:.2f}", ha="center", fontsize=8.5)
-ax.axhline(5, color="grey", lw=0.9, ls=":"); ax.text(len(srcs) - 0.55, 5.1, "A1 line (5 bits)", fontsize=9, color="grey", ha="right")
+ax.axhline(5, color="grey", lw=0.9, ls=":"); ax.text(-0.45, 5.12, "A1 line (5 bits)", fontsize=9, color="grey", ha="left")
 ax.set_xticks(x); ax.set_xticklabels([lab for _, lab in srcs], fontsize=9.5)
 ax.set_ylabel("content bits per text (z - depth-matched z)")
-ax.set_title("(a) Content: lens sentences clear 5 bits only on the wider adapter")
+ax.set_title("(a) Content: lens sentences clear 5 bits\nonly on the wider adapter")
 ax.legend(fontsize=9, loc="upper left")
 ax.set_ylim(0, max(7.5, np.nanmax([rows[k_]["content"] for k_ in rows if rows[k_]]) * 1.35))
 
@@ -66,8 +66,8 @@ for k, (c, clab, col) in enumerate(CRITICS):
             ax.text(xi, y + 0.15, f"{y:.1f}", ha="center", fontsize=9)
 ax.set_xticks(x); ax.set_xticklabels([lab for _, lab in srcs], fontsize=9.5)
 ax.set_ylabel("form bits per text (depth-matched z - shuffled words)")
-ax.set_title("(b) Form: the verbalizer's register earns the most")
+ax.set_title("(b) Form: the verbalizer's register\nearns the most")
 ax.legend(fontsize=9, loc="upper right")
-fig.tight_layout(rect=(0, 0, 1, 0.9))
+fig.tight_layout(rect=(0, 0, 1, 0.9)); fig.subplots_adjust(wspace=0.3)
 fig.savefig(a.out + ".png", dpi=150); fig.savefig(a.out + ".pdf")
 print("wrote", a.out + ".png/.pdf", {f"{c}/{s}": (round(v["content"], 2), round(v["form"], 2)) for (c, s), v in rows.items() if v})
