@@ -29,6 +29,11 @@ def parse():
     p.add_argument("--lam-len-drop", type=float, default=0.08); p.add_argument("--lam-content-gain", type=float, default=0.2); p.add_argument("--lam-min", type=float, default=0.0025)
     p.add_argument("--cross-critics", default=None, help="comma list name:ckpt of extra critics that re-score a subsample of the step's rollouts every --cross-every steps (private-code / critic-hacking check; DECISIONS v1.6); 'frozen' = a frozen copy of the starting critic is always included when --frozen-critic-eval")
     p.add_argument("--cross-every", type=int, default=20); p.add_argument("--cross-n", type=int, default=256)
+    # DECISIONS v1.17 automatic brakes + external stop
+    p.add_argument("--brakes", action=argparse.BooleanOptionalAction, default=True, help="self-BLEU > --brake-selfbleu or entropy < --brake-entropy-frac x its step-0 value -> KL beta x2 and policy lr x0.5 (cooldown --brake-cooldown steps; beta <= 0.32, lr >= 1/8)")
+    p.add_argument("--brake-selfbleu", type=float, default=0.5); p.add_argument("--brake-entropy-frac", type=float, default=0.8); p.add_argument("--brake-cooldown", type=int, default=10)
+    p.add_argument("--stop-file", default=None, help="poll this path every step (default <out>/STOP); if it exists: save and exit. redteam / orchestrator can create it")
+    p.add_argument("--reader-stop-pts", type=float, default=10.0, help="stop if <dump dir>/reader_verdict.json (written by redteam's watcher) reports next_token_acc_delta_pts < -this")
     p.add_argument("--copy-thresh", type=float, default=0.05); p.add_argument("--adv-std", action="store_true", help="divide advantages by the group std (default Dr.GRPO: no)")
     p.add_argument("--adv-mode", choices=["group", "batch"], default="group", help="group (DECISIONS v1.4) | batch = centre per group, one batch-level std (ScaleRL)"); p.add_argument("--zero-var-filter", action="store_true")
     p.add_argument("--adv-std-floor", type=float, default=1.0, help="with --adv-std: divide by max(group std, floor) [reward units ~ bits]; set near the scoring noise")
@@ -289,11 +294,14 @@ def main():
     from nlt.evals.diversity import distinct_n, self_bleu
     lam = None if str(a.lam).strip().lower() == "auto" else float(a.lam)
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"rl_{a.tag}", group="rl", config=vars(a))
-    gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id; lam_hist = []
+    gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id; lam_hist = []; lr_mult = 1.0; ent0 = None; last_brake = -10**9; brakes_n = 0; last_dump_dir = None
     meta_pos = store.meta["pos_idx"].values; meta_next = store.meta["next_token_id"].values
     for step in range(a.steps):
         t0 = time.time(); B, G = a.batch_prompts, a.group
-        for g in optim.param_groups: g["lr"] = lr_at(step, a.lr, a.lr_warmup)
+        for g in optim.param_groups: g["lr"] = lr_at(step, a.lr, a.lr_warmup) * lr_mult
+        stop_path = a.stop_file or os.path.join(a.out, "STOP")
+        if os.path.exists(stop_path):
+            print(f"[rl] STOP file {stop_path} found -> saving and exiting", flush=True); save_adapter(policy, os.path.join(a.out, f"step_{step:05d}_stopped", "lora")); break
         if a.referential:
             rows, I, J, cls = sampler.sample(gen); B = P = len(rows)
             types = [t.strip() for t in a.dist_types.split(",") if t.strip()][: a.n_dist]; types += ["crossdoc"] * (a.n_dist - len(types))
@@ -407,6 +415,23 @@ def main():
         try:                                                # template drift (EVALS 7e): distinct-4-gram ratio and self-BLEU over this step's rollouts
             log["div/distinct4"] = float(distinct_n(resp_ids, 4)); log["div/self_bleu"] = float(self_bleu(resp_ids, n_sample=64, seed=step))
         except Exception as e_: log["div/error"] = str(e_)[:80]
+        # DECISIONS v1.17 automatic brakes: diversity collapse or entropy loss -> more KL, less lr (logged)
+        if ent0 is None and np.isfinite(um["entropy"]) and um["entropy"] > 0: ent0 = um["entropy"]
+        brake_now = a.brakes and step - last_brake >= a.brake_cooldown and ((log.get("div/self_bleu", 0.0) > a.brake_selfbleu) or (ent0 is not None and um["entropy"] < a.brake_entropy_frac * ent0))
+        if brake_now and (a.kl_beta < 0.32 or lr_mult > 1 / 8):
+            a.kl_beta = min(0.32, a.kl_beta * 2); lr_mult = max(1 / 8, lr_mult * 0.5); last_brake = step; brakes_n += 1
+            print(f"   [brake] self-BLEU {log.get('div/self_bleu', float('nan')):.2f} entropy {um['entropy']:.2f} (start {ent0:.2f}) -> kl_beta {a.kl_beta:.3f}, lr x{lr_mult:.3f}", flush=True)
+        log.update({"brake/kl_beta": a.kl_beta, "brake/lr_mult": lr_mult, "brake/n": brakes_n, "brake/entropy_start": ent0 if ent0 is not None else float("nan")})
+        # external reader verdict on the latest dump (redteam's watcher writes <dump dir>/reader_verdict.json with next_token_acc_delta_pts)
+        if last_dump_dir is not None:
+            rv = os.path.join(last_dump_dir, "reader_verdict.json")
+            if os.path.exists(rv):
+                try:
+                    d_ = json.load(open(rv)); delta = float(d_.get("next_token_acc_delta_pts", 0.0)); log["reader/next_token_delta_pts"] = delta
+                    if delta < -a.reader_stop_pts:
+                        print(f"[rl] reader verdict {rv}: next-token accuracy {delta:+.1f} pts vs warm start (< -{a.reader_stop_pts}) -> STOP (v1.17)", flush=True)
+                        save_adapter(policy, os.path.join(a.out, f"step_{step:05d}_reader_stop", "lora")); break
+                except Exception as e_: log["reader/error"] = str(e_)[:80]
         if cross and step % a.cross_every == 0:             # DECISIONS v1.6: re-score a subsample of THIS step's rollouts under the frozen start critic + the teacher-only critic
             tc = time.time(); sub = list(range(min(a.cross_n, n))); sg = groups[sub]; live_b = bits[sub]; sub_txt = [scored[k] if not viol["empty"][k] else None for k in sub]
             for cname, csc in cross.items():
@@ -448,7 +473,8 @@ def main():
                 fb = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
                 fb_rp = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in rp_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
                 fro_content = float((fb - fb_rp).mean())
-                log.update({"eval/bits_frozen_mean": float(fb.mean()), "eval/bits_frozen_rp_mean": float(fb_rp.mean()), "eval/frozen_content": fro_content, "eval/bits_live_minus_frozen": float((eb - fb).mean())})
+                log.update({"eval/bits_frozen_mean": float(fb.mean()), "eval/bits_frozen_rp_mean": float(fb_rp.mean()), "eval/frozen_content": fro_content, "eval/bits_live_minus_frozen": float((eb - fb).mean()),
+                            "gate/Y1_frozen_content_pos": float(fro_content > 0), "gate/Y4_diversity": float(log.get("div/distinct4", 1.0) >= 0.4 and log.get("div/self_bleu", 0.0) <= 0.6)})
                 for bname in ("pre", "workspace", "motor"):
                     m = torch.tensor([band(int(j_)) == bname for j_ in ev_j.tolist()])
                     if m.any(): log[f"eval/frozen_content_{bname}"] = float((fb[m] - fb_rp[m]).mean())
@@ -475,7 +501,7 @@ def main():
                 src = f"{a.tag}_{step + 1}"; dd = os.path.join(a.dump_root, src, "val"); os.makedirs(dd, exist_ok=True)
                 tbl = pa.table({"pair_id": [dump_vp["pair_id"][r["prompt_idx"]] for r in dres], "text": [r["text"].strip() for r in dres], "n_tokens": pa.array([int(r["n_resp"]) for r in dres], pa.int32()),
                                 "verbosity": pa.array([1] * len(dres), pa.int32()), "source": [src] * len(dres), "sample_idx": pa.array([0] * len(dres), pa.int32())})
-                pq.write_table(tbl, os.path.join(dd, f"part_0000000_{len(dres):07d}.parquet"))
+                pq.write_table(tbl, os.path.join(dd, f"part_0000000_{len(dres):07d}.parquet")); last_dump_dir = dd
                 print(f"[dump] {len(dres)} val rollouts -> {dd} ({time.time() - td:.0f}s, {dinfo['tok_per_s']:.0f} tok/s)", flush=True)
     if run is not None: run.finish()
     print("done.", flush=True)
