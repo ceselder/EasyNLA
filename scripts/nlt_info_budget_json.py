@@ -30,6 +30,10 @@ def space_of(v):
     return "pooled+squash" if (v.get("squash") or 0) > 0 else "pooled"
 
 
+# (short name in the bits file, ckpt dir, ODE steps) -> the merge key it should carry (reporter #262: the pooled Heun-64 mask-next table re-used 'union_null')
+RENAME = {("union_null", "text_union_pooled_n", 64): "union_pooled_null_h64"}
+
+
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--results", default=os.path.expanduser("~/nlt-results/results")); p.add_argument("--out", default=os.path.expanduser("~/shared/reports/natural-language-transcoder/data/info_budget.json"))
     a = p.parse_args()
@@ -52,6 +56,12 @@ def main():
                                               "vs_mix_bits": (v.get("exact_pmi_vs_mix_bits") or {}).get("mean"), "mix_ckpt": mix}
             elif v.get("cond") in ("text", "vec", "proj"):
                 crit, sep, label = name.partition("@"); label = label or v.get("cond")
+                # reporter #262: a merge key must name ONE (ckpt, ODE-steps) critic; when a bits file re-uses a short name for a different
+                # checkpoint or a different Heun step count, key it by '<name>[<ckpt dir>@h<steps>]' instead of overwriting/mixing sets
+                crit = RENAME.get((crit, os.path.basename(os.path.dirname(v.get("ckpt") or "")), J.get("ode_steps")), crit)
+                prev = out["text"].get(crit)
+                if prev is not None and ((prev.get("ckpt") or "") != (v.get("ckpt") or "") or prev.get("ode_steps") != J.get("ode_steps")):
+                    crit = f"{crit}[{os.path.basename(os.path.dirname(v.get('ckpt') or ''))}@h{J.get('ode_steps')}]"
                 c = out["text"].setdefault(crit, meta | {"cond": v.get("cond"), "sets": {}, "mix_ckpt": mix})
                 bands = {}
                 for b in BANDS:
@@ -64,6 +74,7 @@ def main():
                 c["sets"][label] = {"n": v.get("n_rows"), "n_paired": v.get("n_paired"), "n_tokens_mean": v.get("n_tokens_mean"), "bits_per_token": v.get("exact_bits_per_token"),
                                     "ratio_to_dm_rp_corrected": v.get("ratio_to_dm_rp_corrected"), "text_presence_offset_flag": v.get("text_presence_offset_flag"),
                                     "frac_z_beats_dm": v.get("frac_z_beats_dm"), "frac_z_beats_rp": v.get("frac_z_beats_rp"), "frac_z_beats_shuf_words": v.get("frac_z_beats_shuf_words"),
+                                    "frac_z_beats_null": (v.get("exact_pmi_bits") or {}).get("frac_positive"), "pmi_exact_bits": (v.get("exact_pmi_bits") or {}).get("mean"),   # v1.16 (3): P(z > null), PMI(z)
                                     "proj_gaussian_bound_bits": v.get("proj_gaussian_bound_bits"), "bands": bands}
     os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out, "w"), indent=1)
     print(f"wrote {a.out}: {len(out['priors'])} priors, {len(out['depth'])} depth critics, {len(out['text'])} text critics ({sum(len(c['sets']) for c in out['text'].values())} sets) from {len(out['sources'])} files")

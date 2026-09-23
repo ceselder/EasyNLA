@@ -125,6 +125,11 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
             out[f"{prefix}/dm_proxy_bits"] = float(((d / 2) * (L_u - L_dm).mean(0) / math.log(2)).mean())
             ws = (js >= 14) & (js <= 32)
             if ws.any(): out[f"{prefix}/content_proxy_bits_workspace"] = float(cont[torch.from_numpy(ws)].mean()); out[f"{prefix}/p_z_beats_dm_workspace"] = float((L_c.mean(0) < L_dm.mean(0))[torch.from_numpy(ws)].float().mean())
+        # DECISIONS v1.16 (3): P(z > null) and PMI(z) next to content -- a content gain without a PMI(z) gain is a Goodhart flag
+        beats_null = (L_c.mean(0) < L_u.mean(0)).float()
+        out[f"{prefix}/p_z_beats_null"] = float(beats_null.mean())
+        ws_ = torch.from_numpy((js >= 14) & (js <= 32))
+        if ws_.any(): out[f"{prefix}/p_z_beats_null_workspace"] = float(beats_null[ws_].mean()); out[f"{prefix}/pmi_proxy_bits_workspace"] = float(pmi[ws_].mean())
     for lo, hi in GAP_BUCKETS:
         m = (gaps >= lo) & (gaps <= hi)
         if m.sum() == 0: continue
@@ -316,11 +321,23 @@ def main():
         if a.null_reg > 0 and a.cond == "text":
             # NULL regulariser: under ANOTHER pair's text (batch rolled by B/2) the velocity must equal the no-text velocity (the frozen prior)
             Bn = x0.shape[0]; eps_n = torch.randn_like(x0); t_n = torch.rand(Bn, device=dev); x_tn = (1 - t_n)[:, None] * x0 + t_n[:, None] * eps_n
-            enc_rp = (enc[perm_t] if (a.null_dm and perm_t is not None) else torch.roll(enc, Bn // 2, 0)); mask_rp = (mask[perm_t] if (a.null_dm and perm_t is not None) else torch.roll(mask, Bn // 2, 0))
+            enc_rp = torch.roll(enc, Bn // 2, 0); mask_rp = torch.roll(mask, Bn // 2, 0)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 with torch.no_grad(): v_null = model(x_tn, t_n, h_i, enc=enc_rp, enc_mask=torch.zeros_like(mask_rp), log_s=log_s)
                 v_rp = model(x_tn, t_n, h_i, enc=enc_rp, enc_mask=mask_rp, log_s=log_s)
-            null_loss = ((v_rp - v_null.detach()) ** 2).mean(); loss = loss + a.null_reg * null_loss
+            null_loss = ((v_rp - v_null.detach()) ** 2).mean()
+            if a.null_dm and perm_t is not None:
+                # DECISIONS v1.16 (2) NULL-DM: the depth-matched wrong text (same (i,j) twin when the batch has one, else same j) is PULLED to the
+                # unconditional velocity too, at the SAME (x_t, t, eps) as the positive -> p(h_j | h_i, z_dm) -> p(h_j | h_i, empty), so
+                # content = PMI(z) - PMI(z_dm) is bounded by PMI(z) - PMI(null) and can only grow by raising the density under the TRUE text.
+                x_tp = (1 - t_b)[:, None] * x0 + t_b[:, None] * eps_b
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    v_dm = model(x_tp, t_b, h_i, enc=enc[perm_t], enc_mask=mask[perm_t], log_s=log_s)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.no_grad(): v_null_p = model(x_tp, t_b, h_i, enc=enc[perm_t], enc_mask=torch.zeros_like(mask[perm_t]), log_s=log_s)
+                null_dm_loss = ((v_dm - v_null_p.detach()) ** 2).mean()
+                null_loss = 0.5 * (null_loss + null_dm_loss)
+            loss = loss + a.null_reg * null_loss
         opt.zero_grad(set_to_none=True); loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip); opt.step()
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
