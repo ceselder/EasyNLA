@@ -87,6 +87,25 @@ Answer with JSON only, exactly this shape:
 {"short": "<a phrase of at most 8 words>", "sentence": "<one sentence>", "long": "<two or three sentences>"}"""
 
 
+class _FastTok:
+    """Qwen3 tokenizer via the `tokenizers` library only (no transformers import: ~500 MB less RSS per driver process)."""
+    def __init__(self):
+        from tokenizers import Tokenizer
+        self.t = Tokenizer.from_pretrained("Qwen/Qwen3-8B")
+
+    def encode(self, text, add_special_tokens=False):
+        return self.t.encode(text or "", add_special_tokens=add_special_tokens).ids
+
+
+def load_tokenizer():
+    try:
+        return _FastTok()
+    except Exception as e:  # pragma: no cover
+        print(f"[tok] tokenizers fallback to transformers: {str(e)[:100]}", flush=True)
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+
+
 def fmt_tokens(toks):
     return ", ".join(json.dumps(t) for t in toks)
 
@@ -276,8 +295,7 @@ def main():
     global NO_FINAL, NO_LENS
     NO_FINAL = a.no_final
     NO_LENS = a.no_lens
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    tok = load_tokenizer()
     feats = pd.concat([pq.read_table(f).to_pandas() for f in a.features], ignore_index=True)
     if a.limit:
         feats = feats.iloc[: a.limit]

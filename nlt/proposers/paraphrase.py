@@ -24,7 +24,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from nlt.evals.regex_tags import hard_hits            # noqa: E402
-from nlt.proposers.teacher_sonnet import client_kwargs  # noqa: E402
+from nlt.proposers.teacher_sonnet import client_kwargs, load_tokenizer  # noqa: E402
 
 MODEL = "claude-sonnet-5"
 PACK = 8
@@ -93,8 +93,7 @@ def main():
     ap.add_argument("--heldout-ids", default="", help="json with pair_ids whose paraphrases go to <out-dir>/heldout/<source>/ instead of the pool dirs")
     a = ap.parse_args()
     held = set(json.load(open(a.heldout_ids))["pair_ids"]) if a.heldout_ids else set()
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    tok = load_tokenizer()
     z = pd.concat([pq.read_table(f, columns=["pair_id", "text", "verbosity", "source"]).to_pandas() for f in a.z], ignore_index=True)
     z = z[z["verbosity"] == a.verbosity].reset_index(drop=True)
     if a.limit: z = z.iloc[: a.limit]

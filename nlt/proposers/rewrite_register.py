@@ -26,7 +26,7 @@ import pyarrow.parquet as pq
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from nlt.evals.regex_tags import hard_hits            # noqa: E402
 from nlt.evals.copy_rate import copy_rate_ngram        # noqa: E402
-from nlt.proposers.teacher_sonnet import client_kwargs, COPY_MAX  # noqa: E402
+from nlt.proposers.teacher_sonnet import client_kwargs, load_tokenizer, COPY_MAX  # noqa: E402
 
 MODEL = "claude-sonnet-5"
 PACK = 8
@@ -144,8 +144,7 @@ def main():
     ap.add_argument("--out-dir", required=True); ap.add_argument("--mode", default="sync", choices=["sync", "batch"])
     ap.add_argument("--concurrency", type=int, default=24); ap.add_argument("--limit", type=int, default=0); ap.add_argument("--tag", default="part")
     a = ap.parse_args()
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    tok = load_tokenizer()
     raw = pd.concat([pq.read_table(f).to_pandas() for f in a.raw], ignore_index=True)
     feats = pd.concat([pq.read_table(f, columns=["pair_id", "context_text"]).to_pandas() for f in a.features], ignore_index=True)
     ctx = dict(zip(feats["pair_id"].astype(str), feats["context_text"]))

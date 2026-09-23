@@ -135,8 +135,7 @@ def main():
     if a.no_final:
         T.NO_FINAL = True
     import anthropic
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    tok = T.load_tokenizer()
     client = anthropic.Anthropic(**T.client_kwargs())
     aclient = anthropic.AsyncAnthropic(**T.client_kwargs())
     os.makedirs(a.out_dir, exist_ok=True)
