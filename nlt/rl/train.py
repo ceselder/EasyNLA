@@ -233,7 +233,9 @@ def main():
             if frozen is not None:
                 fb = frozen.score(ev_acts[:, 0], ev_acts[:, 1], [z if z else None for z in ev_txt], list(range(len(ev))), seed=12345)["exact_bits"].float()
                 log.update({"eval/bits_frozen_mean": float(fb.mean()), "eval/bits_live_minus_frozen": float((eb - fb).mean())})
-            print(f"   eval: bits {log['eval/bits_mean']:+.3f} (med {log['eval/bits_median']:+.3f}, /tok {log['eval/bits_per_token']:+.3f}; random-pair control {log['eval/bits_rp_mean']:+.3f}) tok {log['eval/tokens_mean']:.1f} viol {log['eval/viol_any']:.2f} nonpos {log['eval/frac_nonpos']:.2f}", flush=True)
+            fro = f"; frozen critic {log['eval/bits_frozen_mean']:+.3f} (live-frozen {log['eval/bits_live_minus_frozen']:+.3f})" if "eval/bits_frozen_mean" in log else ""
+            bands = " ".join(f"{b}={log[f'eval/bits_{b}']:+.1f}" for b in ("pre", "workspace", "motor") if f"eval/bits_{b}" in log)
+            print(f"   eval: bits {log['eval/bits_mean']:+.3f} (med {log['eval/bits_median']:+.3f}, /tok {log['eval/bits_per_token']:+.3f}; random-pair control {log['eval/bits_rp_mean']:+.3f}{fro}) by band {bands} | tok {log['eval/tokens_mean']:.1f} viol {log['eval/viol_any']:.2f} nonpos {log['eval/frac_nonpos']:.2f}", flush=True)
         if run is not None: run.log({k: v for k, v in log.items() if not isinstance(v, (list, dict))}, step=step)
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
             d = os.path.join(a.out, f"step_{step + 1:05d}"); save_adapter(policy, os.path.join(d, "lora"))
