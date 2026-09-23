@@ -18,7 +18,9 @@ vol = modal.Volume.from_name("nlt", create_if_missing=True)
 SECRETS = [modal.Secret.from_name("nla-exp-secrets")]
 DATA = os.environ.get("NLT_DATA", "/vol/data/qwen3_8b")
 IGNORE = list(REPO_IGNORE) + ["*.log", "**/logs/**", "logs", "*.npy", "*.pt", "*.jsonl", "*.out", "wandb"]
-image = image_base.env({"HF_HOME": "/vol/hf_cache", "HF_HUB_DISABLE_XET": "1"}).add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=IGNORE)
+image = (image_base.env({"HF_HOME": "/vol/hf_cache", "HF_HUB_DISABLE_XET": "1"})
+         .pip_install("scikit-learn", "scipy")                       # depth classifier / correlations (not in the base stack)
+         .add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=IGNORE))
 app = modal.App(os.environ.get("NLT_APP", "nlt-evals"), image=image)
 GPU = os.environ.get("NLT_GPU", "B200")
 COMMON = dict(volumes={"/vol": vol}, secrets=SECRETS, cpu=16, memory=128 * 1024, ephemeral_disk=512 * 1024)
