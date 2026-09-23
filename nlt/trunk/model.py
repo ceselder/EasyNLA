@@ -220,6 +220,7 @@ class TrunkCritic(nn.Module):
                 sel = (~has).nonzero().squeeze(1)
                 hs[sel] = self._run(toks[sel], None, ar.expand(len(sel), -1), cache=None)
         delta = self.readout(self.readout_ln(hs.float()).reshape(B, Kp * H))
+        self.last_delta_rms = float(delta.detach().float().pow(2).mean().sqrt())                            # diagnostic: how far the readout has moved off zero
         return v_prior + delta.float()
 
     def multi_forward(self, x_t, t, h_i, ids, key_mask, keep, log_s=None):
@@ -246,6 +247,7 @@ class TrunkCritic(nn.Module):
             out = self.owner(inputs_embeds=x_in, attention_mask=m[:, None], position_ids=pos, use_cache=False, trunk_n_act=Kp, trunk_groups=G).last_hidden_state
         hs = out[:, T:].float().reshape(B * G, Kp, H)
         delta = self.readout(self.readout_ln(hs).reshape(B * G, Kp * H)).view(B, G, d)
+        self.last_delta_rms = float(delta.detach().float().pow(2).mean().sqrt())
         return v_prior + delta
 
     def _run(self, x_in, am, pos, cache=None, T=0):

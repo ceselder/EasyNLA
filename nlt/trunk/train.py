@@ -71,7 +71,7 @@ def evaluate(model, store_val, norm, space, sets, dev, eps_bank, B=64):
     """sets: label -> (rows, i, j, texts). Proxy PMI (bits) vs the empty prefix and vs the depth-matched shuffle, fixed eps per t."""
     model.eval(); d = norm.mean.numel(); out = {}; br = {}
     for label, (rows, I, J, texts) in sets.items():
-        n = len(rows); Lc = torch.zeros(len(T_GRID), n); Lu = torch.zeros(len(T_GRID), n); Ld = torch.zeros(len(T_GRID), n)
+        n = len(rows); Lc = torch.zeros(len(T_GRID), n); Lu = torch.zeros(len(T_GRID), n); Ld = torch.zeros(len(T_GRID), n); Lp = torch.zeros(len(T_GRID), n)
         perm = dm_perm(I, J); dm_texts = [texts[int(q)] for q in perm]
         for s in range(0, n, B):
             r, i, j = rows[s:s + B], I[s:s + B], J[s:s + B]
@@ -82,15 +82,17 @@ def evaluate(model, store_val, norm, space, sets, dev, eps_bank, B=64):
                 lc, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, enc=kv, enc_mask=mask, log_s=log_s); Lc[ti, s:s + B] = lc.float().cpu()
                 lu, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, log_s=log_s); Lu[ti, s:s + B] = lu.float().cpu()
                 ld, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, enc=kv_d, enc_mask=mask_d, log_s=log_s); Ld[ti, s:s + B] = ld.float().cpu()
+                with torch.autocast("cuda", dtype=torch.bfloat16): lp_, _, _ = pair_fm_loss(model.prior, x0, h_i, tt, eps, log_s=log_s)
+                Lp[ti, s:s + B] = lp_.float().cpu()                                                                                                   # the frozen prior alone
         pmi = (d / 2) * (Lu - Lc).mean(0) / math.log(2); pmi_dm = (d / 2) * (Lu - Ld).mean(0) / math.log(2)
         js = J.numpy()
         e = {"n": n, "pmi_proxy_bits": float(pmi.mean()), "pmi_proxy_median": float(pmi.median()), "dm_proxy_bits": float(pmi_dm.mean()),
              "content_proxy_bits": float((pmi - pmi_dm).mean()), "p_z_beats_dm": float((pmi > pmi_dm).float().mean()),
-             "fm_cond": float(Lc.mean()), "fm_uncond": float(Lu.mean()),
+             "fm_cond": float(Lc.mean()), "fm_uncond": float(Lu.mean()), "fm_prior": float(Lp.mean()), "null_vs_prior_bits": float(((d / 2) * (Lp - Lu).mean(0) / math.log(2)).mean()),
              "by_band": {lab: {"pmi": float(pmi[m].mean()), "content": float((pmi - pmi_dm)[m].mean()), "p_beats_dm": float((pmi > pmi_dm)[m].float().mean()), "n": int(m.sum())}
                          for lab, lo, hi in (("pre", 10, 13), ("workspace", 14, 32), ("motor", 33, 34)) for m in [(js >= lo) & (js <= hi)] if m.sum()}}
         br[label] = e
-        for k in ("pmi_proxy_bits", "dm_proxy_bits", "content_proxy_bits", "p_z_beats_dm", "fm_cond", "fm_uncond"): out[f"eval_{label}/{k}"] = e[k]
+        for k in ("pmi_proxy_bits", "dm_proxy_bits", "content_proxy_bits", "p_z_beats_dm", "fm_cond", "fm_uncond", "fm_prior", "null_vs_prior_bits"): out[f"eval_{label}/{k}"] = e[k]
         for lab, v in e["by_band"].items(): out[f"eval_{label}/content_{lab}"] = v["content"]; out[f"eval_{label}/pbeat_{lab}"] = v["p_beats_dm"]
     model.train(); return out, br
 
@@ -200,14 +202,14 @@ def main():
         if step % 25 == 0:
             log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/null_loss": float(null_loss), "train/contrast_loss": float(con_loss), "train/contrast_acc": con_acc, "train/lr_mult": m, "train/grad_norm": float(gn),
                    "train/step_s": (time.time() - t0) / max(1, step - step0 + 1), "train/loss_cond": float(loss_vec[kept].mean()) if kept.any() else float("nan"), "train/loss_uncond": float(loss_vec[~kept].mean()) if (~kept).any() else float("nan"),
-                   "train/n_text_tokens": float(mask.sum(1).float().mean())}
+                   "train/n_text_tokens": float(mask.sum(1).float().mean()), "train/delta_rms": getattr(model, "last_delta_rms", float("nan"))}
             wandb.log(log, step=step)
-            if step % 50 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} null {float(null_loss):.5f} con {float(con_loss):.4f} P(z>dm) {con_acc:.2f} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step T {log['train/n_text_tokens']:.0f}", flush=True)
+            if step % 50 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} null {float(null_loss):.5f} con {float(con_loss):.4f} P(z>dm) {con_acc:.2f} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step T {log['train/n_text_tokens']:.0f} dRMS {log['train/delta_rms']:.4f}", flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             if sets:
                 te = time.time(); out, br = evaluate(model, store_val, norm, space, sets, dev, eps_bank)
                 wandb.log(out, step=step); json.dump({"step": step + 1, "scalars": out, "breakdown": br}, open(os.path.join(a.out, "eval_latest.json"), "w"), indent=1)
-                print(f"[eval@{step+1}] ({time.time()-te:.0f}s) " + " | ".join(f"{k}: pmi {v['pmi_proxy_bits']:+.1f} dm {v['dm_proxy_bits']:+.1f} content {v['content_proxy_bits']:+.2f} P(z>dm) {v['p_z_beats_dm']:.2f} ws {v['by_band'].get('workspace', {}).get('content', float('nan')):+.2f}/{v['by_band'].get('workspace', {}).get('p_beats_dm', float('nan')):.2f}" for k, v in br.items()), flush=True)
+                print(f"[eval@{step+1}] ({time.time()-te:.0f}s) " + " | ".join(f"{k}: pmi {v['pmi_proxy_bits']:+.1f} dm {v['dm_proxy_bits']:+.1f} content {v['content_proxy_bits']:+.2f} P(z>dm) {v['p_z_beats_dm']:.2f} null-vs-prior {v['null_vs_prior_bits']:+.1f} ws {v['by_band'].get('workspace', {}).get('content', float('nan')):+.2f}/{v['by_band'].get('workspace', {}).get('p_beats_dm', float('nan')):.2f}" for k, v in br.items()), flush=True)
                 score = float(np.mean([v["content_proxy_bits"] for v in br.values()]))
                 if best is None or score > best[0]:
                     best = (score, step + 1); save(step + 1, "ckpt_best.pt", with_opt=False); json.dump({"step": step + 1, "score": score, "metric": "mean content_proxy_bits"}, open(os.path.join(a.out, "best.json"), "w"))
