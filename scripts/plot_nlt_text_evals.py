@@ -39,8 +39,8 @@ def main():
         ax.grid(True, axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s in ("top", "right"): ax.spines[s].set_visible(False)
     handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in FAMILY_COLOR.values()]; ax2.legend(handles, list(FAMILY_COLOR), frameon=False, fontsize=9, loc="lower right", title="source family", title_fontsize=9)
-    fig.suptitle("Text-only checks on the fixed 4,096-pair eval set (Qwen3-8B, layers 9-34)", fontsize=13, x=0.02, ha="left", color=INK2)
-    fig.tight_layout(); os.makedirs(a.out_dir, exist_ok=True)
+    fig.text(0.01, 0.005, "Text-only checks on the fixed 4,096-pair eval set (Qwen3-8B, pairs of layers 9-34); token counts in parentheses = median length.", fontsize=10, color=INK2, ha="left", va="bottom")
+    fig.tight_layout(rect=(0, 0.03, 1, 1)); os.makedirs(a.out_dir, exist_ok=True)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.out_dir, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"rows": [{"tag": t, "family": f, "label": l, "mi_z_j_bits": n.get("mi_z_j_bits"), "gap_mae_ratio": n.get("gap_mae_ratio"), "next_token_mention": n.get("next_token_mention"), "n": n.get("n_texts"), "tokens_median": n.get("tokens_median")} for t, f, l, n in rows]},
               open(os.path.join(a.out_dir, "data", f"{a.stem}.json"), "w"), indent=1)
