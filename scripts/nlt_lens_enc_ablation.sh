@@ -32,3 +32,6 @@ echo "[$(date -u +%H:%M:%S)] bits $TAG" | tee -a $LOG/enc_ablation.log
 modal run scripts/modal_nlt_critic.py --task bits --tag $TAG --data $D --extra "--ckpts text:/vol/critic/$TAG/ckpt_final.pt --text-parquet $VALSETS --n 1024 --batch 64 --ode-steps 32 --data-device cpu" > $LOG/bits_$TAG.log 2>&1
 grep "\[bits\]" $LOG/bits_$TAG.log | grep -v rows | tail -14
 echo "[$(date -u +%H:%M:%S)] ENC ABLATION DONE $TAG" | tee -a $LOG/enc_ablation.log
+
+# redteam control manifests (#180): form / depth-generic / content decomposition + P(z > z_dm) per arm (append-only: running arms pick this up)
+bash scripts/nlt_lens_arm_manifests.sh $TAG
