@@ -19,9 +19,9 @@ import sys
 
 import modal
 
-_here = os.path.dirname(os.path.abspath(__file__))
-if _here not in sys.path:
-    sys.path.insert(0, _here)
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.join(os.environ.get("PYTHONPATH", "/root/easyNLA").split(":")[0], "scripts")):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)     # local: scripts/; in the container: /root/easyNLA/scripts
 from modal_nla_exp import REPO_LOCAL, REPO_REMOTE, image_base  # noqa: E402  (validated B200 stack)
 
 VOL_NAME = "nlt"
@@ -29,24 +29,14 @@ VOL_MNT = "/nlt"
 vol = modal.Volume.from_name(VOL_NAME, create_if_missing=True)
 
 
-def _ignore(path) -> bool:
-    """Mount only what the lens jobs need: other agents write logs/data inside the repo during our snapshot."""
-    import pathlib
-    parts = pathlib.PurePath(path).parts
-    rel = pathlib.PurePath(*parts)
-    s = str(rel)
-    if any(x in parts for x in (".git", ".venv", "__pycache__", "logs", "data", "wandb", "results")):
-        return True
-    if s.endswith((".pyc", ".parquet", ".log", ".pt", ".safetensors", ".jsonl", ".png", ".pdf", ".html", ".csv", ".npy", ".npz")):
-        return True
-    if parts and parts[0] == "nlt" and len(parts) > 1 and parts[1] not in ("lens", "__init__.py"):
-        return True   # other agents' subpackages
-    return False
-
-
-image = (image_base
-         .env({"HF_HOME": "/root/hf_cache", "NLT_VOL": VOL_MNT, "PYTHONPATH": REPO_REMOTE, "TOKENIZERS_PARALLELISM": "false"})
-         .add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=_ignore))
+MOUNT_IGNORE = ["**/__pycache__/**", "**/*.pyc", "**/*.log", "**/logs/**", "**/*.parquet", "**/*.pt", "**/*.safetensors",
+                "**/*.jsonl", "**/*.png", "**/*.pdf", "**/*.npy", "**/wandb/**", "**/data/**", "**/results/**"]
+image = image_base.env({"HF_HOME": f"{VOL_MNT}/hf_cache", "HF_HUB_DISABLE_XET": "1", "NLT_VOL": VOL_MNT,
+                        "PYTHONPATH": f"{REPO_REMOTE}:{REPO_REMOTE}/scripts", "TOKENIZERS_PARALLELISM": "false"})
+# mount only what the lens jobs need (other agents write logs/data inside the repo while we snapshot)
+for _sub in ("nla", "utils", "scripts", "nlt/lens"):
+    image = image.add_local_dir(f"{REPO_LOCAL}/{_sub}", f"{REPO_REMOTE}/{_sub}", copy=False, ignore=MOUNT_IGNORE)
+image = image.add_local_file(f"{REPO_LOCAL}/nlt/__init__.py", f"{REPO_REMOTE}/nlt/__init__.py", copy=False)
 app = modal.App("nlt-lens", image=image)
 SECRETS = [modal.Secret.from_name("nla-exp-secrets")]
 COMMON = dict(volumes={VOL_MNT: vol}, secrets=SECRETS, cpu=8, memory=96 * 1024)

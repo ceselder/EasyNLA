@@ -74,7 +74,8 @@ CONF_EDGES = (0.1, 0.3, 0.6, 0.9)
 @dataclass
 class PairFeatures:
     top1_i: str; top1_j: str; p1_i: float; p1_j: float; ent_i: float; ent_j: float; cos: float
-    risers: list = field(default_factory=list)      # (display, delta_logp)
+    top1_i_id: int = -1; top1_j_id: int = -1
+    risers: list = field(default_factory=list)      # (display, delta_logp, token_id)
     fallers: list = field(default_factory=list)
     top_j: list = field(default_factory=list)       # top readable tokens after
     top_i: list = field(default_factory=list)       # top readable tokens before
@@ -125,14 +126,14 @@ class LensDiffDescriber:
         a_i, a_j, p1_i, p1_j, ent_i, ent_j, cos = map(cpu, (a_i, a_j, p1_i.exp(), p1_j.exp(), ent_i, ent_j, cos))
         for b in range(B):
             f = PairFeatures(top1_i=self._disp(int(a_i[b])), top1_j=self._disp(int(a_j[b])), p1_i=float(p1_i[b]), p1_j=float(p1_j[b]),
-                             ent_i=float(ent_i[b]), ent_j=float(ent_j[b]), cos=float(cos[b]))
+                             ent_i=float(ent_i[b]), ent_j=float(ent_j[b]), cos=float(cos[b]), top1_i_id=int(a_i[b]), top1_j_id=int(a_j[b]))
             f.risers = self._dedupe(risers[b].tolist(), risers_d[b].tolist(), self.k_list, min_delta=0.0)
             f.fallers = self._dedupe(fallers[b].tolist(), fallers_d[b].tolist(), self.k_list, max_delta=0.0)
             f.top_j = self._dedupe(pool_j[b, :40].tolist(), None, self.k_top)
             f.top_i = self._dedupe(pool_i[b, :40].tolist(), None, self.k_top)
             s50_i = {self.lower[t] for t in top50_i[b].tolist()}; s50_j = {self.lower[t] for t in top50_j[b].tolist()}
-            f.emerging = [d for d, _ in f.top_j if d.lower() not in s50_i]
-            f.fading = [d for d, _ in f.top_i if d.lower() not in s50_j]
+            f.emerging = [(d, 0.0, t) for d, _, t in f.top_j if d.lower() not in s50_i]
+            f.fading = [(d, 0.0, t) for d, _, t in f.top_i if d.lower() not in s50_j]
             out.append(f)
         return out
 
@@ -152,7 +153,7 @@ class LensDiffDescriber:
                 break
             if max_delta is not None and d >= max_delta:
                 break
-            seen.add(key); out.append((self.display[t], d))
+            seen.add(key); out.append((self.display[t], d, t))
             if len(out) >= k:
                 break
         return out
@@ -163,7 +164,7 @@ class LensDiffDescriber:
         return s if s.startswith(("a ", "an ")) and " " in s else f"'{s}'"
 
     def _join(self, items, n):
-        words = [self._q(d) for d, _ in items[:n]]
+        words = [self._q(d) for d, *_ in items[:n]]
         if not words:
             return ""
         if len(words) == 1:
@@ -206,15 +207,15 @@ class LensDiffDescriber:
         elif level == 2:
             s1 = f"{self._move(f)}; it {self._conf_change(f)}, going from {_bucket(f.p1_i, CONF_EDGES, CONF_NAMES)} to {_bucket(f.p1_j, CONF_EDGES, CONF_NAMES)}."
             s1 = s1[0].upper() + s1[1:]
-            em = self._join([(d, 0) for d in f.emerging], 5) or self._join(f.risers, 5)
+            em = self._join(f.emerging, 5) or self._join(f.risers, 5)
             s2 = self.rng.choice([f"Gaining ground: {em}.", f"Newly prominent are {em}.", f"Coming to the fore: {em}."]) if em else "Little new comes to the fore."
-            fa = self._join([(d, 0) for d in f.fading], 4) or self._join(f.fallers, 4)
+            fa = self._join(f.fading, 4) or self._join(f.fallers, 4)
             s3 = (self.rng.choice([f"Fading: {fa}.", f"Receding are {fa}.", f"Losing ground: {fa}."]) if fa else "Nothing notable recedes.")
             s3 += f" Overall the representation {self._cos_words(f)}."
             s = " ".join([s1, s2, s3])
         else:
-            ris = ", ".join(d for d, _ in f.risers[:20]) or "(none)"; fal = ", ".join(d for d, _ in f.fallers[:20]) or "(none)"
-            now = ", ".join(d for d, _ in f.top_j[:10]) or "(none)"; before = ", ".join(d for d, _ in f.top_i[:10]) or "(none)"
+            ris = ", ".join(d for d, *_ in f.risers[:20]) or "(none)"; fal = ", ".join(d for d, *_ in f.fallers[:20]) or "(none)"
+            now = ", ".join(d for d, *_ in f.top_j[:10]) or "(none)"; before = ", ".join(d for d, *_ in f.top_i[:10]) or "(none)"
             s = (f"Rising: {ris}. Falling: {fal}. Now favoured: {now}. Previously favoured: {before}. "
                  f"Top choice {f.top1_i} -> {f.top1_j}; confidence {f.p1_i:.2f} -> {f.p1_j:.2f}; entropy {f.ent_i:.1f} -> {f.ent_j:.1f} nats; cosine {f.cos:.2f}.")
         if FORBIDDEN.search(s):
