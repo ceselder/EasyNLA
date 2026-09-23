@@ -107,7 +107,8 @@ def main():
     p.add_argument("--trunk-id", default="Qwen/Qwen3-8B"); p.add_argument("--n-layers", type=int, default=24); p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--n-act-tokens", type=int, default=4); p.add_argument("--fresh-every", type=int, default=4); p.add_argument("--fresh-heads", type=int, default=8); p.add_argument("--fresh-dhead", type=int, default=128)
     p.add_argument("--max-len", type=int, default=128); p.add_argument("--no-grad-ckpt", action="store_true"); p.add_argument("--readout-rank", type=int, default=0, help="low-rank readout (0 = full 5*4096 -> 4096 linear)")
-    p.add_argument("--text-parquet", required=True, help="pool:glob[@verb+verb],... train text files"); p.add_argument("--pool-weights", default="", help="pool:w,... sampling weights (default equal)")
+    p.add_argument("--text-parquet", default="", help="pool:glob[@verb+verb],... train text files"); p.add_argument("--pool-weights", default="", help="pool:w,... sampling weights (default equal)")
+    p.add_argument("--text-synth", default=None, choices=["depth"], help="DIAGNOSTIC (v1.8 T1, forbidden for the verbalizer): texts = 'from layer i to layer j' for pairs sampled from the store; tests whether the trunk's text pathway can carry a categorical signal at all")
     p.add_argument("--val-text", default="", help="label:glob[@verb],... val text sets for the in-training proxy eval"); p.add_argument("--eval-n", type=int, default=256); p.add_argument("--eval-offset", type=int, default=4096)
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--lr-lora", type=float, default=3e-5)
     p.add_argument("--warmup", type=int, default=100); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-decay", default="cosine", choices=["none", "cosine"])
@@ -131,10 +132,13 @@ def main():
     store = ActStore(a.data_dir, "train", device=a.data_device, max_pos=a.max_train_pos); store_val = ActStore(a.data_dir, "val", device=a.val_device)
     d = store.d
     # ---- text pools
-    df = load_pool(a.text_parquet, os.path.join(a.data_dir, "pairs_train.parquet"), store.row_of)
-    weights = {k: float(v) for k, v in (x.split(":") for x in a.pool_weights.split(",") if x)}
-    sampler = PoolSampler(df, weights, a.seed, j_min=a.curriculum_j_min)
-    print(f"[train] {len(df)} train text rows over {df['pair_id'].nunique()} pairs", flush=True)
+    if a.text_synth:
+        df = None; sampler = None; print(f"[train] SYNTHETIC TEXT MODE '{a.text_synth}' (critic diagnostic, forbidden for the verbalizer)", flush=True)
+    else:
+        df = load_pool(a.text_parquet, os.path.join(a.data_dir, "pairs_train.parquet"), store.row_of)
+        weights = {k: float(v) for k, v in (x.split(":") for x in a.pool_weights.split(",") if x)}
+        sampler = PoolSampler(df, weights, a.seed, j_min=a.curriculum_j_min)
+        print(f"[train] {len(df)} train text rows over {df['pair_id'].nunique()} pairs", flush=True)
     # ---- val sets (pairs after the fixed eval set)
     import pyarrow.parquet as pq
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas(); vp = vp[vp["pos_idx"].isin(store_val.row_of)].iloc[a.eval_offset:]
@@ -147,6 +151,10 @@ def main():
             if len(sub) == 0: print(f"[train] val set {label}: no pairs with text after offset {a.eval_offset}", flush=True); continue
             sets[label] = (store_val.rows_for(sub["pos_idx"].values), torch.tensor(sub["i"].values.astype(np.int64)), torch.tensor(sub["j"].values.astype(np.int64)), vdf.loc[sub["pair_id"], "text"].tolist())
             print(f"[train] val set {label}: {len(sub)} pairs", flush=True)
+    if a.text_synth == "depth":                      # synthetic val set on the same held-out pairs: z = the depth tag (z_dm = another pair with the same (i,j) -> the SAME text, so content is 0 by construction; read PMI vs null)
+        sub = vp.iloc[: a.eval_n]; ii = torch.tensor(sub["i"].values.astype(np.int64)); jj = torch.tensor(sub["j"].values.astype(np.int64))
+        sets["depthtag"] = (store_val.rows_for(sub["pos_idx"].values), ii, jj, [f"from layer {int(x)} to layer {int(y)}" for x, y in zip(ii.tolist(), jj.tolist())])
+        print(f"[train] val set depthtag: {len(sub)} pairs, e.g. {sets['depthtag'][3][0]!r}", flush=True)
     g_eval = torch.Generator().manual_seed(1234); eps_bank = [torch.randn(a.eval_n, d, generator=g_eval) for _ in T_GRID]
     # ---- optimiser
     ad_params = list(model.adapter_parameters()); lora_params = model.lora_parameters()
@@ -161,15 +169,18 @@ def main():
         if a.lr_decay == "none": return 1.0
         pr = (s - a.warmup) / max(1, a.steps - a.warmup); return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, pr)))
     import wandb
-    wandb.init(project=a.wandb, entity=a.wandb_entity, name=a.tag, config=vars(a) | {"space": space, "n_adapter": model.n_adapter_params(), "n_lora": sum(p_.numel() for p_ in lora_params), "n_text_rows": len(df)}, resume="allow")
+    wandb.init(project=a.wandb, entity=a.wandb_entity, name=a.tag, config=vars(a) | {"space": space, "n_adapter": model.n_adapter_params(), "n_lora": sum(p_.numel() for p_ in lora_params), "n_text_rows": (len(df) if df is not None else 0)}, resume="allow")
     def save(step, name="ckpt_latest.pt", with_opt=True):
         ck = {"config": model.config(), "state": model.state(), "step": step, "args": vars(a), "prior_args": {k: v for k, v in paa.items() if k in ("src_rms", "squash", "target", "stats", "data_dir")}}
         if with_opt: ck["opt"] = opt.state_dict()
         torch.save(ck, os.path.join(a.out, name + ".tmp")); os.replace(os.path.join(a.out, name + ".tmp"), os.path.join(a.out, name))
     gen = torch.Generator().manual_seed(a.seed + step0); model.train(); t0 = time.time(); ema = None; best = None
     for step in range(step0, a.steps):
-        sub = sampler.sample(a.batch, curriculum=(a.curriculum_j_min > 0 and step < a.curriculum_steps))
-        rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values.astype(np.int64)); j = torch.tensor(sub["j"].values.astype(np.int64)); texts = sub["text"].tolist()
+        if a.text_synth == "depth":
+            rows, i, j = store.sample_pairs(a.batch, gen); texts = [f"from layer {int(x)} to layer {int(y)}" for x, y in zip(i.tolist(), j.tolist())]
+        else:
+            sub = sampler.sample(a.batch, curriculum=(a.curriculum_j_min > 0 and step < a.curriculum_steps))
+            rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values.astype(np.int64)); j = torch.tensor(sub["j"].values.astype(np.int64)); texts = sub["text"].tolist()
         h_i, x0, log_s, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), space["target"], space["src_rms"], space["squash"])
         ids, mask = model.tokenize(texts); enc = TextIDs(ids)
         m = lr_mult(step)
