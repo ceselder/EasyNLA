@@ -109,7 +109,7 @@ def main():
     p.add_argument("--d-model", type=int, default=2048); p.add_argument("--d-mlp", type=int, default=8192); p.add_argument("--n-layers", type=int, default=8)
     p.add_argument("--n-slots", type=int, default=8); p.add_argument("--n-heads", type=int, default=4); p.add_argument("--d-head", type=int, default=64); p.add_argument("--gate-rank", type=int, default=128)
     p.add_argument("--steps", type=int, default=5000); p.add_argument("--batch", type=int, default=512); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--warmup", type=int, default=200); p.add_argument("--wd", type=float, default=0.01)
-    p.add_argument("--lr-decay", default="cosine", choices=["none", "cosine"]); p.add_argument("--p-uncond", type=float, default=0.15); p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--lr-decay", default="cosine", choices=["none", "cosine"]); p.add_argument("--p-uncond", type=float, default=0.3); p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--max-train-pos", type=int, default=None); p.add_argument("--data-device", default="cuda", help="where the fp16 store lives (cuda on a B200; cpu on smaller GPUs)")
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=4096); p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--text-parquet", default=None, help="comma-separated text files [pair_id, text, verbosity, source] (cond=text)"); p.add_argument("--text-verbosity", default=None, help="comma list of verbosity levels to train on (default all)")

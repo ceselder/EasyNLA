@@ -79,3 +79,18 @@ class ActStore:
 
     def gather_all_layers(self, rows):
         return self.acts[torch.as_tensor(rows).to(self.acts.device)]         # [B, L, d]
+
+    def load_docs(self, data_dir):
+        """doc_id -> (source, text, token_ids) for this split (reads the docs_*.parquet sidecars once)"""
+        import pyarrow.parquet as pq
+        self.docs = {}
+        for f in sorted(glob.glob(os.path.join(data_dir, self.split, "docs_*.parquet"))):
+            t = pq.read_table(f).to_pydict()
+            for d_, s_, x_, ids_ in zip(t["doc_id"], t["source"], t["text"], t["token_ids"]): self.docs[d_] = (s_, x_, ids_)
+        return self.docs
+
+    def context_ids(self, pos_idx, ctx=256):
+        """token ids of the context ENDING AT the sampled position (inclusive), last `ctx` tokens; needs load_docs()"""
+        r = self.row_of[int(pos_idx)]; m = self.meta.iloc[r]
+        ids = self.docs[int(m["doc_id"])][2]
+        return ids[: int(m["pos"]) + 1][-ctx:]
