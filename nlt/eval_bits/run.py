@@ -264,6 +264,10 @@ def main():
                     res["text_presence_offset_flag"] = bool(abs(rp_m) > 2 and abs(rp_m) > 1.96 * rp_sem)
                     res["frac_z_beats_dm"] = float((pe > ps_).mean()); res["frac_z_beats_rp"] = float((pe > pr_).mean())
                     res["content_exact_bits"] = summarize(pe - ps_, gaps, js, "content")           # PAIRED z - z_dm (the headline quantity)
+                    # redteam #312: is content growth a heavy tail or many pairs? share of pairs with z - z_dm > 1 bit, and P(z > z_dm) by band
+                    res["content_share_gt1bit"] = float(((pe - ps_) > 1.0).mean()); res["content_share_gt0"] = float(((pe - ps_) > 0.0).mean())
+                    res["frac_z_beats_dm_by_band"] = {lab: float((pe > ps_)[(js >= lo) & (js <= hi)].mean()) for lab, lo, hi in (("pre<=13", 10, 13), ("workspace14-32", 14, 32), ("motor>=33", 33, 34)) if ((js >= lo) & (js <= hi)).any()}
+                    res["frac_z_beats_null_by_band"] = {lab: float((pe > 0)[(js >= lo) & (js <= hi)].mean()) for lab, lo, hi in (("pre<=13", 10, 13), ("workspace14-32", 14, 32), ("motor>=33", 33, 34)) if ((js >= lo) & (js <= hi)).any()}
                     res["content_rp_exact_bits"] = summarize(pe - pr_, gaps, js, "content_rp")     # PAIRED z - z_rp
                     if not a.skip_extra_controls:
                         pw_ = (lp_w - lp_u).numpy() / math.log(2); pm_ = (lp_m - lp_u).numpy() / math.log(2)

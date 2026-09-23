@@ -125,6 +125,12 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
             out[f"{prefix}/dm_proxy_bits"] = float(((d / 2) * (L_u - L_dm).mean(0) / math.log(2)).mean())
             ws = (js >= 14) & (js <= 32)
             if ws.any(): out[f"{prefix}/content_proxy_bits_workspace"] = float(cont[torch.from_numpy(ws)].mean()); out[f"{prefix}/p_z_beats_dm_workspace"] = float((L_c.mean(0) < L_dm.mean(0))[torch.from_numpy(ws)].float().mean())
+            # redteam #312: median and share > 1 bit of the paired content, P(z > z_dm) by band -- heavy tail vs many pairs
+            out[f"{prefix}/content_proxy_bits_median"] = float(cont.median()); out[f"{prefix}/content_share_gt1bit"] = float((cont > 1.0).float().mean())
+            wins = (L_c.mean(0) < L_dm.mean(0)).float()
+            for lab, lo, hi in (("pre", 10, 13), ("ws", 14, 32), ("motor", 33, 34)):
+                mb = torch.from_numpy((js >= lo) & (js <= hi))
+                if mb.any(): out[f"{prefix}/p_z_beats_dm_{lab}"] = float(wins[mb].mean()); out[f"{prefix}/content_proxy_median_{lab}"] = float(cont[mb].median())
         # DECISIONS v1.16 (3): P(z > null) and PMI(z) next to content -- a content gain without a PMI(z) gain is a Goodhart flag
         beats_null = (L_c.mean(0) < L_u.mean(0)).float()
         out[f"{prefix}/p_z_beats_null"] = float(beats_null.mean())
