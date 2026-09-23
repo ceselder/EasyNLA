@@ -42,41 +42,52 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="bits")
     p.add_argument("--ckpts", required=True, help="comma list name:path"); p.add_argument("--n", type=int, default=1024); p.add_argument("--batch", type=int, default=64)
     p.add_argument("--ode-steps", type=int, default=32); p.add_argument("--probes", type=int, default=1); p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split)"); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20)
+    p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20)
     p.add_argument("--skip-exact", action="store_true"); p.add_argument("--data-device", default="cuda")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
     store_val = ActStore(a.data_dir, "val", device=a.data_device)
     norm = GlobalNorm.load(os.path.join(a.data_dir, "stats.pt"), "affine").to(dev); d = store_val.d
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet")).to_pandas(); vp = vp[vp["pos_idx"].isin(store_val.row_of)]
-    ckpts = [c.split(":", 1) for c in a.ckpts.split(",")]
-    text_map = None; encoder = None
+    from nlt.critic.train import load_text_pairs
+    text_sets = {}                                   # label -> {pair_id: text}
     if a.text_parquet:
-        from nlt.critic.train import load_text_pairs
-        tdf = load_text_pairs(a.text_parquet.split(","), os.path.join(a.data_dir, "pairs_val.parquet")); tdf = tdf.drop_duplicates("pair_id").set_index("pair_id")
-        text_map = tdf["text"].to_dict()
-        vp = vp[vp["pair_id"].isin(tdf.index)]
-        print(f"[bits] {len(vp)} val pairs have text", flush=True)
+        for item in a.text_parquet.split(","):
+            label, path = item.split(":", 1) if ":" in item and not item.startswith("/") else ("text", item)
+            tdf = load_text_pairs([path], os.path.join(a.data_dir, "pairs_val.parquet")).drop_duplicates("pair_id").set_index("pair_id")
+            text_sets[label] = tdf["text"].to_dict()
+        common = set.intersection(*[set(v) for v in text_sets.values()])
+        vp = vp[vp["pair_id"].isin(common)]
+        print(f"[bits] text sets {list(text_sets)}: {len(vp)} val pairs have text in ALL sets", flush=True)
     vp = vp.iloc[: a.n]; n = len(vp)
     rows = store_val.rows_for(vp["pos_idx"].values); I = torch.tensor(vp["i"].values); J = torch.tensor(vp["j"].values); gaps = (J - I).numpy(); js = J.numpy()
-    texts = [text_map[x] for x in vp["pair_id"]] if text_map else None
-    # depth-matched shuffle: another val pair with the same (i, j)
-    shuf_texts = None
-    if texts:
-        rng = np.random.default_rng(a.seed); shuf_texts = list(texts)
+
+    def shuffle_dm(texts):
+        """depth-matched shuffle: another val pair's text with the same (i, j)"""
+        out = list(texts)
         for key, grp in vp.reset_index(drop=True).groupby(["i", "j"]).groups.items():
-            idx = np.asarray(list(grp))
-            if len(idx) > 1: perm = np.roll(idx, 1)
-            else: perm = idx
-            for src, dst in zip(idx, perm): shuf_texts[dst] = texts[src]
+            idx = np.asarray(list(grp)); perm = np.roll(idx, 1) if len(idx) > 1 else idx
+            for src, dst in zip(idx, perm): out[dst] = texts[src]
+        return out
     g = torch.Generator().manual_seed(a.seed + 1); eps_bank = [torch.randn(n, d, generator=g) for _ in T_GRID]
     probe_bank = make_probe_bank(a.ode_steps, a.probes, d, torch.Generator().manual_seed(a.seed + 2))
-    if any(name == "text" or "text" in name for name, _ in ckpts) and texts:
+    encoder = None
+    ckpts = [c.split(":", 1) for c in a.ckpts.split(",")]
+    jobs = []                                         # (result name, ckpt path, texts or None, shuf_texts or None)
+    for name, path in ckpts:
+        cond = torch.load(path, map_location="cpu")["config"]["cond"]
+        if cond == "text" and text_sets:
+            for label, tm in text_sets.items():
+                texts = [tm[x] for x in vp["pair_id"]]; jobs.append((f"{name}@{label}", path, texts, shuffle_dm(texts)))
+        else: jobs.append((name, path, None, None))
+    if any(j[2] is not None for j in jobs):
         from nlt.critic.text_encoder import TextEncoder
         encoder = TextEncoder(a.enc_model, a.enc_layer, dev)
     results = {"n": n, "ode_steps": a.ode_steps, "probes": a.probes, "t_grid": list(T_GRID), "critics": {}}
-    for name, path in ckpts:
-        model, aa, step = load_critic(path, dev, d_enc_override=(encoder.d_enc if encoder else None)); cond = model.cond; target = model.target; src_rms = bool(aa.get("src_rms", 0))
+    _cache = {}
+    for name, path, texts, shuf_texts in jobs:
+        if path not in _cache: _cache[path] = load_critic(path, dev, d_enc_override=(encoder.d_enc if encoder else None))
+        model, aa, step = _cache[path]; cond = model.cond; target = model.target; src_rms = bool(aa.get("src_rms", 0))
         print(f"[bits] critic {name}: cond={cond} target={target} step={step} params {model.n_params()/1e6:.0f}M", flush=True)
         L_u = torch.zeros(len(T_GRID), n); L_c = torch.zeros(len(T_GRID), n); L_s = torch.zeros(len(T_GRID), n)
         lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
