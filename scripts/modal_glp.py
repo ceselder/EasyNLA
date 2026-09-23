@@ -202,8 +202,65 @@ def train_cond_g4(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "s
     rc = proc.wait(); logf.close(); vol_glp.commit(); return rc
 
 
+image_claims = image_base.pip_install("spacy==3.8.*", "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl").add_local_dir(
+    REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE)
+
+
+def _claims(args, commit=True):
+    """python scripts/<args> from the repo, streamed; commits nla-glp so the next stage sees the files"""
+    import subprocess
+    cmd = [sys.executable] + args; print("[modal] " + " ".join(cmd), flush=True)
+    rc = subprocess.call(cmd, cwd=REPO_REMOTE)
+    if commit: vol_glp.commit()
+    return rc
+
+
+@app.function(timeout=8 * 3600, volumes=VOLS, secrets=SECRETS, cpu=4, memory=16 * 1024)
+def claims_docs(source: str, n_docs: int, root: str, tag: str = "v1", slice_: str = "0/1"):
+    """synthetic claims: stream one slice of one source of the corpus mix -> {root}/docs (scripts/claims_extract.py docs)"""
+    return _claims([f"{REPO_REMOTE}/scripts/claims_extract.py", "docs", "--source", source, "--n-docs", str(n_docs), "--root", root, "--tag", tag, "--slice", slice_])
+
+
+@app.function(gpu="B200", timeout=8 * 3600, **COMMON)
+def claims_anchors(root: str, shard: int = 0, nshards: int = 1, tag: str = "v1", extra: str = ""):
+    """synthetic claims: anchors + Qwen3.6-27B state (L42 residual, top-10, entropy, J-lens top-20, vLLM greedy 16) + family-1 claims"""
+    from modal_nla_exp import _prep
+    from playground_app import resolve_base
+    os.environ.update({"NLA_VLLM_EAGER": "1", "VLLM_ATTENTION_BACKEND": "FLASH_ATTN"}); _prep(patch_lens=True)
+    vol_glp.reload(); base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    return _claims([f"{REPO_REMOTE}/scripts/claims_extract.py", "anchors", "--root", root, "--shard", str(shard), "--nshards", str(nshards), "--tag", tag, "--base", base] + extra.split())
+
+
+@app.function(image=image_claims, timeout=6 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=64 * 1024)
+def claims_text(root: str, shard: int = 0, nshards: int = 1, extra: str = ""):
+    """synthetic claims: family 2 (text-grounded, rule-based + spaCy) -> {root}/claims/text_*.parquet"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_text.py", "--root", root, "--shard", str(shard), "--nshards", str(nshards), "--procs", "30"] + extra.split())
+
+
+@app.function(gpu="B200", timeout=8 * 3600, **COMMON)
+def claims_compose(adapter: str, tag: str, extra: str = ""):
+    """stage-1 eval: joint claim-set condition vs velocity composition (w = 1, 1/m) vs sum of single-claim PMIs, exact bits"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_compose_eval.py", "--adapter", adapter, "--tag", tag] + extra.split())
+
+
+@app.function(gpu="B200", timeout=4 * 3600, **COMMON)
+def claims_gates(adapter: str, tag: str, extra: str = ""):
+    """stage-1 gates on the fixed stage-0 benchmark (paired detection, single-claim PMI, greedy frontier, set vs best single)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_gates.py", "--adapter", adapter, "--tag", tag] + extra.split())
+
+
+@app.function(gpu="B200", timeout=6 * 3600, **COMMON)
+def claims_finalize(root: str, extra: str = ""):
+    """synthetic claims: merge the three families per anchor, near-duplicate removal (sentence embeddings), stats -> {root}/final"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_finalize.py", "--root", root] + extra.split())
+
+
 @app.local_entrypoint()
-def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768, prior_tag: str = "glp27b_main", av_merged: str = "/vol/ckpts/qwen36_27b/av_sft_merged", nshards: int = 8):
+def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", ckpt: str = "final", extra: str = "", n_prompts: int = 300000, attn_impl: str = "sdpa", tokens_per_batch: int = 32768, prior_tag: str = "glp27b_main", av_merged: str = "/vol/ckpts/qwen36_27b/av_sft_merged", nshards: int = 8, root: str = "/vol_glp/claims", n_docs: int = 0):
     """--sets "train.lr=1e-4 model.n_layers=12" ; --config configs/glp/<override>.yaml"""
     if task == "smoke":
         print("rc", smoke.remote(tag or "smoke_glp", sets))
@@ -235,5 +292,21 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", sample_diag.remote(tag, ckpt, extra))
     elif task == "bnoise":
         print("rc", bnoise.remote(tag, ckpt, extra))
+    elif task == "claims_docs":   # one CPU container per source, in parallel; --n-docs = total docs over the mix
+        K = {"ffw": 22, "code": 3, "chat": 4, "math": 3, "fiction": 6, "multi": 8} if n_docs >= 50000 else {}   # parallel slices per source at scale
+        calls = [claims_docs.spawn(s_, n_docs, root, tag or "v1", f"{i}/{K.get(s_, 1)}") for s_ in ("ffw", "code", "chat", "math", "fiction", "multi") for i in range(K.get(s_, 1))]   # = claims_extract.SOURCES
+        print("rc", [c.get() for c in calls])
+    elif task == "claims_anchors":   # all shards in parallel, one B200 each
+        calls = [claims_anchors.spawn(root, i, nshards, tag or "v1", extra) for i in range(nshards)]
+        print("rc", [c.get() for c in calls])
+    elif task == "claims_text":
+        calls = [claims_text.spawn(root, i, nshards, extra) for i in range(nshards)]
+        print("rc", [c.get() for c in calls])
+    elif task == "claims_compose":   # --ckpt = adapter path, --tag = output tag
+        print("rc", claims_compose.remote(ckpt, tag, extra))
+    elif task == "claims_gates":   # --ckpt = adapter path, --tag = output tag
+        print("rc", claims_gates.remote(ckpt, tag, extra))
+    elif task == "claims_finalize":
+        print("rc", claims_finalize.remote(root, extra))
     elif task == "gen_onpolicy":
         print("rc", gen_onpolicy.remote(n_prompts, extra))

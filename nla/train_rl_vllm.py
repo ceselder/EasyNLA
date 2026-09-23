@@ -44,6 +44,7 @@ Per step:
 import argparse
 import math
 import os
+import random
 import re
 import time
 import threading
@@ -1198,6 +1199,37 @@ def resolve_kl_beta(kl_beta, kl_estimator):
     return DEFAULT_KL_BETA[kl_estimator]
 
 
+_BYTE_DEC = None
+
+
+def claim_token_bonus(tokenizer, resp_ids, claims, net):
+    """--claim-credit loo: per-token advantage bonus for one rollout. resp_ids = the response token ids, claims = its scored claims,
+    net = per-claim (credit_j - cost) / sigma * beta. Tokens overlapping claim j get net_j, centred by the token-weighted mean over all claim
+    tokens, so the rollout's total advantage mass (the sequence-level signal) is unchanged and only its distribution over claims moves.
+    Claim spans are found in the byte-exact text of the tokens (byte-level BPE), so offsets are exact."""
+    global _BYTE_DEC
+    if _BYTE_DEC is None:   # GPT-2 byte<->unicode table (byte-level BPE; inlined: its import path moved between transformers versions)
+        bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1)); cs = bs[:]; n_ = 0
+        for b_ in range(256):
+            if b_ not in bs: bs.append(b_); cs.append(256 + n_); n_ += 1
+        _BYTE_DEC = {chr(c_): b_ for b_, c_ in zip(bs, cs)}
+    toks = tokenizer.convert_ids_to_tokens([int(x) for x in resp_ids])
+    tb = [bytes(_BYTE_DEC[c] for c in t) if t and all(c in _BYTE_DEC for c in t) else (t or "").encode() for t in toks]
+    ends = np.cumsum([len(b) for b in tb]); starts = ends - np.array([len(b) for b in tb]); raw = b"".join(tb)
+    txt = raw.decode("utf-8", errors="replace")
+    bonus = torch.zeros(len(tb)); cov = torch.zeros(len(tb), dtype=torch.bool); cur = 0; hit = 0
+    for c, v in zip(claims, net):
+        if v is None: continue
+        k = txt.find(c, cur)
+        if k < 0: k = txt.find(c[:40], cur)
+        if k < 0: continue
+        b0 = len(txt[:k].encode()); b1 = b0 + len(c.encode()); cur = k + 1; hit += 1
+        m = torch.from_numpy((starts < b1) & (ends > b0)); bonus[m] = float(v); cov |= m
+    if hit == 0: return None
+    bonus[cov] -= bonus[cov].mean()          # centred over the claim tokens; markup / bullet tokens keep the plain sequence advantage
+    return bonus
+
+
 def grpo_token_loss(new_lp, ref_lp, advantage, *, kl_beta=0.01, kl_tok=None,
                     length_normalizer=None, old_lp=None, loss_mode="reinforce", cispo_eps_max=5.0, ppo_clip=0.2):
     """Per-token policy-gradient loss + KL for ONE sample's response tokens.
@@ -1333,6 +1365,7 @@ def grpo_update_microbatched(
     length_normalizer=None,
     old_logps_list=None, sampler_mismatch_thresh=0.0,
     sample_normalizers=None, loss_mode="reinforce", cispo_eps_max=5.0, ppo_clip=0.2, sort_by_length=True, prefix=None,
+    token_adv_bonus=None,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
 
@@ -1464,8 +1497,12 @@ def grpo_update_microbatched(
                     mismatch_masked_idx.append(i)
                     continue
             _ln = (sample_normalizers[i] if sample_normalizers is not None else length_normalizer)
+            _adv_i = advantages[i]
+            if token_adv_bonus is not None and token_adv_bonus[i] is not None:   # --claim-credit loo: per-token advantage = sequence advantage + claim bonus
+                _b = token_adv_bonus[i].to(new_lp.device, new_lp.dtype)[: new_lp.numel()]
+                _adv_i = _adv_i + F.pad(_b, (0, new_lp.numel() - _b.numel()))
             sample_loss, kl_m = grpo_token_loss(
-                new_lp, ref_lp, advantages[i], kl_beta=kl_beta, kl_tok=kl_tok,
+                new_lp, ref_lp, _adv_i, kl_beta=kl_beta, kl_tok=kl_tok,
                 length_normalizer=_ln, old_lp=_olp, loss_mode=loss_mode, cispo_eps_max=cispo_eps_max, ppo_clip=ppo_clip,
             )
             chunk_losses.append(sample_loss)
@@ -1769,7 +1806,7 @@ def main():
     # ---- reward mode (actor reward; the AR/critic always trains on vector-MSE) ----
     p.add_argument("--reward-mode",
                    choices=["vector_mse", "downstream_mse", "downstream_plus_fve",
-                            "downstream_kl", "downstream_ladder", "vector_plus_kl", "flow"],
+                            "downstream_kl", "downstream_ladder", "vector_plus_kl", "flow", "claims"],
                    default="vector_mse",
                    help="ACTOR reward. vector_mse (DEFAULT) = -MSE(reconstruction, gold) "
                         "in L42 activation space (the classic NLA reward). downstream_mse "
@@ -1779,6 +1816,30 @@ def main():
                         "causal footprint). downstream_plus_fve = vector + "
                         "--downstream-fve-weight * downstream. The critic (AR) ALWAYS "
                         "trains on the vector-MSE targets regardless.")
+    p.add_argument("--claim-cost", type=float, default=40.0,
+                   help="--reward-mode claims (compositional NLA): reward = PMI(h; C) - claim_cost * |C| in nats, C = the explanation's claims "
+                        "(nla.flow.claims.split_claims), PMI from a claim-SET flow conditioner (--flow-adapter trained with train_cond --claim-subsets; "
+                        "needs --ar-loss flow). Deletion test: a false claim is worth ~20 nats of PMI, a true one ~78.")
+    p.add_argument("--claim-max", type=int, default=12, help="claims scored per explanation (the first N); every claim is charged --claim-cost")
+    p.add_argument("--compose", choices=["mean", "joint"], default="mean",
+                   help="claims mode. mean (DEFAULT): SINGLE-CLAIM critic, claims composed in velocity space v = v0 + w * sum_i (v(c_i) - v0) "
+                        "(--compose-weight; FlowCritic.score_claims_composed). joint: the claim set is ONE condition of a claim-set critic")
+    p.add_argument("--compose-weight", default="mean", help="w of the velocity composition: mean (1/m, default) | sqrt (m^-0.5) | sum (1, product of experts) | a number")
+    p.add_argument("--claim-reward", choices=["set", "singles_red"], default="set",
+                   help="set: PMI(h; C) - cost*|C|. singles_red (stage-0 recommendation): sum_i PMI(h; c_i) - redundancy - cost*|C| with redundancy = "
+                        "max(0, sum_i PMI(c_i) - PMI(h; C)) from the same critic (= min(sum of singles, set PMI) - cost*|C|; unclipped it equals 'set')")
+    p.add_argument("--claim-set-encode", choices=["auto", "on", "off"], default="auto",
+                   help="claim-set condition as concatenated per-claim memories (auto = what the critic adapter was trained with)")
+    p.add_argument("--claim-credit", choices=["none", "loo", "singles"], default="none",
+                   help="loo: leave-one-out credit credit_j = PMI(C) - PMI(C minus c_j) for EVERY rollout, and the sequence advantage is "
+                        "redistributed over the claims' tokens by (credit_j - claim_cost) (zero-mean within the rollout, --claim-credit-beta). "
+                        "singles: the same redistribution with credit_j = single-claim PMI(h; c_j). "
+                        "none: sequence-level reward only; credits still computed on --claim-credit-log-n rollouts per rank for logging")
+    p.add_argument("--claim-credit-log-n", type=int, default=32)
+    p.add_argument("--claim-credit-beta", type=float, default=1.0)
+    p.add_argument("--claim-fail-reward", type=float, default=None,
+                   help="reward of an empty / unparseable / truncated explanation in claims mode (default -claim_cost * claim_max: the -2 of "
+                        "the MSE modes is ~0 nats, i.e. it would beat any real explanation whose claims do not pay their cost)")
     p.add_argument("--extraction-layer", type=int, default=42,
                    help="Decoder block whose OUTPUT residual the activations were "
                         "extracted from (= where the downstream reward patches). Must "
@@ -2206,7 +2267,10 @@ def main():
         # the flow critic replaces the MSE reconstructor entirely (no NLACriticModel in memory; --ar-ckpt is unused)
         from nla.flow.rl_critic import FlowCritic
         assert args.flow_prior and args.flow_adapter and args.flow_stats, "--ar-loss flow needs --flow-prior/--flow-adapter/--flow-stats"
-        if args.reward_mode != "flow":
+        if args.reward_mode == "claims":
+            print(f"[flow] compositional reward ({args.claim_reward}, compose {args.compose} w={args.compose_weight}): claims PMI - {args.claim_cost} nats x |claims| (first {args.claim_max} scored), credit {args.claim_credit}, set-encode {args.claim_set_encode}, "
+                  f"critic {'CO-TRAINED' if args.train_critic else 'FROZEN'} ({args.flow_adapter})", flush=True)
+        elif args.reward_mode != "flow":
             print(f"[flow] NOTE: --ar-loss flow with --reward-mode {args.reward_mode}: the actor is rewarded by the flow's x0-prediction MSE", flush=True)
         critic = None
         _flow_dev = torch.device(args.flow_device) if args.flow_device else device
@@ -2949,9 +3013,24 @@ def main():
             # --critic-ema-decay > 0; the co-train loss below always runs on live
             # weights. swapped() restores in a finally, so a crash here cannot
             # leave EMA weights in the live slots.
-            flow_rewards = None
+            flow_rewards = None; claim_res = None
             with critic_ema.swapped():
-                if flow is not None:
+                if flow is not None and args.reward_mode == "claims":
+                    # compositional NLA: PMI(h; claim set) - cost * |claims| from a claim-set conditioner, eps shared by group + unconditional pass
+                    _sub = random.Random(step * 7 + rank).sample(range(len(all_explanations)), min(args.claim_credit_log_n, len(all_explanations)))
+                    _all = list(range(len(all_explanations)))
+                    _loo = _all if args.claim_credit == "loo" else _sub; _sgl = _all if args.claim_credit == "singles" else _sub
+                    if args.compose == "mean":   # single-claim critic, velocity composition (singles + leave-one-out come free from the cached deltas)
+                        claim_res = flow.score_claims_composed(all_explanations, all_activations, all_prompt_group, seed=step, cost=args.claim_cost,
+                                                               claim_max=args.claim_max, loo_rows=[i for i in _loo if not all_truncated[i]],
+                                                               reward=args.claim_reward, weight=args.compose_weight)
+                    else:
+                        claim_res = flow.score_claims(all_explanations, all_activations, all_prompt_group, seed=step, cost=args.claim_cost,
+                                                      claim_max=args.claim_max, loo_rows=[i for i in _loo if not all_truncated[i]],
+                                                      single_rows=[i for i in _sgl if not all_truncated[i]], reward=args.claim_reward,
+                                                      set_encode={"auto": None, "on": True, "off": False}[args.claim_set_encode])
+                    flow_rewards, rewards, recon_preds = claim_res["reward"], claim_res["vr"], claim_res["preds"]
+                elif flow is not None:
                     # flow reward (shared eps per group, fixed t grid) + vector-MSE of the x0-prediction @ t=0.9 (the FVE curve)
                     flow_rewards, rewards, recon_preds = flow.score(all_explanations, all_activations, all_prompt_group, seed=step)
                 else:
@@ -3064,7 +3143,7 @@ def main():
                 None if (rv is None or rd is None) else (rv + _w * rd)
                 for rv, rd in zip(rewards, ds_rewards)
             ]
-        elif args.reward_mode == "flow":
+        elif args.reward_mode in ("flow", "claims"):
             actor_rewards = flow_rewards
         else:  # downstream_plus_fve: -mse_vec + w * -mse_downstream, per sample
             _w = args.downstream_fve_weight
@@ -3083,7 +3162,9 @@ def main():
                 for r in actor_rewards
             ]
         else:
-            rewards_filled = [-2.0 if r is None else r for r in actor_rewards]
+            _fail = (-2.0 if args.reward_mode != "claims" else
+                     (args.claim_fail_reward if args.claim_fail_reward is not None else -args.claim_cost * args.claim_max))
+            rewards_filled = [_fail if r is None else r for r in actor_rewards]
         rewards_t = torch.tensor(rewards_filled, dtype=torch.float32, device=device)
 
         # ---- reward shaping (length penalty) ----
@@ -3095,6 +3176,27 @@ def main():
             if _fv:
                 shape_terms["av/flow_reward_mean"] = float(np.mean(_fv))
                 shape_terms["av/flow_fm_loss"] = -float(np.mean(_fv))   # conditional FM loss of the rollouts (lower = explanation explains h better)
+        if claim_res is not None:
+            _ok = [i for i in range(len(all_explanations)) if flow_rewards[i] is not None]
+            _nc = [claim_res["n_claims"][i] for i in range(len(all_explanations)) if not all_truncated[i]]
+            if _nc: shape_terms["critic/n_claims_mean"] = float(np.mean(_nc)); shape_terms["critic/n_claims_over_max_frac"] = float(np.mean([c > args.claim_max for c in _nc]))
+            shape_terms["critic/claims_fail_frac"] = 1.0 - len(_ok) / max(len(all_explanations), 1)
+            if _ok:
+                _pm = [claim_res["pmi"][i] for i in _ok]
+                shape_terms["critic/claims_pmi_nats_mean"] = float(np.mean(_pm)); shape_terms["critic/claims_pmi_bits_mean"] = float(np.mean(_pm)) / math.log(2)
+                shape_terms["critic/claims_pmi_per_claim_nats"] = float(np.mean([claim_res["pmi"][i] / max(1, min(claim_res["n_claims"][i], args.claim_max)) for i in _ok]))
+                shape_terms["critic/claim_reward_mean"] = float(np.mean([flow_rewards[i] for i in _ok]))
+            _sg = [c for v in claim_res["singles"].values() for c in v if c is not None]
+            if _sg:
+                shape_terms["critic/claim_single_pmi_mean"] = float(np.mean(_sg)); shape_terms["critic/claim_single_pmi_median"] = float(np.median(_sg))
+                shape_terms["critic/claim_single_frac_below_cost"] = float(np.mean([c < args.claim_cost for c in _sg]))
+                _rd = [sum(v) - claim_res["pmi"][i] for i, v in claim_res["singles"].items() if claim_res["pmi"][i] is not None]
+                if _rd: shape_terms["critic/claims_redundancy_mean"] = float(np.mean(_rd)); shape_terms["critic/claims_synergy_frac"] = float(np.mean([r_ < 0 for r_ in _rd]))
+            _cr = [c for v in claim_res["credits"].values() for c in v if c is not None]
+            if _cr:
+                shape_terms["critic/claim_credit_mean"] = float(np.mean(_cr)); shape_terms["critic/claim_credit_median"] = float(np.median(_cr))
+                shape_terms["critic/claim_credit_p10"] = float(np.percentile(_cr, 10)); shape_terms["critic/claim_credit_p90"] = float(np.percentile(_cr, 90))
+                shape_terms["critic/claim_credit_frac_below_cost"] = float(np.mean([c < args.claim_cost for c in _cr])); shape_terms["critic/claim_credit_n"] = float(len(_cr))
         if ds_rewards is not None:
             _dsv = [r for r in ds_rewards if r is not None]
             if _dsv:
@@ -3214,6 +3316,18 @@ def main():
         upd_activations = [all_activations[i] for i in keep]
         upd_old_logps = [all_old_logps[i] for i in keep]
         upd_adv = adv.index_select(0, torch.tensor(keep, device=device))
+        upd_bonus = None
+        if claim_res is not None and args.claim_credit in ("loo", "singles"):
+            _sig = float(shape_terms.get("scalerl/batch_adv_std", float(rewards_t[inject_ok_t].std()) if int(inject_ok_t.sum()) > 1 else 1.0)) + 1e-6
+            upd_bonus = []; _nb = 0
+            for i in keep:
+                cr = (claim_res["credits"] if args.claim_credit == "loo" else claim_res["singles"]).get(i)
+                if not cr or all_truncated[i] or flow_rewards[i] is None: upd_bonus.append(None); continue
+                net = [None if c is None else args.claim_credit_beta * (c - args.claim_cost) / _sig for c in cr]
+                b = claim_token_bonus(tokenizer, all_full_ids[i][all_prompt_lens[i]:].tolist(), claim_res["claims"][i][: args.claim_max], net)
+                upd_bonus.append(b); _nb += b is not None
+            shape_terms["critic/claim_bonus_rollouts"] = float(_nb)
+            if _nb: shape_terms["critic/claim_bonus_abs_mean"] = float(np.mean([b.abs().mean().item() for b in upd_bonus if b is not None]))
         actor.train()
         _grpo_kwargs_common = None
         for _attempt in range(5 if args.oom_keep_prefix else 3):
@@ -3237,6 +3351,7 @@ def main():
             sampler_mismatch_thresh=args.sampler_mismatch_thresh,
             sample_normalizers=([_sample_norm[i] for i in keep] if _sample_norm is not None else None),
             loss_mode=args.loss, cispo_eps_max=args.cispo_eps_max, ppo_clip=args.ppo_clip, sort_by_length=not args.no_sort_microbatches, prefix=_prefix_cache,
+            token_adv_bonus=upd_bonus,
             )
             break
           except (torch.OutOfMemoryError, RuntimeError) as _oom_e:
@@ -3578,6 +3693,14 @@ def main():
                     flush=True,
                 )
         print(rl_logging.format_console_line(step, log, train_ar=args.train_critic), flush=True)
+        if args.reward_mode == "claims":   # compositional reward summary (the same keys go to wandb under critic/*)
+            _g = lambda k: shape_terms.get(k, float("nan"))
+            print(f"  [claims@{step}] n_claims {_g('critic/n_claims_mean'):.2f} (>{args.claim_max}: {_g('critic/n_claims_over_max_frac'):.2f}) | fail {_g('critic/claims_fail_frac'):.2f} | "
+                  f"PMI {_g('critic/claims_pmi_nats_mean'):.1f} nats ({_g('critic/claims_pmi_per_claim_nats'):.1f}/claim) | reward {_g('critic/claim_reward_mean'):.1f} | "
+                  f"LOO credit mean {_g('critic/claim_credit_mean'):.1f} p10/p90 {_g('critic/claim_credit_p10'):.1f}/{_g('critic/claim_credit_p90'):.1f} "
+                  f"frac<cost {_g('critic/claim_credit_frac_below_cost'):.2f} (n {_g('critic/claim_credit_n'):.0f}) | single PMI median {_g('critic/claim_single_pmi_median'):.1f} "
+                  f"redundancy {_g('critic/claims_redundancy_mean'):.1f} | bonus rollouts {_g('critic/claim_bonus_rollouts'):.0f} | "
+                  f"sampler |dlogp| {grpo_metrics.get('sampler_logp_absdiff_mean', float('nan')) if grpo_metrics else float('nan'):.3f}", flush=True)
         # [timing] per-phase breakdown (sync subtracted from the critic window)
         print(
             f"  [timing@{step}] roll {t_roll_end - t0:.1f}s | "

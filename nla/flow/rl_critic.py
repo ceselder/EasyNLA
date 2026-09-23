@@ -329,6 +329,206 @@ class FlowCritic:
         if self.dev_type == "cuda": torch.cuda.empty_cache()
         return fr, vr, preds
 
+    # ------------------------------------------------------------------ compositional reward (claim-set critic)
+    def _tok_states(self, texts, chunk: int = 128):
+        """per-text token memories from the cross-read encoder (no grad), chunked -> (enc [n, T, d], mask [n, T]) on the flow device"""
+        encs, mks = [], []
+        for i in range(0, len(texts), chunk):
+            with torch.no_grad(), torch.autocast(device_type=self.dev_type, dtype=torch.bfloat16):
+                e, m = (self.arvec.tokens(texts[i:i + chunk]) if self.use_enc else self.encode(texts[i:i + chunk]))
+            encs.append(e.to(self.device)); mks.append(m.to(self.device))
+        T = max(e.shape[1] for e in encs)
+        encs = [torch.nn.functional.pad(e, (0, 0, 0, T - e.shape[1])) for e in encs]; mks = [torch.nn.functional.pad(m, (0, T - m.shape[1])) for m in mks]
+        return torch.cat(encs), torch.cat(mks)
+
+    def _fm_losses(self, cond, x0, eps_list):
+        """per-row flow-matching loss (mean over dims, averaged over the t grid and the eps draws). cond = None (unconditional), a list of texts,
+        or a precomputed (enc, mask) memory. x0 [B, d] standardised, eps_list = [eps_k [B, d]] -> [B]"""
+        B = x0.shape[0]; tot = torch.zeros(B, device=self.device); enc = mask = cvec = None
+        if isinstance(cond, tuple): enc, mask = cond
+        elif cond is not None: enc, mask, cvec, _ = self._cond(cond, grad=False)
+        with self._ac():
+            for eps_k in eps_list:
+                for tv in self.t_grid:
+                    t = torch.full((B,), tv, device=self.device); x_t = (1 - tv) * x0 + tv * eps_k
+                    v = (self.model(x_t, t, enc, mask, cvec) if cond is not None else self.model(x_t, t)).float()
+                    tot += ((v - (eps_k - x0)) ** 2).mean(1)
+        return tot / (len(self.t_grid) * len(eps_list))
+
+    @torch.no_grad()
+    def score_claims(self, explanations, activations, groups, seed: int = 0, cost: float = 40.0, claim_max: int = 12, loo_rows=(), single_rows=(),
+                     reward: str = "set", set_encode: bool | None = None):
+        """Compositional-NLA reward from a claim-set conditioner (nla.flow.train_cond --claim-subsets [--set-encode]).
+        claims = nla.flow.claims.split_claims(explanation); the first claim_max are scored.
+          PMI(h; S) [nats] = (d/2) * mean_{t, eps}[ L_uncond - L_cond(S) ]     (FM-loss proxy of log p(h|S) - log p(h))
+          reward "set"        = PMI(h; C) - cost * n_claims
+          reward "singles_red"= sum_i PMI(c_i) - redundancy - cost * n_claims,  redundancy = max(0, sum_i PMI(c_i) - PMI(h; C))
+                                (= min(sum of singles, set PMI) - cost * n; unclipped it would be identical to "set")
+        Every claim is charged, also those beyond claim_max. eps is SHARED by the whole group AND the unconditional pass (common random numbers).
+        Set-encoded critics (adapter args set_encode, or set_encode=True): each claim is encoded ONCE per call and every subset's memory is the
+        concatenation of its claims' token states (exactly order-free; singles / leave-one-out re-use the cache). Otherwise the subset is one
+        bullet text. loo_rows / single_rows: rows whose leave-one-out credits PMI(C) - PMI(C minus c_j) / single-claim PMIs are computed (all rows
+        get singles under reward "singles_red").
+        -> dict(reward, pmi, n_claims, claims, vr, preds, credits {i: [..]}, singles {i: [..]}); None where no claim could be parsed."""
+        from nla.flow.claims import split_claims, format_claims
+        from nla.flow.claimset import memories
+        from nla.schema import normalize_activation
+        assert not self.use_trunk, "score_claims: token/AR-conditioned critics only"
+        se = bool(self.adapter_args.get("set_encode", False)) if set_encode is None else set_encode
+        n = len(explanations); out = {k: [None] * n for k in ("reward", "pmi", "n_claims", "claims", "vr", "preds")}; out["credits"] = {}; out["singles"] = {}
+        cl = [split_claims(z) if (z is not None and z.strip()) else [] for z in explanations]
+        for i in range(n): out["n_claims"][i] = len(cl[i]); out["claims"][i] = cl[i]
+        valid = [i for i in range(n) if cl[i]]
+        if not valid: return out
+        gens = {}
+        def eps_for(g, k=0):
+            if (g, k) not in gens:
+                gen = torch.Generator(device=self.device).manual_seed(int(seed) * 1_000_003 + int(g) * 31 + int(k))
+                gens[(g, k)] = torch.randn(self.d, generator=gen, device=self.device)
+            return gens[(g, k)]
+        self.model.eval(); half_d = 0.5 * self.d
+        if se:   # per-claim encoder cache for the whole call
+            uniq = {}
+            for i in valid:
+                for c in cl[i][:claim_max]: uniq.setdefault(c, len(uniq))
+            C_enc, C_mk = self._tok_states(list(uniq))
+        def cond_for(sets):
+            if se: return memories(C_enc, C_mk, [[uniq[c] for c in s_] for s_ in sets])
+            return [format_claims(s_) for s_ in sets]
+        # unconditional loss once per group (all members share h and eps)
+        Lu = {}; ug = sorted({groups[i] for i in valid}); first = {}
+        for i in valid: first.setdefault(groups[i], i)
+        for cs in range(0, len(ug), self.micro_batch):
+            gs = ug[cs: cs + self.micro_batch]
+            x0 = self.norm.normalize(torch.stack([activations[first[g]].to(self.device).float() for g in gs]))
+            lu = self._fm_losses(None, x0, [torch.stack([eps_for(g, k) for g in gs]) for k in range(self.eps_per_t)])
+            for g, v in zip(gs, lu.tolist()): Lu[g] = v
+        def cond_pmi(rows, sets):
+            res = []
+            for cs in range(0, len(rows), self.micro_batch):
+                ch = rows[cs: cs + self.micro_batch]; st_ = sets[cs: cs + self.micro_batch]
+                x0 = self.norm.normalize(torch.stack([activations[i].to(self.device).float() for i in ch]))
+                lc = self._fm_losses(cond_for(st_), x0, [torch.stack([eps_for(groups[i], k) for i in ch]) for k in range(self.eps_per_t)])
+                res += [half_d * (Lu[groups[i]] - v) for i, v in zip(ch, lc.tolist())]
+            return res
+        pmi = cond_pmi(valid, [cl[i][:claim_max] for i in valid])
+        for i, p in zip(valid, pmi):
+            if math.isfinite(p): out["pmi"][i] = p
+        # single-claim PMIs (all rows for "singles_red", else the requested rows)
+        want_s = [i for i in (valid if reward == "singles_red" else single_rows) if out["pmi"][i] is not None]
+        rows, sets = [], []
+        for i in want_s:
+            for c in cl[i][:claim_max]: rows.append(i); sets.append([c])
+        if rows:
+            for i, p in zip(rows, cond_pmi(rows, sets)): out["singles"].setdefault(i, []).append(p)
+        for i in valid:
+            if out["pmi"][i] is None: continue
+            if reward == "singles_red" and i in out["singles"]:
+                ss = sum(out["singles"][i]); out["reward"][i] = ss - max(0.0, ss - out["pmi"][i]) - cost * len(cl[i])
+            else: out["reward"][i] = out["pmi"][i] - cost * len(cl[i])
+        for cs in range(0, len(valid), self.micro_batch):          # FVE curve: x0-prediction at fve_t under the claim set (same as score())
+            ch = valid[cs: cs + self.micro_batch]; B = len(ch)
+            gold = torch.stack([activations[i].to(self.device).float() for i in ch]); x0 = self.norm.normalize(gold)
+            cnd = cond_for([cl[i][:claim_max] for i in ch])
+            if isinstance(cnd, tuple): enc, mask, cvec = cnd[0], cnd[1], None
+            else: enc, mask, cvec, _ = self._cond(cnd, grad=False)
+            eps = torch.stack([eps_for(groups[i], 0) for i in ch])
+            t = torch.full((B,), self.fve_t, device=self.device); x_t = (1 - self.fve_t) * x0 + self.fve_t * eps
+            with self._ac(): v = self.model(x_t, t, enc, mask, cvec).float()
+            x0_hat = self.norm.denormalize(x_t - self.fve_t * v)
+            mse = ((normalize_activation(x0_hat, self.msf) - normalize_activation(gold, self.msf)) ** 2).mean(1)
+            for r, i in enumerate(ch):
+                if math.isfinite(mse[r].item()): out["vr"][i] = -mse[r].item(); out["preds"][i] = x0_hat[r].detach().float().cpu()
+        # leave-one-out credit
+        rows, sets, own = [], [], []
+        for i in loo_rows:
+            if out["pmi"][i] is None: continue
+            s_ = cl[i][:claim_max]
+            if len(s_) == 1: out["credits"][i] = [out["pmi"][i]]; continue
+            for j in range(len(s_)): rows.append(i); sets.append(s_[:j] + s_[j + 1:]); own.append(j)
+        if rows:
+            for i, j, p in zip(rows, own, cond_pmi(rows, sets)):
+                out["credits"].setdefault(i, [None] * len(cl[i][:claim_max]))[j] = out["pmi"][i] - p
+        if self.dev_type == "cuda": torch.cuda.empty_cache()
+        return out
+
+    @staticmethod
+    def compose_w(m, weight):
+        """velocity-composition weight for m claims: 'mean' 1/m, 'sqrt' m^-0.5, 'sum' 1, or a float"""
+        if m <= 0: return 0.0
+        return {"mean": 1.0 / m, "sqrt": m ** -0.5, "sum": 1.0}.get(weight, None) or float(weight)
+
+    @torch.no_grad()
+    def score_claims_composed(self, explanations, activations, groups, seed: int = 0, cost: float = 40.0, claim_max: int = 12, loo_rows=(),
+                              reward: str = "set", weight: str = "mean", rows_per_chunk: int = 32):
+        """Compositional-NLA reward from a SINGLE-CLAIM conditioner (train_cond --claim-subsets 1), composing claims in velocity space:
+          v(x, t | C) = v0(x, t) + w(m) * sum_i [ v(x, t | c_i) - v0(x, t) ]      w = 1/m ('mean', default) | m^-0.5 ('sqrt') | 1 ('sum')
+          PMI(h; C) [nats] = (d/2) * mean_{t, eps}[ L(v0) - L(v(.|C)) ],  L = per-dim MSE to the flow target (eps - h)
+          reward "set" = PMI(h; C) - cost * n_claims ;  "singles_red" = min(sum_i PMI(h; c_i), PMI(h; C)) - cost * n_claims
+        Each claim is encoded once and its velocity computed once per (t, eps); singles (w = 1 for one claim) and leave-one-out compositions
+        (credit_j = PMI(C) - PMI(C minus c_j), same w rule for m-1 claims) are combinations of the cached deltas: no extra forward passes.
+        eps is shared by the whole group AND the unconditional pass. -> same dict as score_claims (+ singles for every row)."""
+        from nla.flow.claims import split_claims
+        from nla.schema import normalize_activation
+        assert not self.use_trunk and (self.use_enc or self.use_tokens), "velocity composition needs a cross-read (token) conditioner"
+        n = len(explanations); out = {k: [None] * n for k in ("reward", "pmi", "n_claims", "claims", "vr", "preds")}; out["credits"] = {}; out["singles"] = {}
+        cl = [split_claims(z) if (z is not None and z.strip()) else [] for z in explanations]
+        for i in range(n): out["n_claims"][i] = len(cl[i]); out["claims"][i] = cl[i]
+        valid = [i for i in range(n) if cl[i]]
+        if not valid: return out
+        gens = {}
+        def eps_for(g, k=0):
+            if (g, k) not in gens:
+                gen = torch.Generator(device=self.device).manual_seed(int(seed) * 1_000_003 + int(g) * 31 + int(k))
+                gens[(g, k)] = torch.randn(self.d, generator=gen, device=self.device)
+            return gens[(g, k)]
+        self.model.eval(); half_d = 0.5 * self.d; loo_set = set(loo_rows)
+        uniq = {}
+        for i in valid:
+            for c in cl[i][:claim_max]: uniq.setdefault(c, len(uniq))
+        C_enc, C_mk = self._tok_states(list(uniq))
+        tvals = list(self.t_grid); K = self.eps_per_t
+        for c0 in range(0, len(valid), rows_per_chunk):
+            ch = valid[c0: c0 + rows_per_chunk]; R = len(ch)
+            rows = [(r, uniq[c]) for r, i in enumerate(ch) for c in cl[i][:claim_max]]; owner = torch.tensor([r for r, _ in rows], device=self.device)
+            ms = [min(len(cl[i]), claim_max) for i in ch]
+            gold = torch.stack([activations[i].to(self.device).float() for i in ch]); x0 = self.norm.normalize(gold)
+            Lu = torch.zeros(R, device=self.device); Lf = torch.zeros(R, device=self.device); Ls = torch.zeros(len(rows), device=self.device); Ll = torch.zeros(len(rows), device=self.device)
+            wm = torch.tensor([self.compose_w(m, weight) for m in ms], device=self.device)
+            wl = torch.tensor([self.compose_w(ms[r] - 1, weight) for r, _ in rows], device=self.device)
+            fve = None
+            for k in range(K):
+                eps = torch.stack([eps_for(groups[i], k) for i in ch]); tgt = eps - x0
+                extra = [self.fve_t] if (k == 0 and self.fve_t not in tvals) else []          # the FVE point, scored only if not already on the grid
+                for tv in tvals + extra:
+                    t = torch.full((R,), tv, device=self.device); x_t = (1 - tv) * x0 + tv * eps
+                    with self._ac(): v0 = self.model(x_t, t).float()
+                    D = torch.empty(len(rows), self.d, device=self.device)
+                    for b0 in range(0, len(rows), 4 * self.micro_batch):
+                        rr = list(range(b0, min(len(rows), b0 + 4 * self.micro_batch))); own = owner[rr]; ci = [rows[j][1] for j in rr]
+                        with self._ac(): vi = self.model(x_t[own], t[own], C_enc[ci], C_mk[ci]).float()
+                        D[rr] = vi - v0[own]
+                    S = torch.zeros(R, self.d, device=self.device).index_add_(0, owner, D)
+                    vf = v0 + wm[:, None] * S
+                    if tv in extra: fve = (x_t, vf); continue
+                    Lu += ((v0 - tgt) ** 2).mean(1); Lf += ((vf - tgt) ** 2).mean(1)
+                    Ls += ((v0[owner] + D - tgt[owner]) ** 2).mean(1)
+                    Ll += ((v0[owner] + wl[:, None] * (S[owner] - D) - tgt[owner]) ** 2).mean(1)
+                    if tv == self.fve_t and k == 0: fve = (x_t, vf)
+            nrm = len(tvals) * K; Lu, Lf, Ls, Ll = Lu / nrm, Lf / nrm, Ls / nrm, Ll / nrm
+            pf = (half_d * (Lu - Lf)).tolist(); ps = (half_d * (Lu[owner] - Ls)).tolist(); cr = (half_d * (Ll - Lf[owner])).tolist()
+            x_t, vf = fve; x0_hat = self.norm.denormalize(x_t - self.fve_t * vf)
+            mse = ((normalize_activation(x0_hat, self.msf) - normalize_activation(gold, self.msf)) ** 2).mean(1).tolist()
+            for r, i in enumerate(ch):
+                if not math.isfinite(pf[r]): continue
+                out["pmi"][i] = pf[r]; sg = [ps[j] for j, (rj, _) in enumerate(rows) if rj == r]; out["singles"][i] = sg
+                if i in loo_set: out["credits"][i] = [out["pmi"][i]] if ms[r] == 1 else [cr[j] for j, (rj, _) in enumerate(rows) if rj == r]
+                ss = sum(sg); out["reward"][i] = (min(ss, pf[r]) if reward == "singles_red" else pf[r]) - cost * len(cl[i])
+                if math.isfinite(mse[r]): out["vr"][i] = -mse[r]; out["preds"][i] = x0_hat[r].detach().float().cpu()
+        del C_enc, C_mk
+        if self.dev_type == "cuda": torch.cuda.empty_cache()
+        return out
+
     # ------------------------------------------------------------------ co-training
     def train_backward(self, explanations, activations, accum: int = 1):
         """conditional FM loss (per-sample condition dropout) on (explanation, activation) pairs; grads accumulate on the adapter.

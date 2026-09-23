@@ -68,8 +68,20 @@ class FlowBundle:
             assert base, "token conditioning needs --base"
             from nla.flow.train_cond import load_encoder
             self.encode, self.tok = load_encoder(base, aa.get("enc_layer", enc_layer), dev)
-        self.use_enc, self.use_vec = use_enc, use_vec
+        self.use_enc, self.use_vec = use_enc, use_vec; self.set_encode = bool(aa.get("set_encode", False))
         print(f"[scoring] frozen flow: prior {cfg['n_layers']} blocks; adapter step {ad.get('step')} cond_mode={self.cond_mode} from {adapter_path}", flush=True)
+
+    @torch.no_grad()
+    def cond_sets(self, sets):
+        """claim sets -> (enc, mask, None): each claim encoded alone, memories concatenated (set-encoded cross-read conditioners; any cross-read
+        conditioner can be scored this way, but only --set-encode ones were trained on it). A str element = a one-claim set."""
+        from nla.flow.claimset import encode_sets
+        assert self.use_enc or self.encode is not None, "set encoding needs a cross-read conditioner"
+        fn = self.arvec.tokens if self.use_enc else self.encode
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            enc, mk = encode_sets(fn, sets)
+        self.last_shift = None
+        return enc, mk, None
 
     @torch.no_grad()
     def cond(self, texts):

@@ -59,6 +59,36 @@ def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False):
     return (acts, zs, docs[:n]) if with_doc else (acts, zs)
 
 
+def load_claims_dir(root, n, n_val, weights=None, balance=0.0, balance_clip=10.0):
+    """synthetic claim data (scripts/claims_finalize.py): {root}/final/final_*.parquet -> train (acts fp16, claim lists, per-claim sampling weights
+    or None, per-claim false twins or None) up to n non-val anchors, val [(act, claims, families, types, twins)] up to n_val val anchors that carry
+    all three families (internal / text / semantic). weights = parse_weights table (family / family:type -> weight); balance > 0 multiplies each
+    claim's weight by (median type count / its type count) ** balance, clipped to [1/clip, clip] (type-balanced claim sampling)."""
+    import glob as _glob, pyarrow.parquet as pq, numpy as _np
+    from nla.flow.claimset import claim_weight
+    acts, cls, ws, tws, val = [], [], [], [], []; ntr = 0
+    tcount = {}
+    if balance > 0:   # type frequencies from the finalize stats (claims per family:type)
+        st_ = json.load(open(f"{root}/final/stats.json"))["claims_per_type"]; med = float(_np.median(list(st_.values())))
+        tcount = {k: min(balance_clip, max(1 / balance_clip, (med / v) ** balance)) for k, v in st_.items()}
+    weights = weights or ({} if balance > 0 else None)
+    for f in sorted(_glob.glob(f"{root}/final/final_*.parquet")):
+        pf = pq.ParquetFile(f); has_tw = "twins" in pf.schema_arrow.names
+        for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "claims", "families", "types", "is_val"] + (["twins"] if has_tw else [])):
+            av = rb.column("activation_vector"); d_ = av.type.list_size
+            A = torch.from_numpy(av.flatten().to_numpy(zero_copy_only=False).reshape(-1, d_).astype(_np.float16))
+            isv = rb.column("is_val").to_pylist(); cl = rb.column("claims").to_pylist(); fa = rb.column("families").to_pylist(); ty = rb.column("types").to_pylist()
+            tw = rb.column("twins").to_pylist() if has_tw else [None] * len(cl)
+            ti = [i for i, v in enumerate(isv) if not v][: max(0, n - ntr)]
+            if ti:
+                acts.append(A[ti]); cls += [cl[i] for i in ti]; tws += [tw[i] for i in ti]; ntr += len(ti)
+                ws += [[claim_weight(weights, f_, t_) * tcount.get(f"{f_}:{(t_ or '').split('/')[0]}", 1.0) for f_, t_ in zip(fa[i], ty[i])] if weights is not None else None for i in ti]
+            for i, v in enumerate(isv):
+                if v and len(val) < n_val and {"internal", "text", "semantic"} <= set(fa[i]): val.append((A[i], cl[i], fa[i], ty[i], tw[i]))
+        if ntr >= n and len(val) >= n_val: break
+    return (torch.cat(acts) if acts else torch.zeros(0, 1, dtype=torch.float16)), cls, ws, tws, val
+
+
 def load_pairs(parquet, n, skip=0, with_doc=False):
     """Row-batched read (a single 500k x 5120 list array overflows pyarrow's int32 offsets)."""
     from nla.schema import extract_explanation
@@ -254,6 +284,14 @@ def main():
     p.add_argument("--neg-frac", type=float, default=0.0, help="contrastive hard negatives: fraction of the batch that also gets a same-text-one-specific-changed negative (number perturbed / entity swapped); hinge on the paired FM-loss gap")
     p.add_argument("--group-contrast", type=int, default=0, help="same-document InfoNCE: number of document groups per step (0 = off); the G activations of one document are each other's hard negatives")
     p.add_argument("--group-size", type=int, default=8); p.add_argument("--group-tau", type=float, default=0.02, help="temperature on the per-dim FM loss: logits = -loss / tau"); p.add_argument("--group-lambda", type=float, default=1.0)
+    p.add_argument("--claims-dir", default=None, help="synthetic claim data root (scripts/claims_finalize.py -> <dir>/final/final_*.parquet); needs --claim-subsets. Its anchors are ADDED to the gold-split training pairs (--max-train 0: synthetic only); its val anchors give a second eval (prefix eval_synth) with one-claim PMI per claim family")
+    p.add_argument("--max-synth", type=int, default=5000000, help="max synthetic training anchors from --claims-dir")
+    p.add_argument("--set-encode", action="store_true", help="SET-ENCODED claim conditions (tokens_ar): every claim encoded alone, memories concatenated -> exactly order-free (nla.flow.claimset)")
+    p.add_argument("--single-frac", type=float, default=0.0, help="claim-set mode: P(k = 1); otherwise k ~ U{2..min(K, n)} (0 = the plain U{1..min(K, n)})")
+    p.add_argument("--gold-whole-frac", type=float, default=0.0, help="claim-set mode: share of GOLD anchors drawn as the whole unsplit explanation (one element) instead of a claim subset")
+    p.add_argument("--balance-types", type=float, default=0.0, help="claim-set mode with --claims-dir: type-balanced sampling, weight *= (median type count / type count) ** p (clipped x10)")
+    p.add_argument("--claim-weights", default="", help="claim-set mode: sampling weights for synthetic claims, e.g. 'internal=2,text:last_word=2' (family or family:type; default 1)")
+    p.add_argument("--claim-subsets", type=int, default=0, help="compositional-NLA claim-SET conditioner: split each explanation into claims (nla.flow.claims), train on a random subset of k ~ U{1..min(K,n)} shuffled claims formatted as bullets; evals condition on the full claim set and also report single-claim and raw-gold PMI (0 = off)")
     p.add_argument("--eval-samedoc", action="store_true", help="also report same-document discrimination accuracy in eval (on by default when --group-contrast > 0)")
     p.add_argument("--neg-margin", type=float, default=0.02, help="per-dim FM-loss gap (neg - pos) the hinge asks for"); p.add_argument("--neg-lambda", type=float, default=2.0)
     p.add_argument("--enc-layers", default=None, help="tokens_ar_all: comma list of trunk layers whose token states form the cross-read memory (default every 3rd layer from 2 plus --enc-layer)")
@@ -379,6 +417,44 @@ def main():
         if len(m_z): tr_acts = torch.cat([tr_acts, m_acts]); tr_z = tr_z + m_z
         if is0: print(f"[cond] mined on-policy pairs: {len(m_z)} train + {0 if mv_z is None else len(mv_z)} held-out", flush=True)
     if is0: print(f"[cond] {len(tr_z)} train pairs ({n_sft} SFT/Opus + {len(tr_z)-n_sft} on-policy), {len(va_z)} val pairs; d_enc {d_enc}", flush=True)
+    tr_claims = None; va_single = va_gold = None; sv_acts = sv_z = None
+    EXTRAS = {}   # id(eval condition list) -> ((name, per-row condition texts), ...): extra conditions scored on the same (t, eps) / probes
+    tr_w = tr_tw = None; n_gold = len(tr_z); sv_pairs = None
+    if a.claim_subsets > 0:   # compositional NLA: the condition is a SET of claims, not a paragraph
+        from nla.flow.claims import split_claims, format_claims, sample_subset
+        from nla.flow.claimset import weighted_subset, parse_weights
+        assert not a.set_encode or a.cond_mode == "tokens_ar", "--set-encode needs --cond-mode tokens_ar"
+        cond_of = (lambda cl_: list(cl_)) if a.set_encode else (lambda cl_: format_claims(cl_))       # set memory vs one bullet text
+        whole_of = (lambda z_: [z_]) if a.set_encode else (lambda z_: z_)
+        tr_claims = [split_claims(z) or [z] for z in tr_z]; crng = _random.Random(a.seed * 7919 + rank)
+        va_gold = [whole_of(z) for z in va_z]; _vc = [split_claims(z) or [z] for z in va_z]; _vr = _random.Random(12345)
+        va_z = [cond_of(c[: a.claim_subsets]) for c in _vc]; va_single = [cond_of([_vr.choice(c)]) for c in _vc]
+        EXTRAS[id(va_z)] = (("single", va_single), ("gold", va_gold))
+        tr_w = [None] * len(tr_claims); tr_tw = [None] * len(tr_claims)
+        if a.claims_dir:
+            s_acts, s_cl, s_w, s_tw, s_val = load_claims_dir(a.claims_dir, a.max_synth, a.eval_n, parse_weights(a.claim_weights), balance=a.balance_types)
+            tr_acts = torch.cat([tr_acts, s_acts]) if len(tr_claims) else s_acts; tr_claims = tr_claims + s_cl; tr_z = tr_z + [format_claims(c[: a.claim_subsets]) for c in s_cl]
+            tr_w = tr_w + s_w; tr_tw = tr_tw + s_tw
+            _sr = _random.Random(4242); sv_acts = torch.stack([v[0] for v in s_val]) if s_val else None
+            _perm = [_sr.sample(range(len(v[1])), len(v[1])) for v in s_val]
+            sv_z = [cond_of([v[1][j] for j in pm[: a.claim_subsets]]) for v, pm in zip(s_val, _perm)]
+            _fam = lambda v, f: cond_of([_sr.choice([c for c, g in zip(v[1], v[2]) if g == f])])
+            _ex = [(f"single_{f}", [_fam(v, f) for v in s_val]) for f in ("internal", "text", "semantic")]
+            _ex += [(f"size{k_}", [cond_of([v[1][j] for j in pm[:k_]]) for v, pm in zip(s_val, _perm)]) for k_ in (1, 2, 4, 8) if k_ <= a.claim_subsets]   # nested subsets: PMI vs set size
+            EXTRAS[id(sv_z)] = tuple(_ex)
+            sv_pairs = []   # paired detection per family: (row, family, true single, false-twin single)
+            for r_, v in enumerate(s_val):
+                tw_ = v[4] or [None] * len(v[1])
+                for f in ("internal", "text", "semantic"):
+                    cand = [(c, t_) for c, g, t_ in zip(v[1], v[2], tw_) if g == f and t_]
+                    if cand: c, t_ = _sr.choice(cand); sv_pairs.append((r_, f, cond_of([c]), cond_of([t_])))
+            if is0:
+                nc = [len(c) for c in s_cl]
+                print(f"[cond] synthetic claims from {a.claims_dir}: {len(s_cl)} train anchors ({np.mean(nc):.1f} claims each, p10 {np.percentile(nc, 10):.0f} p90 {np.percentile(nc, 90):.0f}) "
+                      f"+ {n_gold} gold-split explanations = {len(tr_claims)} training anchors; {len(s_val)} synthetic val anchors (all 3 families); example:\n{sv_z[0] if sv_z else ''}", flush=True)
+        if is0:
+            nc = [len(c) for c in tr_claims]
+            print(f"[cond] claim-set mode K={a.claim_subsets}: {np.mean(nc):.2f} claims/explanation (p10 {np.percentile(nc,10):.0f}, p90 {np.percentile(nc,90):.0f}); eval condition = full claim set ({'SET-ENCODED' if a.set_encode else 'one bullet text'}); single-frac {a.single_frac} gold-whole-frac {a.gold_whole_frac}; example:\n{va_z[0]}", flush=True)
     from nla.schema import compute_predict_mean_baselines, resolve_target_scale, normalize_activation
     msf = math.sqrt(cfg["d_input"]); _, base_mse = compute_predict_mean_baselines(va_acts[: a.eval_n], msf)
     adapter_ids = {id(p_) for p_ in model.adapter_parameters()}
@@ -407,6 +483,12 @@ def main():
             ids_, mk_ = model.tokenize(zs); return ids_, mk_, None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if a.cond_mode in ("tokens_ar", "tokens_base", "tokens_ar_all"):
+                if a.set_encode:   # claim sets: each claim its own encoder pass, memories concatenated (order-free)
+                    from nla.flow.claimset import encode_sets
+                    if grad and arvec.trainable: e, mk = encode_sets(arvec.tokens, zs)
+                    else:
+                        with torch.no_grad(): e, mk = encode_sets(arvec.tokens, zs)
+                    return e, mk, None
                 if grad and arvec.trainable: e, mk = arvec.tokens(zs)
                 else:
                     with torch.no_grad(): e, mk = arvec.tokens(zs)
@@ -431,7 +513,8 @@ def main():
         zs = ev_z[: n_ev]; zs_shuf = [zs[i] for i in perm.tolist()]
         for t_val in (0.1, 0.3, 0.5, 0.7, 0.9):
             eps = torch.randn(x0.shape, device=dev, generator=g); t = torch.full((n_ev,), t_val, device=dev)
-            for name, cond in (("uncond", None), ("cond", zs), ("shuf", zs_shuf)):
+            _extra = tuple((nm_, lst_[:n_ev]) for nm_, lst_ in EXTRAS.get(id(ev_z), ()))
+            for name, cond in (("uncond", None), ("cond", zs), ("shuf", zs_shuf)) + _extra:
                 ls = []
                 for i in range(0, n_ev, EB):
                     e, mk, cv = enc_batch(cond[i:i+EB]) if cond is not None else (None, None, None)
@@ -440,9 +523,13 @@ def main():
                         x_t = (1 - t_val) * xs + t_val * eps[i:i+EB]; v = model(x_t, t[i:i+EB], e, mk, cv)
                     ls.append(F.mse_loss(v.float(), (eps[i:i+EB] - xs).float(), reduction="sum").item() / x0.shape[1])
                 out[f"eval/fm_{name}_t{t_val}"] = sum(ls) / n_ev
-        for name in ("uncond", "cond", "shuf"): out[f"eval/fm_{name}"] = sum(out[f"eval/fm_{name}_t{t}"] for t in (0.1, 0.3, 0.5, 0.7, 0.9)) / 5
+        _xn = tuple(nm_ for nm_, _ in EXTRAS.get(id(ev_z), ()))
+        for name in ("uncond", "cond", "shuf") + _xn: out[f"eval/fm_{name}"] = sum(out[f"eval/fm_{name}_t{t}"] for t in (0.1, 0.3, 0.5, 0.7, 0.9)) / 5
+        if _xn:   # claim-set mode: FM-proxy information (bits) of the claim set, of ONE claim (per family), of the raw gold paragraph, same (t, eps)
+            for name in ("cond", "shuf") + _xn: out[f"eval/claims_gain_bits_{name}"] = (out["eval/fm_uncond"] - out[f"eval/fm_{name}"]) / (2 * math.log(2)) * x0.shape[1]
         # hard-negative detection: same text with one specific changed; paired (same t, eps) per-row loss; P(neg loss > true loss)
-        nrng = _random.Random(2); negs = [make_negative(z, nrng, zs) for z in zs]; rows_ = [i for i, (zn, _) in enumerate(negs) if zn is not None]
+        _pool = [z if isinstance(z, str) else " ".join(z) for z in zs]
+        nrng = _random.Random(2); negs = [neg_of(z, _pool, nrng) if tr_claims is not None else make_negative(z, nrng, zs) for z in zs]; rows_ = [i for i, (zn, _) in enumerate(negs) if zn is not None]
         if rows_:
             wins = 0; tot = 0; gsum = 0.0; kw = {}; gn_ = torch.Generator(device=dev).manual_seed(3)
             for t_val in (0.3, 0.5, 0.7):
@@ -458,6 +545,21 @@ def main():
                     for r_, w_ in zip(rr, (g_ > 0).tolist()): kw.setdefault(negs[r_][1], [0, 0]); kw[negs[r_][1]][0] += int(w_); kw[negs[r_][1]][1] += 1
             out["eval/neg_detect_acc"] = wins / tot; out["eval/neg_gap"] = gsum / tot; out["eval/neg_n"] = len(rows_)
             for k_, (w_, n_) in kw.items(): out[f"eval/neg_detect_acc_{k_}"] = w_ / n_; out[f"eval/neg_n_{k_}"] = n_ // 3
+        if sv_pairs and ev_z is sv_z:   # paired detection per claim family: single true claim vs its false twin, same activation / t / eps
+            gp_ = torch.Generator(device=dev).manual_seed(5); fam_w = {}; fam_gap = {}
+            prs = [p_ for p_ in sv_pairs if p_[0] < n_ev]
+            for t_val in (0.3, 0.5, 0.7):
+                for i in range(0, len(prs), 64):
+                    ch = prs[i:i + 64]; rr = [p_[0] for p_ in ch]; xs = x0[rr]; eps = torch.randn(xs.shape, device=dev, generator=gp_); t = torch.full((len(ch),), t_val, device=dev); lo = []
+                    for texts in ([p_[2] for p_ in ch], [p_[3] for p_ in ch]):
+                        e, mk, cv = enc_batch(texts)
+                        with torch.autocast("cuda", dtype=torch.bfloat16): v = model((1 - t_val) * xs + t_val * eps, t, e, mk, cv)
+                        lo.append(((v.float() - (eps - xs).float()) ** 2).mean(-1))
+                    g_ = (lo[1] - lo[0]).tolist()
+                    for p_, gv in zip(ch, g_): fam_w.setdefault(p_[1], []).append(gv > 0); fam_gap.setdefault(p_[1], []).append(gv)
+            allw = [w for v in fam_w.values() for w in v]
+            if allw: out["eval/paired_acc"] = sum(allw) / len(allw)
+            for f_, v in fam_w.items(): out[f"eval/paired_acc_{f_}"] = sum(v) / len(v); out[f"eval/paired_gap_nats_{f_}"] = float(np.mean(fam_gap[f_])) * x0.shape[1] / 2; out[f"eval/paired_n_{f_}"] = len(v) // 3
         if va_groups and (a.group_contrast > 0 or a.eval_samedoc):   # same-document discrimination: G cuts of one document, which explanation belongs to which activation
             G = a.group_size; gs_ = va_groups[:48]; ok_r = ok_c = tot_ = 0; gge = torch.Generator(device=dev).manual_seed(11)
             for g_ in gs_:
@@ -509,19 +611,29 @@ def main():
             n_x = min(a.exact_n, n_ev); xx = x0[:n_x]; zz = list(ev_z[:n_x]); d_ = xx.shape[1]
             perm = torch.randperm(n_x, generator=torch.Generator().manual_seed(1)).tolist()
             zs_shuf_x = [zz[i] for i in perm]; lp = {"uncond": [], "cond": [], "shuf": []}
+            _cx = EXTRAS.get(id(ev_z), ())
+            for nm_, _ in _cx: lp[nm_] = []
             for c0 in range(0, n_x, XB):   # chunked: same probe seed per chunk for the three variants -> paired PMI per row
                 sl = slice(c0, min(n_x, c0 + XB)); e_, m_, c_ = enc_batch(zz[sl]); es, ms, cs = enc_batch(zs_shuf_x[sl])
-                for name, (ee, mm, cc) in (("uncond", (None, None, None)), ("cond", (e_, m_, c_)), ("shuf", (es, ms, cs))):
+                _vars = (("uncond", (None, None, None)), ("cond", (e_, m_, c_)), ("shuf", (es, ms, cs)))
+                _vars = _vars + tuple((nm_, enc_batch(lst_[:n_x][sl])) for nm_, lst_ in _cx)
+                for name, (ee, mm, cc) in _vars:
                     gx = torch.Generator(device=dev).manual_seed(11 + c0)
                     lp[name].append(exact_logp(model, xx[sl], ee, mm, n_steps=a.exact_steps, probes=1, gen=gx, cvec=cc))
             lp = {k_: torch.cat(v_) for k_, v_ in lp.items()}
             pmi = (lp["cond"] - lp["uncond"]) / math.log(2); pms = (lp["shuf"] - lp["uncond"]) / math.log(2)
+            if _cx:
+                for nm, _ in _cx:
+                    pv = (lp[nm] - lp["uncond"]) / math.log(2); out[f"{prefix}/exact_pmi_{nm}_bits"] = pv.mean().item()
+                if is0: print(f"  [exact@{step}] ({prefix}) claim-set PMI {pmi.mean().item():.1f} bits | " + " | ".join(f"{nm}: {out[prefix + '/exact_pmi_' + nm + '_bits']:.1f}" for nm, _ in _cx), flush=True)
             out.update({f"{prefix}/exact_pmi_bits": pmi.mean().item(), f"{prefix}/exact_pmi_median_bits": pmi.median().item(), f"{prefix}/exact_pmi_sem_bits": (pmi.std() / math.sqrt(n_x)).item(),
                         f"{prefix}/exact_pmi_shuf_bits": pms.mean().item(), f"{prefix}/exact_frac_positive": (pmi > 0).float().mean().item(),
                         f"{prefix}/exact_bits_per_dim_uncond": (-lp["uncond"].mean() / (d_ * math.log(2))).item(), f"{prefix}/exact_bits_per_dim_cond": (-lp["cond"].mean() / (d_ * math.log(2))).item()})
             if is0: print(f"  [exact@{step}] PMI {pmi.mean().item():.1f} bits (median {pmi.median().item():.1f}, sem {pmi.std().item() / math.sqrt(n_x):.1f}, {100 * (pmi > 0).float().mean().item():.0f}% positive) | shuffled z {pms.mean().item():.1f} bits | n {n_x}, {a.exact_steps} Heun steps", flush=True)
         if not is0: return out
         if P + "/samedoc_acc_row" in out and is0: print(f"  [{P}@{step}] same-document discrimination: activation->explanation {100*out[P+'/samedoc_acc_row']:.1f}%, explanation->activation {100*out[P+'/samedoc_acc_col']:.1f}% (chance {100/a.group_size:.1f}%, {out[P+'/samedoc_groups']} docs x {a.group_size} cuts)", flush=True)
+        if P + "/paired_acc" in out and is0: print(f"  [{P}@{step}] paired detection (true claim vs false twin) {100*out[P+'/paired_acc']:.1f}% | " + " ".join(f"{f_}: {100*out[P+'/paired_acc_'+f_]:.0f}% (n {out[P+'/paired_n_'+f_]})" for f_ in ("internal", "text", "semantic") if P+'/paired_acc_'+f_ in out), flush=True)
+        if P + "/claims_gain_bits_size1" in out and is0: print(f"  [{P}@{step}] FM-proxy bits vs set size: " + " ".join(f"k={k_} {out[P+f'/claims_gain_bits_size{k_}']:.1f}" for k_ in (1, 2, 4, 8) if P+f'/claims_gain_bits_size{k_}' in out), flush=True)
         if P + "/neg_detect_acc" in out and is0: print(f"  [{P}@{step}] hard-negative detection {100*out[P+'/neg_detect_acc']:.1f}% (gap {out[P+'/neg_gap']:.4f}, n {out[P+'/neg_n']}) | " + " ".join(f"{k}: {100*out[P+'/neg_detect_acc_'+k]:.0f}% (n {out[P+'/neg_n_'+k]})" for k in ("number", "quote", "name") if P+"/neg_detect_acc_"+k in out), flush=True)
         print(f"[{P}@{step}] fm uncond {out[P+'/fm_uncond']:.4f} cond {out[P+'/fm_cond']:.4f} shuf {out[P+'/fm_shuf']:.4f} | gain {out[P+'/gain_bits_per_dim']*x0.shape[1]:.1f} bits/activation | cond FVE(x0@0.9) {out[P+'/cond_fve_x0_t0.9']:.1f}% | source-match {100*out[P+'/source_match_acc']:.1f}% (chance 12.5%)", flush=True)
         json.dump(out, open(os.path.join(a.out, f"{P}_{step:06d}.json"), "w"), indent=1)
@@ -529,6 +641,7 @@ def main():
 
     rng = torch.Generator().manual_seed(a.seed + rank); t0 = time.time(); evaluate(0)
     if mv_z is not None: evaluate(0, mv_acts, mv_z, prefix="eval_onpolicy")
+    if sv_z: evaluate(0, sv_acts, sv_z, prefix="eval_synth")
     N = tr_acts.shape[0]
     if is0: print(f"[cond] {a.steps} steps x {a.batch} x {a.grad_accum} accum x {world} ranks = {a.steps*a.batch*a.grad_accum*world} draws over {N} pairs = {a.steps*a.batch*a.grad_accum*world/N:.2f} passes (single pass = no repetition)", flush=True)
     perm = torch.randperm(N, generator=rng); cursor = 0
@@ -538,6 +651,28 @@ def main():
         cursor = (a.start_step % bpp) * a.batch
         if is0: print(f"[cond] resuming at step {a.start_step} (cursor {cursor}/{N})", flush=True)
     neg_rng = _random.Random(a.seed + 17 + int(os.environ.get('RANK', 0)))
+    def draw(i):
+        """claim-set training condition for anchor i: whole gold paragraph (gold anchors, --gold-whole-frac) or k claims (P(k=1) = --single-frac,
+        else U{2..min(K, n)}; with --single-frac 0 the plain U{1..min(K, n)}), drawn by --claim-weights, shuffled"""
+        c = tr_claims[i]
+        if i < n_gold and a.gold_whole_frac > 0 and crng.random() < a.gold_whole_frac: return whole_of(tr_z[i])
+        n_ = len(c); kmax = min(a.claim_subsets, n_)
+        if a.single_frac > 0: k_ = 1 if (kmax == 1 or crng.random() < a.single_frac) else crng.randint(2, kmax)
+        else: k_ = crng.randint(1, kmax)
+        return cond_of(weighted_subset(c, tr_w[i] if tr_w is not None else None, k_, crng))
+    def neg_of(cond, pool, rng_, twins=None, claims=None):
+        """hard negative of a condition: claim-set mode = one claim replaced by its false twin (precomputed) or by make_negative of that claim;
+        paragraph mode = make_negative of the text. -> (negative condition, kind) or (None, None)"""
+        if isinstance(cond, str) and not a.set_encode and not (a.claim_subsets > 0 and cond.startswith("• ")): return make_negative(cond, rng_, pool)
+        items = list(cond) if not isinstance(cond, str) else [x[2:] for x in cond.split("\n")]
+        tmap = dict(zip(claims, twins)) if (twins and claims) else {}
+        for j in rng_.sample(range(len(items)), len(items)):
+            t_ = tmap.get(items[j]); kind = "twin"
+            if not t_: t_, kind = make_negative(items[j], rng_, pool)
+            if t_:
+                new = items[:j] + [t_] + items[j + 1:]
+                return (new if a.set_encode else format_claims(new)), kind
+        return None, None
     for step in range(a.start_step + 1, a.steps + 1):
         sched = min(1.0, step / a.warmup) * (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1)
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
@@ -546,15 +681,20 @@ def main():
         for _acc in range(a.grad_accum):   # gradient accumulation: --grad-accum micro-batches of --batch pairs per optimizer step
             if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0; print(f"[cond] re-shuffle (pass {step*a.batch*a.grad_accum*world/N:.1f})", flush=True)
             idx = perm[cursor:cursor + a.batch]; cursor += a.batch
-            x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch([tr_z[i] for i in idx.tolist()], grad=True)
+            _txt = [draw(i) for i in idx.tolist()] if tr_claims is not None else [tr_z[i] for i in idx.tolist()]
+            x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch(_txt, grad=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift)
             (loss / a.grad_accum).backward(); loss_acc += loss.item() / a.grad_accum
         loss = torch.tensor(loss_acc)
         closs = None; neg_stats = {}
         if a.neg_frac > 0:   # contrastive hard negatives: same activation, same (t, eps); the negative text must score WORSE by a margin
-            nb = max(1, int(round(a.neg_frac * a.batch))); sel = idx[:nb].tolist(); zs_pos = [tr_z[i] for i in sel]
-            negs = [make_negative(z, neg_rng, tr_z) for z in zs_pos]; keep_i = [k for k, (zn, _) in enumerate(negs) if zn is not None]
+            nb = max(1, int(round(a.neg_frac * a.batch))); sel = idx[:nb].tolist()
+            if tr_claims is not None:   # claim-set mode: the positive is this step's drawn condition, the negative swaps one claim for its false twin
+                zs_pos = _txt[:nb]; negs = [neg_of(z, tr_z, neg_rng, tr_tw[i] if tr_tw else None, tr_claims[i]) for z, i in zip(zs_pos, sel)]
+            else:
+                zs_pos = [tr_z[i] for i in sel]; negs = [make_negative(z, neg_rng, tr_z) for z in zs_pos]
+            keep_i = [k for k, (zn, _) in enumerate(negs) if zn is not None]
             if keep_i:
                 zp = [zs_pos[k] for k in keep_i]; zn = [negs[k][0] for k in keep_i]; xn = x0[keep_i].detach(); n2 = len(keep_i)
                 e2, mk2, cv2 = enc_batch(zp + zn, grad=True); tt = torch.rand(n2, device=dev); ee = torch.randn_like(xn)
@@ -601,6 +741,7 @@ def main():
         if step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours:
             ev = evaluate(step)
             if mv_z is not None: ev.update(evaluate(step, mv_acts, mv_z, prefix="eval_onpolicy"))
+            if sv_z: ev.update(evaluate(step, sv_acts, sv_z, prefix="eval_synth"))
             if use_wandb: wandb.log(ev, step=step)
             if a.unfreeze_prior:
                 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
