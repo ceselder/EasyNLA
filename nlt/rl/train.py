@@ -58,6 +58,9 @@ def parse():
     p.add_argument("--n-dist", type=int, default=2, help="distractor pairs scored per rollout (<= per-class - 1)")
     p.add_argument("--dist-types", default="samedoc,crossdoc", help="redteam #228 H1: comma list of distractor types filling the --n-dist slots in order: samedoc (other position of the SAME document, same (i,j)), crossdoc (in-class other document), wrongj (own position, other j; pays for depth cues -- off by default). Remaining slots = crossdoc.")
     p.add_argument("--content-abs", type=float, default=0.2, help="redteam #228 H2: reward = content + content_abs x PMI(own), so junk that hurts distractors more than itself does not win")
+    p.add_argument("--content-abs-clip", action="store_true", help="DECISIONS v1.23: use max(PMI(own), 0) in the absolute term (a mismatcher critic gives negative PMI(own) on true text)")
+    p.add_argument("--winner-require-own-pos", action=argparse.BooleanOptionalAction, default=True, help="listener winners must also have PMI(own) > 0 (v1.23 ref_v2: off -- content > 0 only)")
+    p.add_argument("--motor-own-drop-warn", type=float, default=5.0, help="v1.23: warn when the motor band's mean PMI(own) falls this many bits below its first-20-step mean (a policy saying less about late layers)")
     p.add_argument("--iterated-paraphrase-p", type=float, default=1.0, help="redteam #228 H3: share of recent rollouts PARAPHRASED during the iterated-learning refit (1.0 = paraphrased only)")
     p.add_argument("--iterated-eval-every", type=int, default=10, help="learnability curve: evaluate the fresh listener every k refit steps; report steps to reach P(own > distractor) = 0.7")
     p.add_argument("--cotrain-contrast", type=float, default=0.0, help="DEPRECATED by DECISIONS v1.16 (one-sided hinge Goodharts: the critic destroys the density under wrong text). Weight of softplus((L(z|own) - L(z|distractor) + margin)/tau)*tau; keep 0")
@@ -327,7 +330,7 @@ def main():
         def __exit__(self, *e):
             if a.cross_offload: _place(self.sc, "cpu")
     run = None if a.no_wandb else wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"rl_{a.tag}", group="rl", config=vars(a))
-    gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id; lam_hist = []; lr_mult = 1.0; ent0 = None; last_brake = -10**9; brakes_n = 0; last_dump_dir = None
+    gen = torch.Generator().manual_seed(a.seed); pad_id = tok.pad_token_id; lam_hist = []; lr_mult = 1.0; ent0 = None; last_brake = -10**9; brakes_n = 0; last_dump_dir = None; motor_hist = []
     def dump_val(step_label):
         """the current policy's samples on the first --dump-val-pairs fixed pairs, board #31 format -> <dump_root>/<tag>_<step_label>/val/"""
         import pyarrow as pa
@@ -401,7 +404,7 @@ def main():
         texts_for_score = [z if not viol["empty"][k] else None for k, z in enumerate(scored)]
         if a.referential:
             own_b, dist_b, content_b = referential_score(scorer, ext_h_i, ext_h_j, texts_for_score, groups, dist_idx, seed=step)
-            bits = content_b + a.content_abs * own_b; proxy = torch.full_like(bits, float("nan"))                   # H2: + small absolute term
+            bits = content_b + a.content_abs * (own_b.clamp_min(0.0) if a.content_abs_clip else own_b); proxy = torch.full_like(bits, float("nan"))   # H2 (+ v1.23 clip)
         else:
             sc = scorer.score(h_i[groups], h_j[groups], texts_for_score, groups.tolist(), seed=step); bits, proxy = sc["exact_bits"].float(), sc["proxy_bits"].float(); own_b = bits; dist_b = None; content_b = bits
         t_score = time.time() - t2
@@ -431,7 +434,7 @@ def main():
                 m = (groups == g_) & ~bad
                 if m.any():
                     k_best = int((rewards.masked_fill(~m, -1e9)).argmax())
-                    if (not a.cotrain_guard) or (float(content_b[k_best]) > 0 and float(own_b[k_best]) > 0): best.append(k_best)   # redteam: winners must beat their distractors AND be positive
+                    if (not a.cotrain_guard) or (float(content_b[k_best]) > 0 and (float(own_b[k_best]) > 0 or not a.winner_require_own_pos)): best.append(k_best)   # winners beat their distractors (and, unless v1.23, are positive)
             if best:
                 gb = groups[best]; d0 = dist_idx[gb, step % dist_idx.shape[1]] if dist_idx is not None else gb[torch.randperm(len(gb))]   # alternate distractor types across steps
                 win_rows = {"h_i": h_i[gb], "h_j": h_j[gb], "h_i_d": ext_h_i[d0], "h_j_d": ext_h_j[d0], "texts": [texts[k] for k in best]}
@@ -468,6 +471,11 @@ def main():
                "steer/written": info["steer_written"], "steer/expected": info["steer_expected"], "cotrain/loss": cot_loss,
                "time/gen": t_gen, "time/para": t_para, "time/score": t_score, "time/update": t_upd, "time/sync": t_sync, "time/step": time.time() - t0, "gen_tok_per_s": info["tok_per_s"], **summarize_violations(viol)}
         log["lambda"] = lam
+        if ref and "ref/own_motor" in ref:                  # v1.23: a policy that learns to say less about late layers = stop condition (warned here, decided by the orchestrator)
+            motor_hist.append(ref["ref/own_motor"])
+            if len(motor_hist) > 20:
+                base_m = float(np.mean(motor_hist[:20])); cur_m = float(np.mean(motor_hist[-5:])); log["ref/own_motor_drop"] = base_m - cur_m
+                if base_m - cur_m > a.motor_own_drop_warn: print(f"   [WARN v1.23] motor-band PMI(own) {cur_m:+.2f} is {base_m - cur_m:.1f} bits below its start {base_m:+.2f} -- the policy may be saying less about late layers", flush=True)
         for bname in ("pre", "workspace", "motor"):
             m = torch.tensor([band(int(J[g_])) == bname for g_ in groups.tolist()]) & ok
             if m.any():
