@@ -116,7 +116,8 @@ def main():
     p.add_argument("--lr-decay", default="cosine", choices=["none", "cosine"]); p.add_argument("--p-uncond", type=float, default=0.3); p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--max-train-pos", type=int, default=None); p.add_argument("--data-device", default="cuda", help="where the fp16 store lives (cuda on a B200; cpu on smaller GPUs)")
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=4096); p.add_argument("--save-every", type=int, default=1000)
-    p.add_argument("--text-parquet", default=None, help="comma-separated text files [pair_id, text, verbosity, source] (cond=text)"); p.add_argument("--text-verbosity", default=None, help="comma list of verbosity levels to train on (default all)")
+    p.add_argument("--text-parquet", default=None, help="comma-separated text files/globs [pair_id, text, verbosity, source] for the TRAIN pairs (cond=text)"); p.add_argument("--text-verbosity", default=None, help="comma list of verbosity levels to train on (default all)")
+    p.add_argument("--val-text-parquet", default=None, help="text files/globs for the VAL pairs (default: --text-parquet with '/train/' -> '/val/')")
     p.add_argument("--text-smoke", action="store_true", help="PLUMBING TEST: synthetic 'next token: X' text instead of --text-parquet")
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=128)
     p.add_argument("--wandb", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--seed", type=int, default=0)
@@ -154,7 +155,8 @@ def main():
             verb = [int(x) for x in a.text_verbosity.split(",")] if a.text_verbosity else None
             text_df = load_text_pairs(a.text_parquet.split(","), os.path.join(a.data_dir, "pairs_train.parquet"), verb)
             text_df = text_df[text_df["pos_idx"].isin(store.row_of)].reset_index(drop=True)
-            vdf = load_text_pairs(a.text_parquet.split(","), os.path.join(a.data_dir, "pairs_val.parquet"), verb)
+            val_files = a.val_text_parquet.split(",") if a.val_text_parquet else [x.replace("/train/", "/val/") for x in a.text_parquet.split(",")]
+            vdf = load_text_pairs(val_files, os.path.join(a.data_dir, "pairs_val.parquet"), verb)
             vdf = vdf.drop_duplicates("pair_id").set_index("pair_id")
             pid = [f"val:{p_}:{i_}:{j_}" for p_, i_, j_ in zip(vp["pos_idx"].values, vp["i"].values, vp["j"].values)]
             have = [x in vdf.index for x in pid]
