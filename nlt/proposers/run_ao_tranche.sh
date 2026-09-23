@@ -11,6 +11,10 @@ DATA_DIR=${DATA_DIR:-/vol/data/qwen3_8b}
 PERM_SEED=${PERM_SEED:--1}       # >=0: rows of a fixed permutation of the pairs table (use 0 for train); val uses -1 = first rows
 ROOT=/home/celeste/nlt; LOCAL=/home/celeste/nlt-prop-data
 TAG=$(printf "%07d_%07d" "$START" "$END")
+vget() {  # modal volume get with retries: a just-committed file can take a minute to become visible to the client
+  local remote=$1 local_=$2 n=0
+  until modal volume get nlt "$remote" "$local_" --force > /dev/null 2>&1; do n=$((n+1)); [[ $n -ge 12 ]] && return 1; sleep 10; done; return 0
+}
 mkdir -p "$LOCAL/ao_raw_v1/$SPLIT" "$LOCAL/ao_rewrite/$SPLIT" "$ROOT/nlt/proposers/logs"
 cd "$ROOT"
 if [[ "${SKIP_AO:-0}" != "1" ]]; then
@@ -21,8 +25,8 @@ fi
 PIDS=(); declare -a CTS
 for ((s=START; s<END; s+=CHUNK)); do e=$(( s+CHUNK < END ? s+CHUNK : END )); ct=$(printf "%07d_%07d" "$s" "$e"); CTS+=("$ct")
   RAW="$LOCAL/ao_raw_v1/$SPLIT/ao_${ct}.parquet"; FEAT="$LOCAL/features_v1/$SPLIT/feat_${ct}.parquet"
-  [[ -s "$RAW" ]] || modal volume get nlt "/z/ao_raw_v1/$SPLIT/ao_${ct}.parquet" "$RAW" --force > /dev/null || { echo "[ao-tranche] download FAILED $RAW"; exit 1; }
-  [[ -s "$FEAT" ]] || modal volume get nlt "/z/features_v1/$SPLIT/feat_${ct}.parquet" "$FEAT" --force > /dev/null || { echo "[ao-tranche] features missing for $ct (run the teacher tranche first)"; exit 1; }
+  [[ -s "$RAW" ]] || vget "/z/ao_raw_v1/$SPLIT/ao_${ct}.parquet" "$RAW" || { echo "[ao-tranche] download FAILED $RAW"; exit 1; }
+  [[ -s "$FEAT" ]] || vget "/z/features_v1/$SPLIT/feat_${ct}.parquet" "$FEAT" || { echo "[ao-tranche] features missing for $ct (run the teacher tranche first)"; exit 1; }
   OUTD="$LOCAL/ao_rewrite/$SPLIT/$ct"
   if [[ -d "$OUTD/ao-tgt-v1" ]]; then echo "[ao-tranche] exists $OUTD"; continue; fi
   ( with-local-keys python3 -m nlt.proposers.rewrite_register --raw "$RAW" --features "$FEAT" --out-dir "$OUTD" --mode sync --concurrency "$CONC" --tag "part_${ct}" \

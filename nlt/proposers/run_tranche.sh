@@ -13,6 +13,10 @@ PERM_SEED=${PERM_SEED:--1}       # >=0: rows of a fixed permutation of the pairs
 ZROOT=${ZROOT:-/vol/z}          # override for rehearsals so smoke pair_ids never land under /vol/z
 ROOT=/home/celeste/nlt; LOCAL=${LOCAL:-/home/celeste/nlt-prop-data}
 TAG=$(printf "%07d_%07d" "$START" "$END")
+vget() {  # modal volume get with retries: a just-committed file can take a minute to become visible to the client
+  local remote=$1 local_=$2 n=0
+  until modal volume get nlt "$remote" "$local_" --force > /dev/null 2>&1; do n=$((n+1)); [[ $n -ge 12 ]] && return 1; sleep 10; done; return 0
+}
 mkdir -p "$LOCAL/features_v1/$SPLIT" "$LOCAL/teacher/$SPLIT" "$ROOT/nlt/proposers/logs"
 cd "$ROOT"
 if [[ "${SKIP_FEATURES:-0}" != "1" ]]; then
@@ -23,7 +27,7 @@ fi
 declare -a CH_S CH_E
 for ((s=START; s<END; s+=CHUNK)); do e=$(( s+CHUNK < END ? s+CHUNK : END )); CH_S+=("$s"); CH_E+=("$e")
   f=$(printf "feat_%07d_%07d.parquet" "$s" "$e")
-  [[ -s "$LOCAL/features_v1/$SPLIT/$f" ]] || modal volume get nlt "${ZROOT#/}/features_v1/$SPLIT/$f" "$LOCAL/features_v1/$SPLIT/$f" --force > /dev/null || { echo "[tranche] download FAILED $f"; exit 1; }
+  [[ -s "$LOCAL/features_v1/$SPLIT/$f" ]] || vget "$ZROOT/features_v1/$SPLIT/$f" "$LOCAL/features_v1/$SPLIT/$f" || { echo "[tranche] download FAILED $f"; exit 1; }
 done
 echo "[tranche] $(date -u +%H:%M:%S) features ready: ${#CH_S[@]} chunks"
 PIDS=()
