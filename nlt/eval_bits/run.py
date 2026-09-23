@@ -53,6 +53,8 @@ def main():
     p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default=None, help="default: the text critic's own encoder (from its args)"); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--enc-max-len", type=int, default=None)
     p.add_argument("--skip-exact", action="store_true"); p.add_argument("--data-device", default="cuda"); p.add_argument("--stats", default=None, help="stats.pt (default <data-dir>/stats.pt; must match the critics')")
     p.add_argument("--paired-sets", default=None, help="additional label:path[@v] sets that only define the common/paired rows (not scored)")
+    p.add_argument("--mix-ckpt", default=None, help="DECISIONS v1.9: told-depth critic (same space) for the MIXTURE denominator p_mix(h_j|h_i) = sum_j' p(j'|i) p(h_j|h_i,j'); cached per fixed-set row")
+    p.add_argument("--mix-cache", default=None, help="cache file for the mixture terms (default /vol/results/pmix_<mix ckpt tag>_ode<steps>.pt)")
     p.add_argument("--lens-dir", default="/vol/lens"); p.add_argument("--synth-set", default=None, help="synthetic text sets mode:label (depth:depthtag) built from the pair metadata (v1.8 T1 diagnostic)")
     p.add_argument("--skip-extra-controls", action="store_true", help="skip the shuf_words and mask_next controls (2 extra exact passes per set)")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
@@ -145,7 +147,35 @@ def main():
         ta = next(torch.load(j[1], map_location="cpu")["args"] for j in jobs if j[2] is not None)          # the text critic's training args
         encoder = TextEncoder(a.enc_model or ta.get("enc_model", "Qwen/Qwen3-0.6B"), a.enc_layer if a.enc_layer is not None else ta.get("enc_layer", 20), dev,
                               a.enc_max_len or ta.get("enc_max_len", 128))
-    results = {"n_fixed": NF, "n_per_set": a.n, "n_common": len(common), "ode_steps": a.ode_steps, "probes": a.probes, "t_grid": list(T_GRID), "critics": {}}
+    # ---- mixture denominator (v1.9): log p_mix(h_j | h_i) = logsumexp_j' [ log p(j'|i) + log p(h_j | h_i, j') ] under the told-depth critic, j' > i,
+    #      p(j'|i) from the pair-sampling scheme (j ~ U{10..34}, i ~ U{9..j-1}  =>  p(j|i) ∝ 1/(j-9) on j > i). Bounds the depth gain by -log2 p(j|i) <= 6.6 bits.
+    logp_mix = None
+    if a.mix_ckpt:
+        mix_model, maa, mstep = load_critic(a.mix_ckpt, dev); assert mix_model.cond == "depth", "the mixture model must be a told-depth critic"
+        m_src_rms = bool(maa.get("src_rms", 0)); m_squash = float(maa.get("squash", 0.0) or 0.0)
+        cache = a.mix_cache or f"/vol/results/pmix_{os.path.basename(os.path.dirname(a.mix_ckpt))}_ode{a.ode_steps}_n{NF}.pt"
+        need_rows = sorted(set(k for lab in text_sets for k in set_indices(text_sets[lab])) | set(range(min(a.n, NF))))
+        store_mix = torch.load(cache, map_location="cpu") if os.path.exists(cache) else {}
+        todo = [k for k in need_rows if k not in store_mix]
+        print(f"[bits] mixture denominator from {a.mix_ckpt} (step {mstep}): {len(need_rows)} rows needed, {len(todo)} to compute ({cache})", flush=True)
+        t0 = time.time()
+        for s0 in range(0, len(todo), a.batch):
+            kk = todo[s0:s0 + a.batch]; r = rows_all[kk]; i = I_all[kk]; j = J_all[kk]; B = len(kk)
+            h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), mix_model.target, m_src_rms, m_squash)
+            terms = torch.full((B, K_HI + 1), -float("inf"), device=dev)
+            for jp in range(K_LO + 1, K_HI + 1):                                     # candidate target layers
+                valid = (i.to(dev) < jp)
+                if not valid.any(): continue
+                dep = torch.stack([i.to(dev), torch.full_like(i.to(dev), jp)], 1)
+                lp = exact_logp(mix_model, x0, h_i, depth=dep, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det
+                w = torch.log(1.0 / (jp - K_LO) / torch.tensor([sum(1.0 / (q - K_LO) for q in range(int(ii) + 1, K_HI + 1)) for ii in i.tolist()], device=dev))   # log p(j'|i)
+                terms[:, jp] = torch.where(valid, lp + w, torch.full_like(lp, -float("inf")))
+            lmix = torch.logsumexp(terms, 1).cpu()
+            for q, k in enumerate(kk): store_mix[k] = float(lmix[q])
+            print(f"[bits] mixture {min(len(todo), s0 + a.batch)}/{len(todo)} rows, {time.time() - t0:.0f}s", flush=True)
+            torch.save(store_mix, cache)
+        logp_mix = store_mix
+    results = {"n_fixed": NF, "n_per_set": a.n, "n_common": len(common), "ode_steps": a.ode_steps, "probes": a.probes, "t_grid": list(T_GRID), "critics": {}, "mix_ckpt": a.mix_ckpt}
     _cache = {}; _uncond = {}                          # _uncond[(path, k)] = (L_u [T], lp_u, ruler)  shared by every set of the same critic
     for name, path, label in jobs:
         if path not in _cache: _cache[path] = load_critic(path, dev, d_enc_override=(encoder.d_enc if encoder else None))
@@ -200,6 +230,10 @@ def main():
                "uncond_nll_bits_per_dim": float(-lp_u.mean() / (d * math.log(2))) if not a.skip_exact else None}
         if cond != "none":
             pmi_p = proxy_pmi_bits(L_u, L_c, d).numpy(); res["proxy_pmi_bits"] = summarize(pmi_p, gaps, js, "proxy"); res["proxy_pmi_bits_by_t"] = ((d / 2) * (L_u - L_c).mean(1) / math.log(2)).tolist()
+            if not a.skip_exact and logp_mix is not None:
+                lm = torch.tensor([logp_mix[k] for k in idx])
+                pm = (lp_c - lm).numpy() / math.log(2); res["exact_pmi_vs_mix_bits"] = summarize(pm, gaps, js, "vs_mix"); res["exact_pmi_vs_mix_bits"]["frac_positive"] = float((pm > 0).mean())
+                res["blind_vs_mix_bits"] = summarize((lp_u - lm).numpy() / math.log(2), gaps, js, "blind_vs_mix")    # how far the blind prior is below the mixture (<= 0 expected; = depth hedging)
             if not a.skip_exact:
                 pe = (lp_c - lp_u).numpy() / math.log(2); res["exact_pmi_bits"] = summarize(pe, gaps, js, "exact")
                 res["exact_pmi_bits"]["frac_positive"] = float((pe > 0).mean()); res["proxy_over_exact_ratio"] = float(pmi_p.mean() / max(1e-9, pe.mean()))
