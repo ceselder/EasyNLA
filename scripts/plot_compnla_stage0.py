@@ -71,6 +71,10 @@ for c, s in S.items():
             f = np.array(f); obj = f - lam * np.arange(len(f)); ks.append(int(np.argmax(obj)))
         d["optimal_k_at_lambda"][lam] = {"median": float(np.median(ks)), "mean": float(np.mean(ks)), "frac_zero": float(np.mean(np.array(ks) == 0))}
     out["critics"][c] = d
+import collections
+out["claims_order"] = {"first_claim_type": dict(collections.Counter(it["true_claims"][0]["type"] for it in claims.values())),
+                       "last_claim_type": dict(collections.Counter(it["true_claims"][-1]["type"] for it in claims.values()))}
+out["harness_runtime_s_per_120_rows_one_B200"] = {"sw_tokar": 387, "trunk_dn64": 1188, "source": "'[stage0] wrote stage0_<critic>.json in N s' lines of the Modal logs (excl. model load)"}
 json.dump(out, open("data/stage0_summary.json", "w"), indent=1)
 
 # ---------------- figure
@@ -178,7 +182,8 @@ if ST:
                               "single_repro_maxdiff_max": float(max(r["single_repro_maxdiff"] for r in st["rows"])),
                               "frontier_mean": np.nanmean(Fm, 0).tolist(), "frontier_se": (np.nanstd(Fm, 0) / np.sqrt(np.sum(~np.isnan(Fm), 0))).tolist(),
                               "sum_single_along_path_mean": np.nanmean(Cm, 0).tolist(), "marginal_gain_mean": np.nanmean(np.diff(Fm, axis=1), 0).tolist(), "optimal_k_at_lambda": ok,
-                              "gold_mean": out["critics"][c]["gold_mean"]}
+                              "gold_mean": out["critics"][c]["gold_mean"],
+                              "set_swap_gap_nats_median": float(np.median([np.mean(r["set_joint"]) - np.mean(sw) for r in st["rows"] for sw in r["set_swap"]]))}
     json.dump(out, open("data/stage0_summary.json", "w"), indent=1)
     fig, a3 = plt.subplots(1, 2, figsize=(15, 5.4)); ks_ = list(ST)
     for c in ks_:
