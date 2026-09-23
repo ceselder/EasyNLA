@@ -19,6 +19,8 @@ def main():
     p.add_argument("--n-pairs", type=int, default=4096); p.add_argument("--n-multi", type=int, default=512); p.add_argument("--group-multi", type=int, default=4)
     p.add_argument("--temperature", type=float, default=0.7); p.add_argument("--max-new-tokens", type=int, default=96); p.add_argument("--vllm-gpu-mem", type=float, default=0.40)
     p.add_argument("--vllm-max-len", type=int, default=512); p.add_argument("--seed", type=int, default=0); p.add_argument("--verbosity", type=int, default=1)
+    p.add_argument("--paraphrase-model", default=None, help="also write <out stem>_para.parquet with every text paraphrased by this NON-Qwen model (redteam Y2: from-scratch listener on paraphrased rollouts), source '<source>-para'")
+    p.add_argument("--paraphrase-gpu-mem", type=float, default=0.30)
     a = p.parse_args(); torch.manual_seed(a.seed)
     import pyarrow as pa, pyarrow.parquet as pq
     from nlt.data.dataset import ActStore
@@ -53,6 +55,16 @@ def main():
                                                        "tokens_mean": float(ntok.mean()), "tokens_median": float(np.median(ntok)), "empty_frac": float(np.mean([len(r[1]) == 0 for r in out_rows])),
                                                        "truncated_frac": float(np.mean([r[4] for r in out_rows])), "seconds": time.time() - t0}
     json.dump(summ, open(a.out.replace(".parquet", ".summary.json"), "w"), indent=1); print(json.dumps(summ), flush=True)
+    if a.paraphrase_model:
+        from nlt.rl.paraphrase import Paraphraser
+        del llm; torch.cuda.empty_cache()
+        para = Paraphraser(a.paraphrase_model, gpu_mem=a.paraphrase_gpu_mem, seed=a.seed); tp = time.time()
+        ptexts = para([r[1] for r in out_rows], seed=a.seed + 7)
+        ptbl = pa.table({"pair_id": [r[0] for r in out_rows], "text": ptexts, "n_tokens": pa.array([len(tok.encode(t, add_special_tokens=False)) for t in ptexts], pa.int32()),
+                         "verbosity": pa.array([a.verbosity] * len(out_rows), pa.int32()), "source": [a.source + "-para"] * len(out_rows), "sample_idx": pa.array([int(r[3]) for r in out_rows], pa.int32())})
+        pout = a.out.replace(".parquet", "_para.parquet"); pq.write_table(ptbl, pout)
+        print(f"[dump] paraphrased copy ({a.paraphrase_model}, {time.time() - tp:.0f}s) -> {pout}", flush=True)
+        for r, t in list(zip(out_rows, ptexts))[:3]: print(f"  ORIG {r[1][:120]!r}\n  PARA {t[:120]!r}", flush=True)
     for r in out_rows[:6]: print(f"  [{r[0]}] {r[1][:200]!r}", flush=True)
     print(f"[dump] -> {a.out}", flush=True)
 
