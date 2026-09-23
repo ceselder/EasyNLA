@@ -66,14 +66,25 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
     """fixed pairs, fixed eps (per t) -> loss tables. Returns a flat dict of scalars + a nested breakdown."""
     model.eval()
     B = 256; n = len(val_rows); d = norm.mean.numel()
-    L_c = torch.zeros(len(T_GRID), n); L_u = torch.zeros(len(T_GRID), n); mse_id = torch.zeros(n); mse_x0 = torch.zeros(n); var_j = torch.zeros(n)
+    L_c = torch.zeros(len(T_GRID), n); L_u = torch.zeros(len(T_GRID), n); L_dm = torch.zeros(len(T_GRID), n); mse_id = torch.zeros(n); mse_x0 = torch.zeros(n); var_j = torch.zeros(n)
+    dm_text = None
+    if a.cond == "text" and val_text is not None:                          # depth-matched partner: another val row with the same j (same (i,j) if possible)
+        jj = val_j.tolist(); ii = val_i.tolist(); by_ij = {}; by_j = {}
+        for q, (aa_, bb_) in enumerate(zip(ii, jj)): by_ij.setdefault((aa_, bb_), []).append(q); by_j.setdefault(bb_, []).append(q)
+        dm_text = []
+        for q in range(n):
+            c = [r_ for r_ in by_ij[(ii[q], jj[q])] if r_ != q] or [r_ for r_ in by_j[jj[q]] if r_ != q]
+            dm_text.append(val_text[c[q % len(c)]] if c else val_text[(q + n // 2) % n])
     for s in range(0, n, B):
         rows, i, j = val_rows[s:s + B], val_i[s:s + B], val_j[s:s + B]
         h_i, x0, log_s, _ = make_x0(norm, store_val.gather(rows, i, dev), store_val.gather(rows, j, dev), a.target, a.src_rms, a.squash)
         depth = torch.stack([i, j], 1).to(dev) if a.cond == "depth" else None
         enc = mask = None; vec = None
+        enc_dm = mask_dm = None
         if a.cond == "text":
-            with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(val_text[s:s + B])
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                enc, mask = encoder(val_text[s:s + B])
+                if dm_text is not None: enc_dm, mask_dm = encoder(dm_text[s:s + B])
         if a.cond == "vec": vec = lf.vec_feats(store_val.gather(rows, i), i, store_val.gather(rows, j), j)
         if a.cond == "proj":
             from nlt.critic.model import oracle_projection
@@ -88,6 +99,10 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     lu, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, depth=None, enc=None, enc_mask=None, log_s=log_s)
                 L_u[ti, s:s + B] = lu.cpu()
+                if enc_dm is not None:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        ld, _, _ = pair_fm_loss(model, x0, h_i, tt, eps, enc=enc_dm, enc_mask=mask_dm, log_s=log_s)
+                    L_dm[ti, s:s + B] = ld.cpu()
             if t == 0.9:            # x0-prediction at high noise ~ conditional mean -> FVE-like number comparable to an MSE transcoder
                 x_t = (1 - tt)[:, None] * x0 + tt[:, None] * eps
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -104,6 +119,12 @@ def evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encode
         pmi = (d / 2) * (L_u - L_c).mean(0) / math.log(2)                       # bits per pair, shared eps
         out[f"{prefix}/pmi_proxy_bits"] = float(pmi.mean()); out[f"{prefix}/pmi_proxy_bits_median"] = float(pmi.median()); out[f"{prefix}/fm_loss_uncond"] = float(L_u.mean())
         br["pmi_by_t_bits"] = ((d / 2) * (L_u - L_c).mean(1) / math.log(2)).tolist()
+        if dm_text is not None:                                               # held-out depth-matched shuffle: the early-stopping metric (DECISIONS v1.12)
+            cont = (d / 2) * (L_dm - L_c).mean(0) / math.log(2)                # paired content proxy bits per row
+            out[f"{prefix}/content_proxy_bits"] = float(cont.mean()); out[f"{prefix}/p_z_beats_dm"] = float((L_c.mean(0) < L_dm.mean(0)).float().mean())
+            out[f"{prefix}/dm_proxy_bits"] = float(((d / 2) * (L_u - L_dm).mean(0) / math.log(2)).mean())
+            ws = (js >= 14) & (js <= 32)
+            if ws.any(): out[f"{prefix}/content_proxy_bits_workspace"] = float(cont[torch.from_numpy(ws)].mean()); out[f"{prefix}/p_z_beats_dm_workspace"] = float((L_c.mean(0) < L_dm.mean(0))[torch.from_numpy(ws)].float().mean())
     for lo, hi in GAP_BUCKETS:
         m = (gaps >= lo) & (gaps <= hi)
         if m.sum() == 0: continue
@@ -150,6 +171,7 @@ def main():
     p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
     p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
     p.add_argument("--init-from", default=None, help="checkpoint of a trained BLIND prior (cond none): its weights are loaded into this model (text/depth extras stay zero/fresh, so at step 0 the conditional path IS the prior)")
+    p.add_argument("--prior-lr", type=float, default=2e-5, help="lr of the prior's own parameters when --init-from is given and --freeze-prior 0 (joint fine-tune); conditioning modules use --lr")
     p.add_argument("--freeze-prior", type=int, default=0, help="1 = train only the conditioning modules (cross-reads, gate_mod, depth embeddings); the unconditional path stays exactly the loaded prior")
     a = p.parse_args()
     torch.manual_seed(a.seed); np.random.seed(a.seed); dev = "cuda"; torch.backends.cuda.matmul.allow_tf32 = True
@@ -231,7 +253,13 @@ def main():
         for n, p_ in model.named_parameters(): p_.requires_grad_(n in cond_names)
         trainable = [p_ for n, p_ in model.named_parameters() if n in cond_names]
         print(f"[train] prior frozen: {sum(p_.numel() for p_ in trainable)/1e6:.1f}M trainable conditioning params", flush=True)
-    opt = torch.optim.AdamW(trainable, lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
+    cond_pat = lambda n: (".read." in n or ".gate_mod." in n or ".cvec_out." in n or n.startswith("text_read0") or n.startswith("emb_i") or n.startswith("emb_j") or n.startswith("tok_emb") or n.startswith("vec_in") or n.startswith("proj_in"))
+    if a.init_from and not a.freeze_prior and a.cond != "none":
+        g_cond = [p_ for n, p_ in model.named_parameters() if cond_pat(n)]; g_prior = [p_ for n, p_ in model.named_parameters() if not cond_pat(n)]
+        opt = torch.optim.AdamW([{"params": g_cond, "lr": a.lr}, {"params": g_prior, "lr": a.prior_lr}], betas=(0.9, 0.95), weight_decay=a.wd)
+        print(f"[train] JOINT fine-tune: {sum(p_.numel() for p_ in g_cond)/1e6:.0f}M conditioning params at lr {a.lr}, {sum(p_.numel() for p_ in g_prior)/1e6:.0f}M prior params at lr {a.prior_lr}", flush=True)
+    else:
+        opt = torch.optim.AdamW(trainable, lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
     step0 = 0
     if a.resume and os.path.exists(a.resume):
         ck = torch.load(a.resume, map_location="cpu"); model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); step0 = ck["step"]; print(f"[train] resumed from {a.resume} @ {step0}", flush=True)
@@ -260,7 +288,7 @@ def main():
         if a.cond == "proj":
             from nlt.critic.model import oracle_projection
             vec = oracle_projection(model, x0)
-        for g_ in opt.param_groups: g_["lr"] = lr_at(step)
+        for gi, g_ in enumerate(opt.param_groups): g_["lr"] = lr_at(step) * (1.0 if gi == 0 else a.prior_lr / a.lr)
         t_b = torch.rand(x0.shape[0], device=dev); eps_b = torch.randn_like(x0)                      # shared (t, eps) for the positive and the contrastive negative
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss_vec, t, kept = pair_fm_loss(model, x0, h_i, t_b, eps_b, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s, vec=vec)
@@ -304,9 +332,9 @@ def main():
                 out.update({k: v for k, v in out_tr.items() if "_gap/" not in k}); out["gate/heldout_over_train_fm"] = out["eval/fm_loss"] / max(1e-9, out_tr["eval_train/fm_loss"])
                 br["train_by_gap"] = br_tr["by_gap"]
             wandb.log(out, step=step); json.dump({"step": step + 1, "scalars": out, "breakdown": br}, open(os.path.join(a.out, "eval_latest.json"), "w"), indent=1)
-            score = out.get("eval/pmi_proxy_bits", -out["eval/fm_loss"])
+            score = out.get("eval/p_z_beats_dm", out.get("eval/pmi_proxy_bits", -out["eval/fm_loss"]))      # text: held-out P(z > z_dm) (v1.12); depth/vec: proxy PMI; none: -FM
             if best is None or score > best[0]:
-                best = (score, step + 1); save(step + 1, "ckpt_best.pt"); json.dump({"step": step + 1, "score": score, "metric": "eval/pmi_proxy_bits" if "eval/pmi_proxy_bits" in out else "-eval/fm_loss"}, open(os.path.join(a.out, "best.json"), "w"))
+                best = (score, step + 1); save(step + 1, "ckpt_best.pt"); json.dump({"step": step + 1, "score": score, "metric": "eval/p_z_beats_dm" if "eval/p_z_beats_dm" in out else ("eval/pmi_proxy_bits" if "eval/pmi_proxy_bits" in out else "-eval/fm_loss")}, open(os.path.join(a.out, "best.json"), "w"))
                 print(f"[train] new best ({best[1]}): {score:.3f} -> ckpt_best.pt", flush=True)
             print(f"[eval@{step+1}] " + " ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in out.items() if "/" in k and "_gap/" not in k), flush=True)
             print("[eval] by gap: " + json.dumps({k: {kk: round(vv, 4) for kk, vv in v.items()} for k, v in br["by_gap"].items()}), flush=True)
