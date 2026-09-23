@@ -148,7 +148,10 @@ class LensDiffDescriber:
         return out
 
     def _disp(self, t: int) -> str:
-        return self.display[t] if self.readable[t] else repr(self.tok.decode([t]))
+        if self.readable[t]:
+            return self.display[t]
+        raw = self.tok.decode([t]).strip().replace("'", "")
+        return raw if raw else "a whitespace token"
 
     def _dedupe(self, ids, deltas, k, min_delta=None, max_delta=None, skip=()):
         seen, out = set(skip), []
@@ -171,7 +174,7 @@ class LensDiffDescriber:
     # ------------------------------------------------------------------ text
     @staticmethod
     def _q(s: str) -> str:
-        return s if s.startswith(("a ", "an ")) and " " in s else f"'{s}'"
+        return s if (s.startswith(("a ", "an ")) and " " in s) else f"'{s}'"
 
     def _join(self, items, n):
         words = [self._q(d) for d, *_ in items[:n]]
@@ -226,7 +229,7 @@ class LensDiffDescriber:
             s3 += f" Overall the representation {self._cos_words(f)}."
             s = " ".join([s1, s2, s3])
         else:
-            ris = ", ".join(d for d, *_ in f.risers[:20]) or "(none)"; fal = ", ".join(d for d, *_ in f.fallers[:20]) or "(none)"
+            ris = ", ".join(d for d, *_ in f.risers[:20]) or "nothing besides the top choice"; fal = ", ".join(d for d, *_ in f.fallers[:20]) or "nothing notable"
             now = ", ".join(d for d, *_ in f.top_j[:10]) or "(none)"; before = ", ".join(d for d, *_ in f.top_i[:10]) or "(none)"
             s = (f"Rising: {ris}. Falling: {fal}. Now favoured: {now}. Previously favoured: {before}. "
                  f"Top choice {f.top1_i} -> {f.top1_j}; confidence {f.p1_i:.2f} -> {f.p1_j:.2f}; entropy {f.ent_i:.1f} -> {f.ent_j:.1f} nats; cosine {f.cos:.2f}.")
