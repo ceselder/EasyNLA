@@ -71,7 +71,9 @@ class CriticCotrainer:
         print(f"[cotrain] {sum(p.numel() for p in self.params)/1e6:.1f}M adapter params trainable, prior frozen", flush=True)
         self.replay = None
         if replay_paths:
-            df = load_text_pairs(replay_paths.split(","), os.path.join(data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of)]
+            import glob as _glob
+            files = sorted(sum([_glob.glob(x) if any(c in x for c in "*?[") else [x] for x in replay_paths.split(",")], [])); assert files, f"no replay files match {replay_paths}"
+            df = load_text_pairs(files, os.path.join(data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of)]
             self.replay = df.reset_index(drop=True); print(f"[cotrain] replay pool {len(self.replay)} rows", flush=True)
 
     def step(self, h_i, h_j, texts, n_replay, gen):

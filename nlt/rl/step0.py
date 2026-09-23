@@ -69,7 +69,9 @@ def main():
         m = torch.as_tensor(mask); g = groups[m]
         if m.sum() == 0: return {}
         wg = within_group_std(b0[m], g); nz = float(noise_row[m].std()); bm = float(b0[m].mean()); dm = float(b_dm[m].mean()); rp = float(b_rp[m].mean())
-        return {"n": int(m.sum()), "bits_mean": bm, "bits_median": float(b0[m].median()), "within_group_std": wg, "scoring_noise": nz, "std_over_noise": wg / nz if nz > 0 else float("nan"),
+        bpt = b0[m] / n_tok[m].clamp_min(1)
+        return {"n": int(m.sum()), "bits_mean": bm, "bits_median": float(b0[m].median()), "bits_per_token_median": float(bpt.median()), "bits_per_token_mean": float(bpt.mean()),
+                "lambda_max": 0.5 * float(bpt.median()), "within_group_std": wg, "scoring_noise": nz, "std_over_noise": wg / nz if nz > 0 else float("nan"),
                 "bits_dm": dm, "bits_rp": rp, "bits_over_dm": bm / dm if dm > 0 else float("inf"), "frac_nonpos": float((b0[m] <= 0).float().mean()), "tokens_mean": float(n_tok[m].mean()),
                 "mention_next": float(viol["mention_next"][mask].mean()), "copy_rate": float(viol["copy_rate"][mask].mean()), "regex": float(viol["regex"][mask].mean()), "empty": float(viol["empty"][mask].mean()),
                 "corr_bits_tokens": corr(b0[m], n_tok[m]), "reward_mean": float((b0[m] - a.lam * n_tok[m]).mean())}
