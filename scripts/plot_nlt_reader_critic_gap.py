@@ -14,11 +14,11 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 D = "/home/celeste/shared/reports/natural-language-transcoder/data"
 # (label, reader key, controls-summary file or (content, p) tuple, colour)
-SOURCES = [("teacher\npassage+lens+final", "reader_teacher_v1", "verdicts_union_pooled_null_teacher_v1_controls.json", "#2a78d6"),
-           ("teacher\npassage+lens", "reader_teacher_nofinal_v1", "verdicts_union_pooled_null_teacher_nofinal_v1_controls.json", "#eb6834"),
-           ("teacher\npassage only", "reader_teacher_nolens_v1", "verdicts_union_pooled_null_teacher_nolens_v1_controls.json", "#1baf7a"),
-           ("J-lens diff\ntwo readouts", "reader_lensdiff_jlens_L1", "verdicts_union_pooled_null_lensdiff_L1_controls.json", "#4a3aa7"),
-           ("V0 verbalizer\nactivations only", "reader_v0_ao_tsv1", "verdicts_union_pooled_null_v0_ao_tsv1_controls.json", "#e34948")]
+SOURCES = [("teacher\n+lens\n+final", "reader_teacher_v1", "verdicts_union_pooled_null_teacher_v1_controls.json", "#2a78d6"),
+           ("teacher\n+lens", "reader_teacher_nofinal_v1", "verdicts_union_pooled_null_teacher_nofinal_v1_controls.json", "#eb6834"),
+           ("teacher\npassage\nonly", "reader_teacher_nolens_v1", "verdicts_union_pooled_null_teacher_nolens_v1_controls.json", "#1baf7a"),
+           ("J-lens\ndiff", "reader_lensdiff_jlens_L1", "verdicts_union_pooled_null_lensdiff_L1_controls.json", "#4a3aa7"),
+           ("V0\nverbalizer", "reader_v0_ao_tsv1", "verdicts_union_pooled_null_v0_ao_tsv1_controls.json", "#e34948")]
 
 
 def main():
@@ -49,8 +49,8 @@ def main():
     for ax in (ax1, ax2):
         ax.grid(True, axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s_ in ("top", "right"): ax.spines[s_].set_visible(False)
-    fig.text(0.01, 0.003, "Fixed 4,096-pair eval set (Qwen3-8B, layer pairs 9-34). Reader = Sonnet-5 with the sentence only (512 pairs/source). Critic = exact ODE likelihood (Heun 32, paired probes), null-regularised union adapter on the pooled prior, ~1000 pairs/source, 95% CI.", fontsize=9, color=INK2, ha="left", va="bottom", wrap=True)
-    fig.tight_layout(rect=(0, 0.075, 1, 1)); os.makedirs(a.out_dir, exist_ok=True)
+    fig.text(0.01, 0.003, "Fixed 4,096-pair eval set (Qwen3-8B, layer pairs 9-34). teacher = Sonnet-5 shown the passage (+ lens readouts, + final top-10); J-lens diff = describer of two lens readouts; V0 = SFT verbalizer reading the two activations only. Reader = Sonnet-5 with the sentence alone (512 pairs/source). Critic = exact ODE likelihood (Heun 32, paired probes), null-regularised union adapter on the pooled prior, ~1000 pairs/source, 95% CI.", fontsize=9, color=INK2, ha="left", va="bottom", wrap=True)
+    fig.tight_layout(rect=(0, 0.09, 1, 1)); os.makedirs(a.out_dir, exist_ok=True)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.out_dir, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"rows": [{k: v for k, v in r.items() if k != "colour"} for r in rows], "chance": {"top1": 0.25, "posmatch": 0.20}}, open(os.path.join(a.out_dir, "data", f"{a.stem}.json"), "w"), indent=1, default=str)
     print("saved", os.path.join(a.out_dir, f"{a.stem}.png"))
