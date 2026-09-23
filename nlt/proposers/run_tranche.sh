@@ -10,7 +10,8 @@ set -uo pipefail
 SPLIT=$1; START=$2; END=$3; CHUNK=${4:-2048}; CONC=${5:-32}; VARIANTS=${6:-"final nofinal"}
 DATA_DIR=${DATA_DIR:-/vol/data/qwen3_8b}
 PERM_SEED=${PERM_SEED:--1}       # >=0: rows of a fixed permutation of the pairs table (use 0 for train); val uses -1 = first rows
-ZROOT=${ZROOT:-/vol/z}          # override for rehearsals so smoke pair_ids never land under /vol/z
+ZROOT=${ZROOT:-/vol/z}          # override for rehearsals so smoke pair_ids never land under /vol/z (container mount path)
+ZCLI=${ZROOT#/vol}              # the same path as seen by the `modal volume` CLI (volume root = /vol in the container)
 ROOT=/home/celeste/nlt; LOCAL=${LOCAL:-/home/celeste/nlt-prop-data}
 TAG=$(printf "%07d_%07d" "$START" "$END")
 vget() {  # modal volume get with retries: a just-committed file can take a minute to become visible to the client
@@ -27,7 +28,7 @@ fi
 declare -a CH_S CH_E
 for ((s=START; s<END; s+=CHUNK)); do e=$(( s+CHUNK < END ? s+CHUNK : END )); CH_S+=("$s"); CH_E+=("$e")
   f=$(printf "feat_%07d_%07d.parquet" "$s" "$e")
-  [[ -s "$LOCAL/features_v1/$SPLIT/$f" ]] || vget "$ZROOT/features_v1/$SPLIT/$f" "$LOCAL/features_v1/$SPLIT/$f" || { echo "[tranche] download FAILED $f"; exit 1; }
+  [[ -s "$LOCAL/features_v1/$SPLIT/$f" ]] || vget "$ZCLI/features_v1/$SPLIT/$f" "$LOCAL/features_v1/$SPLIT/$f" || { echo "[tranche] download FAILED $f"; exit 1; }
 done
 echo "[tranche] $(date -u +%H:%M:%S) features ready: ${#CH_S[@]} chunks"
 PIDS=()
@@ -49,7 +50,7 @@ for VAR in $VARIANTS; do
   for k in "${!CH_S[@]}"; do
     ct=$(printf "%07d_%07d" "${CH_S[$k]}" "${CH_E[$k]}"); OUT="$LOCAL/teacher/$SPLIT/${SRC}_part_${ct}.parquet"
     if [[ -s "$OUT" ]]; then
-      modal volume put nlt "$OUT" "$ZROOT/$SRC/$SPLIT/part_${ct}.parquet" --force > /dev/null && echo "[tranche] uploaded $ZROOT/$SRC/$SPLIT/part_${ct}.parquet ($(python3 -c "import pyarrow.parquet as q;print(q.read_metadata('$OUT').num_rows)") rows)"
+      modal volume put nlt "$OUT" "$ZCLI/$SRC/$SPLIT/part_${ct}.parquet" --force > /dev/null && echo "[tranche] uploaded $ZCLI/$SRC/$SPLIT/part_${ct}.parquet ($(python3 -c "import pyarrow.parquet as q;print(q.read_metadata('$OUT').num_rows)") rows)"
     else echo "[tranche] MISSING $OUT"; fi
   done
 done
