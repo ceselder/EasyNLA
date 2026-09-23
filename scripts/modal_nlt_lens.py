@@ -70,6 +70,11 @@ def gpu1(module: str, args: str = "", log_name: str | None = None) -> int:
     return _run(module, args, log_name)
 
 
+@app.function(gpu="H100", timeout=6 * 3600, **COMMON)
+def gpu1_h100(module: str, args: str = "", log_name: str | None = None) -> int:
+    return _run(module, args, log_name)
+
+
 @app.function(timeout=2 * 3600, volumes={VOL_MNT: vol}, secrets=SECRETS, cpu=8, memory=64 * 1024)
 def cpu(module: str, args: str = "", log_name: str | None = None) -> int:
     return _run(module, args, log_name)
@@ -87,7 +92,8 @@ def smoke() -> str:
 
 
 @app.local_entrypoint()
-def main(task: str = "smoke", module: str = "", args: str = "", n_parts: int = 1, n_prompts: int = 48, tag: str = ""):
+def main(task: str = "smoke", module: str = "", args: str = "", n_parts: int = 1, n_prompts: int = 48, tag: str = "", gpu: str = "b200"):
+    fn = gpu1_h100 if gpu.lower() == "h100" else gpu1
     if task == "smoke":
         print(smoke.remote())
     elif task == "jlens":
@@ -100,8 +106,11 @@ def main(task: str = "smoke", module: str = "", args: str = "", n_parts: int = 1
     elif task == "extract":
         rcs = list(gpu1.starmap([("extract_acts", f"--part {p} --n-parts {n_parts} {args}", f"extract_part{p:02d}") for p in range(n_parts)]))
         print("part rcs", rcs)
-    elif task == "run":            # any module on one GPU
-        print("rc", gpu1.remote(module, args, tag or module))
+    elif task == "run":            # any module on one GPU (--gpu h100 for light jobs)
+        print("rc", fn.remote(module, args, tag or module))
+    elif task == "runparts":       # same module, --part p --n-parts N appended, one GPU per part
+        rcs = list(fn.starmap([(module, f"{args} --part {p} --n-parts {n_parts}", f"{tag or module}_part{p:02d}") for p in range(n_parts)]))
+        print("part rcs", rcs)
     elif task == "cpu":
         print("rc", cpu.remote(module, args, tag or module))
     else:
