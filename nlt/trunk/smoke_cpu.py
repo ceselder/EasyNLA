@@ -59,6 +59,14 @@ def main():
             print(f"group {g}: multi vs single max|diff| {(vg[:, g] - vs).abs().max().item():.2e}"); assert (vg[:, g] - vs).abs().max() < 1e-4
         vn = m(xg[1, 1][None], tg[1, 1][None], h_i[1][None])
         print("dropped group vs null", (vg[1, 1] - vn[0]).abs().max().item()); assert (vg[1, 1] - vn[0]).abs().max() < 1e-4
+    # gradient checkpointing: multi-group forward + a single forward, then ONE backward (recompute must match) -- this is the training-step pattern
+    mc = TrunkCritic(prior, tmp, n_layers=4, lora_r=4, lora_alpha=8, n_act_tokens=2, fresh_every=2, fresh_heads=2, fresh_dhead=8, grad_ckpt=True, device=dev, space=m.space, dtype=torch.float32)
+    mc.load_state(m.state()); mc.train()
+    v_multi = mc.multi_forward(xg, tg, h_i, ids, mask, keep); v_single = mc(x_t, t, h_i, enc=TextIDs(ids), enc_mask=mask)
+    (v_multi.pow(2).mean() + v_single.pow(2).mean()).backward()
+    assert all(p.grad is not None for p in mc.lora_parameters()), "no LoRA grads under checkpointing"
+    with torch.no_grad(): assert (v_multi - vg).abs().max() < 1e-4 and (v_single - v_full).abs().max() < 1e-4
+    print("grad-ckpt multi+single backward OK")
     # training loss + grads
     m.train(); x0 = torch.randn(B, d)
     loss, tt, kept = pair_fm_loss(m, x0, h_i, enc=TextIDs(ids), enc_mask=mask, p_uncond=0.5)

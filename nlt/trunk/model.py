@@ -115,8 +115,8 @@ class TrunkCritic(nn.Module):
         nL = len(owner.layers)
         self.fresh_layers = sorted({i for i in range(nL) if (i + 1) % fresh_every == 0} | {nL - 1}) if fresh_every > 0 else []
         self.fresh = nn.ModuleList([FreshAttnBlock(hidden, fresh_heads, fresh_dhead) for _ in self.fresh_layers])
-        self._n_act = n_act_tokens + 1; self._groups = 1
-        for blk, i in zip(self.fresh, self.fresh_layers): owner.layers[i].register_forward_hook(self._make_hook(blk))
+        self._n_act = n_act_tokens + 1
+        for blk, i in zip(self.fresh, self.fresh_layers): owner.layers[i].register_forward_hook(self._make_hook(blk), with_kwargs=True)
         # ---- readout
         self.readout_ln = nn.LayerNorm(hidden); self.readout_rank = readout_rank
         if readout_rank > 0:     # low-rank readout: far fewer effective parameters per output dim -> resolves a ~0.2%-variance text signal from ~100x fewer rows
@@ -137,12 +137,15 @@ class TrunkCritic(nn.Module):
     def target(self): return self.space.get("target", "delta")
 
     def _make_hook(self, blk):
-        def hook(_mod, _inp, out):
-            n = self._n_act * self._groups
+        """forward hook on a trunk layer: bidirectional fresh attention over the activation positions. The group count and the number of
+        activation tokens come in as FORWARD KWARGS (trunk_groups / trunk_n_act, passed through self.owner(...)), never as module state:
+        gradient checkpointing re-runs the layer (and this hook) during backward with the same kwargs, so the recompute matches."""
+        def hook(_mod, _args, kwargs, out):
+            n_act = kwargs.get("trunk_n_act", self._n_act); G = kwargs.get("trunk_groups", 1); n = n_act * G
             if n <= 0: return out                                                                          # text-prefix pass: no activation positions
             h = out[0] if isinstance(out, tuple) else out
             a = h[:, -n:]; Bh, _, Hh = a.shape
-            a2 = blk(a.reshape(Bh * self._groups, self._n_act, Hh)).reshape(Bh, n, Hh)                        # bidirectional WITHIN each noise group only
+            a2 = blk(a.reshape(Bh * G, n_act, Hh)).reshape(Bh, n, Hh)                                       # bidirectional WITHIN each noise group only
             h2 = torch.cat([h[:, :-n], a2], 1) if h.shape[1] > n else a2
             return (h2,) + tuple(out[1:]) if isinstance(out, tuple) else h2
         return hook
@@ -167,12 +170,10 @@ class TrunkCritic(nn.Module):
         B, T = ids.shape
         pos = (mask.long().cumsum(1) - 1).clamp(min=0)
         was = self.owner.training; self.owner.eval()
-        self._n_act = 0                                            # no activation positions in the prefix pass -> fresh hooks are no-ops
         try:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                self.owner(inputs_embeds=self.owner.embed_tokens(ids), position_ids=pos, past_key_values=cache, use_cache=True)
+                self.owner(inputs_embeds=self.owner.embed_tokens(ids), position_ids=pos, past_key_values=cache, use_cache=True, trunk_n_act=0, trunk_groups=1)   # no activation positions -> fresh hooks are no-ops
         finally:
-            self._n_act = self.K + 1
             if was: self.owner.train()
         return TextKV(cache=cache, T=T, lengths=mask.sum(1), ids=ids), mask
 
@@ -241,12 +242,8 @@ class TrunkCritic(nn.Module):
         grp = torch.arange(G * Kp, device=dev) // Kp; apos = torch.arange(G * Kp, device=dev) % Kp
         m[:, T:, :T] = key_mask[:, None, :] & keep[:, grp][:, :, None]
         m[:, T:, T:] = ((grp[:, None] == grp[None, :]) & (apos[:, None] >= apos[None, :]))[None]
-        self._groups = G
-        try:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = self.owner(inputs_embeds=x_in, attention_mask=m[:, None], position_ids=pos, use_cache=False).last_hidden_state
-        finally:
-            self._groups = 1
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = self.owner(inputs_embeds=x_in, attention_mask=m[:, None], position_ids=pos, use_cache=False, trunk_n_act=Kp, trunk_groups=G).last_hidden_state
         hs = out[:, T:].float().reshape(B * G, Kp, H)
         delta = self.readout(self.readout_ln(hs).reshape(B * G, Kp * H)).view(B, G, d)
         return v_prior + delta
@@ -256,12 +253,12 @@ class TrunkCritic(nn.Module):
         Kp = self._n_act
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if cache is None:
-                out = self.owner(inputs_embeds=x_in, attention_mask=(am.long() if am is not None else None), position_ids=pos, use_cache=False).last_hidden_state
+                out = self.owner(inputs_embeds=x_in, attention_mask=(am.long() if am is not None else None), position_ids=pos, use_cache=False, trunk_n_act=Kp, trunk_groups=1).last_hidden_state
             else:
                 was = self.owner.training
                 if was: self.owner.eval()                    # GradientCheckpointingLayer silently DROPS past_key_values in training mode
                 try:
-                    out = self.owner(inputs_embeds=x_in, attention_mask=am.long(), position_ids=pos, past_key_values=cache, use_cache=True).last_hidden_state
+                    out = self.owner(inputs_embeds=x_in, attention_mask=am.long(), position_ids=pos, past_key_values=cache, use_cache=True, trunk_n_act=Kp, trunk_groups=1).last_hidden_state
                 finally:
                     for layer in cache.layers: layer.crop(T)                                                # the prefix cache is reusable
                     if was: self.owner.train()
