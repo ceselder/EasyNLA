@@ -137,6 +137,10 @@ def main():
     vp = vp[vp["pos_idx"].isin(store_val.row_of)].iloc[: a.eval_n]
     val_rows = store_val.rows_for(vp["pos_idx"].values); val_i = torch.tensor(vp["i"].values); val_j = torch.tensor(vp["j"].values)
     g_eval = torch.Generator().manual_seed(1234); eps_bank = [torch.randn(len(val_rows), d, generator=g_eval) for _ in T_GRID]
+    # the same fixed eval on TRAIN pairs (first rows of pairs_train.parquet that are in the store): the D3 gate compares eval/fm_loss with eval_train/fm_loss
+    tp = pq.read_table(os.path.join(a.data_dir, "pairs_train.parquet")).to_pandas(); tp = tp[tp["pos_idx"].isin(store.row_of)].iloc[: len(val_rows)]
+    tr_rows = store.rows_for(tp["pos_idx"].values); tr_i = torch.tensor(tp["i"].values); tr_j = torch.tensor(tp["j"].values)
+    g_eval2 = torch.Generator().manual_seed(4321); eps_bank_tr = [torch.randn(len(tr_rows), d, generator=g_eval2) for _ in T_GRID]
     # ---- text
     encoder = None; text_df = None; val_text = None; tok8 = None
     if a.cond == "text":
@@ -214,6 +218,10 @@ def main():
             if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step", flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             out, br = evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank)
+            if a.cond != "text":       # train-pair eval (same grid, fixed eps) for the generalisation gate; text mode has no per-pair train texts here
+                out_tr, br_tr = evaluate(model, store, norm, a, tr_rows, tr_i, tr_j, None, None, dev, eps_bank_tr, prefix="eval_train")
+                out.update({k: v for k, v in out_tr.items() if "_gap/" not in k}); out["gate/heldout_over_train_fm"] = out["eval/fm_loss"] / max(1e-9, out_tr["eval_train/fm_loss"])
+                br["train_by_gap"] = br_tr["by_gap"]
             wandb.log(out, step=step); json.dump({"step": step + 1, "scalars": out, "breakdown": br}, open(os.path.join(a.out, "eval_latest.json"), "w"), indent=1)
             print(f"[eval@{step+1}] " + " ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in out.items() if "/" in k and "_gap/" not in k), flush=True)
             print("[eval] by gap: " + json.dumps({k: {kk: round(vv, 4) for kk, vv in v.items()} for k, v in br["by_gap"].items()}), flush=True)
