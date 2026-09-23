@@ -172,6 +172,7 @@ def main():
                 w = torch.log(1.0 / (jp - K_LO) / torch.tensor([sum(1.0 / (q - K_LO) for q in range(int(ii) + 1, K_HI + 1)) for ii in i.tolist()], device=dev))   # log p(j'|i)
                 terms[:, jp] = torch.where(valid, lp + w, torch.full_like(lp, -float("inf")))
             lmix = torch.logsumexp(terms, 1).cpu()
+            assert torch.isfinite(lmix).all(), f"non-finite mixture term for rows {[k for q, k in enumerate(kk) if not torch.isfinite(lmix[q])]}"
             for q, k in enumerate(kk): store_mix[k] = float(lmix[q])
             print(f"[bits] mixture {min(len(todo), s0 + a.batch)}/{len(todo)} rows, {time.time() - t0:.0f}s", flush=True)
             torch.save(store_mix, cache)
@@ -233,12 +234,13 @@ def main():
                "proxy_fm_loss_uncond": float(L_u.mean()), "proxy_fm_loss_uncond_by_t": L_u.mean(1).tolist(),
                "uncond_bits_per_dim_vs_gaussian": summarize(ruler.numpy(), gaps, js, "ruler") if not a.skip_exact else None,
                "uncond_nll_bits_per_dim": float(-lp_u.mean() / (d * math.log(2))) if not a.skip_exact else None}
+        if logp_mix is not None and not a.skip_exact:
+            lm_all = torch.tensor([logp_mix[k] for k in idx]); res["blind_vs_mix_bits"] = summarize((lp_u - lm_all).numpy() / math.log(2), gaps, js, "blind_vs_mix")   # <= 0: the hedging the blind prior pays vs the depth-aware mixture
         if cond != "none":
             pmi_p = proxy_pmi_bits(L_u, L_c, d).numpy(); res["proxy_pmi_bits"] = summarize(pmi_p, gaps, js, "proxy"); res["proxy_pmi_bits_by_t"] = ((d / 2) * (L_u - L_c).mean(1) / math.log(2)).tolist()
             if not a.skip_exact and logp_mix is not None:
                 lm = torch.tensor([logp_mix[k] for k in idx])
                 pm = (lp_c - lm).numpy() / math.log(2); res["exact_pmi_vs_mix_bits"] = summarize(pm, gaps, js, "vs_mix"); res["exact_pmi_vs_mix_bits"]["frac_positive"] = float((pm > 0).mean())
-                res["blind_vs_mix_bits"] = summarize((lp_u - lm).numpy() / math.log(2), gaps, js, "blind_vs_mix")    # how far the blind prior is below the mixture (<= 0 expected; = depth hedging)
             if cond == "proj" and proj_y:      # T5 analytic Gaussian bound on the information in y = P x0 + sigma eps about x0: sum_k 1/2 log2(1 + var_k / sigma^2)
                 Y = torch.cat(proj_y, 0); var_k = Y.var(0); res["proj_gaussian_bound_bits"] = float((0.5 * torch.log2(1 + var_k / model.proj_sigma ** 2)).sum()); res["proj_k"] = int(model.proj_k); res["proj_sigma"] = float(model.proj_sigma); res["proj_var_k_mean"] = float(var_k.mean())
             if not a.skip_exact:
