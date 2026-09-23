@@ -486,7 +486,9 @@ class FlowCritic:
         uniq = {}
         for i in valid:
             for c in cl[i][:claim_max]: uniq.setdefault(c, len(uniq))
-        C_enc, C_mk = self._tok_states(list(uniq))
+        from nla.flow.claims import format_claims
+        bullet = self.adapter_args.get("claim_subsets", 0) > 0 and not self.adapter_args.get("set_encode", False)   # train_cond's one-claim format "• c"
+        C_enc, C_mk = self._tok_states([format_claims([c]) if bullet else c for c in uniq])
         tvals = list(self.t_grid); K = self.eps_per_t
         for c0 in range(0, len(valid), rows_per_chunk):
             ch = valid[c0: c0 + rows_per_chunk]; R = len(ch)
