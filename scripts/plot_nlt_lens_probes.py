@@ -18,7 +18,7 @@ KIND_COLORS = {"jlens": "#55A868", "logit": "#4C72B0", "tuned": "#DD8452"}
 
 def plot_a(paths, out):
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 14})
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.2))
     for ax, target in zip(axes, ("delta", "h_j")):
         rows = []
         for p in paths:
@@ -37,7 +37,7 @@ def plot_a(paths, out):
         d0 = json.load(open(paths[0]))["results"][target]
         ax.set_title(f"target {'Δ = h_j − h_i' if target == 'delta' else 'h_j'}: ridge from h_i alone explains {100*d0['h_i']['fve']:.1f}%")
     axes[0].legend(fontsize=10)
-    fig.suptitle("Lens-diff text adds only a few FVE points linearly beyond h_i; the forbidden depth one-hot adds more", fontsize=12)
+    fig.suptitle("J-lens change descriptions explain as much of the residual change as knowing the depth\n(ridge probe, 8k held-out pairs; LINEAR reader: bounds nothing about what the flow critic can extract)", fontsize=12)
     fig.tight_layout(); fig.savefig(f"{out}/lens_probe_fve.png", dpi=150); fig.savefig(f"{out}/lens_probe_fve.pdf")
     print("wrote", f"{out}/lens_probe_fve.png")
 
