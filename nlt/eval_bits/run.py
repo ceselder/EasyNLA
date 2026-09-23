@@ -31,6 +31,14 @@ def summarize(vals, gaps, js, name):
     for lo, hi in GAP_BUCKETS:
         m = (gaps >= lo) & (gaps <= hi)
         if m.sum(): out["by_gap"][f"{lo}-{hi}" if lo != hi else f"{lo}"] = {"mean": float(vals[m].mean()), "sem": float(vals[m].std() / math.sqrt(m.sum())), "n": int(m.sum())}
+    out["by_gap_coarse"] = {}
+    for lo, hi in ((1, 3), (4, 10), (11, 25)):                       # redteam #51 bins
+        m = (gaps >= lo) & (gaps <= hi)
+        if m.sum(): out["by_gap_coarse"][f"{lo}-{hi}"] = {"mean": float(vals[m].mean()), "sem": float(vals[m].std() / math.sqrt(m.sum())), "n": int(m.sum())}
+    out["by_band"] = {}
+    for lab, lo, hi in (("pre<=13", 10, 13), ("workspace14-32", 14, 32), ("motor>=33", 33, 34)):
+        m = (js >= lo) & (js <= hi)
+        if m.sum(): out["by_band"][lab] = {"mean": float(vals[m].mean()), "sem": float(vals[m].std() / math.sqrt(m.sum())), "n": int(m.sum())}
     for jj in range(K_LO + 1, K_HI + 1):
         m = js == jj
         if m.sum(): out["by_j"][str(jj)] = {"mean": float(vals[m].mean()), "sem": float(vals[m].std() / math.sqrt(m.sum())), "n": int(m.sum())}

@@ -118,6 +118,8 @@ def main():
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=128)
     p.add_argument("--wandb", default="nlt-qwen3-8b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
+    p.add_argument("--init-from", default=None, help="checkpoint of a trained BLIND prior (cond none): its weights are loaded into this model (text/depth extras stay zero/fresh, so at step 0 the conditional path IS the prior)")
+    p.add_argument("--freeze-prior", type=int, default=0, help="1 = train only the conditioning modules (cross-reads, gate_mod, depth embeddings); the unconditional path stays exactly the loaded prior")
     a = p.parse_args()
     torch.manual_seed(a.seed); np.random.seed(a.seed); dev = "cuda"; torch.backends.cuda.matmul.allow_tf32 = True
     os.makedirs(a.out, exist_ok=True); t_start = time.time()
@@ -156,7 +158,20 @@ def main():
     if encoder: model.d_enc_ = encoder.d_enc
     model.src_rms_ = bool(a.src_rms)
     print(f"[train] {a.cond} critic: {model.n_params()/1e6:.0f}M params, target {a.target}, norm {a.norm}, src_rms {a.src_rms}, batch {a.batch}, {a.steps} steps", flush=True)
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
+    if a.init_from:
+        ck = torch.load(a.init_from, map_location="cpu"); sd = ck["model"]
+        if a.cond == "text":                                  # prior blocks live under blocks.<k>.base.* in the text model
+            sd = {(k.replace("blocks.", "blocks.", 1) if not k.startswith("blocks.") else "blocks." + k.split(".", 1)[1].split(".", 1)[0] + ".base." + k.split(".", 2)[2]): v for k, v in sd.items()}
+        res = model.load_state_dict(sd, strict=False)
+        assert not res.unexpected_keys, res.unexpected_keys[:5]
+        print(f"[train] init from {a.init_from} (step {ck.get('step')}): {len(sd)} tensors loaded, {len(res.missing_keys)} fresh (conditioning) tensors", flush=True)
+    trainable = list(model.parameters())
+    if a.freeze_prior:
+        cond_names = {n for n, _ in model.named_parameters() if (".read." in n or ".gate_mod." in n or n.startswith("emb_i") or n.startswith("emb_j"))}
+        for n, p_ in model.named_parameters(): p_.requires_grad_(n in cond_names)
+        trainable = [p_ for n, p_ in model.named_parameters() if n in cond_names]
+        print(f"[train] prior frozen: {sum(p_.numel() for p_ in trainable)/1e6:.1f}M trainable conditioning params", flush=True)
+    opt = torch.optim.AdamW(trainable, lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
     step0 = 0
     if a.resume and os.path.exists(a.resume):
         ck = torch.load(a.resume, map_location="cpu"); model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); step0 = ck["step"]; print(f"[train] resumed from {a.resume} @ {step0}", flush=True)
@@ -185,7 +200,7 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss_vec, t, kept = pair_fm_loss(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s)
         loss = loss_vec.mean(); opt.zero_grad(set_to_none=True); loss.backward()
-        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip); opt.step()
+        gn = torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip); opt.step()
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
         if step % 25 == 0:
             log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/step_s": (time.time() - t0) / max(1, step - step0 + 1)}
