@@ -36,9 +36,11 @@ def main():
     def load_rows(paths, split, store):
         df = load_text_pairs(paths.split(","), os.path.join(a.data_dir, f"pairs_{split}.parquet")); df = df[df["pos_idx"].isin(store.row_of)]
         n0 = len(df); df = df[~df["text"].astype(str).map(lambda t: bool(hard_hits(t)))]; n1 = len(df)
-        store.load_docs(a.data_dir); keep = []
+        docs = store.load_docs(a.data_dir); keep = []
+        if not docs: print(f"[sft:{split}] WARNING no docs parquet in {a.data_dir}/{split}: copy filter skipped", flush=True)
         for pos_idx, t in zip(df["pos_idx"].values, df["text"].values):
-            ids = tok.encode(str(t).strip(), add_special_tokens=False); keep.append(copy_rate_ngram(ids, store.context_ids(int(pos_idx), 256), 4) <= a.copy_thresh and len(ids) > 0)
+            ids = tok.encode(str(t).strip(), add_special_tokens=False)
+            ok = len(ids) > 0 and (not docs or copy_rate_ngram(ids, store.context_ids(int(pos_idx), 256), 4) <= a.copy_thresh); keep.append(ok)
         df = df[np.array(keep, bool)]; n2 = len(df)
         if a.one_per_pair: df = df.sample(frac=1.0, random_state=a.seed).drop_duplicates("pair_id")
         print(f"[sft:{split}] rows {n0} -> regex {n1} -> copy/empty {n2} -> {len(df)} used; sources {df['source'].value_counts().to_dict()}", flush=True)
