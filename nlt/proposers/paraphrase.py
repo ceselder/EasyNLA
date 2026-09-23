@@ -28,7 +28,11 @@ from nlt.proposers.teacher_sonnet import client_kwargs  # noqa: E402
 
 MODEL = "claude-sonnet-5"
 PACK = 8
-SYSTEM = """Each item is a one-sentence claim about what a language model worked out internally while reading a passage. Write TWO paraphrases of each that keep EXACTLY the same claims and specifics (same entities, same direction of change, same outcome): "light" = the same sentence with different wording and word order, similar length; "strong" = restructured (different sentence shape, synonyms, clause order, active/passive), still one sentence, similar length. Never add or drop a claim, never quote a passage, never mention layers, depth or stages. Use single quotes inside the sentences, never double quotes. Answer with JSON only: a list of {"id": <item id>, "light": "...", "strong": "..."} in the same order."""
+SYSTEM = """Each item is a one-sentence note about what a language model worked out internally while reading a passage. You see ONLY the sentence. Write two rewrites of each that keep EVERY claim, entity, number, quoted token and direction of change exactly the same; add nothing, drop nothing.
+"light": rewrite with different wording and sentence structure, about the same length, same register.
+"strong": the same content in a DIFFERENT REGISTER, still one sentence of about the same length: for items whose id is EVEN, write it as a terse technical note (compact, nominal, no filler); for items whose id is ODD, write it as a plain-English sentence for a non-expert (everyday words, no jargon).
+Never mention layers, depth, stages or positions in the network. Use single quotes inside the sentences, never double quotes. Answer with JSON only: a list of {"id": <item id>, "light": "...", "strong": "..."} in the same order."""
+REGISTER = {0: "terse-technical", 1: "plain-english"}
 _ITEM = re.compile(r'"id"\s*:\s*(\d+)\s*,\s*"light"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"strong"\s*:\s*"((?:[^"\\]|\\.)*)"', re.S)
 
 
@@ -86,7 +90,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--z", required=True, nargs="+"); ap.add_argument("--out-dir", required=True); ap.add_argument("--tag", default="part")
     ap.add_argument("--verbosity", type=int, default=1); ap.add_argument("--limit", type=int, default=0); ap.add_argument("--concurrency", type=int, default=32)
+    ap.add_argument("--heldout-ids", default="", help="json with pair_ids whose paraphrases go to <out-dir>/heldout/<source>/ instead of the pool dirs")
     a = ap.parse_args()
+    held = set(json.load(open(a.heldout_ids))["pair_ids"]) if a.heldout_ids else set()
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
     z = pd.concat([pq.read_table(f, columns=["pair_id", "text", "verbosity", "source"]).to_pandas() for f in a.z], ignore_index=True)
@@ -107,12 +113,14 @@ def main():
                 if hard_hits(t): stats["regex"] += 1; continue
                 if t.strip().lower() == r["text"].strip().lower(): stats["identical"] += 1; continue
                 rows.append(dict(pair_id=r["pair_id"], text=t, n_tokens=len(tok.encode(t, add_special_tokens=False)), verbosity=a.verbosity,
-                                 source=f"para-{kind}-v1", sample_idx=0, para_of_source=r["source"])); stats[f"kept_{kind}"] += 1
+                                 source=f"para-{kind}-v1", sample_idx=0, para_of_source=r["source"],
+                                 register=("same" if kind == "light" else REGISTER[idx % 2]), heldout=(r["pair_id"] in held))); stats[f"kept_{kind}"] += 1
     stats["seconds"] = round(time.time() - t0, 1)
     df = pd.DataFrame(rows)
-    for src, g in df.groupby("source"):
-        d = os.path.join(a.out_dir, src); os.makedirs(d, exist_ok=True)
-        pq.write_table(pa.Table.from_pandas(g.reset_index(drop=True), preserve_index=False), os.path.join(d, f"{a.tag}.parquet"))
+    stats["heldout_rows"] = int(df["heldout"].sum()) if len(df) else 0
+    for (src, ho), g in df.groupby(["source", "heldout"]):
+        d = os.path.join(a.out_dir, "heldout", src) if ho else os.path.join(a.out_dir, src); os.makedirs(d, exist_ok=True)
+        pq.write_table(pa.Table.from_pandas(g.drop(columns=["heldout"]).reset_index(drop=True), preserve_index=False), os.path.join(d, f"{a.tag}.parquet"))
     os.makedirs(a.out_dir, exist_ok=True)
     json.dump(stats, open(os.path.join(a.out_dir, f"{a.tag}_para_stats.json"), "w"), indent=1)
     print(json.dumps(stats), flush=True)
