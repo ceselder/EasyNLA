@@ -139,6 +139,8 @@ def main():
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
     p.add_argument("--extra-data-dirs", default=None, help="comma list of additional activation dirs (same layout): the train store becomes a CyclingStore over ALL dirs (blind/depth modes only)")
     p.add_argument("--cycle-resident", type=int, default=200_000); p.add_argument("--cycle-refresh", type=int, default=400, help="batches between shard swaps")
+    p.add_argument("--contrast", type=float, default=0.0, help="DECISIONS v1.10 T4: weight of the contrastive hinge softplus((L(z) - L(z_dm) + margin)/tau) with z_dm = a depth-matched WRONG text (another row of the batch with the same j, same (i,j) when available), at the SAME (x_t, t, eps)")
+    p.add_argument("--contrast-tau", type=float, default=0.005, help="logistic temperature in per-dim FM-loss units (0.005 ~ 10 nats)"); p.add_argument("--contrast-margin", type=float, default=0.005)
     p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
     p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
     p.add_argument("--init-from", default=None, help="checkpoint of a trained BLIND prior (cond none): its weights are loaded into this model (text/depth extras stay zero/fresh, so at step 0 the conditional path IS the prior)")
@@ -242,9 +244,25 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts)
         if a.cond == "vec": vec = lf.vec_feats(store.gather(rows, i), i, store.gather(rows, j), j)
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
+        t_b = torch.rand(x0.shape[0], device=dev); eps_b = torch.randn_like(x0)                      # shared (t, eps) for the positive and the contrastive negative
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss_vec, t, kept = pair_fm_loss(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s, vec=vec)
-        loss = loss_vec.mean(); null_loss = torch.zeros((), device=dev)
+            loss_vec, t, kept = pair_fm_loss(model, x0, h_i, t_b, eps_b, depth=depth, enc=enc, enc_mask=mask, p_uncond=(a.p_uncond if a.cond != "none" else 0.0), log_s=log_s, vec=vec)
+        loss = loss_vec.mean(); null_loss = torch.zeros((), device=dev); con_loss = torch.zeros((), device=dev); con_acc = float("nan")
+        if a.contrast > 0 and a.cond == "text":
+            # T4: depth-matched wrong text = another row's text with the same j (same (i, j) when the batch has one); hinge on the per-row FM loss at the same (x_t, t, eps)
+            jj = j.tolist(); ii = i.tolist(); perm = list(range(len(jj)))
+            by_ij = {}; by_j = {}
+            for q, (aa_, bb_) in enumerate(zip(ii, jj)): by_ij.setdefault((aa_, bb_), []).append(q); by_j.setdefault(bb_, []).append(q)
+            for q in range(len(jj)):
+                c = [r_ for r_ in by_ij[(ii[q], jj[q])] if r_ != q] or [r_ for r_ in by_j[jj[q]] if r_ != q]
+                perm[q] = c[q % len(c)] if c else (q + len(jj) // 2) % len(jj)
+            perm_t = torch.tensor(perm, device=dev); enc_dm = enc[perm_t]; mask_dm = mask[perm_t] & kept[:, None]                   # dropped rows stay dropped on both sides
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss_dm, _, _ = pair_fm_loss(model, x0, h_i, t_b, eps_b, enc=enc_dm, enc_mask=mask_dm, log_s=log_s)
+            gap = (loss_vec - loss_dm)[kept]                                                                                           # < 0 = the true text wins
+            if gap.numel():
+                con_loss = torch.nn.functional.softplus((gap + a.contrast_margin) / a.contrast_tau).mean() * a.contrast_tau           # tau-scaled so the gradient is O(1) per row
+                con_acc = float((gap < 0).float().mean()); loss = loss + a.contrast * con_loss
         if a.null_reg > 0 and a.cond == "text":
             # NULL regulariser: under ANOTHER pair's text (batch rolled by B/2) the velocity must equal the no-text velocity (the frozen prior)
             Bn = x0.shape[0]; eps_n = torch.randn_like(x0); t_n = torch.rand(Bn, device=dev); x_tn = (1 - t_n)[:, None] * x0 + t_n[:, None] * eps_n
@@ -257,11 +275,11 @@ def main():
         gn = torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip); opt.step()
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
         if step % 25 == 0:
-            log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/null_loss": float(null_loss), "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/step_s": (time.time() - t0) / max(1, step - step0 + 1)}
+            log = {"train/loss": loss.item(), "train/loss_ema": ema, "train/null_loss": float(null_loss), "train/contrast_loss": float(con_loss), "train/contrast_acc": con_acc, "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/step_s": (time.time() - t0) / max(1, step - step0 + 1)}
             if a.cond != "none":
                 log["train/loss_cond"] = float(loss_vec[kept].mean()) if kept.any() else float("nan"); log["train/loss_uncond"] = float(loss_vec[~kept].mean()) if (~kept).any() else float("nan")
             wandb.log(log, step=step)
-            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step" + (f" cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} null {float(null_loss):.4f}" if a.cond != "none" else ""), flush=True)
+            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/step_s']:.3f}s/step" + (f" cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} null {float(null_loss):.4f} con {float(con_loss):.4f} P(z>dm) {con_acc:.2f}" if a.cond != "none" else ""), flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             out, br = evaluate(model, store_val, norm, a, val_rows, val_i, val_j, val_text, encoder, dev, eps_bank, lf=lf)
             if a.cond != "text" and (has_train_eval or True):       # train-pair eval (same grid, fixed eps) for the generalisation gate; text mode has no per-pair train texts here
