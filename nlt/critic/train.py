@@ -181,6 +181,7 @@ def main():
     p.add_argument("--contrast-tau", type=float, default=0.005, help="logistic temperature in per-dim FM-loss units (0.005 ~ 10 nats)"); p.add_argument("--contrast-margin", type=float, default=0.005)
     p.add_argument("--neg-text-parquet", default="", help="v1.16 (2) 'and twins': globs of [pair_id, text] rows that are KNOWN-WRONG texts for their pair (content twins); with --null-dm a row whose pair has a twin uses the twin as its z_dm negative (pulled to the unconditional velocity) instead of the batch permutation")
     p.add_argument("--neg-weight", type=float, default=1.0, help="redteam #329: weight of the TWIN branch of the null-dm term relative to the permutation branch (twins share topic/register/direction with the true text, so pin them only partially: 0.3-0.5)")
+    p.add_argument("--keep-every", type=int, default=0, help="also write a numbered model-only checkpoint ckpt_step<N>.pt every N steps (rl hot-swap; DECISIONS v1.18)")
     p.add_argument("--null-dm", type=int, default=0, help="lens #264: null regulariser pairs each row with a DEPTH-MATCHED wrong text (same (i,j)/same j, the T4 permutation) instead of the batch roll, so p(h_j | z_dm) is pulled to p(h_j | empty) rather than pushed away")
     p.add_argument("--null-reg", type=float, default=0.0, help="text mode: weight of the NULL regulariser ||v(x_t, z_rp) - v(x_t, no text)||^2 with z_rp = another pair's text of the batch (DECISIONS v1.5: pushes bits(random text) -> 0)")
     p.add_argument("--stats", default=None, help="stats.pt to normalise with (default <data-dir>/stats.pt). MUST be the prior's stats when --init-from is used on another store")
@@ -292,8 +293,10 @@ def main():
     import wandb
     run = wandb.init(project=a.wandb, entity=a.wandb_entity, name=a.tag, config=vars(a) | {"n_params": model.n_params(), "n_train_pos": store.N, "n_val_pos": store_val.N, "n_shards": len(getattr(store, "files", []))}, resume="allow")
     gen = torch.Generator().manual_seed(a.seed + step0)
-    def save(step, name="ckpt_latest.pt"):
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "args": vars(a), "config": model.config(), "d_enc": (encoder.d_enc if encoder else 0)}, os.path.join(a.out, name))
+    def save(step, name="ckpt_latest.pt", with_opt=True):
+        d_ = {"model": model.state_dict(), "step": step, "args": vars(a), "config": model.config(), "d_enc": (encoder.d_enc if encoder else 0)}
+        if with_opt: d_["opt"] = opt.state_dict()
+        torch.save(d_, os.path.join(a.out, name))
     t0 = time.time(); ema = None; best = None; neg_frac = 0.0
     for step in range(step0, a.steps):
         if a.cond == "text" and not a.text_smoke:
@@ -400,6 +403,7 @@ def main():
             print(f"[eval@{step+1}] " + " ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in out.items() if "/" in k and "_gap/" not in k), flush=True)
             print("[eval] by gap: " + json.dumps({k: {kk: round(vv, 4) for kk, vv in v.items()} for k, v in br["by_gap"].items()}), flush=True)
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps: save(step + 1)
+        if a.keep_every and (step + 1) % a.keep_every == 0: save(step + 1, f"ckpt_step{step + 1:06d}.pt", with_opt=False)      # v1.18: numbered model-only checkpoints for rl's hot-swap
         if (time.time() - t_start) / 3600 > a.max_hours: print("[train] max hours reached", flush=True); save(step + 1); break
     save(a.steps, "ckpt_final.pt"); wandb.finish()
     print("[train] DONE", flush=True)
