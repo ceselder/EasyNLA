@@ -129,10 +129,11 @@ def ao_propose(data_dir: str, split: str, start: int, end: int, out_dir: str = "
 
 
 @app.local_entrypoint()
-def main(data_dir: str = "/vol/data/qwen3_8b", split: str = "val", start: int = 0, end: int = 4096, chunk: int = 0):
+def run_ao(data_dir: str = "/vol/data/qwen3_8b", split: str = "val", start: int = 0, end: int = 4096, chunk: int = 0, out_dir: str = "/vol/z/ao_raw_v1"):
+    """modal run nlt/proposers/modal_ao_proposers.py::run_ao --split val --start 0 --end 4096 [--chunk 1024]"""
     if chunk <= 0:
-        print(ao_propose.remote(data_dir, split, start, end))
+        print(ao_propose.remote(data_dir, split, start, end, out_dir))
     else:
         rngs = [(s, min(s + chunk, end)) for s in range(start, end, chunk)]
-        for out in ao_propose.starmap([(data_dir, split, s, e) for s, e in rngs]):
+        for out in ao_propose.starmap([(data_dir, split, s, e, out_dir) for s, e in rngs]):
             print(out)

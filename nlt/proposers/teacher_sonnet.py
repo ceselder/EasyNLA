@@ -29,7 +29,7 @@ from nlt.evals.copy_rate import copy_rate_ngram        # noqa: E402
 
 MODEL = "claude-sonnet-5"
 SOURCE = "teacher-sonnet-v1"
-MAX_TOKENS = 400
+MAX_TOKENS = 700
 COPY_MAX = 0.05
 VERBOSITY = {"short": 0, "sentence": 1, "long": 2}
 
@@ -42,6 +42,7 @@ Rules:
 - Never mention layers, depth, stages, blocks, snapshots being early or late in the network, how far along processing is, or the readout mechanism.
 - Do not simply list the leaning tokens. Do not write "the next word is X" as a bare prediction; describe what has been worked out that makes an outcome likely.
 - No hedging boilerplate, no meta commentary about your task.
+- Inside the JSON strings use single quotes if you must quote a word; never use double quotes inside the text.
 
 Answer with JSON only, exactly this shape:
 {"short": "<a phrase of at most 8 words>", "sentence": "<one sentence>", "long": "<two or three sentences>"}"""
@@ -85,15 +86,38 @@ def system_text():
     return SYSTEM.replace(" You also get the model's final leanings for the next token.", "") if NO_FINAL else SYSTEM
 
 
+_FIELD = {k: re.compile(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % k, re.S) for k in VERBOSITY}
+
+
 def parse_json(text: str) -> dict | None:
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return None
-    try:
-        d = json.loads(m.group(0))
-    except Exception:
-        return None
-    return d if all(k in d and isinstance(d[k], str) for k in VERBOSITY) else None
+    """Strict JSON first; otherwise recover whatever complete fields exist (a truncated 'long' must not cost the other two)."""
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if m:
+        try:
+            d = json.loads(m.group(0))
+            if all(k in d and isinstance(d[k], str) for k in VERBOSITY):
+                return d
+        except Exception:
+            pass
+    d = {}
+    for k, rx in _FIELD.items():
+        mm = rx.search(text or "")
+        if mm:
+            d[k] = mm.group(1).replace('\\"', '"').strip()
+    return d if "short" in d and "sentence" in d else None
+
+
+_QUOTED = re.compile(r"[\"“”']([^\"“”']{3,120})[\"“”']")
+
+
+def quoted_span_in_prefix(text: str, prefix: str) -> str | None:
+    """A quoted span of >= 2 words that occurs verbatim in the prefix = quoting the passage (forbidden)."""
+    low = " ".join(prefix.lower().split())
+    for m in _QUOTED.finditer(text or ""):
+        span = " ".join(m.group(1).lower().split()).strip(" ,.;:!?-")
+        if len(span.split()) >= 2 and span in low:
+            return span
+    return None
 
 
 def client_kwargs():
@@ -148,7 +172,10 @@ async def _one(client, sem, r, out, retries=8):
         for a in range(retries):
             try:
                 msg = await client.messages.create(**params(r))
-                out[r["pair_id"].replace(":", "_")] = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+                txt = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+                if not txt.strip() and a < retries - 1:
+                    continue                     # empty content: retry
+                out[r["pair_id"].replace(":", "_")] = txt
                 return
             except Exception as e:
                 wait = min(60, 2 ** a) + random.random()
@@ -191,10 +218,15 @@ def make_rows(features: pd.DataFrame, answers: dict, tok):
             continue
         prefix_ids = tok.encode(r["context_text"], add_special_tokens=False)[-256:]
         for key, verb in VERBOSITY.items():
+            if key not in d or not d[key].strip():
+                stats["bad_json"] += 1; continue
             text = d[key].strip()
             z_ids = tok.encode(text, add_special_tokens=False)
             hh = hard_hits(text)
             cr = copy_rate_ngram(z_ids, prefix_ids, 4)
+            qs = quoted_span_in_prefix(text, r["context_text"])
+            if qs:
+                stats["quote"] = stats.get("quote", 0) + 1; rejects.append(dict(pair_id=r["pair_id"], reason=f"quote:{qs[:40]}", text=text)); continue
             if hh:
                 stats["hard_regex"] += 1; rejects.append(dict(pair_id=r["pair_id"], reason=f"regex:{hh[:2]}", text=text)); continue
             if cr > COPY_MAX:
