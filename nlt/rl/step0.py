@@ -53,9 +53,20 @@ def main():
     t0 = time.time(); b0 = score(texts, 0); t_score = time.time() - t0; b1 = score(texts, 1)
     # depth-matched shuffle: for each prompt, texts of another prompt with the same (i, j) (roll inside the (i,j) class); random-pair shuffle
     rng = np.random.default_rng(a.seed); perm_dm = np.arange(N); perm_rp = rng.permutation(N)
+    # depth-matched partner: another prompt with the same (i, j); singleton classes fall back to the nearest class (same j, closest i;
+    # then same gap, closest j) so no prompt is ever paired with itself
+    ii = vp["i"].values.astype(int); jj = vp["j"].values.astype(int)
     for key, idx in vp.groupby(["i", "j"]).groups.items():
-        idx = np.asarray(list(idx));
+        idx = np.asarray(list(idx))
         if len(idx) > 1: perm_dm[idx] = np.roll(idx, 1)
+    n_approx = 0
+    for g in range(N):
+        if perm_dm[g] != g: continue
+        cand = np.where((jj == jj[g]) & (np.arange(N) != g))[0]
+        if len(cand) == 0: cand = np.where(((jj - ii) == (jj[g] - ii[g])) & (np.arange(N) != g))[0]
+        if len(cand) == 0: cand = np.where(np.arange(N) != g)[0]
+        dist = np.abs(ii[cand] - ii[g]) * 1000 + np.abs(jj[cand] - jj[g]); perm_dm[g] = int(cand[np.argmin(dist)]); n_approx += 1
+    print(f"[step0] depth-matched partners: {N - n_approx} exact (same i,j), {n_approx} nearest-class", flush=True)
     gl = groups.tolist(); by_prompt = {}
     for k, g in enumerate(gl): by_prompt.setdefault(g, []).append(k)
     def shuffled(perm):
@@ -73,9 +84,9 @@ def main():
         return {"n": int(m.sum()), "bits_mean": bm, "bits_median": float(b0[m].median()), "bits_per_token_median": float(bpt.median()), "bits_per_token_mean": float(bpt.mean()),
                 "lambda_max": 0.5 * float(bpt.median()), "within_group_std": wg, "scoring_noise": nz, "std_over_noise": wg / nz if nz > 0 else float("nan"),
                 "bits_dm": dm, "bits_rp": rp, "bits_over_dm": bm / dm if dm > 0 else float("inf"), "frac_nonpos": float((b0[m] <= 0).float().mean()), "tokens_mean": float(n_tok[m].mean()),
-                "mention_next": float(viol["mention_next"][mask].mean()), "copy_rate": float(viol["copy_rate"][mask].mean()), "regex": float(viol["regex"][mask].mean()), "empty": float(viol["empty"][mask].mean()),
+                "mention_next": float(viol["mention_next"][mask].mean()), "copy_rate": float(viol["copy_rate"][mask].mean()), "regex": float(viol["regex"][mask].mean()), "empty": float(viol["empty"][mask].mean()), "junk": float(viol["junk"][mask].mean()),
                 "corr_bits_tokens": corr(b0[m], n_tok[m]), "reward_mean": float((b0[m] - a.lam * n_tok[m]).mean())}
-    out = {"init": a.init, "n_pairs": N, "group": a.group, "critic": a.critic or "stub", "ode_steps": a.ode_steps, "probes": a.probes, "score_s_per_row": t_score / n,
+    out = {"init": a.init, "n_pairs": N, "group": a.group, "dm_exact_partners": int(N - n_approx), "critic": a.critic or "stub", "ode_steps": a.ode_steps, "probes": a.probes, "score_s_per_row": t_score / n,
            "all": stats(np.ones(n, bool)), "bands": {b: stats(bands[gl] == b) for b in ("pre", "workspace", "motor")}, "rollout": info}
     ws = out["bands"].get("workspace", {})
     out["pass_workspace"] = bool(ws and ws["std_over_noise"] >= 3 and ws["bits_over_dm"] >= 3 and ws["mention_next"] < 0.2)
