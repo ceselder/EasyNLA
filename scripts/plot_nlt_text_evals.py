@@ -25,16 +25,16 @@ def main():
     a = ap.parse_args(); d = json.load(open(a.data)); by = {t["tag"]: t for t in d["table"]}
     rows = [(tag, fam, lab, by[tag]["numbers"]) for tag, fam, lab in ORDER if tag in by]
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2})
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 6.4), dpi=150, sharey=True, gridspec_kw={"wspace": 0.08})
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 6.8), dpi=150, sharey=True, gridspec_kw={"wspace": 0.10})
     y = np.arange(len(rows))[::-1]; labels = [r[2] for r in rows]; cols = [FAMILY_COLOR[r[1]] for r in rows]
     mi = [r[3].get("mi_z_j_bits") or 0.0 for r in rows]; ntm = [r[3].get("next_token_mention") or 0.0 for r in rows]; gapr = [r[3].get("gap_mae_ratio") for r in rows]
-    ax1.barh(y, mi, color=cols, height=0.7); ax1.axvline(0, color=INK2, lw=0.8); ax1.axvline(1.5, color="#b91c1c", lw=1, ls="--"); ax1.text(1.52, y[0] + 0.3, "monitor line 1.5 bits", color="#b91c1c", fontsize=10, va="bottom")
+    ax1.barh(y, mi, color=cols, height=0.7); ax1.axvline(0, color=INK2, lw=0.8); ax1.axvline(1.5, color="#b91c1c", lw=1, ls="--"); ax1.text(1.47, y[-1] - 0.2, "monitor line\n1.5 bits", color="#b91c1c", fontsize=9, va="top", ha="right")
     for yi, v, g in zip(y, mi, gapr):
         if g is not None and g < 0.9: ax1.text(max(v, 0) + 0.02, yi, f"gap ratio {g:.2f}", va="center", fontsize=9, color=INK2)
     ax1.set_yticks(y); ax1.set_yticklabels(labels); ax1.set_xlabel("I(z; j) recovered by a text-only classifier, bits (max 4.6)"); ax1.set_xlim(-0.25, 2.0)
-    ax1.set_title("Teacher, AO and V0 texts carry no recoverable depth;\nlens-diff leaks up to 0.35 bits, mostly via its magnitude sentence", loc="left")
+    ax1.set_title("Teacher, AO and V0 texts carry no recoverable\ndepth; lens-diff leaks up to 0.35 bits, mostly\nthrough its magnitude sentence", loc="left")
     ax2.barh(y, [100 * v for v in ntm], color=cols, height=0.7); ax2.set_xlabel("sentences naming the true next token, %"); ax2.set_xlim(0, 45)
-    ax2.set_title("Next-token mention grows with verbosity; V0 names it in 21%\nof sentences from activations alone (reported, not gated)", loc="left")
+    ax2.set_title("Next-token mention grows with verbosity;\nV0 names it in 21% of sentences from\nactivations alone (reported, not gated)", loc="left")
     for ax in (ax1, ax2):
         ax.grid(True, axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s in ("top", "right"): ax.spines[s].set_visible(False)
