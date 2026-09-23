@@ -52,6 +52,7 @@ def main():
     p.add_argument("--ode-steps", type=int, default=32); p.add_argument("--probes", type=int, default=1); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default=None, help="default: the text critic's own encoder (from its args)"); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--enc-max-len", type=int, default=None)
     p.add_argument("--skip-exact", action="store_true"); p.add_argument("--data-device", default="cuda"); p.add_argument("--stats", default=None, help="stats.pt (default <data-dir>/stats.pt; must match the critics')")
+    p.add_argument("--paired-sets", default=None, help="additional label:path[@v] sets that only define the common/paired rows (not scored)")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
     store_val = ActStore(a.data_dir, "val", device=a.data_device)
@@ -72,8 +73,15 @@ def main():
             tdf = load_text_pairs([path], os.path.join(a.data_dir, "pairs_val.parquet"), verbosity=verb).drop_duplicates("pair_id").set_index("pair_id")
             text_sets[label] = tdf["text"].to_dict(); print(f"[bits] set {label}: {len(tdf)} pairs with text ({path}{'@'+str(verb[0]) if verb else ''})", flush=True)
     pid_all = vp["pair_id"].tolist()
-    common = [k for k, pid in enumerate(pid_all) if all(pid in tm for tm in text_sets.values())] if text_sets else list(range(NF))
-    print(f"[bits] fixed set {NF} pairs; {len(common)} have text in ALL {len(text_sets)} sets (paired subset)", flush=True)
+    paired_sets = dict(text_sets)                      # extra sets that only DEFINE the common (paired) rows, so parallel jobs over set groups share one paired subset
+    if a.paired_sets:
+        for item in a.paired_sets.split(","):
+            label, path = item.split(":", 1) if ":" in item and not item.startswith("/") else ("paired", item); verb = None
+            if "@" in path: path, v_ = path.rsplit("@", 1); verb = [int(v_)]
+            if label in paired_sets: continue
+            tdf = load_text_pairs([path], os.path.join(a.data_dir, "pairs_val.parquet"), verbosity=verb).drop_duplicates("pair_id").set_index("pair_id"); paired_sets[label] = tdf["text"].to_dict()
+    common = [k for k, pid in enumerate(pid_all) if all(pid in tm for tm in paired_sets.values())] if paired_sets else list(range(NF))
+    print(f"[bits] fixed set {NF} pairs; {len(common)} have text in ALL {len(paired_sets)} sets (paired subset)", flush=True)
 
     def set_indices(tm):
         """rows of the fixed set scored for this set: the common (paired) rows first, then the set's own rows, up to a.n"""
