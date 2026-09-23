@@ -130,6 +130,7 @@ def main():
     ap.add_argument("--max-active", type=int, default=16, help="max batches in flight")
     ap.add_argument("--sync-concurrency", type=int, default=48)
     ap.add_argument("--no-final", action="store_true")
+    ap.add_argument("--sync-only", action="store_true", help="skip the Batch API: every pending chunk goes straight to the concurrent sync path")
     a = ap.parse_args()
     if a.no_final:
         T.NO_FINAL = True
@@ -155,7 +156,9 @@ def main():
         c["feat"] = f
         if c["status"] != "done":
             todo.append(tag)
-    log(f"{len(files)} feature files, {len(todo)} chunks to do: {todo[:20]}{'...' if len(todo) > 20 else ''}")
+        if a.sync_only and c["status"] == "pending":
+            c["status"] = "sync_pending"
+    log(f"{len(files)} feature files, {len(todo)} chunks to do: {todo[:20]}{'...' if len(todo) > 20 else ''}{' (sync-only)' if a.sync_only else ''}")
     save_state(a.state, st)
 
     while True:
