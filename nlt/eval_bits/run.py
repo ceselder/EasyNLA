@@ -62,8 +62,10 @@ def main():
     if a.text_parquet:
         for item in a.text_parquet.split(","):
             label, path = item.split(":", 1) if ":" in item and not item.startswith("/") else ("text", item)
-            tdf = load_text_pairs([path], os.path.join(a.data_dir, "pairs_val.parquet")).drop_duplicates("pair_id").set_index("pair_id")
-            text_sets[label] = tdf["text"].to_dict()
+            verb = None
+            if "@" in path: path, v_ = path.rsplit("@", 1); verb = [int(v_)]          # label:path@2 -> only verbosity 2 rows of that file
+            tdf = load_text_pairs([path], os.path.join(a.data_dir, "pairs_val.parquet"), verbosity=verb).drop_duplicates("pair_id").set_index("pair_id")
+            text_sets[label] = tdf["text"].to_dict(); print(f"[bits] set {label}: {len(tdf)} pairs with text ({path}{'@'+str(verb[0]) if verb else ''})", flush=True)
         common = set.intersection(*[set(v) for v in text_sets.values()])
         vp = vp[vp["pair_id"].isin(common)]
         print(f"[bits] text sets {list(text_sets)}: {len(vp)} val pairs have text in ALL sets", flush=True)
@@ -77,6 +79,10 @@ def main():
             idx = np.asarray(list(grp)); perm = np.roll(idx, 1) if len(idx) > 1 else idx
             for src, dst in zip(idx, perm): out[dst] = texts[src]
         return out
+
+    def shuffle_rp(texts):
+        """random-pair control: another val pair's text, any (i, j)"""
+        return [texts[k] for k in np.roll(np.arange(len(texts)), len(texts) // 2)]
     g = torch.Generator().manual_seed(a.seed + 1); eps_bank = [torch.randn(n, d, generator=g) for _ in T_GRID]
     probe_bank = make_probe_bank(a.ode_steps, a.probes, d, torch.Generator().manual_seed(a.seed + 2))
     encoder = None
@@ -86,8 +92,8 @@ def main():
         cond = torch.load(path, map_location="cpu")["config"]["cond"]
         if cond == "text" and text_sets:
             for label, tm in text_sets.items():
-                texts = [tm[x] for x in vp["pair_id"]]; jobs.append((f"{name}@{label}", path, texts, shuffle_dm(texts)))
-        else: jobs.append((name, path, None, None))
+                texts = [tm[x] for x in vp["pair_id"]]; jobs.append((f"{name}@{label}", path, texts, shuffle_dm(texts), shuffle_rp(texts)))
+        else: jobs.append((name, path, None, None, None))
     if any(j[2] is not None for j in jobs):
         from nlt.critic.text_encoder import TextEncoder
         ta = next(torch.load(j[1], map_location="cpu")["args"] for j in jobs if j[2] is not None)          # the text critic's training args
@@ -95,26 +101,28 @@ def main():
                               a.enc_max_len or ta.get("enc_max_len", 128))
     results = {"n": n, "ode_steps": a.ode_steps, "probes": a.probes, "t_grid": list(T_GRID), "critics": {}}
     _cache = {}
-    for name, path, texts, shuf_texts in jobs:
+    for name, path, texts, shuf_texts, rp_texts in jobs:
         if path not in _cache: _cache[path] = load_critic(path, dev, d_enc_override=(encoder.d_enc if encoder else None))
         model, aa, step = _cache[path]; cond = model.cond; target = model.target; src_rms = bool(aa.get("src_rms", 0))
         print(f"[bits] critic {name}: cond={cond} target={target} step={step} params {model.n_params()/1e6:.0f}M", flush=True)
-        L_u = torch.zeros(len(T_GRID), n); L_c = torch.zeros(len(T_GRID), n); L_s = torch.zeros(len(T_GRID), n)
-        lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
+        L_u = torch.zeros(len(T_GRID), n); L_c = torch.zeros(len(T_GRID), n); L_s = torch.zeros(len(T_GRID), n); L_r = torch.zeros(len(T_GRID), n)
+        lp_u = torch.zeros(n); lp_c = torch.zeros(n); lp_s = torch.zeros(n); lp_r = torch.zeros(n); ruler = torch.zeros(n); t0 = time.time()
         for s in range(0, n, a.batch):
             r, i, j = rows[s:s + a.batch], I[s:s + a.batch], J[s:s + a.batch]
             h_i, x0, log_s, log_det = make_x0(norm, store_val.gather(r, i, dev), store_val.gather(r, j, dev), target, src_rms)
             x_aff = norm.normalize(store_val.gather(r, j, dev))                 # the target in the pooled-affine space (for the Gaussian ruler)
             depth = torch.stack([i, j], 1).to(dev) if cond == "depth" else None
-            enc = mask = enc_s = mask_s = None
+            enc = mask = enc_s = mask_s = enc_r = mask_r = None
             if cond == "text" and texts:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    enc, mask = encoder(texts[s:s + a.batch]); enc_s, mask_s = encoder(shuf_texts[s:s + a.batch])
+                    enc, mask = encoder(texts[s:s + a.batch]); enc_s, mask_s = encoder(shuf_texts[s:s + a.batch]); enc_r, mask_r = encoder(rp_texts[s:s + a.batch])
             eb = [e[s:s + a.batch] for e in eps_bank]
             L_u[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, log_s=log_s)
             if cond != "none":
                 L_c[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, depth=depth, enc=enc, enc_mask=mask, log_s=log_s)
-                if cond == "text": L_s[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_s, enc_mask=mask_s, log_s=log_s)
+                if cond == "text":
+                    L_s[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_s, enc_mask=mask_s, log_s=log_s)
+                    L_r[:, s:s + a.batch] = proxy_losses(model, x0, h_i, T_GRID, eb, enc=enc_r, enc_mask=mask_r, log_s=log_s)
             if not a.skip_exact:
                 lu = exact_logp(model, x0, h_i, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_u[s:s + a.batch] = lu.cpu()
                 ruler[s:s + a.batch] = bits_vs_gaussian(lu, x_aff).cpu()          # both sides in the pooled-affine space
@@ -122,6 +130,7 @@ def main():
                     lc = exact_logp(model, x0, h_i, depth=depth, enc=enc, enc_mask=mask, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_c[s:s + a.batch] = lc.cpu()
                     if cond == "text":
                         ls = exact_logp(model, x0, h_i, enc=enc_s, enc_mask=mask_s, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_s[s:s + a.batch] = ls.cpu()
+                        lr_ = exact_logp(model, x0, h_i, enc=enc_r, enc_mask=mask_r, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det; lp_r[s:s + a.batch] = lr_.cpu()
             print(f"[bits] {name}: {min(n, s + a.batch)}/{n} rows, {time.time() - t0:.0f}s", flush=True)
         res = {"cond": cond, "target": target, "src_rms": src_rms, "step": step, "ckpt": path,
                "proxy_fm_loss_uncond": float(L_u.mean()), "proxy_fm_loss_uncond_by_t": L_u.mean(1).tolist(),
@@ -134,7 +143,12 @@ def main():
                 res["exact_pmi_bits"]["frac_positive"] = float((pe > 0).mean()); res["proxy_over_exact_ratio"] = float(pmi_p.mean() / max(1e-9, pe.mean()))
             if cond == "text":
                 res["shuffle_proxy_pmi_bits"] = summarize(proxy_pmi_bits(L_u, L_s, d).numpy(), gaps, js, "shuf")
-                if not a.skip_exact: res["shuffle_exact_pmi_bits"] = summarize((lp_s - lp_u).numpy() / math.log(2), gaps, js, "shuf_exact")
+                res["rp_proxy_pmi_bits"] = summarize(proxy_pmi_bits(L_u, L_r, d).numpy(), gaps, js, "rp")
+                if not a.skip_exact:
+                    res["shuffle_exact_pmi_bits"] = summarize((lp_s - lp_u).numpy() / math.log(2), gaps, js, "shuf_exact")
+                    res["rp_exact_pmi_bits"] = summarize((lp_r - lp_u).numpy() / math.log(2), gaps, js, "rp_exact")
+                    res["n_tokens_mean"] = float(np.mean([len(encoder.tok(z, add_special_tokens=False)["input_ids"]) for z in texts]))
+                    res["exact_bits_per_token"] = res["exact_pmi_bits"]["mean"] / max(1e-9, res["n_tokens_mean"])
         results["critics"][name] = res
         hdr = {k: (round(v, 4) if isinstance(v, float) else (round(v["mean"], 3) if isinstance(v, dict) and "mean" in v else None)) for k, v in res.items() if k not in ("proxy_fm_loss_uncond_by_t", "proxy_pmi_bits_by_t", "ckpt")}
         print(f"[bits] {name}: {json.dumps(hdr)}", flush=True)
