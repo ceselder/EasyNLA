@@ -50,7 +50,7 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="bits")
     p.add_argument("--ckpts", required=True, help="comma list name:path"); p.add_argument("--n", type=int, default=1024); p.add_argument("--batch", type=int, default=64)
     p.add_argument("--ode-steps", type=int, default=32); p.add_argument("--probes", type=int, default=1); p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20)
+    p.add_argument("--text-parquet", default=None, help="comma list of text files for the text critics (val split); 'label:path' items are scored as SEPARATE sets (e.g. verbosity levels)"); p.add_argument("--enc-model", default=None, help="default: the text critic's own encoder (from its args)"); p.add_argument("--enc-layer", type=int, default=None); p.add_argument("--enc-max-len", type=int, default=None)
     p.add_argument("--skip-exact", action="store_true"); p.add_argument("--data-device", default="cuda")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
@@ -90,7 +90,9 @@ def main():
         else: jobs.append((name, path, None, None))
     if any(j[2] is not None for j in jobs):
         from nlt.critic.text_encoder import TextEncoder
-        encoder = TextEncoder(a.enc_model, a.enc_layer, dev)
+        ta = next(torch.load(j[1], map_location="cpu")["args"] for j in jobs if j[2] is not None)          # the text critic's training args
+        encoder = TextEncoder(a.enc_model or ta.get("enc_model", "Qwen/Qwen3-0.6B"), a.enc_layer if a.enc_layer is not None else ta.get("enc_layer", 20), dev,
+                              a.enc_max_len or ta.get("enc_max_len", 128))
     results = {"n": n, "ode_steps": a.ode_steps, "probes": a.probes, "t_grid": list(T_GRID), "critics": {}}
     _cache = {}
     for name, path, texts, shuf_texts in jobs:
