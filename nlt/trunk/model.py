@@ -67,7 +67,7 @@ class FreshAttnBlock(nn.Module):
 class TrunkCritic(nn.Module):
     def __init__(self, prior, trunk_id: str = "Qwen/Qwen3-8B", n_layers: int = 24, lora_r: int = 64, lora_alpha: int = 16, n_act_tokens: int = 4,
                  fresh_every: int = 4, fresh_heads: int = 8, fresh_dhead: int = 128, grad_ckpt: bool = True, max_len: int = 256, device="cuda",
-                 space: dict | None = None, dtype=torch.bfloat16):
+                 space: dict | None = None, dtype=torch.bfloat16, readout_rank: int = 0):
         super().__init__()
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, inject_adapter_in_model
@@ -118,8 +118,11 @@ class TrunkCritic(nn.Module):
         self._n_act = n_act_tokens + 1; self._groups = 1
         for blk, i in zip(self.fresh, self.fresh_layers): owner.layers[i].register_forward_hook(self._make_hook(blk))
         # ---- readout
-        self.readout_ln = nn.LayerNorm(hidden)
-        self.readout = nn.Linear((n_act_tokens + 1) * hidden, self.d); nn.init.zeros_(self.readout.weight); nn.init.zeros_(self.readout.bias)
+        self.readout_ln = nn.LayerNorm(hidden); self.readout_rank = readout_rank
+        if readout_rank > 0:     # low-rank readout: far fewer effective parameters per output dim -> resolves a ~0.2%-variance text signal from ~100x fewer rows
+            self.readout = nn.Sequential(nn.Linear((n_act_tokens + 1) * hidden, readout_rank, bias=False), nn.Linear(readout_rank, self.d)); nn.init.zeros_(self.readout[1].weight); nn.init.zeros_(self.readout[1].bias)
+        else:
+            self.readout = nn.Linear((n_act_tokens + 1) * hidden, self.d); nn.init.zeros_(self.readout.weight); nn.init.zeros_(self.readout.bias)
         for m_ in self.adapter_modules(): m_.to(device).float()
         self.slots.data = self.slots.data.to(device).float()
         n_lora = sum(p_.numel() for p_ in self.lora_parameters())
@@ -303,7 +306,7 @@ class TrunkCritic(nn.Module):
 
     def config(self):
         return {"trunk_id": self.trunk_id, "n_layers": self.n_layers_kept, "lora_r": self.lora_r, "lora_alpha": self.lora_alpha, "n_act_tokens": self.K,
-                "fresh_every": self.fresh_every, "fresh_heads": self.fresh_heads, "fresh_dhead": self.fresh_dhead, "max_len": self.max_len, "d": self.d, "space": self.space}
+                "fresh_every": self.fresh_every, "fresh_heads": self.fresh_heads, "fresh_dhead": self.fresh_dhead, "max_len": self.max_len, "d": self.d, "space": self.space, "readout_rank": self.readout_rank}
 
 
 def load_prior(path, device, dtype=torch.bfloat16):
@@ -321,7 +324,7 @@ def build_trunk_critic(ckpt_path, device="cuda", prior_path=None, grad_ckpt=Fals
     ck = torch.load(ckpt_path, map_location="cpu"); cfg = ck["config"]
     prior, space, _ = load_prior(prior_path or cfg["space"]["prior_ckpt"], device)
     m = TrunkCritic(prior, cfg["trunk_id"], cfg["n_layers"], cfg["lora_r"], cfg["lora_alpha"], cfg["n_act_tokens"], cfg["fresh_every"], cfg["fresh_heads"], cfg["fresh_dhead"],
-                    grad_ckpt=grad_ckpt, max_len=cfg["max_len"], device=device, space=space)
+                    grad_ckpt=grad_ckpt, max_len=cfg["max_len"], device=device, space=space, readout_rank=cfg.get("readout_rank", 0))
     m.load_state(ck["state"]); m.eval()
     for p_ in m.parameters(): p_.requires_grad_(False)
     return m, ck

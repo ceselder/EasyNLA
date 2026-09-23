@@ -70,6 +70,9 @@ def main():
     lp_c = exact_logp(m, x0, h_i, enc=kv, enc_mask=mask2, n_steps=4, probe_bank=pb); lp_u = exact_logp(m, x0, h_i, n_steps=4, probe_bank=pb)
     print("exact logp cond", lp_c.tolist(), "uncond", lp_u.tolist()); assert torch.isfinite(lp_c).all() and torch.isfinite(lp_u).all()
     assert abs(float(lp_c[2] - lp_u[2])) < 1e-3, "empty text must give the unconditional log p"
+    m3 = TrunkCritic(prior, tmp, n_layers=4, lora_r=4, lora_alpha=8, n_act_tokens=2, fresh_every=2, fresh_heads=2, fresh_dhead=8, grad_ckpt=False, device=dev, space=m.space, dtype=torch.float32, readout_rank=16)
+    with torch.no_grad(): v3 = m3(x_t, t, h_i, enc=TextIDs(ids), enc_mask=mask); assert (v3 - prior(x_t, t, h_i)).abs().max() < 1e-6, "low-rank readout must start as the prior"
+    m3.load_state(m3.state()); print("low-rank readout ok")
     st = m.state(); m2 = TrunkCritic(prior, tmp, n_layers=4, lora_r=4, lora_alpha=8, n_act_tokens=2, fresh_every=2, fresh_heads=2, fresh_dhead=8, grad_ckpt=False, device=dev, space=m.space, dtype=torch.float32); m2.load_state(st); m2.eval()
     with torch.no_grad(): v2 = m2(x_t, t, h_i, enc=TextIDs(ids), enc_mask=mask)
     print("state round-trip max|diff|", (v2 - v_full).abs().max().item()); assert (v2 - v_full).abs().max() < 1e-5

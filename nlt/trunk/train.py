@@ -101,7 +101,7 @@ def main():
     p.add_argument("--prior", required=True, help="blind PairDenoiser ckpt (its space is used: target / src_rms / squash / stats)")
     p.add_argument("--trunk-id", default="Qwen/Qwen3-8B"); p.add_argument("--n-layers", type=int, default=24); p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--n-act-tokens", type=int, default=4); p.add_argument("--fresh-every", type=int, default=4); p.add_argument("--fresh-heads", type=int, default=8); p.add_argument("--fresh-dhead", type=int, default=128)
-    p.add_argument("--max-len", type=int, default=128); p.add_argument("--no-grad-ckpt", action="store_true")
+    p.add_argument("--max-len", type=int, default=128); p.add_argument("--no-grad-ckpt", action="store_true"); p.add_argument("--readout-rank", type=int, default=0, help="low-rank readout (0 = full 5*4096 -> 4096 linear)")
     p.add_argument("--text-parquet", required=True, help="pool:glob[@verb+verb],... train text files"); p.add_argument("--pool-weights", default="", help="pool:w,... sampling weights (default equal)")
     p.add_argument("--val-text", default="", help="label:glob[@verb],... val text sets for the in-training proxy eval"); p.add_argument("--eval-n", type=int, default=256); p.add_argument("--eval-offset", type=int, default=4096)
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--lr-lora", type=float, default=3e-5)
@@ -118,7 +118,7 @@ def main():
     prior, space, paa = load_prior(a.prior, dev)
     norm = GlobalNorm.load(space["stats"] if os.path.exists(space["stats"]) else os.path.join(a.data_dir, "stats.pt"), "affine").to(dev)
     print(f"[train] prior {a.prior} (step {space['prior_step']}), space {space}", flush=True)
-    model = TrunkCritic(prior, a.trunk_id, a.n_layers, a.lora_r, a.lora_alpha, a.n_act_tokens, a.fresh_every, a.fresh_heads, a.fresh_dhead, grad_ckpt=not a.no_grad_ckpt, max_len=a.max_len, device=dev, space=space)
+    model = TrunkCritic(prior, a.trunk_id, a.n_layers, a.lora_r, a.lora_alpha, a.n_act_tokens, a.fresh_every, a.fresh_heads, a.fresh_dhead, grad_ckpt=not a.no_grad_ckpt, max_len=a.max_len, device=dev, space=space, readout_rank=a.readout_rank)
     store = ActStore(a.data_dir, "train", device=a.data_device, max_pos=a.max_train_pos); store_val = ActStore(a.data_dir, "val", device=a.val_device)
     d = store.d
     # ---- text pools
