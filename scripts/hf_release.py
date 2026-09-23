@@ -98,7 +98,7 @@ def _plan_repo(repo: dict, work: str):
     return items
 
 
-@app.function(timeout=6 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=4, memory=32 * 1024, ephemeral_disk=256 * 1024)
+@app.function(timeout=6 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=4, memory=32 * 1024, ephemeral_disk=512 * 1024)
 def run(task: str = "plan", only: str = "", dry_run: int = 1):
     import shutil, tempfile
     vol.reload(); man = _load_manifest(); total = 0
