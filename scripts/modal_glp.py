@@ -233,6 +233,15 @@ image_claims = image_base.pip_install("spacy==3.8.*", "https://github.com/explos
     REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE)
 
 
+def _gather(calls):
+    """wait for every spawned call; a failed call is reported, not raised (raising would stop the app and cancel the others)"""
+    out = []
+    for c in calls:
+        try: out.append(c.get())
+        except Exception as e: out.append(f"ERR {type(e).__name__}: {str(e)[:120]}")
+    return out
+
+
 def _claims(args, commit=True):
     """python scripts/<args> from the repo, streamed; commits nla-glp so the next stage sees the files"""
     import subprocess
@@ -325,12 +334,12 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", gumbel_av.remote(tag or "gumbel_av", extra))
     elif task == "mine_pairs":   # all shards in parallel, one B200 each
         calls = [mine_pairs.spawn(tag or "sft_av", av_merged, shard=i, nshards=nshards, extra=extra) for i in range(nshards)]
-        print("rc", [c.get() for c in calls])
+        print("rc", _gather(calls))
     elif task == "eval_cond":
         print("rc", eval_cond.remote(tag, prior_tag, ckpt, extra))
     elif task == "ultra_extract":   # all shards in parallel, one B200 each; --tag = explained dir name, --sets = out dir
         calls = [ultra_extract.spawn(f"/vol_glp/data/{tag or 'ultra_explained_t1'}/chunk_*.parquet", sets or "/vol_glp/data/ultra_L42", shard=i, nshards=nshards, extra=extra) for i in range(nshards)]
-        print("rc", [c.get() for c in calls])
+        print("rc", _gather(calls))
     elif task == "train_cond_g4":
         print("rc", train_cond_g4.remote(tag or "cond_cotrain", prior_tag, ckpt, extra))
     elif task == "train_cond_ddp":   # 8 ranks on B200:8 (--nshards 2 -> the B200:2 smoke function)
@@ -348,18 +357,18 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         todo = [(s_, i) for s_ in ("ffw", "code", "chat", "math", "fiction", "multi") for i in range(K.get(s_, 1))]   # = claims_extract.SOURCES
         if sets: todo = [(x.split(":")[0], int(x.split(":")[1])) for x in sets.split(",")]          # --sets "ffw:3,ffw:17": re-run only these slices
         calls = [claims_docs.spawn(s_, n_docs, root, tag or "v1", f"{i}/{K.get(s_, 1)}", extra) for s_, i in todo]
-        print("rc", [c.get() for c in calls])
+        print("rc", _gather(calls))
     elif task == "claims_anchors":   # all shards in parallel, one B200 each
         calls = [claims_anchors.spawn(root, i, nshards, tag or "v1", extra) for i in range(nshards)]
-        print("rc", [c.get() for c in calls])
+        print("rc", _gather(calls))
     elif task == "claims_anchors_v2":   # one call per shard, queued; Modal runs <= 14 at a time; returns when all are done
         calls = [claims_anchors_v2.spawn(root, i, nshards, tag or "v2", extra) for i in range(nshards)]
-        print("rc", [c.get() for c in calls])
+        print("rc", _gather(calls))
     elif task == "claims_finalize_shard":   # CPU finalize of one streaming shard (--tag = shard name, e.g. v2_017)
         print("rc", claims_text.remote(root, 0, 1, "--names __none__", tag))
     elif task == "claims_text":
         calls = [claims_text.spawn(root, i, nshards, extra) for i in range(nshards)]
-        print("rc", [c.get() for c in calls])
+        print("rc", _gather(calls))
     elif task == "claims_compose":   # --ckpt = adapter path, --tag = output tag
         print("rc", claims_compose.remote(ckpt, tag, extra))
     elif task == "claims_gates":   # --ckpt = adapter path, --tag = output tag
