@@ -13,8 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 MARKER = " ?"
-DEFAULT_QUESTION = ("These are two snapshots of the same forward pass, the first taken before the second. "
-                    "In one or two sentences, what did the model work out between them?")
+DEFAULT_QUESTION = ("These are two snapshots of a language model's internal state while it reads a passage, the first taken before "
+                    "the second. In one or two sentences, what did the model work out between them?")
 
 
 @dataclass
@@ -53,6 +53,15 @@ def build_prompt(tok, question: str = DEFAULT_QUESTION) -> PromptSpec:
     assert len(pos) == 2, f"expected exactly 2 marker tokens in the prompt, found {len(pos)}: {tok.convert_ids_to_tokens(ids)}"
     assert tok.decode([ids[pos[0] + 1]]) == " \n" and tok.decode([ids[pos[1] + 1]]) == " \n", "marker right-neighbour drifted"
     return PromptSpec(text=text, ids=ids, pos_i=pos[0], pos_j=pos[1], marker_id=mid)
+
+
+REF_INSTRUCTION = "Describe what changed inside a language model while it processed a passage."
+
+
+def build_ref_prompt(tok, instruction: str = REF_INSTRUCTION) -> list[int]:
+    """DECISIONS v1.2 KL reference: the fixed base on a TEXT-ONLY prompt (no markers, no injection). Returns the prompt token ids."""
+    text = tok.apply_chat_template([{"role": "user", "content": instruction}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    return tok.encode(text, add_special_tokens=False)
 
 
 def response_ids(tok, text: str, max_len: int | None = None) -> list[int]:

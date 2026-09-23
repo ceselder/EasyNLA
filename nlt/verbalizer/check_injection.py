@@ -20,6 +20,7 @@ def main():
     p.add_argument("--max-new-tokens", type=int, default=48); p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--vllm-gpu-mem", type=float, default=0.40); p.add_argument("--vllm-max-len", type=int, default=256)
     p.add_argument("--out", required=True); p.add_argument("--seed", type=int, default=0); p.add_argument("--question", default=None)
+    p.add_argument("--base-samples", type=int, default=64, help="DECISIONS v1.2: dump this many BASE samples on the marker prompt (injected) and on the text-only reference prompt")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed)
     import pyarrow.parquet as pq
     from nlt.data.dataset import ActStore
@@ -37,6 +38,18 @@ def main():
     policy = load_policy(a.base, a.init, device=dev); policy.eval()
     inj = TwoMarkerInjector(policy, spec.marker_id)
     llm = make_engine(a.base, tokenizer=a.base, gpu_mem=a.vllm_gpu_mem, max_len=a.vllm_max_len, seed=a.seed)
+    base_samples = {}
+    if a.base_samples > 0:                       # vLLM still holds the plain base here
+        from nlt.verbalizer.prompt import build_ref_prompt, REF_INSTRUCTION
+        from nlt.verbalizer.vllm_rollout import chat_generate
+        nb = min(a.base_samples, acts.shape[0] * a.group)
+        rb, _ = rollout(llm, spec, acts[: max(1, nb // a.group)], a.group, a.max_new_tokens, 1.0, seed=a.seed + 1)
+        base_samples["base_marker_prompt_injected"] = [{"i": int(I[r["prompt_idx"]]), "j": int(J[r["prompt_idx"]]), "text": r["text"][:300]} for r in rb[:nb]]
+        base_samples["base_text_only_prompt"] = chat_generate(llm, tok, [REF_INSTRUCTION] * nb, temperature=1.0, max_tokens=a.max_new_tokens, seed=a.seed + 2)
+        print("[check] BASE on marker prompt (injected):", flush=True)
+        for s_ in base_samples["base_marker_prompt_injected"][:12]: print(f"   [{s_['i']}->{s_['j']}] {s_['text']!r}", flush=True)
+        print("[check] BASE on text-only prompt:", flush=True)
+        for s_ in base_samples["base_text_only_prompt"][:12]: print(f"   {s_[:300]!r}", flush=True)
     if a.init != "base":
         from nla.train_rl_vllm import sync_actor_to_vllm
         dt = sync_actor_to_vllm(policy, llm); print(f"[check] synced LoRA-merged policy into vLLM in {dt:.1f}s", flush=True)
@@ -73,7 +86,7 @@ def main():
     samples = []
     for r in res[:: max(1, len(res) // 12)][:12]:
         pi = r["prompt_idx"]; samples.append({"i": int(I[pi]), "j": int(J[pi]), "text": r["text"][:300], "n_resp": r["n_resp"]})
-    summ["samples"] = samples
+    summ["samples"] = samples; summ["base_samples"] = base_samples
     print(json.dumps({k: v for k, v in summ.items() if k != "samples"}, indent=1), flush=True)
     for s in samples: print(f"  [{s['i']}->{s['j']}] {s['text']!r}", flush=True)
     os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(summ, open(a.out, "w"), indent=1)

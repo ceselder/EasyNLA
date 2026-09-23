@@ -58,17 +58,22 @@ class TwoMarkerInjector:
         if ids is None or resid.shape[1] < 2: return output          # decode step
         B = ids.shape[0]
         assert vec.shape[0] == B, f"injection slot has {vec.shape[0]} rows for a batch of {B}"
-        out = resid.clone()
+        bidx, pidx, vrows = [], [], []
         for b in range(B):
             pos = (ids[b] == self.marker_id).nonzero(as_tuple=False).flatten().tolist()
             if len(pos) != 2:
                 if self.strict: raise RuntimeError(f"row {b}: expected 2 marker tokens, found {len(pos)}")
                 continue
-            vb = vec[b].to(out.device)
+            vb = vec[b]
             if vb.dim() == 1: vb = vb.unsqueeze(0).expand(2, -1)
-            for k, p in enumerate(pos):
-                out[b, p] = norm_matched_add(out[b, p], vb[k])
-                self.n_writes += 1
+            for k, p in enumerate(pos): bidx.append(b); pidx.append(p); vrows.append(vb[k])
+        if not bidx: return output
+        # read the PRE-injection rows from `resid` (never modified), write the new rows into a clone: no saved-for-backward tensor
+        # aliases a buffer that is later written in place (the norm-match's backward needs the original h_p).
+        v = torch.stack(vrows).to(resid.device)
+        h = resid[bidx, pidx]
+        out = resid.clone(); out[bidx, pidx] = norm_matched_add(h, v)
+        self.n_writes += len(bidx)
         return (out, *output[1:]) if isinstance(output, tuple) else out
 
     def reset_count(self) -> int:
