@@ -42,16 +42,19 @@ def load_pool(spec, pairs_parquet, row_of):
 
 
 class PoolSampler:
-    def __init__(self, df, weights: dict, seed=0):
+    def __init__(self, df, weights: dict, seed=0, j_min: int = 0):
         self.df = df; self.rng = np.random.default_rng(seed)
         self.pools = sorted(df["pool"].unique().tolist())
         self.idx = {p: np.where(df["pool"].values == p)[0] for p in self.pools}
+        jv = df["j"].values.astype(np.int64)
+        self.idx_cur = {p: np.where((df["pool"].values == p) & (jv >= j_min))[0] for p in self.pools} if j_min > 0 else self.idx   # curriculum subset (e.g. motor band j >= 33)
         w = np.array([weights.get(p, 1.0) for p in self.pools], dtype=np.float64); self.w = w / w.sum()
-        print("[pool] sampling weights: " + ", ".join(f"{p} {w_:.2f} ({len(self.idx[p])} rows)" for p, w_ in zip(self.pools, self.w)), flush=True)
+        print("[pool] sampling weights: " + ", ".join(f"{p} {w_:.2f} ({len(self.idx[p])} rows, {len(self.idx_cur[p])} with j >= {j_min})" for p, w_ in zip(self.pools, self.w)), flush=True)
 
-    def sample(self, B):
+    def sample(self, B, curriculum: bool = False):
+        idx = self.idx_cur if curriculum else self.idx
         counts = self.rng.multinomial(B, self.w)
-        out = np.concatenate([self.rng.choice(self.idx[p], n, replace=True) for p, n in zip(self.pools, counts) if n > 0])
+        out = np.concatenate([self.rng.choice(idx[p], n, replace=True) for p, n in zip(self.pools, counts) if n > 0 and len(idx[p]) > 0])
         self.rng.shuffle(out); return self.df.iloc[out]
 
 
@@ -109,6 +112,8 @@ def main():
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=64); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--lr-lora", type=float, default=3e-5)
     p.add_argument("--warmup", type=int, default=100); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-decay", default="cosine", choices=["none", "cosine"])
     p.add_argument("--p-uncond", type=float, default=0.3); p.add_argument("--null-reg", type=float, default=1.0); p.add_argument("--null-frac", type=float, default=0.25)
+    p.add_argument("--curriculum-j-min", type=int, default=0, help="motor-band warm-up: for the first --curriculum-steps steps sample only pairs with j >= this (the text signal is largest where h_j ~ the next-token distribution)")
+    p.add_argument("--curriculum-steps", type=int, default=0)
     p.add_argument("--groups", type=int, default=1, help="G noise draws (t, eps) per text row in ONE trunk forward (block-diagonal mask; each group == a single forward). Multiplies the FM samples per step at ~1.3x the compute; condition dropout is per group")
     p.add_argument("--contrast", type=float, default=0.0, help="BANNED by DECISIONS v1.16 (one-sided hinge Goodharts by destroying the density under wrong text); kept for the record, do not use")
     p.add_argument("--contrast-tau", type=float, default=0.005); p.add_argument("--contrast-margin", type=float, default=0.005)
@@ -128,7 +133,7 @@ def main():
     # ---- text pools
     df = load_pool(a.text_parquet, os.path.join(a.data_dir, "pairs_train.parquet"), store.row_of)
     weights = {k: float(v) for k, v in (x.split(":") for x in a.pool_weights.split(",") if x)}
-    sampler = PoolSampler(df, weights, a.seed)
+    sampler = PoolSampler(df, weights, a.seed, j_min=a.curriculum_j_min)
     print(f"[train] {len(df)} train text rows over {df['pair_id'].nunique()} pairs", flush=True)
     # ---- val sets (pairs after the fixed eval set)
     import pyarrow.parquet as pq
@@ -163,7 +168,7 @@ def main():
         torch.save(ck, os.path.join(a.out, name + ".tmp")); os.replace(os.path.join(a.out, name + ".tmp"), os.path.join(a.out, name))
     gen = torch.Generator().manual_seed(a.seed + step0); model.train(); t0 = time.time(); ema = None; best = None
     for step in range(step0, a.steps):
-        sub = sampler.sample(a.batch)
+        sub = sampler.sample(a.batch, curriculum=(a.curriculum_j_min > 0 and step < a.curriculum_steps))
         rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values.astype(np.int64)); j = torch.tensor(sub["j"].values.astype(np.int64)); texts = sub["text"].tolist()
         h_i, x0, log_s, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), space["target"], space["src_rms"], space["squash"])
         ids, mask = model.tokenize(texts); enc = TextIDs(ids)
