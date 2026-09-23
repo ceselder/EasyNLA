@@ -12,14 +12,14 @@ from __future__ import annotations
 import re, sys, json, argparse
 
 HARD = [   # network-depth references only; bare 'layer' / 'block' / 'depth' are natural words ("a layer of complexity", "a block of marble") -> soft tier
-    r"\b(?:layer|block)s?\s*#?\s*\d{1,2}\b", r"\bstages?\s*#?\s*(?:9|1\\d|2\\d|3[0-4])\b", r"\b\d{1,2}\s*(?:st|nd|rd|th)?\s*(?:layer|block)s?\b",
+    r"\b(?:layer|block)s?\s*#?\s*\d{1,2}\b", r"\bstages?\s*#?\s*(?:9|1\d|2\d|3[0-4])\b", r"\b\d{1,2}\s*(?:st|nd|rd|th)?\s*(?:layer|block)s?\b",
     r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty)\s+(?:more\s+|later\s+|further\s+|transformer\s+)?(?:layers|blocks)\b",
     r"\b(?:transformer|network|model|residual|hidden|attention|mlp|decoder)\W{1,3}(?:layer|block)s?\b", r"\b(?:layer|block)s?\s+(?:of|in|into|through)\s+the\s+(?:model|network|transformer|net)\b",
     r"\b(?:early|earlier|middle|mid|late|later|deep|deeper|shallow|final|last|upper|lower|higher|top|bottom|next|previous|intermediate|subsequent)[- ](?:layer|block)s?\b",
     r"\b(?:at|in|by|from|to|after|before|between|across|through)\s+(?:the\s+)?(?:layer|block)s?\b", r"\blayer[- ]?wise\b", r"\bL\d{1,2}\b",
     r"\bdepth\s+(?:of|in|into|through)\s+the\s+(?:model|network|transformer|net|stack)\b", r"\bnetwork depth\b", r"\bmodel depth\b", r"\bdeeper (?:in|into) the (?:model|network)\b",
-    r"\bhidden[- ]states?\s*\d", r"\bresidual(?:[- ]stream)?\s+(?:at|after|from|to)\s+\d", r"\b(?:9|1\\d|2\\d|3[0-4])\s*(?:->|→)\s*(?:9|1\\d|2\\d|3[0-4])\b", r"\bfrom\s+(?:9|1\\d|2\\d|3[0-4])\s+to\s+(?:9|1\\d|2\\d|3[0-4])\b",
-    r"\bsteps?\s+(?:9|1\\d|2\\d|3[0-4])\s+(?:of|to|through)\b", r"\bposition\s+in\s+the\s+network\b", r"\bmid[- ]?network\b", r"\bearly[- ]network\b", r"\blate[- ]network\b",
+    r"\bhidden[- ]states?\s*\d", r"\bresidual(?:[- ]stream)?\s+(?:at|after|from|to)\s+\d", r"\b(?:9|1\d|2\d|3[0-4])\s*(?:->|→)\s*(?:9|1\d|2\d|3[0-4])\b", r"\bfrom\s+(?:9|1\d|2\d|3[0-4])\s+to\s+(?:9|1\d|2\d|3[0-4])\b",
+    r"\bsteps?\s+(?:9|1\d|2\d|3[0-4])\s+(?:of|to|through)\b", r"\bposition\s+in\s+the\s+network\b", r"\bmid[- ]?network\b", r"\bearly[- ]network\b", r"\blate[- ]network\b",
     r"\b(?:percent|%)\s+(?:of\s+the\s+way\s+)?through\s+the\s+(?:model|network)\b", r"\b(?:forward|processing)\s+pass\W+(?:layer|block|stage)",
 ]
 SOFT = [
