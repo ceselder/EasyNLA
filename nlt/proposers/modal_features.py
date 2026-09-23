@@ -75,7 +75,6 @@ def load_split_index(data_dir: str, split: str):
     return row_of, docs
 
 
-@app.function(gpu="H100", volumes={"/vol": vol, "/vol_nla_exp": vol_ro}, secrets=SECRETS, timeout=4 * 60 * 60, max_containers=4)
 def select_rows(pairs, start: int, end: int, perm_seed: int):
     """rows [start, end) of the pairs table, or of a fixed random permutation of it when perm_seed >= 0
     (train pairs are stored in extraction order, so a prefix would be a biased source mix; the SAME seed must be used by every job)."""
@@ -86,6 +85,7 @@ def select_rows(pairs, start: int, end: int, perm_seed: int):
     return pairs.iloc[perm[start:end]].reset_index(drop=True)
 
 
+@app.function(gpu="H100", volumes={"/vol": vol, "/vol_nla_exp": vol_ro}, secrets=SECRETS, timeout=4 * 60 * 60, max_containers=4)
 def features(data_dir: str, split: str, start: int, end: int, out_dir: str = "/vol/z/features_v1", fwd_bs: int = 8, lens_bs: int = 512, perm_seed: int = -1) -> str:
     import numpy as np
     import pandas as pd
