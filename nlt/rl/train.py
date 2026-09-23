@@ -10,7 +10,7 @@ with the violation floor -> group-centred advantages -> REINFORCE/CISPO update w
 (nlt/rl/update.py) -> weight sync. Layout: GPU0 = policy (HF + vLLM engine); GPU1 (if present) = critic + text encoder + paraphraser.
 """
 from __future__ import annotations
-import argparse, json, math, os, time
+import argparse, json, math, os, re, time
 import numpy as np, torch
 
 
@@ -56,6 +56,8 @@ def parse():
     p.add_argument("--referential", action=argparse.BooleanOptionalAction, default=True, help="stratified batches + content reward = PMI(own) - mean_k PMI(distractor_k); off = plain bits reward")
     p.add_argument("--n-classes", type=int, default=16, help="distinct (i,j) classes per step"); p.add_argument("--per-class", type=int, default=8, help="pairs (positions) per class; distractors come from the class")
     p.add_argument("--n-dist", type=int, default=2, help="distractor pairs scored per rollout (<= per-class - 1)")
+    p.add_argument("--class-j-min", type=int, default=None, help="redteam #442: sample only classes with j >= this for the first --class-j-min-until steps (e.g. 14 = skip the pre band)")
+    p.add_argument("--class-j-min-until", type=int, default=40)
     p.add_argument("--dist-types", default="samedoc,crossdoc", help="redteam #228 H1: comma list of distractor types filling the --n-dist slots in order: samedoc (other position of the SAME document, same (i,j)), crossdoc (in-class other document), wrongj (own position, other j; pays for depth cues -- off by default). Remaining slots = crossdoc.")
     p.add_argument("--content-abs", type=float, default=0.2, help="redteam #228 H2: reward = content + content_abs x PMI(own), so junk that hurts distractors more than itself does not win")
     p.add_argument("--content-abs-clip", action="store_true", help="DECISIONS v1.23: use max(PMI(own), 0) in the absolute term (a mismatcher critic gives negative PMI(own) on true text)")
@@ -367,7 +369,7 @@ def main():
         if os.path.exists(stop_path):
             print(f"[rl] STOP file {stop_path} found -> saving and exiting", flush=True); save_adapter(policy, os.path.join(a.out, f"step_{step:05d}_stopped", "lora")); break
         if a.referential:
-            rows, I, J, cls = sampler.sample(gen); B = P = len(rows)
+            rows, I, J, cls = sampler.sample(gen, j_min=(a.class_j_min if (a.class_j_min is not None and step < a.class_j_min_until) else None)); B = P = len(rows)
             types = [t.strip() for t in a.dist_types.split(",") if t.strip()][: a.n_dist]; types += ["crossdoc"] * (a.n_dist - len(types))
             cross_idx = sampler.distractors(cls, max(1, types.count("crossdoc")), gen)          # [P, n_cross] in-class other-document pairs
             ext_rows, ext_I, ext_J = [rows], [I], [J]; dist_cols = []; nc = 0
@@ -481,6 +483,9 @@ def main():
             if m.any():
                 log[f"bits/{bname}"] = float(bits[m].mean()); log[f"reward/{bname}"] = float(rewards[m].mean()); log[f"bits_per_token/{bname}"] = float(bits[m].sum() / max(1.0, float(n_tok[m].sum())))
                 log[f"bits/{bname}_within_group_std"] = within_group_std(bits[m], groups[m]); log[f"tokens/{bname}"] = float(n_tok[m].mean())
+        _list_rx = re.compile(r"\b(Rising|Fading|Falling|Now favou?red|lean(s|ing)? toward|Gaining ground|Losing ground|moved toward|leading candidates|Top choices)\b", re.I)
+        log["reg/list_share"] = float(np.mean([bool(_list_rx.search(t or "")) for t in texts]))             # redteam #433: list-register share of this step's rollouts
+        log["reg/phrase_share"] = float(np.mean([(n_ <= 12) for n_ in n_tok.tolist()]))                          # 9-token-phrase register (V0b's third mode)
         try:                                                # template drift (EVALS 7e): distinct-4-gram ratio and self-BLEU over this step's rollouts
             log["div/distinct4"] = float(distinct_n(resp_ids, 4)); log["div/self_bleu"] = float(self_bleu(resp_ids, n_sample=64, seed=step))
         except Exception as e_: log["div/error"] = str(e_)[:80]
@@ -518,7 +523,7 @@ def main():
                     if m.any(): log[f"cross/{cname}/bits_{bname}"] = float(cb[m].mean())
             log["cross/live_bits_mean_subsample"] = float(live_b[torch.isfinite(live_b)].mean()); log["time/cross"] = time.time() - tc
             print("   cross (" + ("content" if a.referential else "bits") + "): " + " | ".join(f"{c}: {log[f'cross/{c}/bits_mean']:+.2f} (corr live {log[f'cross/{c}/corr_live']:.2f}, ws {log.get(f'cross/{c}/bits_workspace', float('nan')):+.1f}" + (f", ref acc {log[f'cross/{c}/ref_acc']:.3f}" if f"cross/{c}/ref_acc" in log else "") + ")" for c in cross) + f" | live {log['cross/live_bits_mean_subsample']:+.2f}", flush=True)
-        print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | {'content' if a.referential else 'bits'} {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} ws {log.get('bits/workspace', float('nan')):+.2f}" + (f" | own {ref['ref/own_bits']:+.2f} P(own>null) {ref['ref/p_own_gt_null']:.2f} dist {ref['ref/dist_bits']:+.2f} acc {ref['ref/acc']:.3f} (pre {ref.get('ref/acc_pre', float('nan')):.2f} ws {ref.get('ref/acc_workspace', float('nan')):.2f} mo {ref.get('ref/acc_motor', float('nan')):.2f})" if ref else "") + f" | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | d4 {log.get('div/distinct4', float('nan')):.2f} | lam {lam:.4f} | gn {gn:.2f}" + (f" | listener fm {cot_m['fm']:.3f} nulldm {cot_m['nulldm']:.4f} null {cot_m['null']:.4f} own<dist {cot_m['contrast_acc']:.2f}" if cot_m and 'fm' in cot_m else "") + f" | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} cot {t_cot:.0f})", flush=True)
+        print(f"step {step:4d} | R {log['reward/mean']:+.3f} (wg std {log['reward/within_group_std']:.3f}) | {'content' if a.referential else 'bits'} {log['bits/mean']:+.3f} med {log['bits/median']:+.3f} ws {log.get('bits/workspace', float('nan')):+.2f}" + (f" | own {ref['ref/own_bits']:+.2f} P(own>null) {ref['ref/p_own_gt_null']:.2f} dist {ref['ref/dist_bits']:+.2f} acc {ref['ref/acc']:.3f} (pre {ref.get('ref/acc_pre', float('nan')):.2f} ws {ref.get('ref/acc_workspace', float('nan')):.2f} mo {ref.get('ref/acc_motor', float('nan')):.2f})" if ref else "") + f" | tok {log['tokens/mean']:.1f} | viol {log['viol/any']:.2f} | kl {log['kl']:.4f} | ent {log['entropy']:.2f} | d4 {log.get('div/distinct4', float('nan')):.2f} list {log['reg/list_share']:.2f} | lam {lam:.4f} | gn {gn:.2f}" + (f" | listener fm {cot_m['fm']:.3f} nulldm {cot_m['nulldm']:.4f} null {cot_m['null']:.4f} own<dist {cot_m['contrast_acc']:.2f}" if cot_m and 'fm' in cot_m else "") + f" | {log['time/step']:.0f}s (gen {t_gen:.0f} score {t_score:.0f} upd {t_upd:.0f} cot {t_cot:.0f})", flush=True)
         if step % a.eval_every == 0:
             order = rewards.argsort(); pick = [int(order[0]), int(order[len(order) // 2]), int(order[-1])]
             for k in pick: print(f"   [{int(I[groups[k]])}->{int(J[groups[k]])}] r={float(rewards[k]):+.2f} bits={float(bits[k]):+.2f} tok={int(n_tok[k])} viol={bool(bad[k])} :: {texts[k][:200]!r}", flush=True)

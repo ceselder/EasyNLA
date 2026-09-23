@@ -14,11 +14,12 @@ class StratifiedSampler:
     def __init__(self, store, n_classes: int = 16, per_class: int = 8, j_lo: int = J_LO, j_hi: int = J_HI, i_lo: int = K_LO):
         self.store, self.n_classes, self.per_class, self.j_lo, self.j_hi, self.i_lo = store, n_classes, per_class, j_lo, j_hi, i_lo
 
-    def sample(self, gen: torch.Generator | None = None):
-        """-> rows [P], I [P], J [P], cls [P] with P = n_classes * per_class; positions distinct within a class; classes distinct."""
-        seen = set(); classes = []
+    def sample(self, gen: torch.Generator | None = None, j_min: int | None = None):
+        """-> rows [P], I [P], J [P], cls [P] with P = n_classes * per_class; positions distinct within a class; classes distinct.
+        j_min: temporarily restrict the target layer (redteam #442: exclude the pre band j <= 13 while a mis-calibrated listener is bedded in)."""
+        seen = set(); classes = []; j_lo = max(self.j_lo, j_min) if j_min is not None else self.j_lo
         while len(classes) < self.n_classes:
-            j = int(torch.randint(self.j_lo, self.j_hi + 1, (1,), generator=gen)); i = int(torch.randint(self.i_lo, j, (1,), generator=gen))
+            j = int(torch.randint(j_lo, self.j_hi + 1, (1,), generator=gen)); i = int(torch.randint(self.i_lo, j, (1,), generator=gen))
             if (i, j) in seen and len(seen) < (self.j_hi - self.j_lo + 1) * 10: continue
             seen.add((i, j)); classes.append((i, j))
         rows, I, J, cls = [], [], [], []
