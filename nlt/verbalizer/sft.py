@@ -95,8 +95,10 @@ def main():
         idx = order[ptr: ptr + a.batch]; ptr += a.batch; sub = df.iloc[idx]
         opt.zero_grad(set_to_none=True); tot = 0.0; ntk = 0
         for s in range(0, len(sub), a.micro):
-            ids, am, lab, acts = batch_tensors(sub.iloc[s: s + a.micro], store); l, k = loss_on(ids, am, lab, acts); tot += float(l); ntk += k
-            (l / max(1, len(sub))).backward()
+            ids, am, lab, acts = batch_tensors(sub.iloc[s: s + a.micro], store); l, k = loss_on(ids, am, lab, acts); tot += float(l.detach()); ntk += k
+            # per-TOKEN mean over the whole batch (each micro-batch weighted by its share of the batch): grad norm is then O(1) instead of
+            # O(tokens per response) and the 1.0 clip is a safety net, not the effective learning rate
+            (l / max(1, k) * (len(ids) / len(sub))).backward()
         gn = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
         if math.isfinite(gn): opt.step()
         log = {"step": step, "loss_per_token": tot / max(1, ntk), "tokens": ntk, "grad_norm": gn, "lr": opt.param_groups[0]["lr"], "time": time.time() - t_start}
