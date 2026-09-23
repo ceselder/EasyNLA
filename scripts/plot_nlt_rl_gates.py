@@ -93,21 +93,28 @@ ax.set_title("(d) Length: shortest at step 20, recovering")
 ax.legend(fontsize=9, loc="upper right")
 
 # (e) frozen headline critic: content vs form on the control manifests (SFT source vs each scored dump)
-fc = g.get("frozen_critic_controls", {})
+fc = g.get("frozen_critic_controls", {}); fb2 = g.get("frozen_big_critic_controls", {})
 tags = [("v0_ao_tsv1", "SFT\ndata")] + [(t, f"step\n{t.rsplit('_', 1)[1]}") for t, _ in order[1:] if t in fc]
 ax = axes[2, 0]
 if len(tags) >= 2:
-    xx = np.arange(len(tags)); w = 0.38
+    xx = np.arange(len(tags)); w = 0.2
     cont = [fc[t]["content"] for t, _ in tags]; form = [fc[t]["form"] for t, _ in tags]
-    ax.bar(xx - w / 2, cont, w, color="#1f5f8b", label="content = bits(z) - bits(depth-matched z)")
-    ax.bar(xx + w / 2, form, w, color="#b5532a", label="form = bits(depth-matched z) - bits(shuffled words)")
+    ax.bar(xx - 1.5 * w, cont, w, color="#1f5f8b", label="content, headline critic")
+    ax.bar(xx - 0.5 * w, form, w, color="#b5532a", label="form, headline critic")
     for xi, c, f_ in zip(xx, cont, form):
-        ax.text(xi - w / 2, c + 0.15, f"{c:.2f}", ha="center", fontsize=10); ax.text(xi + w / 2, f_ + 0.15, f"{f_:.1f}", ha="center", fontsize=10)
+        ax.text(xi - 1.5 * w, c + 0.2, f"{c:.2f}", ha="center", fontsize=8.5); ax.text(xi - 0.5 * w, f_ + 0.2, f"{f_:.1f}", ha="center", fontsize=8.5)
+    if all(t in fb2 for t, _ in tags):
+        cont2 = [fb2[t]["content"] for t, _ in tags]; form2 = [fb2[t]["form"] for t, _ in tags]
+        ax.bar(xx + 0.5 * w, cont2, w, color="#1f5f8b", alpha=0.45, hatch="//", label="content, wider adapter")
+        ax.bar(xx + 1.5 * w, form2, w, color="#b5532a", alpha=0.45, hatch="//", label="form, wider adapter")
+        for xi, c, f_ in zip(xx, cont2, form2):
+            ax.text(xi + 0.5 * w, c + 0.2, f"{c:.2f}", ha="center", fontsize=8.5); ax.text(xi + 1.5 * w, f_ + 0.2, f"{f_:.1f}", ha="center", fontsize=8.5)
+        form = form + form2
     ax.set_xticks(xx); ax.set_xticklabels([lab for _, lab in tags])
-    ax.set_ylabel("bits per sentence (frozen headline critic)")
-    ax.set_title("(e) Frozen critic: content down, form up")
-    ax.legend(fontsize=8.5, loc="upper left")
-    ax.set_ylim(0, max(form) * 1.3)
+    ax.set_ylabel("bits per sentence (frozen critics)")
+    ax.set_title("(e) Both frozen critics: content down, form up")
+    ax.legend(fontsize=8, loc="upper left", ncol=2)
+    ax.set_ylim(0, max(form) * 1.35)
 else:
     ax.axis("off")
 # (f) paired preference probabilities on the same critic
