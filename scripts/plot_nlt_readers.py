@@ -28,7 +28,7 @@ def main():
         ax.bar(x, vals, color=[c for _, _, c in srcs], width=0.58)
         for xi, v in zip(x, vals): ax.text(xi, v + 1.2, f"{v:.0f}%", ha="center", va="bottom", fontsize=11, color=INK)
         ax.axhline(chance, color="#b91c1c", lw=1.2, ls="--"); ax.text(len(srcs) - 0.5, chance + 1.5, f"chance {chance}%", color="#b91c1c", fontsize=10, ha="right")
-        ax.set_xticks(x); ax.set_xticklabels([l for _, l, _ in srcs], fontsize=9.5); ax.set_ylim(0, 100); ax.set_ylabel("reader accuracy, %")
+        ax.set_xticks(x); ax.set_xticklabels([l for _, l, _ in srcs], fontsize=9.5, rotation=18, ha="right", rotation_mode="anchor"); ax.set_ylim(0, 100); ax.set_ylabel("reader accuracy, %")
         ax.set_title(f"Reader given the text only: {title}", loc="left")
         ax.grid(True, axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s in ("top", "right"): ax.spines[s].set_visible(False)
