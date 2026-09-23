@@ -19,10 +19,10 @@ from nlt.data.extract import K_LO, N_LAYERS
 
 class PairDenoiser(nn.Module):
     def __init__(self, d: int = 4096, d_model: int = 2048, d_mlp: int = 8192, n_layers: int = 8, cond: str = "none", d_enc: int = 0,
-                 n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, target: str = "hj", vec_k: int = 20, vec_vocab: int = 151936, proj_k: int = 32, proj_sigma: float = 0.1):
+                 n_slots: int = 8, n_heads: int = 4, d_head: int = 64, gate_rank: int = 128, target: str = "hj", vec_k: int = 20, vec_vocab: int = 151936, proj_k: int = 32, proj_sigma: float = 0.1, cond_path: str = "gate"):
         super().__init__()
         assert cond in ("none", "depth", "text", "vec", "proj")
-        self.d, self.d_model, self.d_mlp, self.n_layers, self.cond, self.target = d, d_model, d_mlp, n_layers, cond, target
+        self.d, self.d_model, self.d_mlp, self.n_layers, self.cond, self.target, self.cond_path = d, d_model, d_mlp, n_layers, cond, target, cond_path
         self.in_proj = nn.Linear(2 * d, d_model)
         self.time_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
         self.src_embed = nn.Sequential(nn.Linear(d + 1, d_model), nn.SiLU(), nn.Linear(d_model, d_model))   # [h_i, log rms(h_i)]: the source scale is a function of h_i (allowed)
@@ -39,15 +39,19 @@ class PairDenoiser(nn.Module):
             self.vec_in = nn.Sequential(nn.Linear(2 * 128 + 2 * vec_k, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
             nn.init.zeros_(self.vec_in[2].weight); nn.init.zeros_(self.vec_in[2].bias)
         base = [MLPBlock(d_model, d_mlp) for _ in range(n_layers)]
+        self.feat_dim = {"vec": 2 * 128 + 2 * vec_k, "proj": proj_k}.get(cond, 0)
         if cond == "text":
             assert d_enc > 0
             self.blocks = nn.ModuleList([CondMLPBlock(b, d_enc, n_slots, n_heads, d_head, gate_rank, use_read=True, d_c=0) for b in base])
+        elif cond in ("vec", "proj") and cond_path == "block":
+            # the vector enters EVERY block additively (zero-init) + modulates its gate, i.e. the same pathway the text cross-reads use
+            self.blocks = nn.ModuleList([CondMLPBlock(b, 1, 1, 1, 1, gate_rank, use_read=False, d_c=self.feat_dim) for b in base])
         else:
             self.blocks = nn.ModuleList(base)
         self.ln = nn.LayerNorm(d_model); self.out_proj = nn.Linear(d_model, d)
 
     def config(self):
-        return {k: getattr(self, k) for k in ("d", "d_model", "d_mlp", "n_layers", "cond", "target")} | {"d_enc": getattr(self, "d_enc_", 0), "src_rms": getattr(self, "src_rms_", False), "squash": getattr(self, "squash_", 0.0)}
+        return {k: getattr(self, k) for k in ("d", "d_model", "d_mlp", "n_layers", "cond", "target")} | {"d_enc": getattr(self, "d_enc_", 0), "src_rms": getattr(self, "src_rms_", False), "squash": getattr(self, "squash_", 0.0), "cond_path": getattr(self, "cond_path", "gate")}
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -68,17 +72,22 @@ class PairDenoiser(nn.Module):
             de = self.emb_i(depth[:, 0] - K_LO) + self.emb_j(depth[:, 1] - K_LO)
             if depth_has is not None: de = de * depth_has[:, None].to(de.dtype)
             emb = emb + de
+        c_feat = None
         if self.cond == "vec" and vec is not None:
-            ve = self.vec_in(self.vec_features(*vec).to(emb.dtype))
+            c_feat = self.vec_features(*vec).to(emb.dtype)
+            ve = self.vec_in(c_feat)
             if vec_has is not None: ve = ve * vec_has[:, None].to(ve.dtype)
             emb = emb + ve
         if self.cond == "proj" and vec is not None:                              # vec = the noisy projection y [B, k]
-            ve = self.proj_in(vec.to(emb.dtype))
+            c_feat = vec.to(emb.dtype); ve = self.proj_in(c_feat)
             if vec_has is not None: ve = ve * vec_has[:, None].to(ve.dtype)
             emb = emb + ve
         h = self.in_proj(torch.cat([x_t, h_i], -1))
         if self.cond == "text":
             for blk in self.blocks: h = blk(h, emb, enc, enc_mask)
+        elif self.cond in ("vec", "proj") and self.cond_path == "block" and c_feat is not None:
+            c_has = vec_has if vec_has is not None else torch.ones(h.shape[0], dtype=torch.bool, device=h.device)
+            for blk in self.blocks: h = blk(h, emb, None, None, c_feat, c_has)
         else:
             for blk in self.blocks: h = blk(h, emb)
         return self.out_proj(self.ln(h)).float()

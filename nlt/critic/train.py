@@ -142,6 +142,7 @@ def main():
     p.add_argument("--resume", default=None); p.add_argument("--max-hours", type=float, default=20.0)
     p.add_argument("--extra-data-dirs", default=None, help="comma list of additional activation dirs (same layout): the train store becomes a CyclingStore over ALL dirs (blind/depth modes only)")
     p.add_argument("--cycle-resident", type=int, default=200_000); p.add_argument("--cycle-refresh", type=int, default=400, help="batches between shard swaps")
+    p.add_argument("--cond-path", default="gate", choices=["gate", "block"], help="vec/proj conditioning pathway: gate modulation only (like the depth embedding) or per-block additive + gate (like the text cross-reads)")
     p.add_argument("--proj-k", type=int, default=32); p.add_argument("--proj-sigma", type=float, default=0.1); p.add_argument("--proj-mode", default="random", choices=["random", "pca"], help="T5 directions: random orthonormal or top-PCA of the flow target (from 16k sampled pairs)")
     p.add_argument("--contrast", type=float, default=0.0, help="DECISIONS v1.10 T4: weight of the contrastive hinge softplus((L(z) - L(z_dm) + margin)/tau) with z_dm = a depth-matched WRONG text (another row of the batch with the same j, same (i,j) when available), at the SAME (x_t, t, eps)")
     p.add_argument("--contrast-tau", type=float, default=0.005, help="logistic temperature in per-dim FM-loss units (0.005 ~ 10 nats)"); p.add_argument("--contrast-margin", type=float, default=0.005)
@@ -204,7 +205,7 @@ def main():
             val_rows, val_i, val_j = val_rows[keep], val_i[keep], val_j[keep]; eps_bank = [e[keep] for e in eps_bank]
             val_text = [vdf.loc[pid[k], "text"] for k in keep]
             print(f"[train] text pairs: train {len(text_df)} (verbosity {sorted(text_df['verbosity'].unique().tolist())}), val {len(keep)}/{len(pid)} with text", flush=True)
-    model = PairDenoiser(d, a.d_model, a.d_mlp, a.n_layers, a.cond, d_enc=(encoder.d_enc if encoder else 0), n_slots=a.n_slots, n_heads=a.n_heads, d_head=a.d_head, gate_rank=a.gate_rank, target=a.target, proj_k=a.proj_k, proj_sigma=a.proj_sigma).to(dev)
+    model = PairDenoiser(d, a.d_model, a.d_mlp, a.n_layers, a.cond, d_enc=(encoder.d_enc if encoder else 0), n_slots=a.n_slots, n_heads=a.n_heads, d_head=a.d_head, gate_rank=a.gate_rank, target=a.target, proj_k=a.proj_k, proj_sigma=a.proj_sigma, cond_path=a.cond_path).to(dev)
     if a.cond == "proj":                       # T5 directions (fixed, saved in the checkpoint as a buffer)
         g_p = torch.Generator().manual_seed(777)
         if a.proj_mode == "random":
@@ -218,14 +219,14 @@ def main():
     print(f"[train] {a.cond} critic: {model.n_params()/1e6:.0f}M params, target {a.target}, norm {a.norm}, src_rms {a.src_rms}, squash {a.squash}, batch {a.batch}, {a.steps} steps", flush=True)
     if a.init_from:
         ck = torch.load(a.init_from, map_location="cpu"); sd = ck["model"]
-        if a.cond == "text":                                  # prior blocks live under blocks.<k>.base.* in the text model
+        if a.cond == "text" or (a.cond in ("vec", "proj") and a.cond_path == "block"):     # prior blocks live under blocks.<k>.base.* in wrapped models
             sd = {(k.replace("blocks.", "blocks.", 1) if not k.startswith("blocks.") else "blocks." + k.split(".", 1)[1].split(".", 1)[0] + ".base." + k.split(".", 2)[2]): v for k, v in sd.items()}
         res = model.load_state_dict(sd, strict=False)
         assert not res.unexpected_keys, res.unexpected_keys[:5]
         print(f"[train] init from {a.init_from} (step {ck.get('step')}): {len(sd)} tensors loaded, {len(res.missing_keys)} fresh (conditioning) tensors", flush=True)
     trainable = list(model.parameters())
     if a.freeze_prior:
-        cond_names = {n for n, _ in model.named_parameters() if (".read." in n or ".gate_mod." in n or n.startswith("emb_i") or n.startswith("emb_j") or n.startswith("tok_emb") or n.startswith("vec_in") or n.startswith("proj_in"))}
+        cond_names = {n for n, _ in model.named_parameters() if (".read." in n or ".gate_mod." in n or ".cvec_out." in n or n.startswith("emb_i") or n.startswith("emb_j") or n.startswith("tok_emb") or n.startswith("vec_in") or n.startswith("proj_in"))}
         for n, p_ in model.named_parameters(): p_.requires_grad_(n in cond_names)
         trainable = [p_ for n, p_ in model.named_parameters() if n in cond_names]
         print(f"[train] prior frozen: {sum(p_.numel() for p_ in trainable)/1e6:.1f}M trainable conditioning params", flush=True)
