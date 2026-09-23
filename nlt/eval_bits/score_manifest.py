@@ -57,12 +57,15 @@ def main():
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True); m.to_parquet(a.out, index=False)
     # quick per-variant summary vs the 'empty' row of the same pair
     if "variant" in m and (m["variant"] == "empty").any() and not a.skip_exact:
-        emp = m[m["variant"] == "empty"].set_index("pair_id")["logp"]
-        summ = {}
-        for v in sorted(set(m["variant"]) - {"empty"}):
-            sub = m[m["variant"] == v]; b = (sub["logp"].values - emp.reindex(sub["pair_id"]).values) / math.log(2)
-            summ[v] = {"bits_mean": float(np.nanmean(b)), "bits_median": float(np.nanmedian(b)), "n": int(np.isfinite(b).sum())}
-        print("[manifest] bits vs empty:", json.dumps(summ), flush=True)
+        try:                                              # quick per-variant summary (the authoritative one is nlt.evals.summarize_scored)
+            emp = m[m["variant"] == "empty"].drop_duplicates("pair_id").set_index("pair_id")["logp"]
+            summ = {}
+            for v in sorted(set(m["variant"]) - {"empty"}):
+                sub = m[m["variant"] == v]; b = (sub["logp"].values - emp.reindex(sub["pair_id"]).values) / math.log(2)
+                summ[v] = {"bits_mean": float(np.nanmean(b)), "bits_median": float(np.nanmedian(b)), "n": int(np.isfinite(b).sum())}
+            print("[manifest] bits vs empty:", json.dumps(summ), flush=True)
+        except Exception as e:
+            print(f"[manifest] summary skipped: {type(e).__name__}: {e}", flush=True)
     print("[manifest] DONE ->", a.out, flush=True)
 
 
