@@ -48,6 +48,8 @@ def match_case(src: str, dst: str) -> str:
 
 def build(a):
     z = load_table(a.z); z["pair_id"] = z["pair_id"].astype(str)
+    if "verbosity" in z.columns and a.verbosity is not None and a.verbosity >= 0:      # multi-verbosity tables (teacher): keep one register, else drop_duplicates keeps the 9-token phrases
+        z = z[z["verbosity"] == a.verbosity]
     tcol = a.text_col or next(c for c in ("text", "answer", "z") if c in z.columns)
     z = z[["pair_id", tcol]].rename(columns={tcol: "text"}).dropna(); z = z.drop_duplicates("pair_id")
     c = pd.read_parquet(a.causal); c["pair_id"] = c["pair_id"].astype(str)
@@ -87,7 +89,7 @@ def build(a):
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--z", required=True); ap.add_argument("--causal", required=True); ap.add_argument("--pairs")
-    ap.add_argument("--out", required=True); ap.add_argument("--jsonl"); ap.add_argument("--n", type=int, default=0); ap.add_argument("--text-col")
+    ap.add_argument("--out", required=True); ap.add_argument("--jsonl"); ap.add_argument("--n", type=int, default=0); ap.add_argument("--text-col"); ap.add_argument("--verbosity", type=int, default=1, help="keep this verbosity when the table has several (default 1 = sentences); -1 = keep all")
     build(ap.parse_args())
 
 

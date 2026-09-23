@@ -17,6 +17,8 @@ def main():
     a = ap.parse_args(); res = {"critic": a.critic, "sources": {}, "edits": {}}
     for f in sorted(glob.glob(os.path.join(a.scored_dir, a.pattern + ".summary.json"))):
         stem = os.path.basename(f)[: -len(".summary.json")]; s = json.load(open(f))
+        if any(k in stem for k in ("_para_", "_twinnext", "_doc_", "_mask_")):      # edit / same-doc manifests are read via their own branches below, not as control sources
+            continue
         if "orig" in s and "dm" in s and "by_band" in s:      # controls summary
             src = re.sub(r"^scored_[^_]+_", "", stem); ws = s["by_band"]["orig"].get("workspace"); wd = s["by_band"]["dm"].get("workspace"); wr = s["by_band"]["rp"].get("workspace") if "rp" in s["by_band"] else None
             n = s["orig"]["n"]; noise = (s["orig"]["ci95"][1] - s["orig"]["ci95"][0]) / 2 / 1.96 * math.sqrt(max(1, n)) / math.sqrt(max(1, n))   # per-pair sem as the stand-in
@@ -27,8 +29,12 @@ def main():
                    "p_orig_gt_dm": p_dm, "p_orig_gt_shuf": s.get("shuf_words", {}).get("p_orig_higher"), "rp_by_band": rp_by_band, "noise_proxy_bits": noise,
                    "A1_content_ws_ge_5": bool(content_ws >= 5) if not math.isnan(content_ws) else None, "A2_P_ge_0.70": bool(p_dm >= 0.70) if p_dm is not None else None,
                    "A1b_orig_ws_gt_0": bool(ws["bits_mean"] > 0) if ws else None,        # absolute anchor (board #263): the true text must beat the blind prior, else the critic is a discriminator
-                   "A3_rp_within_3x_noise": bool(all(abs(v) <= 3 * max(noise, 0.5) for v in rp_by_band.values())) if rp_by_band else None}
-            row["ACCEPT"] = bool(row["A1_content_ws_ge_5"] and row["A1b_orig_ws_gt_0"] and row["A2_P_ge_0.70"] and row["A3_rp_within_3x_noise"])
+                   "A3_rp_within_3x_noise": bool(all(abs(v) <= 3 * max(noise, 0.5) for v in rp_by_band.values())) if rp_by_band else None,      # two-sided (v1.12 wording), reported
+                   # A3 as intended (v1.8 board #114): no text-PRESENCE BONUS -- a random pair's text must not earn bits it has no right to. A NEGATIVE offset (a text about another pair makes h_j
+                   # less likely) is what a calibrated conditional density does and does not inflate any reported number, so the binding form is one-sided (lens #362 / infra #365, 09-24).
+                   "A3_no_presence_bonus": bool(all(v <= 3 * max(noise, 0.5) for v in rp_by_band.values())) if rp_by_band else None}
+            row["ACCEPT_two_sided_A3"] = bool(row["A1_content_ws_ge_5"] and row["A1b_orig_ws_gt_0"] and row["A2_P_ge_0.70"] and row["A3_rp_within_3x_noise"])
+            row["ACCEPT"] = bool(row["A1_content_ws_ge_5"] and row["A1b_orig_ws_gt_0"] and row["A2_P_ge_0.70"] and row["A3_no_presence_bonus"])
             # A4 (proposed, board #285): P(z > twin) >= 0.65 from this critic's paraphrase/twin summary of the same source, if scored
             prefix = a.pattern.split("*")[0]                      # e.g. 'scored_big_' -> this critic's twin file is scored_big_para_<src>; pooled_n's were written without a critic tag
             cands = [os.path.join(a.scored_dir, f"{prefix}para_{src}.summary.json")] + ([os.path.join(a.scored_dir, f"scored_para_{src}.summary.json")] if a.critic == "union_pooled_null" else [])
@@ -51,7 +57,7 @@ def main():
             res["edits"].setdefault(src, {})[kind] = {k: v for k, v in s.items() if isinstance(v, dict) or k in ("n_pairs", "orig_bits_mean")}
     json.dump(res, open(a.out, "w"), indent=1, default=str)
     for src, r in res["sources"].items():
-        print(f"{src:22s} content ws {r['content_workspace']:6.2f} | all {r['content_all']:5.2f} | P(z>dm) {r['p_orig_gt_dm']:.2f} | rp by band {({b: round(v, 1) for b, v in r['rp_by_band'].items()})} | A1 {r['A1_content_ws_ge_5']} A1b {r['A1b_orig_ws_gt_0']} A2 {r['A2_P_ge_0.70']} A3 {r['A3_rp_within_3x_noise']} -> {'ACCEPT' if r['ACCEPT'] else 'REJECT'}" + (f" | twin P {r['twin']['p_orig_gt_twin']:.2f} A4 {'PASS' if r.get('A4_P_gt_twin_ge_0.65') else 'FAIL'}" if r.get("twin") else "") + (f" | twin_next near/far P {r['twin_next']['p_orig_gt_near']} / {r['twin_next']['p_orig_gt_far']} A4b {'PASS' if r.get('A4b_P_gt_twin_next_ge_0.65') else 'FAIL'}" if r.get("twin_next") else ""))
+        print(f"{src:22s} content ws {r['content_workspace']:6.2f} | all {r['content_all']:5.2f} | P(z>dm) {r['p_orig_gt_dm']:.2f} | rp by band {({b: round(v, 1) for b, v in r['rp_by_band'].items()})} | A1 {r['A1_content_ws_ge_5']} A1b {r['A1b_orig_ws_gt_0']} A2 {r['A2_P_ge_0.70']} A3(no bonus) {r['A3_no_presence_bonus']} [two-sided {r['A3_rp_within_3x_noise']}] -> {'ACCEPT' if r['ACCEPT'] else 'REJECT'}" + (f" | twin P {r['twin']['p_orig_gt_twin']:.2f} A4 {'PASS' if r.get('A4_P_gt_twin_ge_0.65') else 'FAIL'}" if r.get("twin") else "") + (f" | twin_next near/far P {r['twin_next']['p_orig_gt_near']} / {r['twin_next']['p_orig_gt_far']} A4b {'PASS' if r.get('A4b_P_gt_twin_next_ge_0.65') else 'FAIL'}" if r.get("twin_next") else ""))
     for src, e in res["edits"].items():
         for kind, d in e.items():
             keys = [k for k in d if k in ("para_light", "para_strong", "twin", "mask_next", "twin_next")]
