@@ -45,12 +45,17 @@ def main():
         out["sources"].append(os.path.basename(f)); mix = J.get("mix_ckpt")
         for name, v in J["critics"].items():
             meta = {"ckpt": v.get("ckpt"), "step": v.get("step"), "space": space_of(v), "n_rows": v.get("n_rows"), "ode_steps": J.get("ode_steps"), "file": os.path.basename(f)}
+            def _uniq(branch, key):   # reporter #308: the same '<name>[<ckpt dir>@h<steps>]' rule for priors/depth as for text critics
+                prev = out[branch].get(key)
+                if prev is not None and ((prev.get("ckpt") or "") != (v.get("ckpt") or "") or prev.get("ode_steps") != J.get("ode_steps")):
+                    return f"{key}[{os.path.basename(os.path.dirname(v.get('ckpt') or ''))}@h{J.get('ode_steps')}]"
+                return key
             if v.get("cond") == "none":
-                r = v.get("uncond_bits_per_dim_vs_gaussian") or {}
+                r = v.get("uncond_bits_per_dim_vs_gaussian") or {}; name = _uniq("priors", name)
                 out["priors"][name] = meta | {"nll_bits_per_dim": v.get("uncond_nll_bits_per_dim"), "bits_per_dim_vs_gaussian": {"all": r.get("mean"), "by_band": {k: x["mean"] for k, x in (r.get("by_band") or {}).items()}, "by_j": {k: x["mean"] for k, x in (r.get("by_j") or {}).items()}},
                                                 "blind_vs_mix_bits": (v.get("blind_vs_mix_bits") or {}).get("mean"), "mix_ckpt": mix}
             elif v.get("cond") == "depth":
-                e = v["exact_pmi_bits"]
+                e = v["exact_pmi_bits"]; name = _uniq("depth", name)
                 out["depth"][name] = meta | {"exact_gain_bits": e["mean"], "sem": e["sem"], "median": e.get("median"), "frac_positive": e.get("frac_positive"), "by_band": {k: x["mean"] for k, x in (e.get("by_band") or {}).items()},
                                               "by_gap_coarse": {k: x["mean"] for k, x in (e.get("by_gap_coarse") or {}).items()}, "proxy_gain_bits": (v.get("proxy_pmi_bits") or {}).get("mean"),
                                               "vs_mix_bits": (v.get("exact_pmi_vs_mix_bits") or {}).get("mean"), "mix_ckpt": mix}
