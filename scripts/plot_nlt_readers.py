@@ -22,14 +22,14 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--data", required=True); ap.add_argument("--out-dir", required=True); ap.add_argument("--stem", default="reader_usefulness")
     a = ap.parse_args(); d = json.load(open(a.data)); srcs = [(k, l, c) for k, l, c in SOURCES if k in d]
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2})
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10), dpi=150, gridspec_kw={"wspace": 0.18, "hspace": 0.45}); axes = axes.ravel()
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10), dpi=150, gridspec_kw={"wspace": 0.18, "hspace": 0.62}); axes = axes.ravel()
     x = np.arange(len(srcs))
     for ax, (task, title, chance) in zip(axes, TASKS):
         raw = [d[k].get(task) for k, _, _ in srcs]; vals = [100 * v if v is not None else 0 for v in raw]
         ax.bar(x, vals, color=[c for _, _, c in srcs], width=0.58)
         for xi, v, r in zip(x, vals, raw): ax.text(xi, v + 1.2, f"{v:.0f}%" if r is not None else "not run", ha="center", va="bottom", fontsize=11 if r is not None else 9, color=INK if r is not None else INK2)
         ax.axhline(chance, color="#b91c1c", lw=1.2, ls="--"); ax.text(len(srcs) - 0.5, chance + 1.5, f"chance {chance}%", color="#b91c1c", fontsize=10, ha="right")
-        ax.set_xticks(x); ax.set_xticklabels([l for _, l, _ in srcs], fontsize=9.5); ax.set_ylim(0, 100); ax.set_ylabel("reader accuracy, %")
+        ax.set_xticks(x); ax.set_xticklabels([l for _, l, _ in srcs], fontsize=9.5, rotation=25, ha="right", rotation_mode="anchor"); ax.set_ylim(0, 100); ax.set_ylabel("reader accuracy, %")
         ax.set_title(f"Reader given the text only: {title}", loc="left")
         ax.grid(True, axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s in ("top", "right"): ax.spines[s].set_visible(False)
