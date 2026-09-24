@@ -71,7 +71,8 @@ def main():
         maj = true_r.value_counts(normalize=True).iloc[0]
         # gap-informed majority = per-(j-i) majority class: the most a model that knows only the marker count (gap) can reach
         gap_maj = m.loc[rows].groupby("gap")[s].agg(lambda x: x.astype(str).value_counts().index[0]); gi = float((true_r.values == m.loc[rows, "gap"].map(gap_maj).astype(str).values).mean())
-        res["slots"][s] = {"n_scored": int(rows.sum()), "parsed_share": float(ok.mean()), "accuracy_on_parsed": acc, "accuracy_all": float(((pred_r.astype(str) == true_r) & ok).mean()),
+        by_class = {c: {"n": int((true_r == c).sum()), "recall": float(((pred_r.astype(str) == true_r) & (true_r == c)).sum() / max(1, (true_r == c).sum()))} for c in sorted(true_r.unique())}
+        res["slots"][s] = {"n_scored": int(rows.sum()), "parsed_share": float(ok.mean()), "accuracy_on_parsed": acc, "accuracy_all": float(((pred_r.astype(str) == true_r) & ok).mean()), "recall_by_true_class": by_class,
                            "chance": float(1.0 / true_r.nunique()), "majority_class": true_r.value_counts().index[0], "majority_baseline": float(maj), "gap_informed_majority_baseline": gi,
                            "confusion": pd.crosstab(pred_r.fillna("NONE").astype(str), true_r).to_dict()}
     pct = parsed["attn_pct"]; okp = pct.notna()
@@ -88,7 +89,7 @@ def main():
         if sel.any(): res["by_gap_bin"][lab] = {"n": int(sel.sum()), **{s: float(((parsed.loc[sel, s].astype(str) == m.loc[sel, s].astype(str))).mean()) for s in SLOTS}}
     if a.out: json.dump(res, open(a.out, "w"), indent=1)
     print(json.dumps({k: v for k, v in res.items() if k != "slots"}, indent=None)[:600])
-    for s in SLOTS: print(f"  {s:10s} n {res['slots'][s]['n_scored']} parsed {res['slots'][s]['parsed_share']:.3f} acc(all) {res['slots'][s]['accuracy_all']:.3f} | chance {res['slots'][s]['chance']:.3f} majority {res['slots'][s]['majority_class']} {res['slots'][s]['majority_baseline']:.3f} gap-informed {res['slots'][s]['gap_informed_majority_baseline']:.3f}")
+    for s in SLOTS: print(f"  {s:10s} n {res['slots'][s]['n_scored']} parsed {res['slots'][s]['parsed_share']:.3f} acc(all) {res['slots'][s]['accuracy_all']:.3f} | chance {res['slots'][s]['chance']:.3f} majority {res['slots'][s]['majority_class']} {res['slots'][s]['majority_baseline']:.3f} gap-informed {res['slots'][s]['gap_informed_majority_baseline']:.3f} | recall by class " + " ".join(f"{c}:{v['recall']:.2f}(n{v['n']})" for c, v in res['slots'][s]['recall_by_true_class'].items()))
 
 
 if __name__ == "__main__":
