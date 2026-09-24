@@ -311,7 +311,12 @@ def main():
     nstore = None
     if a.neighbor_dir:
         from nlt.rl.sampler import anchor_col
-        nstore = ActStore(a.neighbor_dir, "train", device="cpu"); acol = anchor_col(nstore)
+        import nlt.data.dataset as _ds
+        _orig_glob = _ds.glob.glob                                                 # skip half-written shards (acts_*.tmp.npy left by a stopped extractor)
+        _ds.glob.glob = lambda pat, **k: [f for f in _orig_glob(pat, **k) if ".tmp." not in os.path.basename(f)]
+        try: nstore = ActStore(a.neighbor_dir, "train", device="cpu")
+        finally: _ds.glob.glob = _orig_glob
+        acol = anchor_col(nstore)
         anchors = set(nstore.meta[acol].tolist()); has_nb = store.meta["pos_idx"].isin(anchors).values
         print(f"[rl] neighbour store: {nstore.N} rows for {len(anchors)} anchors (covers {has_nb.mean():.1%} = {int(has_nb.sum())} of the train store rows), offsets {sorted(nstore.meta['offset'].unique().tolist()) if 'offset' in nstore.meta else '?'}", flush=True)
         if a.neighbor_only_anchors:
