@@ -333,6 +333,13 @@ def claims_gates(adapter: str, tag: str, extra: str = ""):
     return _claims([f"{REPO_REMOTE}/scripts/claims_gates.py", "--adapter", adapter, "--tag", tag] + extra.split())
 
 
+@app.function(gpu="B200", timeout=4 * 3600, **COMMON)
+def claims_compose_variants(adapter: str, tag: str, extra: str = ""):
+    """eval only: velocity-composition weights (mean / sum / w(t) linear / hard switch) and singles-minus-LM-redundancy on the 120-row benchmark"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_compose_variants.py", "--adapter", adapter, "--tag", tag] + extra.split())
+
+
 @app.function(gpu="B200", timeout=6 * 3600, **COMMON)
 def claims_finalize(root: str, extra: str = ""):
     """synthetic claims: merge the three families per anchor, near-duplicate removal (sentence embeddings), stats -> {root}/final"""
@@ -401,6 +408,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", claims_compose.remote(ckpt, tag, extra))
     elif task == "claims_gates":   # --ckpt = adapter path, --tag = output tag
         print("rc", claims_gates.remote(ckpt, tag, extra))
+    elif task == "claims_compose_variants":   # --ckpt = adapter path, --tag = output tag
+        print("rc", claims_compose_variants.remote(ckpt, tag, extra))
     elif task == "claims_finalize":
         print("rc", claims_finalize.remote(root, extra))
     elif task == "gen_onpolicy":
