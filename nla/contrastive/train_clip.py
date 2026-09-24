@@ -135,6 +135,7 @@ def main():
     if ddp: dist.init_process_group("nccl"); rank, world = dist.get_rank(), dist.get_world_size(); dev = torch.device("cuda", int(os.environ["LOCAL_RANK"])); torch.cuda.set_device(dev)
     else: rank, world, dev = 0, 1, torch.device("cuda")
     torch.manual_seed(a.seed); is0 = rank == 0; os.makedirs(a.out, exist_ok=True)
+    torch.backends.cuda.enable_cudnn_sdp(False)   # clipQ_opus_top12 died at step 195 on a cuDNN SDPA graph failure (backward through the LoRA trunk)
     from transformers import AutoTokenizer
     from nla.flow.model import Normalizer
     from nla.flow.train_cond import ARVecEncoder
