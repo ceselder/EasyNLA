@@ -151,58 +151,6 @@
    "note": "rl #690: one headline + one record checkpoint per RL arm; the co-trained listener critic.pt of each step is NOT shipped (GBs each; on the volume)"
   },
   {
-   "name": "nlt-qwen3-8b-critics",
-   "type": "model",
-   "card": "critics.md",
-   "files": [
-    {
-     "src": "/vol/critic/none_v1_pooled/eval_latest.json",
-     "dst": "none_v1_pooled"
-    },
-    {
-     "src": "/vol/critic/none_v1_squash/eval_latest.json",
-     "dst": "none_v1_squash"
-    },
-    {
-     "src": "/vol/data/qwen3_8b/stats.pt"
-    },
-    {
-     "src": "/vol/data/qwen3_8b/stats.json"
-    },
-    {
-     "src": "/vol/data/qwen3_8b/spikes.json"
-    }
-   ],
-   "card_vars": {
-    "critic_list": "Priority order: none_v1_pooled (the blind prior every text critic sits on), depth_v1_pooled (told-depth diagnostic / p_mix), text_union_pooled_big (first natural-language sources over the content gate), enc_e2 (Qwen3-8B-L24 encoder adapter; the first critic to pass the RL acceptance on lens text), critic_para_p3 (paraphrase-augmented adapter; the first MEANING-reading critic: PMI(orig) +9..+12, paraphrase retention 0.74/0.84, twin_far 0.66), critic_v3b_fbp (v3 recipe, pooled, full pool), then none_v1_squash, text_union_pooled_n, critic_v3b_e2p / e2sentp, none_v2 (4.4B prior, stopped early), critic_v3a_nd (record). Steps are in each folder's best.json / eval_latest.json."
-   },
-   "builders": [
-    {
-     "kind": "strip_ckpt",
-     "dst": "",
-     "sidecars": [
-      "best.json",
-      "eval_latest.json"
-     ],
-     "src": [
-      "/vol/critic/none_v1_pooled/ckpt_final.pt",
-      "/vol/critic/depth_v1_pooled/ckpt_final.pt",
-      "/vol/critic/text_union_pooled_big/ckpt_best.pt",
-      "/vol/critic/enc_e2/ckpt_best.pt",
-      "/vol/critic/critic_para_p3/ckpt_latest.pt",
-      "/vol/critic/critic_v3b_fbp/ckpt_best.pt",
-      "/vol/critic/none_v1_squash/ckpt_final.pt",
-      "/vol/critic/text_union_pooled_n/ckpt_best.pt",
-      "/vol/critic/critic_v3b_e2p/ckpt_best.pt",
-      "/vol/critic/critic_v3b_e2sentp/ckpt_best.pt",
-      "/vol/critic/none_v2/ckpt_latest.pt",
-      "/vol/critic/critic_v3a_nd/ckpt_best.pt"
-     ]
-    }
-   ],
-   "note": "priority order (quota): pooled prior, told-depth, union_pooled_big, enc_e2 (first accepted critic), critic_para_p3 (first meaning-reading critic), v3b_fbp, then the rest; optimizer states stripped"
-  },
-  {
    "name": "nlt-teacher-sonnet-v1",
    "type": "dataset",
    "card": "teacher.md",
@@ -355,6 +303,59 @@
     }
    ],
    "card_vars": {}
+  },
+  {
+   "name": "nlt-qwen3-8b-critics",
+   "type": "model",
+   "card": "critics.md",
+   "files": [
+    {
+     "src": "/vol/critic/none_v1_pooled/eval_latest.json",
+     "dst": "none_v1_pooled"
+    },
+    {
+     "src": "/vol/critic/none_v1_squash/eval_latest.json",
+     "dst": "none_v1_squash"
+    },
+    {
+     "src": "/vol/data/qwen3_8b/stats.pt"
+    },
+    {
+     "src": "/vol/data/qwen3_8b/stats.json"
+    },
+    {
+     "src": "/vol/data/qwen3_8b/spikes.json"
+    }
+   ],
+   "card_vars": {
+    "critic_list": "Priority order and gate status (redteam #713; every 'accepted' cites data/acceptance_<critic>.json and names the register): none_v1_pooled -- blind conditional flow prior, 1.89B, exact NLL 0.742 bits/dim (+1.41 vs N(0,I)); depth_v1_pooled -- told-depth diagnostic (FORBIDDEN as a critic), +29.7 exact bits vs blind; text_union_pooled_big -- accepted on teacher / V0 text (content 5-9 bits, PMI(z) > 0), paraphrase-invariant (0.96 / 0.92), twin gate FAIL (0.53 / 0.50); enc_e2 (Qwen3-8B-L24 encoder adapter) -- accepted on J-lens-register descriptions ONLY (lens_L1: A1/A1b/A2/A3 pass); on free verbalizer text PMI(z) < 0 (a pure mismatcher); not claim-sensitive (twin gate FAIL on every register); critic_para_p3 (paraphrase-augmented adapter) -- paraphrase-invariant (retention 0.88 / 0.90 median on teacher text), twin gate FAIL (0.589 teacher / 0.473 V0 = chance), twin_far 0.657 on the selection slice, held-out acceptance pending; critic_v3b_fbpc (v3 recipe, pooled prior, full pool, decaying-lr continuation; exact-selected numbered checkpoint) -- selection-slice numbers lens_L1 PMI +14..+20 / content 17-19 / P(z>dm) 0.77-0.80, V0 +6..+12 / 8 / 0.68; held-out acceptance pending; then none_v1_squash (documents the squash finding), text_union_pooled_n (first-budget headline), critic_v3b_e2pc / e2sentpc (8B-L24 encoder continuations), none_v2 (4.4B prior, stopped early; record), critic_v3a_nd (record). Steps in each folder's best.json / eval_latest.json / BEST.txt."
+   },
+   "builders": [
+    {
+     "kind": "strip_ckpt",
+     "dst": "",
+     "sidecars": [
+      "best.json",
+      "eval_latest.json",
+      "BEST.txt"
+     ],
+     "src": [
+      "/vol/critic/none_v1_pooled/ckpt_final.pt",
+      "/vol/critic/depth_v1_pooled/ckpt_final.pt",
+      "/vol/critic/text_union_pooled_big/ckpt_best.pt",
+      "/vol/critic/enc_e2/ckpt_best.pt",
+      "BEST:/vol/critic/critic_para_p3/BEST.txt",
+      "BEST:/vol/critic/critic_v3b_fbpc/BEST.txt",
+      "/vol/critic/none_v1_squash/ckpt_final.pt",
+      "/vol/critic/text_union_pooled_n/ckpt_best.pt",
+      "BEST:/vol/critic/critic_v3b_e2pc/BEST.txt",
+      "BEST:/vol/critic/critic_v3b_e2sentpc/BEST.txt",
+      "/vol/critic/none_v2/ckpt_latest.pt",
+      "/vol/critic/critic_v3a_nd/ckpt_best.pt"
+     ]
+    }
+   ],
+   "note": "#708/#711: priority order; BEST:<dir>/BEST.txt = the numbered EXACT-selected checkpoint named inside (never ckpt_best.pt of a v3b arm: proxy-selected); records (none_v2, v3a_nd) last"
   }
  ]
 }

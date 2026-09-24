@@ -59,6 +59,12 @@ def _build_dataset_files(repo: dict, work: str, plan_only: bool = False) -> list
         kind = b["kind"]
         if kind == "strip_ckpt":                        # critic checkpoint without optimizer states (22-39 GB -> 4-13 GB); keeps model/args/config/step/d_enc
             for src in b["src"]:
+                if src.startswith("BEST:"):             # the run's exact-selected checkpoint, named inside <dir>/BEST.txt (a path; fallback: ckpt_latest.pt with a note)
+                    bf = src[5:]; d_ = os.path.dirname(bf)
+                    if os.path.exists(bf):
+                        named = open(bf).read().strip().split()[0]; src = named if os.path.isabs(named) else os.path.join(d_, named)
+                    else:
+                        src = os.path.join(d_, "ckpt_latest.pt"); print(f"   NOTE {bf} missing -> using ckpt_latest.pt (not exact-selected)", flush=True)
                 dst = os.path.join(work, b["dst"], os.path.basename(os.path.dirname(src)), os.path.basename(src)); os.makedirs(os.path.dirname(dst), exist_ok=True)
                 if plan_only or not os.path.exists(src):
                     out.append((src if os.path.exists(src) else src + ".MISSING", os.path.relpath(dst, work))); continue
