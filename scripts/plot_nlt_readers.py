@@ -14,7 +14,7 @@ SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 SOURCES = [("reader_teacher_v1", "teacher\n+lens +final", "#2a78d6"), ("reader_teacher_nofinal_v1", "teacher\n+lens", "#eb6834"),
            ("reader_teacher_nolens_v1", "teacher\npassage only", "#1baf7a"), ("reader_lensdiff_jlens_L1", "J-lens\nsentence", "#4a3aa7"),
            ("reader_v0_ao_tsv1", "verbalizer\nactivations only", "#e34948"), ("reader_lensdiff_jlens_L3", "J-lens lists\ntwo readouts", "#e87ba4"),
-           ("reader_prelim_v1n_20", "plain-PMI RL\nstep 20", "#eda100"), ("reader_prelim_v1n_40", "plain-PMI RL\nstep 40", "#008300"), ("reader_ref_v1_0", "list-naming\nwarm start (V0b)", "#87867F")]
+           ("reader_prelim_v1n_20", "plain-PMI RL\nstep 20", "#eda100"), ("reader_prelim_v1n_40", "plain-PMI RL\nstep 40", "#008300"), ("reader_ref_v1_0", "list-naming\nwarm start (V0b)", "#87867F"), ("reader_dossier_sonnet_v0_v1", "feature dossier\n(no passage)", "#b07aa1")]
 TASKS = [("top1", "model's final top-1 among 4", 25), ("posmatch", "position among 5 cuts of the doc", 20), ("direction", "direction of change (lens j vs i)", 50), ("category", "next-token category (5 classes)", 30)]
 
 
@@ -34,7 +34,7 @@ def main():
         ax.grid(True, axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for s in ("top", "right"): ax.spines[s].set_visible(False)
     fig.text(0.01, 0.005, "Sonnet-5 sees ONE sentence and no activations or passage; 512 fixed-eval pairs per source; accuracy on parsed answers. Teacher rows partly read back what the teacher was shown; V0 and lens rows are uncontaminated.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
-    fig.suptitle("A verbalizer trained on activations alone writes sentences from which a reader recovers the model's next token and document position far above chance;\nthe plain-PMI RL arm loses that content as it collapses onto fewer phrasings (steps 20, 40), and the list-naming warm start keeps the next token but loses the position", fontsize=12.5, x=0.01, ha="left")
+    fig.suptitle("A verbalizer trained on activations alone writes sentences from which a reader recovers the model's next token and document position far above chance;\nthe plain-PMI RL arm loses that content as it collapses onto fewer phrasings (steps 20, 40); the list-naming warm start keeps the next token but loses the position; a description written from SAE features and lens readouts without the passage reads like the lens sentence", fontsize=12.5, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0.035, 1, 0.965)); os.makedirs(a.out_dir, exist_ok=True)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.out_dir, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"sources": [{"key": k, "label": l.replace("\n", " ")} | {t: d[k].get(t) for t, _, _ in TASKS} | {"claim": d[k].get("claim"), "fluency": d[k].get("fluency"), "mag_rho": d[k].get("mag_rho")} for k, l, _ in srcs],
