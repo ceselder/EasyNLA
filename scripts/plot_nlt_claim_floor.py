@@ -37,7 +37,7 @@ def main():
             for b, y in zip(bars, ys):
                 if y == y: ax.text(b.get_x() + b.get_width() / 2, y + 0.006, f"{y:.2f}", ha="center", va="bottom", fontsize=8.5, color=INK2, rotation=90)
         l1 = ax.axhline(0.5, color=INK2, lw=1.0, ls=(0, (4, 2)), label="chance 0.50")
-        l2 = ax.axhline(0.65, color=CAT[7], lw=1.2, ls=(0, (4, 2)), label="claim gate A4: P ≥ 0.65")
+        l2 = ax.axhline(0.65, color=CAT[7], lw=1.2, ls=(0, (4, 2)), label="claim gate: P ≥ 0.65")
         xt = []
         for c in critics:
             pmi = (C["critics"][c].get(reg) or {}).get("pmi_orig_bits")

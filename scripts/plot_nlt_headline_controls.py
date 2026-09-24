@@ -51,7 +51,7 @@ def main():
         vals = [(r.get("content_by_band") or {}).get(bk, np.nan) for r in rows]
         ax2.bar(x + bi * wb - 0.4 + wb / 2, vals, wb * 0.92, color=col, label=blab)
     ax2.axhline(0, color=INK2, lw=0.8); ax2.set_xticks(x); ax2.set_xticklabels([LABEL.get(r["source"], r["source"]) for r in rows], fontsize=9.5); ax2.grid(axis="x", visible=False)
-    ax2.set_ylabel("content bits = own sentence − depth-matched wrong sentence, by band"); ax2.legend(frameon=False, loc="upper right", fontsize=10)
+    ax2.set_ylabel("content bits = own − wrong-depth sentence, by band"); ax2.legend(frameon=False, loc="upper right", fontsize=10)
     def rng(key):
         v = [(r.get("content_by_band") or {}).get(key) for r in rows]; v = [x for x in v if x is not None]
         return (min(v), max(v)) if v else (float("nan"), float("nan"))

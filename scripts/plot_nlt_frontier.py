@@ -61,7 +61,7 @@ def main():
         xl = min(200, 22 / bpt); ax.text(xl, bpt * xl * 1.08, f"{bpt:g} bits / token", color=INK2, fontsize=9.5, ha="right", va="bottom")
     ax.set_xscale("log"); ax.set_yscale("symlog", linthresh=1); ax.set_xlim(5, 220); ax.set_ylim(-0.3, 25)
     ax.set_yticks([0, 0.5, 1, 2, 3, 5, 10, 20]); ax.set_yticklabels(["0", "0.5", "1", "2", "3", "5", "10", "20"]); ax.set_xticks([10, 20, 40, 80, 160]); ax.set_xticklabels(["10", "20", "40", "80", "160"])
-    ax.set_xlabel("mean length of the text, tokens (log scale)"); ax.set_ylabel("paired content bits = own sentence − depth-matched wrong sentence, all bands")
+    ax.set_xlabel("mean length of the text, tokens (log scale)"); ax.set_ylabel("paired content bits = own − wrong-depth sentence, all bands")
     ax.legend(frameon=False, loc="upper left", fontsize=9.5); ax.axhline(0, color=INK2, lw=0.8)
     ax.set_title("Natural-language sources sit between 0.01 and 0.5 bits per token and gain sub-linearly with length;\nthe wider 16-slot adapter roughly doubles every source; the raw lens list at the same length is 2–4× higher still", loc="left", fontsize=12.5)
     fig.suptitle("\n".join(textwrap.wrap("The bits-per-token frontier the spec asks for is concave and low: natural-language sources buy 1–6 content bits at 0.02–0.5 bits per token under the pooled "

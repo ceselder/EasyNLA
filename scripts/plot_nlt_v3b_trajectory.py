@@ -57,7 +57,7 @@ def main():
             ax1.axhline(refs[st][1], color="#87867F", lw=1.2, ls=(0, (4, 2))); ax1.text(0.01, 0.97, f"{refs[st][0]}: {refs[st][1]:+.1f}", transform=ax1.transAxes, ha="left", va="top", fontsize=9.5, color=INK2)
         ax1.set_title("exact PMI of the TRUE text vs the blind prior", loc="left", fontsize=11.5)
         ax2.set_title("paired content = own − depth-matched wrong sentence", loc="left", fontsize=11.5)
-        ax1.set_ylabel("exact bits (true text vs empty text)"); ax2.set_ylabel("content bits (label = P(own beats the depth-matched wrong sentence))"); ax2.axhline(0, color=INK2, lw=0.9)
+        ax1.set_ylabel("exact bits (true text vs empty text)"); ax2.set_ylabel("content bits (label = P(own beats wrong-depth text))"); ax2.axhline(0, color=INK2, lw=0.9)
         for ax in (ax1, ax2):
             ax.set_xlabel("training step (checkpoint)"); ax.grid(color=GRID)
             for s_ in ("top", "right"): ax.spines[s_].set_visible(False)
@@ -67,7 +67,7 @@ def main():
         ax1 = axes[r][0]; fig.text(0.01, ax1.get_position().y1 + 0.045, f"({'abc'[r]}) {slab}", fontsize=12.5, fontweight="bold", ha="left", va="bottom")
     fig.suptitle("\n".join(textwrap.wrap("Scaled-up critics on the pooled prior: at a constant learning rate the true text's exact presence penalty stays at −20 to −40 bits from step 3000; continuing the step-7000 checkpoint with a DECAYING rate (orange) lifts the true text above silence on all three registers (+13.7 / +6.4 / +17.8 bits at step 8000) — the first checkpoints meeting the listener conditions on their selection slice, though held out the twin test still fails (Qwen3-8B layers 9–34; 256 fixed pairs per set; exact ODE, Heun 32) — PRELIMINARY", 96)), x=0.01, y=0.995, ha="left", va="top", fontsize=14)
     fig.legend(_h, _l, frameon=False, fontsize=10, loc="upper left", bbox_to_anchor=(0.01, 0.875), ncol=3, handlelength=2.0, columnspacing=1.4)
-    fig.text(0.01, 0.005, "Infra's per-checkpoint exact spot checks (data/info_budget.json keys v3b<arm>_s<step>; own rows, no shuffled-words control). Read as trajectories, not endpoints (board #593). The hard condition for a listener is exact PMI(z) > 0 on the lens-sentence AND verbalizer slices with P(z > z_dm) ≥ 0.65 on the verbalizer slice.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
+    fig.text(0.01, 0.005, "Infra's per-checkpoint exact spot checks (data/info_budget.json keys v3b<arm>_s<step>; own rows, no shuffled-words control). Read as trajectories, not endpoints (board #593). The hard condition for a listener is exact PMI(z) > 0 on the lens-sentence AND verbalizer slices with P(own beats wrong-depth text) ≥ 0.65 on the verbalizer slice.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
     fig.subplots_adjust(left=0.08, right=0.98, top=0.78, bottom=0.07, hspace=0.75, wspace=0.30)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"arms": {arm: {"label": next((l for k, l, _, _ in ARMS if k == arm), arm), "sets": sets} for arm, sets in traj.items()}, "references": refs}, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)
