@@ -152,6 +152,11 @@ def fig_scaling(rep, out):
             c = INK if r["text"] == "prose" else GREY; ax.scatter([r["n_pairs"]], [r["gain"]], marker="D", s=80, color=c, zorder=5, label=f"{'Sonnet prose' if r['text'] == 'prose' else 'lens-diff text'}, same {r['n_pairs'] // 1000}k pairs: {r['gain']:+.3f}")
     ax.axhline(0, color=INK, lw=0.8); ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off()
     ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("FVE of Δ gained over the same net with no text")
+    # absolute-FVE inset-free context: annotate what a text-free h_i-only MLP reaches with the same loss (fixed references)
+    fb = S.get("fixed_baselines_energy_loss") or {}
+    if fb:
+        txt = "; ".join(f"{'no depth' if 'nodepth' in k else 'TOLD depth'} @ {fb[k]['n_train'] // 1000}k: {fb[k]['fve']:.3f}" for k in ("mlp_nodepth_matched", "mlp_nodepth_extra", "mlp_depth_extra") if k in fb)
+        ax.text(0.02, 0.02, "h_i-only MLP, same loss, absolute FVE(Δ): " + txt, transform=ax.transAxes, fontsize=8.5, color=INK, va="bottom")
     ax.set_title(S.get("title_left", "Does the bullet-list gain rise with data?\n(held-out val rows 0:1024, energy-weighted loss, gap ≥ 2)")); ax.legend(frameon=False, fontsize=9, loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
     ax = axes[1]
     ax.plot(x, [r["bits_median"] for r in pts], marker="o", lw=2.5, color=CLAY, label="median bits per list (d_eff)")
