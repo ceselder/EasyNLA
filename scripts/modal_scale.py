@@ -47,8 +47,7 @@ app = modal.App("nla-scale")
 LABEL_CFG = dict(fp8=False, fp8_kv=False, max_num_seqs=1024, max_num_batched_tokens=32768, n=1, attention_backend="TRITON_FLASHINFER")   # backend: [gemma-engine] 03:40 win, quality-guarded
 
 
-def _llm(cfg=None):
-    from vllm import LLM
+def _engine_kwargs(cfg=None):
     c = {**LABEL_CFG, **(cfg or {})}
     kw = dict(model=LABELLER, dtype="bfloat16", max_model_len=8192, gpu_memory_utilization=0.90, limit_mm_per_prompt={"image": 0},
               max_num_seqs=c["max_num_seqs"], enable_prefix_caching=True, seed=0)
@@ -56,7 +55,12 @@ def _llm(cfg=None):
     if c.get("attention_backend"): kw["attention_backend"] = c["attention_backend"]
     if c.get("fp8"): kw["quantization"] = "fp8"
     if c.get("fp8_kv"): kw["kv_cache_dtype"] = "fp8"
-    return LLM(**kw)
+    return kw
+
+
+def _llm(cfg=None):
+    from vllm import LLM
+    return LLM(**_engine_kwargs(cfg))
 
 
 def _label(llm, texts, variants, max_prefix_chars=24000, n=1):
@@ -145,23 +149,71 @@ def _g2_lib():
     return json.load(open(p)) if os.path.exists(p) else None
 
 
+class _AsyncGen:
+    """AsyncLLM on a persistent per-container event loop, pre-tokenised requests: the chat template + tokenisation run in a worker thread in
+    500-prompt batches, so the engine gets work while later prompts are still being encoded ([gemma-pipeline] g2_async, pipeline=False:
+    +5.6% positions/s with identical outputs vs llm.chat, which tokenises ~100k prompts single-threaded first)."""
+    def __init__(self, cfg=None):
+        import asyncio, threading
+        from transformers import AutoTokenizer
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        try: from vllm.v1.engine.async_llm import AsyncLLM
+        except ImportError: from vllm import AsyncLLMEngine as AsyncLLM
+        self.tok = AutoTokenizer.from_pretrained(LABELLER, token=os.environ.get("HF_TOKEN")); self.n = 0
+        self.loop = asyncio.new_event_loop(); threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        kw = _engine_kwargs(cfg)
+        async def mk(): return AsyncLLM.from_engine_args(AsyncEngineArgs(**kw))
+        self.engine = asyncio.run_coroutine_threadsafe(mk(), self.loop).result()
+
+    def _encode(self, contents):
+        return self.tok([self.tok.apply_chat_template([{"role": "user", "content": c}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                         for c in contents], add_special_tokens=False)["input_ids"]
+
+    def generate(self, contents, sps):
+        """contents: user messages; sps: one SamplingParams or a list -> [(text, n_prompt_tokens, n_out_tokens)] in order"""
+        import asyncio
+        from vllm.sampling_params import RequestOutputKind
+        sps = sps if isinstance(sps, list) else [sps] * len(contents)
+        async def one(ids, sp, rid):
+            final = None
+            async for o in self.engine.generate({"prompt_token_ids": ids}, sp, rid): final = o
+            return final
+        async def run():
+            loop = asyncio.get_running_loop(); tasks = []
+            for b0 in range(0, len(contents), 500):
+                ids = await loop.run_in_executor(None, self._encode, contents[b0:b0 + 500])
+                for j, pid in enumerate(ids):
+                    sp = sps[b0 + j].clone(); sp.output_kind = RequestOutputKind.FINAL_ONLY; self.n += 1
+                    tasks.append(asyncio.ensure_future(one(pid, sp, f"r{self.n}")))
+            outs = await asyncio.gather(*tasks)
+            return [(o.outputs[0].text, len(o.prompt_token_ids), len(o.outputs[0].token_ids)) for o in outs]
+        return asyncio.run_coroutine_threadsafe(run(), self.loop).result()
+
+
+def _sync_gen(llm):
+    """llm.chat backend with the same interface as _AsyncGen.generate"""
+    def generate(contents, sps):
+        res = llm.chat([[{"role": "user", "content": c}] for c in contents], sps, use_tqdm=False, chat_template_kwargs={"enable_thinking": False})
+        return [(r.outputs[0].text, len(r.prompt_token_ids), len(r.outputs[0].token_ids)) for r in res]
+    return generate
+
+
 def _g2_rows(llm, texts, keys, docs, k=G2_K):
     """stage A fact sheets (sampled context window) + validation, programmatic ladders/twins, stage B k renderings at sampled style points + QC.
     -> (records aligned with texts, timing stats)"""
     import random
     from vllm import SamplingParams
     from nla.datagen import g2_spec as G
-    lib = _g2_lib(); ck = {"enable_thinking": False}
+    lib = _g2_lib(); gen = llm.generate if isinstance(llm, _AsyncGen) else _sync_gen(llm)
     wins = [G._pick(G.WINDOWS, random.Random(f"w|{key}")) for key in keys]
     ctxs = [G.window(t, w) for t, w in zip(texts, wins)]
     t0 = time.time()
-    resA = llm.chat([[{"role": "user", "content": G.FACT_PROMPT.format(text=c)}] for c in ctxs], SamplingParams(temperature=0.3, top_p=0.95, max_tokens=900),
-                    use_tqdm=False, chat_template_kwargs=ck)
-    tA = time.time() - t0; nA_in = sum(len(r.prompt_token_ids) for r in resA); nA_out = sum(len(r.outputs[0].token_ids) for r in resA)
+    resA = gen([G.FACT_PROMPT.format(text=c) for c in ctxs], SamplingParams(temperature=0.3, top_p=0.95, max_tokens=900))
+    tA = time.time() - t0; nA_in = sum(r[1] for r in resA); nA_out = sum(r[2] for r in resA)
     facts, vstats = [], []
     n_bad = 0
     for r, c in zip(resA, ctxs):
-        f = G.parse_facts(r.outputs[0].text)
+        f = G.parse_facts(r[0])
         if f is None: facts.append(None); vstats.append(None); continue
         try: v, st = G.validate(f, c); G.fact_list(v)
         except Exception: n_bad += 1; facts.append(None); vstats.append(None); continue          # one malformed fact sheet must never fail the shard
@@ -186,13 +238,12 @@ def _g2_rows(llm, texts, keys, docs, k=G2_K):
             except Exception: n_bad += 1; continue
             jobs.append((i, j, pr, G.RENDER_MAX_TOKENS[st_["length"]])); plans.append((st_, plan, fl, tw))
     t0 = time.time()
-    resB = llm.chat([[{"role": "user", "content": pr}] for _, _, pr, _ in jobs], [SamplingParams(temperature=0.9, top_p=0.95, max_tokens=mt) for *_, mt in jobs],
-                    use_tqdm=False, chat_template_kwargs=ck)
-    tB = time.time() - t0; nB_in = sum(len(r.prompt_token_ids) for r in resB); nB_out = sum(len(r.outputs[0].token_ids) for r in resB)
+    resB = gen([pr for _, _, pr, _ in jobs], [SamplingParams(temperature=0.9, top_p=0.95, max_tokens=mt) for *_, mt in jobs])
+    tB = time.time() - t0; nB_in = sum(r[1] for r in resB); nB_out = sum(r[2] for r in resB)
     recs = [{"window": wins[i], "facts": None if facts[i] is None else json.dumps(facts[i], ensure_ascii=False), "claims": G.claims(facts[i]) if facts[i] else [],
              "fact_ladders": None, "renders": [], "styles": [], "qc": [], "validate": json.dumps(vstats[i]) if vstats[i] else None} for i in range(len(texts))]
     for (i, j, _, _), r, (st_, plan, fl, tw) in zip(jobs, resB, plans):
-        txt = G.parse_render(r.outputs[0].text)
+        txt = G.parse_render(r[0])
         recs[i]["renders"].append(txt); recs[i]["styles"].append(json.dumps(st_))
         recs[i]["qc"].append(json.dumps(G.qc_render(txt, fl, plan, ctxs[i], tw) if txt else {"parse_fail": 1}))
         if recs[i]["fact_ladders"] is None: recs[i]["fact_ladders"] = json.dumps([{**x, "twin": t} for x, t in zip(fl, tw)], ensure_ascii=False)
@@ -234,14 +285,28 @@ def g2_label(sid: int, src: str, out_root: str):
     vol_glp.reload()
     if _exists(out): return "exists"
     d = pq.read_table(f"{src}/pos/pos_{sid:04d}.parquet", columns=["doc_id", "n_raw_tokens", "text"]).to_pydict()
-    global _LLM
-    if "_LLM" not in globals(): _LLM = _llm()
-    recs, st = _g2_rows(_LLM, d["text"], [f"{a}|{b}" for a, b in zip(d["doc_id"], d["n_raw_tokens"])], d["doc_id"])
-    import vllm as _v; eng = f"vllm-{_v.__version__}-{LABEL_CFG.get('attention_backend') or 'auto'}"
+    global _AGEN
+    if "_AGEN" not in globals(): _AGEN = _AsyncGen()
+    recs, st = _g2_rows(_AGEN, d["text"], [f"{a}|{b}" for a, b in zip(d["doc_id"], d["n_raw_tokens"])], d["doc_id"])
+    import vllm as _v; eng = f"vllm-{_v.__version__}-{LABEL_CFG.get('attention_backend') or 'auto'}-asyncpretok"
     rows = [{"doc_id": a, "n_raw_tokens": b, **r, "engine": eng} for a, b, r in zip(d["doc_id"], d["n_raw_tokens"], recs)]
     st["engine"] = eng
     os.makedirs(f"{out_root}/lab", exist_ok=True); pq.write_table(pa.Table.from_pylist(rows), out, compression="zstd"); vol_glp.commit()
     st["sid"] = sid; print("[g2label]", json.dumps(st), flush=True); return st
+
+
+@app.function(image=image_g, gpu="B200", timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=128 * 1024)
+def g2_async_smoke(n: int = 2000):
+    """the async pre-tokenised labeller on n real g1 positions (two back-to-back calls = the per-container engine reuse across shards)"""
+    import pyarrow.parquet as pq
+    d = pq.read_table(f"{ROOT}/g1/pos/pos_0000.parquet", columns=["doc_id", "n_raw_tokens", "text"]).slice(0, n).to_pydict()
+    keys = [f"{a}|{b}" for a, b in zip(d["doc_id"], d["n_raw_tokens"])]
+    t0 = time.time(); g = _AsyncGen(); load = time.time() - t0
+    h = n // 2; r1, s1 = _g2_rows(g, d["text"][:h], keys[:h], d["doc_id"][:h]); r2, s2 = _g2_rows(g, d["text"][h:], keys[h:], d["doc_id"][h:])
+    recs = r1 + r2; ren = [t for r in recs for t in r["renders"]]
+    out = {"load_s": load, "call1": s1, "call2": s2, "render_parse": sum(t is not None for t in ren) / max(1, len(ren)), "facts_ok": sum(r["facts"] is not None for r in recs) / len(recs),
+           "positions_passing": sum(r["n_pass"] > 0 for r in recs) / len(recs), "example": next((t for t in ren if t), None)}
+    print("[g2smoke]", json.dumps(out)[:3000], flush=True); return out
 
 
 @app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=64 * 1024)
@@ -317,6 +382,8 @@ def run_g2(src_tag: str = "g1", tag: str = "g2", max_shards: int = 0):
                     except Exception as e:
                         inflight.pop(key); fails[key] = fails.get(key, 0) + 1; print(f"[run_g2] {key} failed #{fails[key]}: {str(e)[:200]}", flush=True)
                 if fails.get(key, 0) >= 3 or key in inflight: continue
+                if key.startswith("g2lab|") and sum(1 for k in inflight if k.startswith("g2lab|")) >= 8: continue   # never queue beyond the 8 labellers:
+                # queued inputs stay bound to the deploy version they were spawned under, so a capped queue lets redeploys take effect at shard boundaries
                 if key.startswith("acts|") and n_lab_open == 0 and sum(1 for k in inflight if k.startswith("acts|")) >= 2: fn = extract_burst
                 inflight[key] = fn.spawn(*args)
         cnt = dict(pos=len(sids), g2_lab=sum(have(R, "lab", s) for s in sids), acts=sum(have(S, "acts", s) for s in sids), g2_shards=sum(have(R, "shards", s) for s in sids),
@@ -448,8 +515,8 @@ def _extract_impl(sid: int, root: str = ROOT):
     try:
         while i0 < len(docs_):
             n = 1
-            while i0 + n < len(docs_) and (n + 1) * len(ids_of[docs_[i0 + n]]) <= budget and n < 256: n += 1
-            b = docs_[i0:i0 + n]; L = len(ids_of[b[-1]])
+            while i0 + n < len(docs_) and (n + 1) * (-(-len(ids_of[docs_[i0 + n]]) // 256) * 256) <= budget and n < 256: n += 1
+            b = docs_[i0:i0 + n]; L = -(-len(ids_of[b[-1]]) // 256) * 256              # round up to x256: bounded set of autotuned (batch, length) shapes
             x = torch.zeros(n, L, dtype=torch.long); am = torch.zeros(n, L, dtype=torch.long)
             for j, k in enumerate(b):
                 s = ids_of[k]; x[j, :len(s)] = torch.tensor(s); am[j, :len(s)] = 1
@@ -562,6 +629,7 @@ def main(task: str = "pilot", n: int = 3000, nv: int = 400, n_docs: int = 100000
     if task == "pilot": print(pilot.remote(n, nv))
     elif task == "run": print(run.remote(n_docs, slices, tag, max_shards))
     elif task == "docs": print(docs_all.remote(n_docs, slices, tag))
+    elif task == "g2asyncsmoke": print(json.dumps(g2_async_smoke.remote(n))[:3000])
     elif task == "g2pilot":
         rows = sorted(int(k.split("|")[1]) for k in json.load(open("/home/celeste/shared/reports/nla-flow-prior/data/scale/pilot_judge.json"))["rows"] if k.startswith("opus|"))
         print(g2_pilot.remote(rows, n, f"{ROOT}/g1", tag))
