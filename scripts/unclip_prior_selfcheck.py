@@ -93,12 +93,15 @@ def main():
         from nla.unclip.prior import exact_logp
         from nla.unclip.critic import _MemModel
         gu = torch.Generator(device=dev).manual_seed(5); lpu = exact_logp(_MemModel(C.model, None, None, None), CX[:R], n_steps=st, probes=1, gen=gu).cpu()
+        assert not torch.isnan(lpu).any()
         RB = max(1, 2048 // R)
         for i0 in range(0, R, RB):
             rows = list(range(i0, min(R, i0 + RB))); nr = len(rows); xx = CX[rows].repeat_interleave(R, 0)
-            jj = torch.arange(R, device=dev).repeat(nr); mm = _MemModel(C.model, mem[jj] if mem is not None else None, mk[jj], g[jj] if g is not None else None)
-            gx = torch.Generator(device=dev).manual_seed(5); Lp[rows] = exact_logp(mm, xx, n_steps=st, probes=1, gen=gx).view(nr, R).cpu()
+            jj = torch.arange(R, device=dev).repeat(nr); mm_ = mem[jj] if mem is not None else None; gg_ = g[jj] if g is not None else None
+            mm = _MemModel(C.model, mm_, mk[jj], gg_)
+            gx = torch.Generator(device=dev).manual_seed(5); Lp[rows] = exact_logp(mm, xx, enc=mm_, enc_mask=mk[jj], g=gg_, n_steps=st, probes=1, gen=gx).view(nr, R).cpu()   # enc/g MUST be passed: an enc-less call is the unconditional branch
         P = Lp - lpu[:, None]   # PMI matrix
+        assert P.abs().max() > 1e-3, "exact retrieval block degenerate (conditional == unconditional): condition not passed to exact_logp"
         rk_a2t = (Lp >= Lp.diagonal()[:, None]).sum(1) - 1; rk_t2a_lp = (Lp >= Lp.diagonal()[None, :]).sum(0) - 1; rk_t2a_pmi = (P >= P.diagonal()[None, :]).sum(0) - 1   # ties count against
         res["exact"] = {"n": R, "steps": st, "a2t_top1": (rk_a2t == 0).float().mean().item(), "a2t_top5": (rk_a2t < 5).float().mean().item(), "a2t_mean_rank": rk_a2t.float().mean().item() + 1,
                         "t2a_top1_logp": (rk_t2a_lp == 0).float().mean().item(), "t2a_top1_pmi": (rk_t2a_pmi == 0).float().mean().item(), "t2a_top5_pmi": (rk_t2a_pmi < 5).float().mean().item(),
