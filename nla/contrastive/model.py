@@ -93,6 +93,20 @@ class ClipCritic:
             x = self.norm.normalize(h_raw.to(self.device).float()).float()
             return F.normalize(self.heads.act(x).float(), dim=-1)
 
+    @torch.no_grad()
+    def rl_scores(self, explanations, activations, bank=None, bs=64):
+        """RL reward per rollout: scaled cosine s(h_i, z_i) of each explanation with ITS activation (None -> None); with bank [N, D]
+        (act embeddings) the bank-normalised discriminative PMI s(h, z) - log mean_j exp s(h_j, z)."""
+        out = [None] * len(explanations); idx = [i for i, z in enumerate(explanations) if z]
+        if not idx: return out
+        T = self.text_emb([explanations[i] for i in idx], bs=bs)
+        A = torch.cat([self.act_emb(torch.stack([activations[i].float() for i in idx[c:c + 512]])) for c in range(0, len(idx), 512)])
+        s = self.heads.scale(); r = s * (A * T).sum(-1)
+        if bank is not None: r = r - (torch.logsumexp(s * bank @ T.T, 0) - math.log(bank.shape[0]))
+        for j, i in enumerate(idx):
+            v = float(r[j]); out[i] = v if math.isfinite(v) else None
+        return out
+
     def score(self, A, T):
         """[nA, D] x [nT, D] -> scaled cosine logits [nA, nT]"""
         return self.heads.scale().detach() * A @ T.T

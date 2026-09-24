@@ -1806,7 +1806,7 @@ def main():
     # ---- reward mode (actor reward; the AR/critic always trains on vector-MSE) ----
     p.add_argument("--reward-mode",
                    choices=["vector_mse", "downstream_mse", "downstream_plus_fve",
-                            "downstream_kl", "downstream_ladder", "vector_plus_kl", "flow", "claims"],
+                            "downstream_kl", "downstream_ladder", "vector_plus_kl", "flow", "claims", "clip"],
                    default="vector_mse",
                    help="ACTOR reward. vector_mse (DEFAULT) = -MSE(reconstruction, gold) "
                         "in L42 activation space (the classic NLA reward). downstream_mse "
@@ -1816,6 +1816,10 @@ def main():
                         "causal footprint). downstream_plus_fve = vector + "
                         "--downstream-fve-weight * downstream. The critic (AR) ALWAYS "
                         "trains on the vector-MSE targets regardless.")
+    p.add_argument("--clip-ckpt", default=None, help="--reward-mode clip: a CLIP-style contrastive critic dir (nla.contrastive, heads.pt [+ text_lora.pt]); FROZEN, the MSE critic still runs for the FVE curve")
+    p.add_argument("--clip-device", default=None, help="--reward-mode clip: device of the contrastive critic (cuda:1 = a second GPU per rank, with --vllm-gpu-index 1)")
+    p.add_argument("--clip-reward", choices=["raw", "pmi"], default="raw", help="raw = scaled cosine s(h, z); pmi = s(h, z) - log mean_j exp s(h_j, z) over a fixed bank (charges generic explanations)")
+    p.add_argument("--clip-bank-n", type=int, default=4096, help="--clip-reward pmi: bank activations (first rows of --rl-parquet, fixed across the run)")
     p.add_argument("--claim-cost", type=float, default=40.0,
                    help="--reward-mode claims (compositional NLA): reward = PMI(h; C) - claim_cost * |C| in nats, C = the explanation's claims "
                         "(nla.flow.claims.split_claims), PMI from a claim-SET flow conditioner (--flow-adapter trained with train_cond --claim-subsets; "
@@ -2094,7 +2098,7 @@ def main():
         # communicator to this rank's masked GPU (no "Guessing device ID" heuristic).
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=2),
                                 device_id=torch.device("cuda:0"))
-        _extra_gpus = 1 if any(d and d not in ("cuda", "cuda:0") for d in (args.flow_device, args.flow_enc_device)) else 0   # a critic GPU per rank (--flow-device / --flow-enc-device cuda:1)
+        _extra_gpus = 1 if any(d and d not in ("cuda", "cuda:0") for d in (args.flow_device, args.flow_enc_device, getattr(args, "clip_device", None))) else 0   # a critic GPU per rank (--flow-device / --flow-enc-device / --clip-device cuda:1)
         assert torch.cuda.device_count() == args.vllm_tp + _extra_gpus, (
             f"[dp] rank sees {torch.cuda.device_count()} GPUs but --vllm-tp={args.vllm_tp} (+{_extra_gpus} critic GPU); "
             f"need total_gpus == world_size * (vllm_tp + critic_gpus).")
@@ -2262,7 +2266,18 @@ def main():
         if (_crit_latest / "value_head.safetensors").exists():
             ar_src = str(_crit_latest)
             print(f"[critic] RESUMING co-trained critic from {ar_src}")
-    flow = None
+    flow = None; clipc = None
+    if args.reward_mode == "clip":
+        # CLIP-style contrastive critic as the ACTOR reward (frozen); the MSE critic below still scores every rollout for the FVE curve
+        assert args.clip_ckpt and args.ar_loss != "flow", "--reward-mode clip needs --clip-ckpt (and the MSE critic path, not --ar-loss flow)"
+        from nla.contrastive.model import ClipCritic
+        clipc = ClipCritic(args.clip_ckpt, args.av_ckpt, torch.device(args.clip_device) if args.clip_device else device)
+        clipc.bank = None
+        if args.clip_reward == "pmi":
+            _bt = pq.read_table(args.rl_parquet, columns=["activation_vector"]).slice(0, args.clip_bank_n)
+            _ba = torch.tensor(np.asarray(_bt.column(0).combine_chunks().flatten(), dtype=np.float32).reshape(_bt.num_rows, -1))
+            with torch.no_grad(): clipc.bank = torch.cat([clipc.act_emb(_ba[i:i + 1024]) for i in range(0, len(_ba), 1024)])
+        print(f"[clip] actor reward = contrastive critic {args.clip_ckpt} ({args.clip_reward}{', bank ' + str(args.clip_bank_n) if clipc.bank is not None else ''}) on {clipc.device}", flush=True)
     if args.ar_loss == "flow":
         # the flow critic replaces the MSE reconstructor entirely (no NLACriticModel in memory; --ar-ckpt is unused)
         from nla.flow.rl_critic import FlowCritic
@@ -3038,6 +3053,8 @@ def main():
                         critic, tokenizer, all_explanations, all_activations,
                         template, mse_scale_f, device,
                     )
+            if clipc is not None:   # contrastive reward: per-rollout score of (explanation, own activation); unparsed -> None (failure floor)
+                flow_rewards = clipc.rl_scores(all_explanations, all_activations, bank=clipc.bank)
             # TRUNCATED -> FAILED: a rollout that hit the max_new_tokens cap must not
             # be scored as if its explanation were complete (a cut-off <explanation>
             # that still parses scores artificially — the "FVE peaks then drops"
@@ -3143,7 +3160,7 @@ def main():
                 None if (rv is None or rd is None) else (rv + _w * rd)
                 for rv, rd in zip(rewards, ds_rewards)
             ]
-        elif args.reward_mode in ("flow", "claims"):
+        elif args.reward_mode in ("flow", "claims", "clip"):
             actor_rewards = flow_rewards
         else:  # downstream_plus_fve: -mse_vec + w * -mse_downstream, per sample
             _w = args.downstream_fve_weight

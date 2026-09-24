@@ -34,15 +34,17 @@ def _qc_ok(q):
     return not any(d.get(k, 0) for k in ("exact_missing", "leaked", "unsupported_numbers", "parse_fail"))
 
 
-def load_rows(globs, rank, world, max_rows, seed, render_pick="random", with_text=True):
-    """rank-disjoint by document; -> acts fp16 [n, 5120], explanations, doc ids, grounded numbers per row (list of raw strings)"""
+def load_rows(globs, rank, world, max_rows, seed, render_pick="random", with_text=True, with_ladders=False):
+    """rank-disjoint by document; -> acts fp16 [n, 5120], explanations, doc ids, grounded numbers per row (list of raw strings)
+    [, (facts json, fact_ladders json) per row: g2 shards only, else None]"""
     import pyarrow.parquet as pq
     from nla.flow.halluc_classify import grounded_numbers
-    acts, zs, docs, nums = [], [], [], []; n = 0; rng = np.random.default_rng(seed + 17 * rank)
+    acts, zs, docs, nums, lads = [], [], [], [], []; n = 0; rng = np.random.default_rng(seed + 17 * rank)
     for f in _files(globs):
         names = pq.ParquetFile(f).schema_arrow.names
         multi = render_pick == "random" and "explanations" in names and "qc" in names
-        cols = ["activation_vector", "explanation", "is_val", "doc_id"] + (["text"] if with_text and "text" in names else []) + (["explanations", "qc"] if multi else [])
+        hasl = with_ladders and "fact_ladders" in names and "facts" in names
+        cols = ["activation_vector", "explanation", "is_val", "doc_id"] + (["text"] if with_text and "text" in names else []) + (["explanations", "qc"] if multi else []) + (["facts", "fact_ladders"] if hasl else [])
         t = pq.read_table(f, columns=cols)
         dids = t.column("doc_id").to_pylist(); isv = t.column("is_val").to_pylist()
         keep = [i for i, (d, v) in enumerate(zip(dids, isv)) if not v and zlib.crc32(str(d).encode()) % world == rank]
@@ -55,13 +57,17 @@ def load_rows(globs, rank, world, max_rows, seed, render_pick="random", with_tex
                 ok = [e for e, q in zip(es or [], qs or []) if e and _qc_ok(q)]
                 if ok: ex[j] = ok[int(rng.integers(len(ok)))]
         txt = t.column("text").take(keep).to_pylist() if "text" in cols else [None] * len(keep)
+        if with_ladders:
+            if hasl: lads += list(zip(t.column("facts").take(keep).to_pylist(), t.column("fact_ladders").take(keep).to_pylist()))
+            else: lads += [None] * len(keep)
         for j, z in enumerate(ex):
             z = (z or "").strip(); zs.append(z); docs.append(str(dids[keep[j]]))
             nums.append([g[2] for g in grounded_numbers(z, txt[j])] if (txt[j] and z) else [])
         n += len(keep); del t
         if max_rows and n >= max_rows: break
     A = torch.cat(acts)[: max_rows or None] if acts else torch.zeros(0, 5120, dtype=torch.float16)
-    m = A.shape[0]; return A, zs[:m], docs[:m], nums[:m]
+    m = A.shape[0]
+    return (A, zs[:m], docs[:m], nums[:m], lads[:m]) if with_ladders else (A, zs[:m], docs[:m], nums[:m])
 
 
 class DocBatcher:
@@ -117,6 +123,8 @@ def main():
     p.add_argument("--frozen-text", action="store_true", help="no LoRA at all: frozen trunk token states, only the pooling head + activation encoder train")
     p.add_argument("--act-arch", default="mlp", choices=["mlp", "chunks"]); p.add_argument("--d-out", type=int, default=1024); p.add_argument("--max-len", type=int, default=224)
     p.add_argument("--batch", type=int, default=512, help="per-rank rows (global = world x batch)"); p.add_argument("--max-cuts", type=int, default=4)
+    p.add_argument("--neg-source", default="make_negative", choices=["make_negative", "twins"], help="twins: g2 wrong-exact twins swapped into the rendering (nla.contrastive.ladders)")
+    p.add_argument("--rank-source", default="perturb", choices=["perturb", "ladders"], help="ladders: g2 specificity ladders, s(exact) > s(partial) > s(category) > s(omit) > s(twin)")
     p.add_argument("--neg-frac", type=float, default=0.25); p.add_argument("--rank-frac", type=float, default=0.5, help="of the rows with a grounded number"); p.add_argument("--rank-lambda", type=float, default=0.5)
     p.add_argument("--steps", type=int, default=400); p.add_argument("--epochs", type=float, default=0, help="if > 0: steps = epochs x rows / global batch")
     p.add_argument("--lr-lora", type=float, default=3e-5); p.add_argument("--lr-heads", type=float, default=5e-4); p.add_argument("--wd", type=float, default=0.05); p.add_argument("--warmup", type=int, default=30)
@@ -161,12 +169,16 @@ def main():
                              {"params": nodecay, "lr": a.lr_heads, "base": a.lr_heads, "weight_decay": 0.0}], betas=(0.9, 0.98), eps=1e-6)
     log(f"[clip] world {world}, per-rank batch {a.batch} (global {world * a.batch}); text encoder {a.enc_model or a.ar_ckpt} L{a.enc_layer}: LoRA {sum(p_.numel() for p_ in lora) / 1e6:.0f}M; heads {sum(p_.numel() for p_ in hp) / 1e6:.1f}M ({a.act_arch})")
 
-    t0 = time.time(); A, Z, D, NUMS = load_rows(a.train_globs, rank, world, a.max_rows, a.seed, a.render_pick)
+    from nla.contrastive.ladders import twin_negative, ladder_rungs
+    use_lad = a.neg_source == "twins" or a.rank_source == "ladders"
+    t0 = time.time(); _r = load_rows(a.train_globs, rank, world, a.max_rows, a.seed, a.render_pick, with_text=(a.rank_source == "perturb"), with_ladders=use_lad)
+    A, Z, D, NUMS = _r[:4]; LAD = _r[4] if use_lad else None
     n_loc = torch.tensor([A.shape[0]], device=dev)
     if ddp: dist.all_reduce(n_loc, op=dist.ReduceOp.MIN)
     n_all = torch.tensor([A.shape[0]], device=dev)
     if ddp: dist.all_reduce(n_all)
-    log(f"[clip] rows: {int(n_all)} total ({int(n_loc)} min per rank) from {a.train_globs} in {time.time() - t0:.0f}s; grounded-number rows (rank 0) {sum(1 for x in NUMS if x)}/{len(NUMS)}")
+    log(f"[clip] rows: {int(n_all)} total ({int(n_loc)} min per rank) from {a.train_globs} in {time.time() - t0:.0f}s; grounded-number rows (rank 0) {sum(1 for x in NUMS if x)}/{len(NUMS)}"
+        + (f"; rows with g2 ladders (rank 0) {sum(1 for x in LAD if x)}" if LAD is not None else "") + f"; negatives: {a.neg_source}, ranking: {a.rank_source}")
     steps = int(a.epochs * int(n_all) / (world * a.batch)) if a.epochs > 0 else a.steps
     batcher = DocBatcher(D, a.batch, a.max_cuts, a.seed * 1000 + rank); rng = random.Random(a.seed * 7 + rank)
     snaps = sorted(int(float(x)) for x in a.snap_pairs.split(",") if x); done_snaps = set()
@@ -274,10 +286,19 @@ def main():
         idx = batcher.next(); zs = [Z[i] for i in idx]
         negs = []; tries = 0
         while len(negs) < n_neg and tries < 4 * n_neg:
-            j = rng.randrange(len(idx)); zn, _ = make_negative(zs[j], rng, zs); tries += 1
+            j = rng.randrange(len(idx)); tries += 1
+            if a.neg_source == "twins":
+                lj = LAD[idx[j]]; zn = twin_negative(zs[j], lj[1], rng)[0] if lj else None
+            else: zn, _ = make_negative(zs[j], rng, zs)
             if zn: negs.append(zn)
         neg_valid = len(negs); negs += [zs[rng.randrange(len(zs))]] * (n_neg - len(negs))      # pad (masked out below) so every rank gathers equal shapes
-        rk = [(j, NUMS[i][0]) for j, i in enumerate(idx) if NUMS[i] and rng.random() < a.rank_frac]
+        rk = [] if a.rank_source == "ladders" else [(j, NUMS[i][0]) for j, i in enumerate(idx) if NUMS[i] and rng.random() < a.rank_frac]
+        lad_items = []
+        if a.rank_source == "ladders":
+            for j, i in enumerate(idx):
+                if LAD[i] and rng.random() < a.rank_frac:
+                    rr = ladder_rungs(LAD[i][0], LAD[i][1], rng)
+                    if rr: lad_items.append((j, rr))
         nears, hedges = [], []
         for j, raw in rk:
             z = zs[j]; pos = z.find(raw)
@@ -305,6 +326,11 @@ def main():
             jj = torch.tensor([j for j, _ in rk], device=dev); a_ = A_loc[jj]
             s_o = s * (a_ * T_loc[jj]).sum(-1); s_n = s * (a_ * En).sum(-1); s_h = s * (a_ * Eh).sum(-1)
             loss_rank = (F.softplus(s_n - s_h) + F.softplus(s_h - s_o)).mean()
+        if lad_items:   # consecutive rungs of each fact's ladder: softplus(s_lower - s_higher), same activation
+            flat = [t_ for _, rr in lad_items for _, t_ in rr]; E = embed_texts(flat, grad=True, bs=len(flat)); pos = 0; terms = []
+            for j, rr in lad_items:
+                sv = s * (E[pos:pos + len(rr)] @ A_loc[j]); pos += len(rr); terms.append(F.softplus(sv[1:] - sv[:-1]))
+            loss_rank = torch.cat(terms).mean(); rk = lad_items
         loss = loss_nce + a.rank_lambda * loss_rank * (len(rk) > 0)
         opt.zero_grad(set_to_none=True); loss.backward()
         if ddp: allreduce_grads(lora + hp)

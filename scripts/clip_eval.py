@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.di
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--ckpt", required=True); p.add_argument("--base", required=True); p.add_argument("--out", default=None)
-    p.add_argument("--val-n", type=int, default=14711); p.add_argument("--bank-n", type=int, default=4096); p.add_argument("--tests", default="val,detector,groups,twins,deletions,pmi")
+    p.add_argument("--val-n", type=int, default=14711); p.add_argument("--bank-n", type=int, default=4096); p.add_argument("--tests", default="val,detector,groups,twins,deletions,pmi,ladder")
     a = p.parse_args(); tests = set(a.tests.split(",")); t0 = time.time()
     import pyarrow.parquet as pq
     from nla.contrastive.model import ClipCritic
@@ -94,6 +94,21 @@ def main():
                 raw, lz, _ = score(Ah, [it["z"], it["remove_false"] or "(empty)", it["remove_true"] or "(empty)"])
                 dl.append({"av": it["av"], "g": it["g"], "i": it["i"], "row": row, "n_removed": it["n_removed"], "n_false": it["n_false"], "raw": raw[0].tolist(), "pmi": (raw[0] - lz).tolist()})
         res["groups"] = gr; res["twins"] = tw; res["deletions"] = dl; print(f"[clip-eval] groups/twins/deletions done ({time.time() - t0:.0f}s)", flush=True)
+
+    if "ladder" in tests and os.path.exists("/vol_glp/scale/g2pilot/g2_pilot_v3.parquet"):
+        # held-out hedge ladders (g2 pilot Opus-overlap positions = av_sft_val rows; same items + template as scripts/hedge_ladder_eval.py)
+        from nla.contrastive.ladders import sentence, z0_of, ORDER
+        P_ = [r for r in pq.read_table("/vol_glp/scale/g2pilot/g2_pilot_v3.parquet").to_pylist() if r["src"] == "opus_overlap" and r["facts"] and r["fact_ladders"]]
+        vfull = pq.read_table("/vol_q36/data/sft/av_sft_val.parquet", columns=["activation_vector"]); lad = []
+        for r in P_:
+            z0 = z0_of(r["facts"]); facts = [x for x in json.loads(r["fact_ladders"]) if x.get("twin")][:3]
+            if not z0 or not facts: continue
+            Ae = C.act_emb(torch.tensor(np.asarray(vfull.column(0)[r["row"]].as_py(), dtype=np.float32))[None])
+            for x in facts:
+                rungs = {k: (z0 + " " + sentence(x, k)) if sentence(x, k) else (z0 if k == "omit" else None) for k in ORDER}; names = [k for k, v in rungs.items() if v]
+                raw, lz, _ = score(Ae, [rungs[k] for k in names])
+                lad.append({"row": r["row"], "type": x["type"], "raw": dict(zip(names, raw[0].tolist())), "pmi": dict(zip(names, (raw[0] - lz).tolist()))})
+        res["ladder"] = lad; print(f"[clip-eval] ladder: {len(lad)} items", flush=True)
 
     if "pmi" in tests:
         n = 256; perm = torch.randperm(n, generator=torch.Generator().manual_seed(1)).tolist(); zs = CZ[:n]; zsh = [zs[i] for i in perm]
