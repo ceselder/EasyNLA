@@ -119,8 +119,14 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred = model(x, texts).float()
         loss, rm, cos = M.recon_loss(pred, d, a.cos_w, a.loss)
-        opt.zero_grad(set_to_none=True); loss.backward(); gn = float(torch.nn.utils.clip_grad_norm_([q for g in opt.param_groups for q in g["params"]], 1.0)); opt.step()
-        log = {"train/loss": float(loss.detach()), "train/relmse": float(rm.detach().mean()), "train/cos": float(cos.detach().mean()), "train/grad_norm": gn, "train/lr_head": opt.param_groups[-1]["lr"]}
+        opt.zero_grad(set_to_none=True)
+        if not torch.isfinite(loss):                                                  # non-finite loss (S_prose_20k diverged to NaN at step ~600): skip the batch
+            n_skipped = locals().get("n_skipped", 0) + 1; print(f"[train] step {step}: non-finite loss, batch skipped ({n_skipped} so far)", flush=True); gn = float("nan")
+        else:
+            loss.backward(); gn = float(torch.nn.utils.clip_grad_norm_([q for g in opt.param_groups for q in g["params"]], 1.0))
+            if math.isfinite(gn): opt.step()
+            else: n_skipped = locals().get("n_skipped", 0) + 1; print(f"[train] step {step}: non-finite grad norm, step skipped ({n_skipped} so far)", flush=True)
+        log = {"train/loss": float(loss.detach()) if torch.isfinite(loss) else float("nan"), "train/relmse": float(rm.detach().mean()), "train/cos": float(cos.detach().mean()), "train/grad_norm": gn, "train/lr_head": opt.param_groups[-1]["lr"], "train/skipped": locals().get("n_skipped", 0)}
         if step % 50 == 0:
             print(f"[train] {step}/{a.steps} loss {log['train/loss']:.4f} relmse {log['train/relmse']:.4f} cos {log['train/cos']:.3f} gn {gn:.2f} {(time.time() - t0) / (step + 1):.2f}s/step", flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
