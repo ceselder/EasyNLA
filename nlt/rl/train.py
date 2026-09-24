@@ -58,7 +58,8 @@ def parse():
     p.add_argument("--n-dist", type=int, default=2, help="distractor pairs scored per rollout (<= per-class - 1)")
     p.add_argument("--class-j-min", type=int, default=None, help="redteam #442: sample only classes with j >= this for the first --class-j-min-until steps (e.g. 14 = skip the pre band)")
     p.add_argument("--class-j-min-until", type=int, default=40)
-    p.add_argument("--dist-types", default="samedoc,crossdoc", help="redteam #228 H1: comma list of distractor types filling the --n-dist slots in order: samedoc (other position of the SAME document, same (i,j)), crossdoc (in-class other document), wrongj (own position, other j; pays for depth cues -- off by default). Remaining slots = crossdoc.")
+    p.add_argument("--dist-types", default="samedoc,crossdoc", help="redteam #228 H1: comma list of distractor types filling the --n-dist slots in order: samedoc (other position of the SAME document, same (i,j)), crossdoc (in-class other document), wrongj (own position, other j; pays for depth cues -- off by default), neighbor (same document, position p+-k from --neighbor-dir: same topic and place, different next token -- the hard negative for next-token content, board #535). Remaining slots = crossdoc.")
+    p.add_argument("--neighbor-dir", default=None, help="ActStore-layout dir (split 'train': acts_*.npy + meta_*.parquet) of NEIGHBOUR positions; meta needs anchor_pos_idx (the anchor's pos_idx in --data-dir train) and offset")
     p.add_argument("--content-abs", type=float, default=0.2, help="redteam #228 H2: reward = content + content_abs x PMI(own), so junk that hurts distractors more than itself does not win")
     p.add_argument("--content-abs-clip", action="store_true", help="DECISIONS v1.23: use max(PMI(own), 0) in the absolute term (a mismatcher critic gives negative PMI(own) on true text)")
     p.add_argument("--winner-require-own-pos", action=argparse.BooleanOptionalAction, default=True, help="listener winners must also have PMI(own) > 0 (v1.23 ref_v2: off -- content > 0 only)")
@@ -301,6 +302,11 @@ def main():
     scorer = make_scorer(a, cdev)
     para = Paraphraser(a.paraphrase_model, gpu_mem=a.paraphrase_gpu_mem, gpu_index=cidx, seed=a.seed) if a.paraphrase_p > 0 else None
     sampler = StratifiedSampler(store, a.n_classes, a.per_class)
+    nstore = None
+    if a.neighbor_dir:
+        nstore = ActStore(a.neighbor_dir, "train", device="cpu")
+        n_anch = int(nstore.meta["anchor_pos_idx"].nunique()); cover = float(store.meta["pos_idx"].isin(set(nstore.meta["anchor_pos_idx"].tolist())).mean())
+        print(f"[rl] neighbour store: {nstore.N} rows for {n_anch} anchors (covers {cover:.1%} of the train store), offsets {sorted(nstore.meta['offset'].unique().tolist()) if 'offset' in nstore.meta else '?'}", flush=True)
     cot = Listener(scorer, a, store, sampler, paraphraser=para) if (a.cotrain and not a.stub_critic and a.critic) else None
     frozen = make_scorer(a, cdev) if (cot is not None and a.frozen_critic_eval) else None
     cross = {}
@@ -372,17 +378,24 @@ def main():
             rows, I, J, cls = sampler.sample(gen, j_min=(a.class_j_min if (a.class_j_min is not None and step < a.class_j_min_until) else None)); B = P = len(rows)
             types = [t.strip() for t in a.dist_types.split(",") if t.strip()][: a.n_dist]; types += ["crossdoc"] * (a.n_dist - len(types))
             cross_idx = sampler.distractors(cls, max(1, types.count("crossdoc")), gen)          # [P, n_cross] in-class other-document pairs
-            ext_rows, ext_I, ext_J = [rows], [I], [J]; dist_cols = []; nc = 0
+            ext_rows, ext_I, ext_J, ext_src = [rows], [I], [J], [torch.zeros(P, dtype=torch.bool)]; dist_cols = []; nc = 0   # ext_src: row lives in nstore
             for t_ in types:
-                if t_ == "crossdoc": dist_cols.append(cross_idx[:, nc]); nc += 1
-                elif t_ == "samedoc":
-                    sd = sampler.same_doc_partners(rows, gen); ext_rows.append(sd); ext_I.append(I); ext_J.append(J); dist_cols.append(torch.arange(P) + sum(len(r_) for r_ in ext_rows[:-1]))
-                elif t_ == "wrongj":
-                    jw = sampler.wrong_j(I, J, gen=gen); ext_rows.append(rows); ext_I.append(I); ext_J.append(jw); dist_cols.append(torch.arange(P) + sum(len(r_) for r_ in ext_rows[:-1]))
+                if t_ == "crossdoc": dist_cols.append(cross_idx[:, nc]); nc += 1; continue
+                if t_ == "samedoc": r_, i_, j_, s_ = sampler.same_doc_partners(rows, gen), I, J, torch.zeros(P, dtype=torch.bool)
+                elif t_ == "wrongj": r_, i_, j_, s_ = rows, I, sampler.wrong_j(I, J, gen=gen), torch.zeros(P, dtype=torch.bool)
+                elif t_ == "neighbor":
+                    assert nstore is not None, "--dist-types neighbor needs --neighbor-dir"
+                    r_, s_ = sampler.neighbor_partners(rows, nstore, gen); i_, j_ = I, J
+                    if step == a.start_step or step % 20 == 0: print(f"   [neighbor] {int(s_.sum())}/{P} pairs got a true neighbour distractor (rest: same-doc fallback)", flush=True)
                 else: raise ValueError(t_)
+                dist_cols.append(torch.arange(P) + sum(len(x) for x in ext_rows)); ext_rows.append(r_); ext_I.append(i_); ext_J.append(j_); ext_src.append(s_)
             dist_idx = torch.stack(dist_cols, 1)                                                  # [P, K] into the EXTENDED pair table
-            ext_rows_t, ext_I_t, ext_J_t = torch.cat(ext_rows), torch.cat(ext_I), torch.cat(ext_J)
-            ext_h_i = store.gather(ext_rows_t, ext_I_t, out_device="cpu").float(); ext_h_j = store.gather(ext_rows_t, ext_J_t, out_device="cpu").float()
+            ext_rows_t, ext_I_t, ext_J_t, ext_src_t = torch.cat(ext_rows), torch.cat(ext_I), torch.cat(ext_J), torch.cat(ext_src)
+            def _gather_ext(k_t):
+                out = store.gather(torch.where(ext_src_t, torch.zeros_like(ext_rows_t), ext_rows_t), k_t, out_device="cpu").float()
+                if bool(ext_src_t.any()): out[ext_src_t] = nstore.gather(ext_rows_t[ext_src_t], k_t[ext_src_t], out_device="cpu").float()
+                return out
+            ext_h_i, ext_h_j = _gather_ext(ext_I_t), _gather_ext(ext_J_t)
             h_i, h_j = ext_h_i[:P], ext_h_j[:P]
         else:
             rows, I, J = store.sample_pairs(B, gen); dist_idx = None; types = []

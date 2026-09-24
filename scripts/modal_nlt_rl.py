@@ -47,10 +47,25 @@ def _prep():
     print(f"[prep] fork={is_fork} eager={os.environ.get('NLA_VLLM_EAGER', '1')}", flush=True)
 
 
+def _sync_daemon(every: float):
+    """commit + reload the volume every `every` s while the trainer runs: makes checkpoints / dumps visible to other containers mid-run
+    (lens #520 found commits only happened at job end) and makes STOP / SWAP files written from outside visible to the run (ref_v1 had
+    to be stopped with `modal app stop` because the in-loop STOP check never saw the file). Errors are logged, never fatal."""
+    import threading, time
+    def loop():
+        while True:
+            time.sleep(every)
+            for name, fn in (("commit", vol.commit), ("reload", vol.reload)):
+                try: fn()
+                except Exception as e: print(f"[modal] vol.{name} (daemon): {str(e)[:160]}", flush=True)
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def _run(cmd):
-    import subprocess
+    import os, subprocess
     _prep()
     print("[modal] " + " ".join(cmd), flush=True)
+    _sync_daemon(float(os.environ.get("NLT_SYNC_EVERY", "90")))
     rc = subprocess.call(cmd, cwd=REPO_REMOTE)
     try: vol.commit()
     except Exception as e: print(f"[modal] vol.commit: {e}", flush=True)

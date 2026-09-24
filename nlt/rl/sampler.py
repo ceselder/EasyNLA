@@ -52,6 +52,22 @@ class StratifiedSampler:
             out.append(cands[int(torch.randint(0, len(cands), (1,), generator=gen))] if cands else self.same_class_partner(0, 0, r, gen))
         return torch.tensor(out)
 
+    def neighbor_partners(self, rows: torch.Tensor, nstore, gen: torch.Generator | None = None):
+        """for each store row, a random row of the NEIGHBOUR store (same document, position p+-k: same topic, same place, different next
+        token -- the hard negative for next-token content, board #535/#527). nstore.meta needs anchor_pos_idx (the anchor's pos_idx).
+        -> (rows [P] into nstore OR the main store, is_neighbor [P] bool); anchors without neighbours fall back to a same-doc partner."""
+        if not hasattr(self, "_nb_rows"):
+            import collections
+            self._nb_rows = collections.defaultdict(list)
+            for r_, a_ in enumerate(nstore.meta["anchor_pos_idx"].values): self._nb_rows[int(a_)].append(r_)
+            self._pos = self.store.meta["pos_idx"].values
+        out, src = [], []
+        for r in rows.tolist():
+            c = self._nb_rows.get(int(self._pos[r]), [])
+            if c: out.append(c[int(torch.randint(0, len(c), (1,), generator=gen))]); src.append(True)
+            else: out.append(int(self.same_doc_partners(torch.tensor([r]), gen)[0])); src.append(False)
+        return torch.tensor(out), torch.tensor(src, dtype=torch.bool)
+
     @staticmethod
     def wrong_j(I: torch.Tensor, J: torch.Tensor, j_hi: int = J_HI, gen: torch.Generator | None = None) -> torch.Tensor:
         """another target layer j' != j in {i+1 .. j_hi} for each pair (redteam #228 H1c; OPTIONAL: pays for depth cues)"""
