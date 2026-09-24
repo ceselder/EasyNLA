@@ -64,6 +64,7 @@ def _expand(globs):
     files = []
     for g in (globs if isinstance(globs, (list, tuple)) else str(globs).split(",")):
         files += sorted(glob.glob(g)) if any(c in g for c in "*?[") else [g]
+    files = [f for f in files if not f.endswith("_rejects.parquet")]          # generator side-files (no bullets column) never count as text
     assert files, f"no text files match {globs}"
     return files
 
