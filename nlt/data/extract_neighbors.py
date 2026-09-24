@@ -44,6 +44,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--split", default="train"); p.add_argument("--out-dir", required=True); p.add_argument("--base", default="Qwen/Qwen3-8B")
     p.add_argument("--pos-idx-file", default=""); p.add_argument("--offsets", default="-2,-1,1,2"); p.add_argument("--docs-per-batch", type=int, default=8); p.add_argument("--shard-size", type=int, default=8192)
+    p.add_argument("--shards", default="", help="comma list of input meta indices to process (parallel workers); default all"); p.add_argument("--tag-prefix", default="nbr", help="output shard tag prefix (must differ per worker)")
     a = p.parse_args(); offsets = [int(x) for x in a.offsets.split(",")]
     import pyarrow.parquet as pq, pyarrow as pa
     dev = "cuda"; torch.backends.cuda.matmul.allow_tf32 = True
@@ -52,13 +53,15 @@ def main():
     keep = None
     if a.pos_idx_file:
         txt = open(a.pos_idx_file).read().strip(); keep = set(int(x) for x in (json.loads(txt) if txt.startswith("[") else txt.split()))
-    metas = sorted(glob.glob(os.path.join(a.data_dir, a.split, "meta_*.parquet"))); t0 = time.time(); n_tot = 0; shard = 0
+    metas = sorted(glob.glob(os.path.join(a.data_dir, a.split, "meta_*.parquet")))
+    if a.shards: want = {int(x) for x in a.shards.split(",")}; metas = [m for i, m in enumerate(metas) if i in want]
+    t0 = time.time(); n_tot = 0; shard = 0
     buf_acts, buf_meta = [], []
 
     def flush(force=False):
         nonlocal shard, buf_acts, buf_meta
         if not buf_meta or (not force and sum(x.shape[0] for x in buf_acts) < a.shard_size): return
-        A = np.concatenate(buf_acts, 0); tag = f"nbr_{shard:04d}"
+        A = np.concatenate(buf_acts, 0); tag = f"{a.tag_prefix}_{shard:04d}"
         np.save(os.path.join(out_dir, f"acts_{tag}.tmp.npy"), A); os.replace(os.path.join(out_dir, f"acts_{tag}.tmp.npy"), os.path.join(out_dir, f"acts_{tag}.npy"))
         pq.write_table(pa.Table.from_pylist(buf_meta), os.path.join(out_dir, f"meta_{tag}.parquet")); shard += 1; buf_acts, buf_meta = [], []
     for mpath in metas:
@@ -88,7 +91,7 @@ def main():
             buf_acts.append(state["out"].permute(1, 0, 2).cpu().numpy()); buf_meta += rows_meta; n_tot += len(bsel); flush()
         print(f"[nbr:{a.split}] {os.path.basename(mpath)}: {n_tot} neighbour positions so far, {time.time() - t0:.0f}s", flush=True)
     flush(force=True)
-    json.dump({"offsets": offsets, "n_positions": n_tot, "pos_idx_rule": "7e9 + 10*orig + (offset+5)", "layout": "same as the main store (acts_<tag>.npy [n,26,4096] fp16 + meta_<tag>.parquet); extra meta cols nbr_of, offset"}, open(os.path.join(out_dir, "nbr_info.json"), "w"), indent=1)
+    json.dump({"offsets": offsets, "n_positions": n_tot, "worker": a.tag_prefix, "shards": a.shards, "pos_idx_rule": "7e9 + 10*orig + (offset+5)", "layout": "same as the main store (acts_<tag>.npy [n,26,4096] fp16 + meta_<tag>.parquet); extra meta cols nbr_of, offset"}, open(os.path.join(out_dir, f"nbr_info_{a.tag_prefix}.json"), "w"), indent=1)
     print(f"[nbr:{a.split}] DONE {n_tot} positions -> {out_dir}", flush=True)
 
 
