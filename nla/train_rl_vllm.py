@@ -3055,6 +3055,8 @@ def main():
                     )
             if clipc is not None:   # contrastive reward: per-rollout score of (explanation, own activation); unparsed -> None (failure floor)
                 flow_rewards = clipc.rl_scores(all_explanations, all_activations, bank=clipc.bank)
+                _cv = [r for r in flow_rewards if r is not None]
+                if _cv and rank == 0: print(f"  [clip-reward@{step}] mean {np.mean(_cv):.3f} std {np.std(_cv):.3f} scored {len(_cv)}/{len(flow_rewards)}", flush=True)
             # TRUNCATED -> FAILED: a rollout that hit the max_new_tokens cap must not
             # be scored as if its explanation were complete (a cut-off <explanation>
             # that still parses scores artificially — the "FVE peaks then drops"
