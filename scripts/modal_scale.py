@@ -193,7 +193,7 @@ def _g2_rows(llm, texts, keys, docs, k=G2_K):
         if recs[i]["fact_ladders"] is None: recs[i]["fact_ladders"] = json.dumps([{**x, "twin": t} for x, t in zip(fl, tw)], ensure_ascii=False)
     for rc in recs:                             # canonical explanation: first rendering passing every deterministic check
         good = [t for t, q in zip(rc["renders"], rc["qc"]) if t and not any(json.loads(q).get(kk, 0) for kk in ("exact_missing", "leaked", "unsupported_numbers", "parse_fail"))]
-        rc["explanation"] = good[0] if good else next((t for t in rc["renders"] if t), None); rc["n_pass"] = len(good)
+        rc["explanation"] = good[0] if good else None; rc["n_pass"] = len(good)          # no passing rendering -> the position is dropped at join
     stats = dict(n=len(texts), facts_ok=sum(f is not None for f in facts), stageA_s=tA, stageA_prefill_tok_s=nA_in / tA, stageA_decode_tok_s=nA_out / tA,
                  stageA_mean_out=nA_out / len(texts), renders=len(jobs), stageB_s=tB, stageB_prefill_tok_s=nB_in / tB, stageB_decode_tok_s=nB_out / tB,
                  stageB_mean_out=nB_out / max(1, len(jobs)), positions_per_s=len(texts) / (tA + tB), renders_per_s=len(jobs) / (tA + tB))

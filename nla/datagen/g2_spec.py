@@ -319,6 +319,7 @@ def parse_render(raw):
     t = (m.group(1) if m else raw).strip()
     t = re.sub(r"</?(?:small|p|br|b|i|span|div)\s*/?>", "", t).strip()                  # stray HTML-ish tags
     if not m and t.startswith("<"): t = t.lstrip("<").rstrip(">").strip()             # "<text ...>" used as its own wrapper
+    t = re.sub(r"^(?:[a-z]{1,4}>)\s*", "", t)                                          # "dev>" / "d>" fragments of a mangled opening tag
     return t if 2 <= len(t.split()) <= 300 and "<d>" not in t and "</d>" not in t else None
 
 
