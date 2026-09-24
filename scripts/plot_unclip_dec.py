@@ -12,7 +12,7 @@ C = {"cond": "#c2410c", "shuf": "#6b7280", "base": "#1d4ed8", "alt": "#0f766e", 
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "axes.labelsize": 12, "legend.fontsize": 11})
 
 
-def main(paths):
+def main(paths, stem="unclip_decoder"):
     runs = [json.load(open(p)) for p in paths]; names = [os.path.basename(p).replace("decoder_", "").replace(".json", "") for p in paths]
     fig, ax = plt.subplots(2, 2, figsize=(11, 9)); data = {"runs": names}
     # (1) bits density per t
@@ -20,11 +20,13 @@ def main(paths):
     for r, nm, k in zip(runs, names, range(len(runs))):
         if "fm" not in r: continue
         ts = np.array(r["fm"]["ts"]); y = np.array(r["fm"]["bits_density_per_t"]); s = np.array(r["fm"]["bits_density_per_t_sem"])
-        a.plot(ts, y, "-o", ms=3, color=C["cond"] if k == 0 else C["alt"], label=f"gold e ({nm}, ELBO PMI {r['fm']['elbo_pmi_bits']['mean']:.0f} bits)"); a.fill_between(ts, y - s, y + s, alpha=.2, color=C["cond"] if k == 0 else C["alt"])
-        ys = np.array(r["fm"]["loss"]["uncond"]) - np.array(r["fm"]["loss"]["shuf"]); a.plot(ts, r["fm"]["bits_cumulative"][-1] * 0 + 5120 * (1 - ts) / ts * ys / np.log(2), "--", color=C["shuf"], label="shuffled e (control)" if k == 0 else None)
+        tz = getattr(np, "trapezoid", None) or np.trapz; i0 = ts.tolist().index(0.1) if 0.1 in ts.tolist() else 0; part = float(tz(y[i0:], ts[i0:]))
+        a.plot(ts, y, "-o", ms=3, color=C["cond"] if k == 0 else C["alt"], label=f"gold e ({nm}): ∫ t≥0.1 = {part:.0f} bits" + (f"; exact ODE PMI {r['exact']['pmi_bits']['mean']:.0f}" if "exact" in r else "")); a.fill_between(ts, y - s, y + s, alpha=.2, color=C["cond"] if k == 0 else C["alt"])
+        data[f"elbo_partial_t_ge_0.1_{nm}"] = part
+        ys = np.array(r["fm"]["loss"]["uncond"]) - np.array(r["fm"]["loss"]["shuf"]); a.plot(ts, 5120 * (1 - ts) / ts * ys / np.log(2), "--", color=C["shuf"], label="shuffled e (control)" if k == 0 else None)
         data[f"bits_density_{nm}"] = {"ts": ts.tolist(), "gold": y.tolist(), "sem": s.tolist()}
-    a.set_xscale("log"); a.set_xlabel("noise level t (1 = pure noise)"); a.set_ylabel("bits of h explained per unit t"); a.axhline(0, color="k", lw=.5)
-    a.set_title("e informs h mostly at high noise:\nbits density of log p(h|e) − log p(h) per t"); a.legend(loc="upper left")
+    a.set_xscale("log"); a.set_yscale("symlog", linthresh=100); a.set_xlabel("noise level t (1 = pure noise)"); a.set_ylabel("bits of h explained per unit t (symlog)"); a.axhline(0, color="k", lw=.5)
+    a.set_title("e informs h at HIGH noise (t ≥ 0.1); the t < 0.1 tail is\n(1−t)/t-amplified noise: bits density of log p(h|e) − log p(h)"); a.legend(loc="upper left")
     # (2) reconstruction
     a = ax[0, 1]; r = runs[0]
     if "recon" in r:
@@ -56,9 +58,10 @@ def main(paths):
         data["exact"] = {"pmi_mean": float(pmi.mean()), "pmi_sem": float(pmi.std() / np.sqrt(len(pmi))), "frac_pos": float((pmi > 0).mean()), "shuf_mean": r["exact"]["shuf_bits"]["mean"], "bpd_uncond": r["exact"]["bits_per_dim_uncond"], "bpd_cond": r["exact"]["bits_per_dim_cond"]}
     fig.suptitle(f"unCLIP decoder p(h | e) — {names[0]} (step {r.get('step')}, {(r.get('samples') or 0) / 1e6:.0f}M activations)", fontsize=14); fig.tight_layout()
     os.makedirs(OUT, exist_ok=True)
-    for ext in ("png", "pdf"): fig.savefig(os.path.join(REP, f"unclip_decoder.{ext}"), dpi=150)
-    json.dump(data, open(os.path.join(OUT, "unclip_decoder_plot.json"), "w"), indent=1); print("wrote", os.path.join(REP, "unclip_decoder.png"))
+    for ext in ("png", "pdf"): fig.savefig(os.path.join(REP, f"{stem}.{ext}"), dpi=150)
+    json.dump(data, open(os.path.join(OUT, f"{stem}_plot.json"), "w"), indent=1); print("wrote", os.path.join(REP, f"{stem}.png"))
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    args = [a for a in sys.argv[1:] if not a.startswith("--stem=")]; stem = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--stem=")), "unclip_decoder")
+    main(args, stem)

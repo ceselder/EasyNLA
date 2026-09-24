@@ -71,6 +71,7 @@ def main():
         res["fm"] = {"ts": TS, "D": a.fm_draws, "loss": {b: L[b].mean(0).tolist() for b in L}, "loss_sem": {b: (L[b].std(0) / math.sqrt(a.n)).tolist() for b in L},
                      "gain_per_t": (L["uncond"] - L["cond"]).mean(0).tolist(), "bits_density_per_t": dens.mean(0).tolist(), "bits_density_per_t_sem": (dens.std(0) / math.sqrt(a.n)).tolist(),
                      "bits_cumulative": [float(integ(dens[:, : j + 1]).mean()) for j in range(len(TS))], "elbo_pmi_bits": stats(pmi_rows), "elbo_shuf_bits": stats(integ(dens_s)),
+                     "elbo_pmi_bits_t_ge_0.1": stats(tz(dens[:, TS.index(0.1):], ts[TS.index(0.1):], axis=-1)), "elbo_shuf_bits_t_ge_0.1": stats(tz(dens_s[:, TS.index(0.1):], ts[TS.index(0.1):], axis=-1)),   # the (1-t)/t weight blows up the noise of tiny deltas at t < 0.1; this partial integral is robust
                      "rl_grid_gain": {str(t_): float((L["uncond"][:, TS.index(t_)] - L["cond"][:, TS.index(t_)]).mean()) for t_ in (0.1, 0.3, 0.5, 0.7, 0.9)}}
         print(f"[dec-eval] fm: ELBO PMI {res['fm']['elbo_pmi_bits']['mean']:.0f} +- {res['fm']['elbo_pmi_bits']['sem']:.0f} bits (shuffled e {res['fm']['elbo_shuf_bits']['mean']:.0f}); gain at t=0.5 {res['fm']['rl_grid_gain']['0.5']:.4f}, t=0.9 {res['fm']['rl_grid_gain']['0.9']:.4f} ({time.time() - t0:.0f}s)", flush=True); dump()
 
