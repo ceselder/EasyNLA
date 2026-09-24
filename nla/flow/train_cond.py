@@ -382,6 +382,7 @@ def main():
     p.add_argument("--snap-pairs", default="", help="comma list of global pair counts (e.g. 64e3,128e3,...,8e6): at each, eval + save a loadable snapshot dir <out>/snap_<pairs>/ (adapter_latest.pt [+ prior_cotrained_latest.pt / ar_encoder_latest.pt] + eval.json)")
     p.add_argument("--render-pick", default="canonical", choices=["canonical", "random"], help="shards with k renderings per activation (g2): canonical column or one random QC-passing rendering per activation")
     p.add_argument("--resume-opt", action="store_true", help="also restore the AdamW state from <resume-from>/opt_latest.pt (replicated DDP / single GPU)")
+    p.add_argument("--lr-linear-to", type=float, default=None, help="anneal schedule: warm-up then LINEAR decay to this fraction of --lr at the last step")
     p.add_argument("--cfm-lambda", type=float, default=0.0, help="Contrastive Flow Matching weight: loss = ||v - (eps_i - x_i)||^2 - lambda ||v - (eps_j - x_j)||^2, j = batch rolled by one")
     p.add_argument("--snap-final", action="store_true", help="also save a snapshot dir at the last step (snap_<pairs seen>)")
     p.add_argument("--start-pairs", type=int, default=0, help="pairs already seen when resuming (keeps the snapshot schedule on the global pair count)")
@@ -851,7 +852,9 @@ def main():
             if is0: print(f"[cond] same-template sampler replayed {a.start_step} steps; {sum(len(v) for v in pools.values())} fresh activations left on rank 0", flush=True)
     ctr_stats = {}
     for step in range(a.start_step + 1, a.steps + 1):
-        sched = min(1.0, step / a.warmup, (step - a.start_step) / a.rewarm if a.rewarm > 0 else 1.0) * (1.0 if a.lr_const else (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1))
+        _decay = ((1.0 - (1.0 - a.lr_linear_to) * min(1.0, step / a.steps)) if a.lr_linear_to is not None     # anneal: linear decay to lr_linear_to x lr
+                  else (1.0 if a.lr_const else (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1)))
+        sched = min(1.0, step / a.warmup, (step - a.start_step) / a.rewarm if a.rewarm > 0 else 1.0) * _decay
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
         lr = a.lr * sched
         opt.zero_grad(set_to_none=True); loss_acc = 0.0
