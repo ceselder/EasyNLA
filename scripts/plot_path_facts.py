@@ -21,7 +21,7 @@ def main():
     d = json.load(open(a.scores)); rows = {r["arm"]: r for r in d["rows"]}; base = rows["baselines"]
     arms = [k for k in ("none", "count", "path", "path_s") if k in rows]
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE})
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6.4), gridspec_kw={"width_ratios": [2.3, 1.3]})
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6.8), gridspec_kw={"width_ratios": [2.2, 1.4]})
     ax = axes[0]; x = np.arange(len(FACTS)); w = 0.8 / (len(arms) + 1)
     ax.bar(x - (len(arms)) / 2 * w, [base[f"gapmajority_{f}"] for f, _ in FACTS], width=w * 0.92, color="#c3c2b7", edgecolor=SURFACE, label="gap-informed majority (knows only j - i)")
     for k, arm in enumerate(arms):
@@ -31,16 +31,16 @@ def main():
     for xi, (f, _) in zip(x, FACTS): ax.plot([xi - 0.45, xi + 0.45], [base[f"chance_{f}"]] * 2, color=INK2, lw=1, ls=":")
     ax.set_xticks(x); ax.set_xticklabels([lab for _, lab in FACTS], fontsize=10); ax.set_ylim(0, 1.12); ax.set_ylabel("exact accuracy of the stated fact")
     ax.grid(axis="y", color="#e6e5e1", lw=0.8); ax.set_axisbelow(True); ax.spines[["top", "right"]].set_visible(False)
-    ax.legend(frameon=False, fontsize=9, loc="lower left", bbox_to_anchor=(0, 1.0), ncol=2); ax.set_title("Categorical facts on the 4096 val pairs (dotted = chance)", loc="left", fontsize=11, color=INK2, pad=40)
-    ax = axes[1]; short = {"none": "endpoints\nonly", "count": "+ empty\nmarkers", "path": "+ attn / MLP\nwrites", "path_s": "+ writes,\nmagnitudes"}; labels = ["gap-mean\nbaseline"] + [short[a_] for a_ in arms]
+    ax.legend(frameon=False, fontsize=9, loc="lower left", bbox_to_anchor=(0, 1.0), ncol=2); ax.set_title("Categorical facts on the 4096 val pairs (dotted = chance)", loc="left", fontsize=11, color=INK2, pad=62)
+    ax = axes[1]; short = {"none": "endpoints\nonly", "count": "+ empty\nmarkers", "path": "+ writes", "path_s": "+ writes,\nmagnitudes"}; labels = ["gap-mean\nbaseline"] + [short[a_] for a_ in arms]
     vals = [base["pct_mae_predict_gap_mean"]] + [rows[a_]["pct_mae"] for a_ in arms]; cols = ["#c3c2b7"] + [ARM_COLOR[a_] for a_ in arms]
     ax.bar(range(len(vals)), vals, color=cols, edgecolor=SURFACE, width=0.7)
     for k, v in enumerate(vals): ax.text(k, v + 0.2, f"{v:.1f}", ha="center", va="bottom", fontsize=10, color=INK)
-    ax.set_xticks(range(len(vals))); ax.set_xticklabels(labels, fontsize=9); ax.set_ylabel("|stated - true| attention share, % points (lower is better)", fontsize=10); ax.set_ylim(0, max(vals) * 1.25)
+    ax.set_xticks(range(len(vals))); ax.set_xticklabels(labels, fontsize=8.5); ax.set_ylabel("|stated - true| attention share, % points (lower is better)", fontsize=10); ax.set_ylim(0, max(vals) * 1.25)
     ax.grid(axis="y", color="#e6e5e1", lw=0.8); ax.set_axisbelow(True); ax.spines[["top", "right"]].set_visible(False); ax.set_title("Stated attention %", loc="left", fontsize=12, color=INK2)
     fig.suptitle(d.get("title", "Path-dependent facts: only the arm that sees the attention / MLP writes can say where the change came from\n"
                                  "(same init, same rows, same hyper-parameters; facts parsed from each arm's own generations on the fixed val pairs)"), fontsize=12.5, x=0.01, ha="left")
-    fig.tight_layout(rect=(0, 0, 1, 0.92)); fig.savefig(a.out + ".png", dpi=150); fig.savefig(a.out + ".pdf"); print("->", a.out + ".png")
+    fig.tight_layout(rect=(0, 0, 1, 0.93)); fig.savefig(a.out + ".png", dpi=150); fig.savefig(a.out + ".pdf"); print("->", a.out + ".png")
 
 
 if __name__ == "__main__":
