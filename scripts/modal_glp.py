@@ -370,7 +370,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         calls = [claims_anchors_v2.spawn(root, i, nshards, tag or "v2", extra) for i in range(nshards)]
         print("rc", _gather(calls))
     elif task == "claims_finalize_shard":   # CPU finalize of one streaming shard (--tag = shard name, e.g. v2_017)
-        print("rc", claims_text.remote(root, 0, 1, "--names __none__", tag))
+        old_share = tag.startswith("v2_") and int(tag[3:]) <= 22    # extracted under the .4/.4/.2 family shares: redo its text claims under the current draw
+        print("rc", claims_text.remote(root, 0, 1, f"--names {tag}" if old_share else "--names __none__", tag))
     elif task == "claims_text":
         calls = [claims_text.spawn(root, i, nshards, extra) for i in range(nshards)]
         print("rc", _gather(calls))
