@@ -1,0 +1,250 @@
+"""Train the unCLIP prior p(e | z) (nla.unclip.prior.EPrior) on labelled (activation, explanation) pairs.
+
+  torchrun, replicated weights (denoiser fp32 + trunk LoRA), manual AVG all-reduce of the grads every step (nla.contrastive.train_clip.allreduce_grads);
+  data rank-disjoint by document (train_clip.load_rows over extraction shards: activation_vector / explanation / is_val [/ explanations, qc for the
+  g2 renderings]); e = f(h) is computed on the fly with the frozen ActEncoder (recipe: --encoder-json, fallback DEFAULT_ENCODER), the model space
+  is ENormalizer(sqrt(d) e) fitted on the first --enorm-n rows of rank 0 (+ N(0, e_noise^2) when e is unit-normalised).
+  Text conditioning: ARVecEncoder.tokens (AR-SFT trunk layer-42 token states, LoRA r64 a16 rsLoRA at --lr-lora; frozen with --lr-lora 0) and,
+  with --use-g, the frozen CLIP text embedding g(z) (pool over the trunk with LoRA disabled when the CLIP text trunk was frozen).
+  Evals (every --eval-every steps and at every snapshot, all ranks redundantly, rank 0 writes): held-out FM loss cond / uncond / shuffled per t,
+  retrieval of the true e among --ret-n by the FM proxy, exact PMI (probability-flow ODE) on --exact-n rows (gold vs shuffled explanation).
+  Snapshots at --snap-pairs global pairs: <out>/snap_<pairs>/{prior.pt, text_lora.pt, eval.json}; <out>/latest/ (+ opt.pt) for resume.
+"""
+from __future__ import annotations
+import argparse, json, math, os, random, time
+import numpy as np, torch, torch.nn.functional as F
+import torch.distributed as dist
+
+
+def log(*a, **k):
+    if int(os.environ.get("RANK", 0)) == 0: print(*a, **k, flush=True)
+
+
+class TextCond:
+    """texts -> (token states [B, T, d_enc], key mask [B, T], g [B, d_g] or None). LoRA-tuned trunk for the tokens; g from the FROZEN trunk
+    (LoRA disabled) through the frozen CLIP pooling head when the CLIP text trunk was frozen (else through the same LoRA trunk)."""
+    def __init__(self, arvec, act_enc, use_g, max_len):
+        self.arvec, self.act_enc, self.use_g, self.max_len = arvec, act_enc, use_g, max_len
+        mod = arvec.crit if arvec.crit is not None else arvec.lm
+        self.lora_layers = [m for m in mod.modules() if hasattr(m, "enable_adapters") and hasattr(m, "lora_A")]
+        self.g_frozen = act_enc.frozen_text() if use_g else False
+
+    def lora(self, on):
+        for m in self.lora_layers: m.enable_adapters(bool(on))
+
+    def __call__(self, texts, grad=False):
+        texts = [z if z else "(empty)" for z in texts]; g = None
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            if self.use_g and (self.g_frozen and self.lora_layers):
+                self.lora(False)
+                with torch.no_grad(): e0, m0 = self.arvec.tokens(texts, max_len=self.max_len); g = self.act_enc.pool_text(e0, m0)
+                self.lora(True); del e0, m0
+            if grad and self.arvec.trainable: e, m = self.arvec.tokens(texts, max_len=self.max_len)
+            else:
+                with torch.no_grad(): e, m = self.arvec.tokens(texts, max_len=self.max_len)
+            if self.use_g and g is None:
+                with torch.no_grad(): g = self.act_enc.pool_text(e.detach(), m)
+        return e, m, g
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--out", required=True); p.add_argument("--tag", default="unclip_prior"); p.add_argument("--base", required=True, help="Qwen/Qwen3.6-27B (tokenizer)")
+    p.add_argument("--encoder-json", default="/vol_glp/unclip/encoder.json"); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--enc-layer", type=int, default=42)
+    p.add_argument("--train-globs", default="/vol_q36/data/acts_qwen36_L42/shard_*.parquet"); p.add_argument("--max-rows", type=int, default=0, help="per rank (0 = all)"); p.add_argument("--render-pick", default="random", choices=["random", "canonical"])
+    p.add_argument("--val-parquet", default="/vol_q36/data/sft/av_sft_val_clean1.parquet"); p.add_argument("--eval-n", type=int, default=736); p.add_argument("--ret-n", type=int, default=256); p.add_argument("--exact-n", type=int, default=64); p.add_argument("--exact-steps", type=int, default=24)
+    p.add_argument("--n-tok", type=int, default=16); p.add_argument("--d-model", type=int, default=1024); p.add_argument("--n-layers", type=int, default=16); p.add_argument("--n-heads", type=int, default=16); p.add_argument("--mlp-ratio", type=int, default=4)
+    p.add_argument("--no-tokens", action="store_true", help="no cross-attention over the explanation tokens (g-only ablation)"); p.add_argument("--no-g", action="store_true", help="no CLIP text-embedding vector condition (tokens only)")
+    p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--e-noise", type=float, default=0.05, help="isotropic noise added to the standardised e during training when e is unit-normalised (proper density off the shell); 0 with unnormalised e")
+    p.add_argument("--max-len", type=int, default=224); p.add_argument("--enorm-n", type=int, default=65536)
+    p.add_argument("--batch", type=int, default=64, help="per rank"); p.add_argument("--steps", type=int, default=0); p.add_argument("--epochs", type=float, default=1.0, help="steps = epochs x min rows per rank / batch when --steps is 0")
+    p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--lr-lora", type=float, default=3e-5); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--warmup", type=int, default=300); p.add_argument("--lr-const", action="store_true", help="constant lr after warm-up (phases that continue each other); default cosine to 10 %")
+    p.add_argument("--eval-every", type=int, default=500); p.add_argument("--snap-pairs", default="64e3,128e3,256e3,512e3,1e6,2e6,4e6,8e6"); p.add_argument("--snap-final", action="store_true")
+    p.add_argument("--resume-from", default=None, help="dir with prior.pt (+ text_lora.pt, opt.pt)"); p.add_argument("--resume-opt", action="store_true"); p.add_argument("--start-pairs", type=int, default=-1, help="-1 = from the checkpoint")
+    p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb", default="nla-glp"); p.add_argument("--max-hours", type=float, default=22.5); p.add_argument("--log-every", type=int, default=25)
+    a = p.parse_args()
+    ddp = "RANK" in os.environ
+    if ddp:
+        from datetime import timedelta
+        dist.init_process_group("nccl", timeout=timedelta(hours=3)); rank, world = dist.get_rank(), dist.get_world_size(); dev = torch.device("cuda", int(os.environ["LOCAL_RANK"])); torch.cuda.set_device(dev)
+    else: rank, world, dev = 0, 1, torch.device("cuda")
+    is0 = rank == 0; torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
+    torch.backends.cuda.enable_cudnn_sdp(False)   # cuDNN SDPA graph failure in the LoRA-trunk backward (train_clip)
+    from transformers import AutoTokenizer
+    from nla.flow.train_cond import ARVecEncoder
+    from nla.contrastive.train_clip import load_rows, allreduce_grads
+    from nla.schema import extract_explanation
+    from nla.unclip.prior import EPrior, ENormalizer, ActEncoder, load_encoder_recipe, fm_loss, fm_proxy, exact_logp, save_prior
+    import pyarrow.parquet as pq
+
+    # ---------------- frozen activation encoder e = f(h)
+    recipe = load_encoder_recipe(a.encoder_json); act_enc = ActEncoder(recipe, dev)
+    e_noise = a.e_noise if act_enc.normalize_e else 0.0; scale = 1.0   # e already arrives at radius e_scale (per-coordinate variance ~ 1)
+    log(f"[prior] encoder recipe ({recipe['source']}): ckpt {recipe.get('ckpt_dir')} normalize_e {act_enc.normalize_e} e_scale {act_enc.e_scale} d_e {act_enc.d_e}; e_noise {e_noise}")
+
+    # ---------------- text conditioner: AR-SFT trunk (LoRA) + optional frozen CLIP pool
+    tok = AutoTokenizer.from_pretrained(a.base); tok.padding_side = "right"
+    if tok.pad_token_id is None: tok.pad_token = tok.eos_token
+    use_tokens, use_g = not a.no_tokens, not a.no_g
+    arvec = ARVecEncoder(a.ar_ckpt, tok, dev, lora_r=64, lora_alpha=16, grad_ckpt=True, trainable=a.lr_lora > 0, enc_layer=a.enc_layer)
+    cond = TextCond(arvec, act_enc, use_g, a.max_len)
+    d_enc = 5120 if arvec.crit is not None else arvec.owner.config.hidden_size
+
+    # ---------------- denoiser
+    model = EPrior(d_e=act_enc.d_e, n_tok=a.n_tok, d_model=a.d_model, n_layers=a.n_layers, n_heads=a.n_heads, d_enc=d_enc, d_g=act_enc.d_e, use_tokens=use_tokens, use_g=use_g, mlp_ratio=a.mlp_ratio).to(dev)
+    start_step = 0; start_pairs = 0; enorm = None
+    if a.resume_from:
+        ck = torch.load(os.path.join(a.resume_from, "prior.pt"), map_location="cpu", weights_only=False)
+        assert ck["arch"] == model.arch(), (ck["arch"], model.arch())
+        model.load_state_dict(ck["model"]); enorm = ENormalizer.from_state(ck["e_norm"]).to(dev); start_step = int(ck["step"]); start_pairs = int(ck["pairs"]) if a.start_pairs < 0 else a.start_pairs
+        tl = os.path.join(a.resume_from, "text_lora.pt")
+        if os.path.exists(tl) and arvec.trainable: arvec.load_saved(torch.load(tl, map_location="cpu", weights_only=False))
+        if ck.get("encoder", {}).get("ckpt_dir") != recipe.get("ckpt_dir") or bool(ck.get("encoder", {}).get("normalize_e", True)) != act_enc.normalize_e:
+            log(f"[prior] WARNING: resumed checkpoint was trained with encoder {ck.get('encoder')} but the current recipe is {recipe}")
+        log(f"[prior] resumed from {a.resume_from}: step {start_step}, pairs {start_pairs}")
+    lora = arvec.trainable_parameters() if arvec.trainable else []
+    if ddp:
+        with torch.no_grad():
+            for p_ in list(model.parameters()) + lora: dist.broadcast(p_.data, src=0)
+    decay = [p_ for n_, p_ in model.named_parameters() if p_.ndim >= 2 and "table" not in n_ and "pos" not in n_]; nodecay = [p_ for n_, p_ in model.named_parameters() if not (p_.ndim >= 2 and "table" not in n_ and "pos" not in n_)]
+    groups = [{"params": decay, "lr": a.lr, "base": a.lr, "weight_decay": a.wd}, {"params": nodecay, "lr": a.lr, "base": a.lr, "weight_decay": 0.0}]
+    if lora: groups.append({"params": lora, "lr": a.lr_lora, "base": a.lr_lora, "weight_decay": 0.0})
+    opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8)
+    if a.resume_from and a.resume_opt and os.path.exists(os.path.join(a.resume_from, "opt.pt")):
+        opt.load_state_dict(torch.load(os.path.join(a.resume_from, "opt.pt"), map_location="cpu", weights_only=False)); log("[prior] AdamW state restored")
+    trainable = list(model.parameters()) + lora
+    log(f"[prior] world {world}; denoiser {model.n_params()/1e6:.0f}M params ({a.n_layers} blocks x d {a.d_model}, {a.n_tok} e-tokens, tokens={use_tokens}, g={use_g}); trunk LoRA {sum(p_.numel() for p_ in lora)/1e6:.0f}M at lr {a.lr_lora}; denoiser lr {a.lr}")
+
+    # ---------------- data
+    t0 = time.time(); A, Z, D, _ = load_rows(a.train_globs, rank, world, a.max_rows, a.seed, a.render_pick, with_text=False)
+    n_loc = torch.tensor([A.shape[0]], device=dev); n_all = n_loc.clone()
+    if ddp: dist.all_reduce(n_loc, op=dist.ReduceOp.MIN); dist.all_reduce(n_all)
+    N = A.shape[0]; log(f"[prior] rows: {int(n_all)} total ({int(n_loc)} min per rank; rank 0 {N}) from {a.train_globs[:200]}{'...' if len(a.train_globs) > 200 else ''} in {time.time()-t0:.0f}s")
+    steps = a.steps if a.steps > 0 else int(a.epochs * int(n_loc) / a.batch)
+    # validation rows (clean1: one row per doubly-held-out document)
+    vt = pq.read_table(a.val_parquet, columns=["activation_vector", "response"]).slice(0, a.eval_n)
+    VA = torch.tensor(np.asarray(vt.column("activation_vector").combine_chunks().flatten(), dtype=np.float32).reshape(vt.num_rows, -1))
+    VZ = [(extract_explanation(r) or r or "").strip() for r in vt.column("response").to_pylist()]; n_ev = len(VZ)
+
+    @torch.no_grad()
+    def embed(h):   # raw h [n, 5120] (cpu fp16/fp32) -> e [n, d_e] on dev
+        return torch.cat([act_enc(h[i:i + 4096]) for i in range(0, h.shape[0], 4096)])
+    if enorm is None:
+        E0 = embed(A[: a.enorm_n]); enorm = ENormalizer.fit(E0, scale).to(dev)
+        if ddp:
+            dist.broadcast(enorm.mean, src=0); dist.broadcast(enorm.std, src=0)
+        sd = enorm.std; log(f"[prior] e normaliser fitted on {E0.shape[0]} rows: per-dim std of e min {sd.min():.3f} median {sd.median():.3f} max {sd.max():.3f}; |mean| {enorm.mean.norm():.3f}; logdet {enorm.logdet:.1f}"); del E0
+    VX = enorm.normalize(embed(VA))   # clean e's (no noise) in model space
+
+    # ---------------- eval
+    T_GRID = (0.1, 0.3, 0.5, 0.7, 0.9)
+    def _exact_mem(model_, x0, mem, mk, g, n_steps, gen):
+        """exact_logp with a precomputed memory (wrap the model so the ODE code passes mem through)"""
+        class W(torch.nn.Module):
+            def __init__(s, m): super().__init__(); s.m = m
+            def forward(s, x, t, enc=None, enc_mask=None, gg=None): return s.m(x, t, None, mk, g, mem=mem)
+        return exact_logp(W(model_), x0, enc=mem, enc_mask=mk, g=g, n_steps=n_steps, probes=1, gen=gen)
+
+    @torch.no_grad()
+    def evaluate(step, pairs):
+        model.eval(); (arvec.crit if arvec.crit is not None else arvec.lm).eval(); out = {"step": step, "pairs": pairs}; te = time.time()
+        # condition every held-out text once (memory + g), reuse for all evals
+        mems, masks, gs = [], [], []
+        for i in range(0, n_ev, 64):
+            e_, m_, g_ = cond(VZ[i:i + 64]); mems.append(model.memory(e_).to(torch.bfloat16)); masks.append(m_); gs.append(g_)
+        Tm = max(m.shape[1] for m in masks)
+        MEM = torch.cat([F.pad(m, (0, 0, 0, Tm - m.shape[1])) for m in mems]); MK = torch.cat([F.pad(m, (0, Tm - m.shape[1])) for m in masks]); G = torch.cat(gs) if use_g else None
+        perm = torch.randperm(n_ev, generator=torch.Generator().manual_seed(1)).tolist()
+        gen = torch.Generator(device=dev).manual_seed(0)
+        for tv in T_GRID:
+            eps = torch.randn(VX.shape, device=dev, generator=gen); tt = torch.full((n_ev,), tv, device=dev); x_t = (1 - tv) * VX + tv * eps; tgt = eps - VX
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                vu = torch.cat([model(x_t[i:i+256], tt[i:i+256]).float() for i in range(0, n_ev, 256)])
+                vc = torch.cat([model(x_t[i:i+256], tt[i:i+256], None, MK[i:i+256], G[i:i+256] if use_g else None, mem=MEM[i:i+256]).float() for i in range(0, n_ev, 256)])
+                pi = torch.tensor(perm, device=dev)
+                vs = torch.cat([model(x_t[i:i+256], tt[i:i+256], None, MK[pi[i:i+256]], G[pi[i:i+256]] if use_g else None, mem=MEM[pi[i:i+256]]).float() for i in range(0, n_ev, 256)])
+            for nm, v in (("uncond", vu), ("cond", vc), ("shuf", vs)): out[f"eval/fm_{nm}_t{tv}"] = ((v - tgt) ** 2).mean().item()
+        for nm in ("uncond", "cond", "shuf"): out[f"eval/fm_{nm}"] = float(np.mean([out[f"eval/fm_{nm}_t{tv}"] for tv in T_GRID]))
+        d_e = VX.shape[1]; out["eval/proxy_gain_bits"] = (out["eval/fm_uncond"] - out["eval/fm_cond"]) * d_e / (2 * math.log(2)); out["eval/proxy_shuf_bits"] = (out["eval/fm_uncond"] - out["eval/fm_shuf"]) * d_e / (2 * math.log(2))
+        # retrieval among ret_n by the FM proxy: L[i, j] = loss of e_i under text j (shared eps per row and t)
+        R = min(a.ret_n, n_ev); L = torch.zeros(R, R, device=dev); gen = torch.Generator(device=dev).manual_seed(2); RB = max(1, 4096 // R)
+        for tv in T_GRID:
+            eps = torch.randn(R, d_e, device=dev, generator=gen); x_t = (1 - tv) * VX[:R] + tv * eps; tgt = eps - VX[:R]
+            for i0 in range(0, R, RB):
+                rows = list(range(i0, min(R, i0 + RB))); nr = len(rows)
+                xx = x_t[rows].repeat_interleave(R, 0); tt = torch.full((nr * R,), tv, device=dev)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    v = model(xx, tt, None, MK[:R].repeat(nr, 1), G[:R].repeat(nr, 1) if use_g else None, mem=MEM[:R].repeat(nr, 1, 1)).float()
+                L[rows] += ((v - tgt[rows].repeat_interleave(R, 0)) ** 2).mean(-1).view(nr, R) / len(T_GRID)
+        rk_r = (L <= L.diagonal()[:, None]).sum(1) - 1; rk_c = (L <= L.diagonal()[None, :]).sum(0) - 1   # ties count against the true item (a zero-init model ties everything)
+        out.update({"eval/ret_a2t_top1": (rk_r == 0).float().mean().item(), "eval/ret_t2a_top1": (rk_c == 0).float().mean().item(), "eval/ret_a2t_top5": (rk_r < 5).float().mean().item(),
+                    "eval/ret_mean_rank_a2t": rk_r.float().mean().item() + 1, "eval/ret_n": R})
+        # exact PMI (probability-flow ODE), gold vs shuffled explanation, same probes
+        nx = min(a.exact_n, n_ev); lp = {}
+        for nm, idx in (("uncond", None), ("cond", list(range(nx))), ("shuf", perm[:nx])):
+            gx = torch.Generator(device=dev).manual_seed(11)
+            if idx is None: lp[nm] = exact_logp(model, VX[:nx], n_steps=a.exact_steps, probes=1, gen=gx)
+            else: ii = torch.tensor(idx, device=dev); lp[nm] = _exact_mem(model, VX[:nx], MEM[ii], MK[ii], G[ii] if use_g else None, a.exact_steps, gx)
+        pmi = (lp["cond"] - lp["uncond"]) / math.log(2); pms = (lp["shuf"] - lp["uncond"]) / math.log(2)
+        out.update({"eval/exact_pmi_bits": pmi.mean().item(), "eval/exact_pmi_median_bits": pmi.median().item(), "eval/exact_pmi_sem_bits": (pmi.std() / math.sqrt(nx)).item(), "eval/exact_frac_positive": (pmi > 0).float().mean().item(),
+                    "eval/exact_pmi_shuf_bits": pms.mean().item(), "eval/exact_nats_per_dim_uncond": (-lp["uncond"].mean() / d_e).item(), "eval/exact_n": nx, "eval/exact_steps": a.exact_steps, "eval/seconds": time.time() - te})
+        log(f"  [eval@{step}] fm uncond {out['eval/fm_uncond']:.4f} cond {out['eval/fm_cond']:.4f} shuf {out['eval/fm_shuf']:.4f} | proxy gain {out['eval/proxy_gain_bits']:.1f} bits | "
+            f"retrieval@{R} a2t top1 {100*out['eval/ret_a2t_top1']:.1f}% t2a {100*out['eval/ret_t2a_top1']:.1f}% mean rank {out['eval/ret_mean_rank_a2t']:.1f} | exact PMI {out['eval/exact_pmi_bits']:.1f} bits (median {out['eval/exact_pmi_median_bits']:.1f}, {100*out['eval/exact_frac_positive']:.0f}% > 0; shuffled {out['eval/exact_pmi_shuf_bits']:.1f}) | {out['eval/seconds']:.0f}s")
+        model.train(); (arvec.crit if arvec.crit is not None else arvec.lm).train()
+        return out
+
+    def save(dirname, step, pairs, ev, with_opt=False):
+        if not is0: return
+        save_prior(dirname, model, enorm, vars(a) | {"world": world, "d_enc": d_enc, "e_noise": e_noise}, recipe, step, pairs, text_state=arvec.state_for_save() if arvec.trainable else None,
+                   opt_state=opt.state_dict() if with_opt else None)
+        json.dump(ev, open(os.path.join(dirname, "eval.json"), "w"), indent=1); log(f"[prior] saved {dirname}")
+
+    use_wandb = bool(a.wandb) and is0
+    if use_wandb:
+        try: import wandb; wandb.init(project=a.wandb, name=a.tag, config=vars(a) | {"world": world, "rows": int(n_all), "denoiser_params": model.n_params(), "encoder": recipe}, resume="allow", id=None)
+        except Exception as e: log("[prior] wandb off:", e); use_wandb = False
+    ev = evaluate(start_step, start_pairs)
+    if use_wandb: wandb.log(ev, step=start_step)
+    snaps = sorted(int(float(x)) for x in a.snap_pairs.split(",") if x.strip()); done = set(q for q in snaps if q <= start_pairs)
+    rng = torch.Generator().manual_seed(a.seed * 1000 + rank); perm = torch.randperm(N, generator=rng); cursor = 0
+    for _ in range(start_step):   # replay the sampler so a resumed run continues the same data order
+        if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0
+        cursor += a.batch
+    pairs = start_pairs; t_start = time.time(); t_log = time.time(); loss_acc = 0.0; n_acc = 0
+    log(f"[prior] {steps} steps x {a.batch} x {world} = {steps*a.batch*world} draws ({steps*a.batch*world/int(n_all):.2f} passes over {int(n_all)} rows); start step {start_step}, pairs {start_pairs}; snapshots at {snaps}")
+    model.train(); (arvec.crit if arvec.crit is not None else arvec.lm).train()
+    for step in range(start_step + 1, steps + 1):
+        f_ = min(1.0, step / max(a.warmup, 1)) * (1.0 if a.lr_const else (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, step / steps)))))
+        for g_ in opt.param_groups: g_["lr"] = g_["base"] * f_
+        if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0
+        idx = perm[cursor:cursor + a.batch]; cursor += a.batch
+        x0 = enorm.normalize(act_enc(A[idx]))
+        if e_noise > 0: x0 = x0 + e_noise * torch.randn_like(x0)
+        e_, m_, g_ = cond([Z[i] for i in idx.tolist()], grad=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss, _ = fm_loss(model, x0, e_ if use_tokens else None, m_ if use_tokens else None, g_, p_uncond=a.p_uncond)
+        opt.zero_grad(set_to_none=True); loss.backward()
+        if ddp: allreduce_grads(trainable)
+        gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); opt.step()
+        pairs += a.batch * world; loss_acc += loss.item(); n_acc += 1
+        if step % a.log_every == 0 or step == start_step + 1:
+            dt = (time.time() - t_log) / n_acc; t_log = time.time()
+            log(f"[prior] step {step}/{steps} pairs {pairs} loss {loss_acc/n_acc:.4f} gn {gn.item():.3f} lr_f {f_:.3f} {dt:.2f}s/step | peak {torch.cuda.max_memory_allocated()/2**30:.0f} GiB")
+            if use_wandb: wandb.log({"train/loss": loss_acc / n_acc, "train/gn": gn.item(), "train/lr_f": f_, "train/pairs": pairs, "time/step_s": dt}, step=step)
+            loss_acc = 0.0; n_acc = 0
+        hit = [q for q in snaps if pairs >= q and q not in done]
+        timeout = (time.time() - t_start) / 3600 > a.max_hours; last = step == steps
+        if step % a.eval_every == 0 or last or hit or timeout:
+            ev = evaluate(step, pairs)
+            if use_wandb: wandb.log(ev, step=step)
+            for q in hit: save(os.path.join(a.out, f"snap_{q}"), step, pairs, ev); done.add(q)
+            if (last or timeout) and a.snap_final and pairs not in done: save(os.path.join(a.out, f"snap_{pairs}"), step, pairs, ev); done.add(pairs)
+            save(os.path.join(a.out, "latest"), step, pairs, ev, with_opt=True)
+            if timeout: log(f"[prior] max hours reached at step {step}"); break
+    if ddp: dist.barrier()
+    log(f"[prior] done: {steps} steps, {pairs} pairs, {(time.time()-t_start)/3600:.2f} h")
+    if ddp: dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
