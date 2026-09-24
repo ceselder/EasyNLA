@@ -318,6 +318,8 @@ def main():
     p.add_argument("--one-claim", action="store_true", help="claims-dir: ONE claim per training activation (drawn family, then balanced type, then claim; val keeps all); gold explanations: one random claim each")
     p.add_argument("--draw-families", default="", help="--one-claim: only training anchors whose drawn family is in this comma list (e.g. internal,text); default all")
     p.add_argument("--claims-glob", default=None, help="which synthetic final files (default <claims-dir>/final/final_*.parquet)")
+    p.add_argument("--snap-pairs", default="", help="comma list of global pair counts (e.g. 64e3,128e3,...,8e6): at each, eval + save a loadable snapshot dir <out>/snap_<pairs>/ (adapter_latest.pt [+ prior_cotrained_latest.pt / ar_encoder_latest.pt] + eval.json)")
+    p.add_argument("--start-pairs", type=int, default=0, help="pairs already seen when resuming (keeps the snapshot schedule on the global pair count)")
     p.add_argument("--one-pass", action="store_true", help="steps = min(--steps, training anchors per rank // (batch * grad_accum)): every activation seen at most once, no re-shuffle")
     p.add_argument("--lr-const", action="store_true", help="linear warm-up then CONSTANT lr (no cosine decay): for phases that continue each other on fresh shards")
     p.add_argument("--balance-types", type=float, default=0.0, help="claim-set mode with --claims-dir: type-balanced sampling, weight *= (median type count / type count) ** p (clipped x10)")
@@ -715,6 +717,24 @@ def main():
         if ddp: dist.all_reduce(_nmin, op=dist.ReduceOp.MIN)
         a.steps = min(a.steps, int(_nmin.item()) // (a.batch * a.grad_accum))
         if is0: print(f"[cond] --one-pass: {a.steps} steps (min training anchors per rank {int(_nmin.item())}, global batch {a.batch * a.grad_accum * world})", flush=True)
+    snap_pairs = sorted(int(float(x)) for x in a.snap_pairs.split(",") if x.strip()); snaps_done = set(q for q in snap_pairs if q <= a.start_pairs)
+
+    def save_ckpt(d_, step):
+        """adapter_latest.pt (+ prior_cotrained_latest.pt for --unfreeze-prior, + ar_encoder_latest.pt for trained encoders) into d_ (collective under FSDP)"""
+        if a.unfreeze_prior:
+            from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+            full = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+            if is0:
+                torch.save({"adapter": {k: v for k, v in full.items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(d_, "adapter_latest.pt"))
+                torch.save({"model": {k[len("prior."):]: v.to(torch.bfloat16) for k, v in full.items() if k.startswith("prior.")}, "args": cfg, "step": step, "cotrained_with": a.tag}, os.path.join(d_, "prior_cotrained_latest.pt"))
+        elif is0 and a.cond_mode == "trunk":
+            torch.save({"adapter": model.adapter_state_dict(), "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(d_, "adapter_latest.pt"))
+            torch.save({"lora": model.lora_state_dict(), "step": step}, os.path.join(d_, "ar_encoder_latest.pt"))
+        elif is0:
+            torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(d_, "adapter_latest.pt"))
+        if arvec is not None and is0:
+            torch.save(dict(arvec.state_for_save(), step=step), os.path.join(d_, "ar_encoder_latest.pt"))
+
     if is0: print(f"[cond] {a.steps} steps x {a.batch} x {a.grad_accum} accum x {world} ranks = {a.steps*a.batch*a.grad_accum*world} draws; rank 0 holds {N} pairs = {a.steps*a.batch*a.grad_accum*world/N:.2f} passes (single pass = no repetition)", flush=True)
     perm = torch.randperm(N, generator=rng); cursor = 0
     if a.start_step:   # replay the sampler: full passes re-draw the permutation, the remainder advances the cursor (same data order as an uninterrupted run)
@@ -796,24 +816,21 @@ def main():
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats}, step=step)
             if gstats and is0: print(f"  [samedoc] ce {gstats['train/samedoc_ce']:.3f} acc row {100*gstats['train/samedoc_acc_row']:.0f}% col {100*gstats['train/samedoc_acc_col']:.0f}% (chance {100/a.group_size:.0f}%)", flush=True)
             if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
-        if step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours:
+        pairs_seen = a.start_pairs + (step - a.start_step) * a.batch * a.grad_accum * world      # global (activation, text) draws so far
+        snap_now = [q for q in snap_pairs if q <= pairs_seen and q not in snaps_done]
+        is_eval = step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours
+        if is_eval or snap_now:
             ev = evaluate(step)
             if mv_z is not None: ev.update(evaluate(step, mv_acts, mv_z, prefix="eval_onpolicy"))
             if sv_z: ev.update(evaluate(step, sv_acts, sv_z, prefix="eval_synth"))
+            ev["train/pairs_seen"] = pairs_seen
             if use_wandb: wandb.log(ev, step=step)
-            if a.unfreeze_prior:
-                from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
-                full = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
-                if is0:
-                    torch.save({"adapter": {k: v for k, v in full.items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
-                    torch.save({"model": {k[len("prior."):]: v.to(torch.bfloat16) for k, v in full.items() if k.startswith("prior.")}, "args": cfg, "step": step, "cotrained_with": a.tag}, os.path.join(a.out, "prior_cotrained_latest.pt"))
-            elif is0 and a.cond_mode == "trunk":
-                torch.save({"adapter": model.adapter_state_dict(), "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
-                torch.save({"lora": model.lora_state_dict(), "step": step}, os.path.join(a.out, "ar_encoder_latest.pt"))
-            elif is0:
-                torch.save({"adapter": {k: v for k, v in model.state_dict().items() if ".read." in k or ".gate_mod." in k or ".cvec_out." in k or k.startswith("cvec_") or k.startswith("token_encoder.")}, "args": vars(a), "prior_cfg": cfg, "step": step}, os.path.join(a.out, "adapter_latest.pt"))
-            if arvec is not None and is0:
-                torch.save(dict(arvec.state_for_save(), step=step), os.path.join(a.out, "ar_encoder_latest.pt"))
+            dirs = ([a.out] if is_eval else []) + [os.path.join(a.out, f"snap_{q}") for q in snap_now]   # log-spaced snapshots: own dir, loadable directly
+            for d_ in dirs:
+                if is0: os.makedirs(d_, exist_ok=True)
+                save_ckpt(d_, step)
+                if is0 and d_ != a.out: json.dump({**ev, "pairs_seen": pairs_seen, "step": step}, open(os.path.join(d_, "eval.json"), "w"), indent=1)
+            snaps_done.update(snap_now)
             if (time.time() - t0) / 3600 > a.max_hours: break
     if is0: print("[cond] done", flush=True)
     if ddp: dist.destroy_process_group()
