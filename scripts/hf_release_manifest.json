@@ -161,6 +161,14 @@
     {
      "src_glob": "/vol/rl/sft/v0*dossier*/lora",
      "dst_fmt": "{run}/lora"
+    },
+    {
+     "src_glob": "/vol/rl/sft/*matched*/lora",
+     "dst_fmt": "{run}/lora"
+    },
+    {
+     "src_glob": "/vol/rl/sft/*tdv1*/lora",
+     "dst_fmt": "{run}/lora"
     }
    ],
    "file_globs": [
@@ -174,6 +182,14 @@
     },
     {
      "src_glob": "/vol/rl/sft/v0*dossier*/meta.json",
+     "dst_fmt": "{run}"
+    },
+    {
+     "src_glob": "/vol/rl/sft/*matched*/meta.json",
+     "dst_fmt": "{run}"
+    },
+    {
+     "src_glob": "/vol/rl/sft/*tdv1*/meta.json",
      "dst_fmt": "{run}"
     }
    ]
@@ -224,6 +240,28 @@
       "/vol/z/teacher-dossier-v1/train/*.parquet"
      ],
      "dst": "data/teacher-dossier-v1/train"
+    },
+    {
+     "kind": "copy_parquet",
+     "src": [
+      "/vol/z/v0c-tdv1/train/*.parquet"
+     ],
+     "dst": "data/v0c_sft_rows/v0c-tdv1"
+    },
+    {
+     "kind": "copy_parquet",
+     "src": [
+      "/vol/z/v0-matched/train/*.parquet"
+     ],
+     "dst": "data/v0c_sft_rows/v0-matched"
+    },
+    {
+     "kind": "copy_tree",
+     "src": [
+      "/vol/z/v0-matched/train/*.json"
+     ],
+     "root": "/vol/z/v0-matched/train",
+     "dst": "data/v0c_sft_rows/v0-matched"
     }
    ],
    "card_vars": {},

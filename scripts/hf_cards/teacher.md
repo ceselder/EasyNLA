@@ -16,6 +16,8 @@ Columns: `pair_id` (`<split>:<pos_idx>:<i>:<j>`, joins the NLT pair lists), `tex
 
 `data/teacher-dossier-v1/{val,train}` (DECISIONS v1.33): the same teacher prompted with the featurizer's per-pair FEATURE DOSSIER (SAE / transcoder / MAEMM / NLA / J-lens readouts of the change) instead of the lens top-k alone; same schema; val landed ~03:40 UTC, train after the 04:05 cut (parts present = what existed at upload time).
 
+`data/v0c_sft_rows/{v0c-tdv1,v0-matched}` (rl, DECISIONS v1.33): the exact SFT rows of V0c (dossier sentences) and of its matched V0 control (teacher-sonnet-v1 sentences of the SAME pair ids; ~3 % nearest-verbosity substitutions listed in the .json).
+
 Splits (parquet): `data/train` (train pairs of the NLT store), `data/val` (the fixed 4096 evaluation pairs, first rows of `pairs_val`),
 `data/val_nofinal` (teacher without the model's final top-10), `data/val_nolens` (passage only, no lens readouts -- grounding ablation).
 
