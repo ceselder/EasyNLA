@@ -79,19 +79,19 @@ def main():
                        n_pairs=n_pairs, n_pairs_with_writes=n_w, attn_share_of_delta_mean=float(np.mean(attn_tot)) if n_w else None,
                        mlp_share_of_delta_mean=float(np.mean(mlp_tot)) if n_w else None, attn_norm2_fraction_mean=float(np.mean(a_norm_frac)) if n_w else None,
                        last_layer_share_mean=float(np.mean(abs_last)), last_layer_share_median=float(np.median(abs_last)))
-    fig, axs = plt.subplots(1, 2, figsize=(11, 4.6))
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5)); fig.subplots_adjust(wspace=0.3)
     x = np.arange(nb); w = 0.38
     axs[0].bar(x - w / 2, delta_by_pos, w, color=C["grey"], label="share of Δ (projection of d_k on Δ)")
     axs[0].bar(x + w / 2, fchg_by_pos, w, color=C["sae"], label="share of top SAE-feature change")
     axs[0].set_xticks(x); axs[0].set_xticklabels(out["fig1"]["bins"]); axs[0].set_xlabel("relative position of the block inside the gap (i, j]")
     axs[0].set_ylabel("mean share per pair"); axs[0].legend(loc="upper left")
-    axs[0].set_title("Δ and the SAE-feature change are spread across the gap,\nnot concentrated in the last block")
+    axs[0].set_title("Δ and the SAE-feature change are spread\nacross the gap, not only in the last block")
     axs[1].bar(x - w / 2, attn_by_pos, w, color=C["attn"], label="attention writes a_k")
     axs[1].bar(x + w / 2, mlp_by_pos, w, color=C["mlp"], label="MLP writes m_k")
     axs[1].set_xticks(x); axs[1].set_xticklabels(out["fig1"]["bins"]); axs[1].set_xlabel("relative position of the block inside the gap (i, j]")
     axs[1].set_ylabel("mean share of Δ per pair")
     if n_w:
-        axs[1].set_title(f"MLP writes carry {100 * np.mean(mlp_tot):.0f}% of Δ, attention {100 * np.mean(attn_tot):.0f}%\n(n={n_w} val pairs with separate writes)")
+        axs[1].set_title(f"MLP writes carry {100 * np.mean(mlp_tot):.0f}% of Δ,\nattention {100 * np.mean(attn_tot):.0f}% (n={n_w} val pairs)")
     axs[1].legend()
     save(fig, a.report_dir, "featurizer_delta_by_position")
 
@@ -102,20 +102,20 @@ def main():
                    "fve_hj_mean": float(sae.fve_hj.mean()), "l0_i_mean": float(sae.l0_i.mean()), "l0_j_mean": float(sae.l0_j.mean()), "n_shared_mean": float(sae.n_shared.mean())}
     gap_bins = pd.cut(sae.gap, [0, 3, 6, 12, 25], labels=["1-3", "4-6", "7-12", "13-25"])
     out["fig2"]["by_gap"] = {str(b): {c: float(g[c].clip(lower=-1).mean()) for c in fve_cols} | {"n": int(len(g))} for b, g in sae.groupby(gap_bins, observed=True)}
-    fig, axs = plt.subplots(1, 2, figsize=(11, 4.6))
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5)); fig.subplots_adjust(wspace=0.3)
     Ks = [5, 10, 20, 40]
     for b, g in sae.groupby("band"):
         axs[0].plot(Ks, [g[f"fve_top{K}"].clip(lower=-1).mean() for K in Ks], marker="o", label=f"{b} (n={len(g)})")
     axs[0].axhline(sae.fve_sae_delta.clip(lower=-1).mean(), color=C["grey"], ls="--", label="full SAE code difference")
     axs[0].set_xscale("log", base=2); axs[0].set_xticks(Ks); axs[0].set_xticklabels([str(k) for k in Ks])
     axs[0].set_xlabel("K most-changed SAE features (decoder directions, least squares)"); axs[0].set_ylabel("fraction of ||Δ||² explained")
-    axs[0].set_title(f"The top-20 changed SAE features explain {100 * sae.fve_top20.clip(lower=-1).mean():.0f}% of Δ;\nthe full 16k SAE code difference only {100 * sae.fve_sae_delta.clip(lower=-1).mean():.0f}%")
+    axs[0].set_title(f"Top-20 changed SAE features explain {100 * sae.fve_top20.clip(lower=-1).mean():.0f}% of Δ;\nthe full SAE code difference only {100 * sae.fve_sae_delta.clip(lower=-1).mean():.0f}%")
     axs[0].legend(); axs[0].set_ylim(-0.05, 1)
     for b, g in sae.groupby(gap_bins, observed=True):
         axs[1].plot(Ks, [g[f"fve_top{K}"].clip(lower=-1).mean() for K in Ks], marker="o", label=f"gap {b} (n={len(g)})")
     axs[1].set_xscale("log", base=2); axs[1].set_xticks(Ks); axs[1].set_xticklabels([str(k) for k in Ks])
     axs[1].set_xlabel("K most-changed SAE features"); axs[1].set_ylabel("fraction of ||Δ||² explained")
-    axs[1].set_title("Short gaps are the most feature-explainable;\nlong gaps need more features"); axs[1].legend(); axs[1].set_ylim(-0.05, 1)
+    axs[1].set_title("Long gaps are the most feature-explainable;\nshort gaps are mostly dense change"); axs[1].legend(); axs[1].set_ylim(-0.05, 1)
     save(fig, a.report_dir, "featurizer_delta_fve_sae")
 
     # ------------------------------------------------------------------ Fig 3: SAE risers vs J-lens risers (agreement via output tokens)
@@ -158,7 +158,7 @@ def main():
         bands = list(agree["by_band"]); x = np.arange(len(bands)); w = 0.38
         ax.bar(x - w / 2, [agree["by_band"][b]["hit"] for b in bands], w, color=C["sae"], label="same pair")
         ax.bar(x + w / 2, [agree["by_band"][b]["ctrl"] for b in bands], w, color=C["grey"], label="control: another pair's J-lens risers")
-        ax.set_xticks(x); ax.set_xticklabels([f"{b}\n(n={agree['by_band'][b]['n']})" for b in bands]); ax.set_ylabel("P(a rising SAE feature promotes a J-lens riser token)")
+        ax.set_xticks(x); ax.set_xticklabels([f"{b}\n(n={agree['by_band'][b]['n']})" for b in bands]); ax.set_ylabel("P(rising SAE feature promotes\na J-lens riser token)")
         ax.set_title(f"Rising SAE features promote the J-lens riser tokens {100 * agree['p_sae_riser_tokens_hit_jlens_risers']:.0f}% of the time\n"
                      f"vs {100 * agree['p_control_other_pair']:.0f}% for another pair's risers")
         ax.legend(); ax.set_ylim(0, 1)
@@ -175,7 +175,7 @@ def main():
         pp = pd.Series(per_pair)
         out["fig4"] = {"by_layer": tcs.to_dict("records"), "delta_share_from_top_tc_features_mean": float(pp.mean()), "delta_share_from_top_tc_features_median": float(pp.median()),
                        "n_pairs": int(len(pp)), "fve_tc_median_all": float(tc.fve_tc.median()), "fve_top8_median_all": float(tc.fve_top.median())}
-        fig, axs = plt.subplots(1, 2, figsize=(11, 4.6))
+        fig, axs = plt.subplots(1, 2, figsize=(12, 5)); fig.subplots_adjust(wspace=0.3)
         axs[0].plot(tcs.k, tcs.fve_tc, marker="o", color=C["tc"], label="all active features (median)")
         axs[0].plot(tcs.k, tcs.fve_top, marker="s", color=C["mlp"], label="top-8 features by write norm (median)")
         axs[0].set_xlabel("MLP block k"); axs[0].set_ylabel("fraction of ||m_k||² explained"); axs[0].set_ylim(0, 1)
