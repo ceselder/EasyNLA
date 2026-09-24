@@ -84,7 +84,7 @@ def main():
         ax.set_xticks(range(len(src))); ax.set_xticklabels([lab for _, lab in src]); ax.set_ylabel("final held-out CE, nats / token")
         allv = [d.get(kk) for d in fin for kk, _ in src if d.get(kk) is not None]
         if allv: ax.set_ylim(max(0, min(allv) - (0.02 if a.single_source else 0.4)), max(allv) + (0.02 if a.single_source else 0.45))
-        if a.single_source: ax.set_xticks([0]); ax.set_xticklabels(["final held-out CE"]); ax.legend(frameon=False, fontsize=9, loc="upper right")
+        if a.single_source: ax.set_xticks([0]); ax.set_xticklabels(["final held-out CE (colours as on the left)"])
         ax.grid(axis="y", color="#e6e5e1", lw=0.8); ax.set_axisbelow(True); ax.spines[["top", "right"]].set_visible(False); ax.set_title("Final loss per arm" if a.single_source else "Final loss by SFT source", loc="left", fontsize=12, color=INK2)
         fig.suptitle(a.title or "Do the intermediate attention / MLP writes help the verbalizer?\nHeld-out SFT loss: same rows, same init, same hyper-parameters, only the input differs", fontsize=13, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.90)); fig.savefig(a.plot + ".png", dpi=150); fig.savefig(a.plot + ".pdf"); print("->", a.plot + ".png")
