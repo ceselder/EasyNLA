@@ -56,8 +56,8 @@ def main():
         if st in refs and refs[st][1] is not None:
             ax1.axhline(refs[st][1], color="#87867F", lw=1.2, ls=(0, (4, 2))); ax1.text(0.01, 0.97, f"{refs[st][0]}: {refs[st][1]:+.1f}", transform=ax1.transAxes, ha="left", va="top", fontsize=9.5, color=INK2)
         ax1.set_title("exact PMI of the TRUE text vs the blind prior", loc="left", fontsize=11.5)
-        ax2.set_title("paired content = bits(z) − bits(z_dm)", loc="left", fontsize=11.5)
-        ax1.set_ylabel("exact bits (true text vs empty text)"); ax2.set_ylabel("content bits (label = P(z beats z_dm))"); ax2.axhline(0, color=INK2, lw=0.9)
+        ax2.set_title("paired content = own − depth-matched wrong sentence", loc="left", fontsize=11.5)
+        ax1.set_ylabel("exact bits (true text vs empty text)"); ax2.set_ylabel("content bits (label = P(own beats the depth-matched wrong sentence))"); ax2.axhline(0, color=INK2, lw=0.9)
         for ax in (ax1, ax2):
             ax.set_xlabel("training step (checkpoint)"); ax.grid(color=GRID)
             for s_ in ("top", "right"): ax.spines[s_].set_visible(False)

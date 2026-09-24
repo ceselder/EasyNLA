@@ -77,7 +77,7 @@ def main():
         n = S["step"][-1]
         fig.suptitle("\n".join(textwrap.wrap(f"PRELIMINARY referential RL ({n} steps so far, {a.label}): reward = content + 0.2·PMI(own) − λ·tokens with same-(i, j) distractors; "
                                               f"content moved {S['content'][0]:+.2f} → {S['content'][-1]:+.2f} bits, referential accuracy {S['ref_acc'][0]:.2f} → {S['ref_acc'][-1]:.2f}", 108)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
-        fig.text(0.01, 0.005, f"Run {a.tag}: 12 (i, j) classes × 8 pairs × 8 samples per step (768 rollouts); same-document and cross-document distractors; null-dm listener co-trained at lr 5e-6 every 2 steps on winners with paraphrase augmentation; iterated reset every 100 steps; "
+        fig.text(0.01, 0.005, f"Referential RL run: 12 (i, j) classes × 8 pairs × 8 samples per step (768 rollouts); same-document and cross-document distractors; null-dm listener co-trained at lr 5e-6 every 2 steps on winners with paraphrase augmentation; iterated reset every 100 steps; "
                  "KL β 0.01 to Qwen3-8B on a text-only prompt; paraphrase-scored reward p = 0.3. Parsed from the trainer log.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
         fig.subplots_adjust(left=0.08, right=0.985, top=0.86, bottom=0.10, hspace=0.5, wspace=0.28)
         for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")

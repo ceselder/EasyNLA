@@ -15,7 +15,7 @@ SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 # critics to plot: (ckpt stem, label, colour, marker)
 CRITICS = [("text_union_pooled_n", "all-sources adapter + null reg., pooled prior (headline)", CAT[0], "o"), ("text_mine_lens_pooled", "J-lens-text-only adapter + null reg., pooled prior", CAT[6], "s"),
-           ("text_union_pooled_big", "all-sources adapter, 16 slots, 4000 steps, pooled", CAT[2], "D"), ("critic_v3a", "critic v3a (every lever, prior unfrozen)", CAT[1], "^")]
+           ("text_union_pooled_big", "all-sources adapter, 16 slots, 4000 steps, pooled", CAT[2], "D"), ("critic_v3a", "all-levers critic (prior unfrozen)", CAT[1], "^")]
 SET_SHORT = {"teacher_v0": "teacher phrase", "teacher_v1": "teacher 1 sent.", "teacher_v2": "teacher long", "teacher_nofinal_v1": "teacher no-final", "twins": "twins", "ao_src": "oracle h_i", "ao_tgt": "oracle h_j", "ao_delta": "oracle Δ",
              "lens_L0": "J-lens phrase", "lens_L1": "J-lens 1 sent.", "lens_L2": "J-lens 3 sent.", "lens_L3": "J-lens lists", "lens_L2m": "J-lens 3 sent.+mag", "lens_L3m": "J-lens lists+mag", "logit_L1": "logit lens", "tuned_L1": "tuned lens", "v0": "VERBALIZER", "v0b_mix": "V0b targets (lists)"}
 
@@ -61,7 +61,7 @@ def main():
         xl = min(200, 22 / bpt); ax.text(xl, bpt * xl * 1.08, f"{bpt:g} bits / token", color=INK2, fontsize=9.5, ha="right", va="bottom")
     ax.set_xscale("log"); ax.set_yscale("symlog", linthresh=1); ax.set_xlim(5, 220); ax.set_ylim(-0.3, 25)
     ax.set_yticks([0, 0.5, 1, 2, 3, 5, 10, 20]); ax.set_yticklabels(["0", "0.5", "1", "2", "3", "5", "10", "20"]); ax.set_xticks([10, 20, 40, 80, 160]); ax.set_xticklabels(["10", "20", "40", "80", "160"])
-    ax.set_xlabel("mean length of the text, tokens (log scale)"); ax.set_ylabel("paired content bits = bits(z) − bits(z_dm), all bands")
+    ax.set_xlabel("mean length of the text, tokens (log scale)"); ax.set_ylabel("paired content bits = own sentence − depth-matched wrong sentence, all bands")
     ax.legend(frameon=False, loc="upper left", fontsize=9.5); ax.axhline(0, color=INK2, lw=0.8)
     ax.set_title("Natural-language sources sit between 0.01 and 0.5 bits per token and gain sub-linearly with length;\nthe wider 16-slot adapter roughly doubles every source; the raw lens list at the same length is 2–4× higher still", loc="left", fontsize=12.5)
     fig.suptitle("\n".join(textwrap.wrap("The bits-per-token frontier the spec asks for is concave and low: natural-language sources buy 1–6 content bits at 0.02–0.5 bits per token under the pooled "

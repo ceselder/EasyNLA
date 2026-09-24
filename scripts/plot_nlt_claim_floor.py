@@ -12,8 +12,8 @@ SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 VARIANTS = [("para_light", "light paraphrase (same claim)", "#9fbde6"), ("para_strong", "strong paraphrase (same claim)", CAT[0]),
             ("twin", "Sonnet claim-flip twin", CAT[3]), ("twin_near", "single-token twin: model's runner-up", CAT[1]), ("twin_far", "single-token twin: implausible token", CAT[7])]
-CRITIC_LABEL = {"pooled_n (frozen)": "headline critic\n(pooled, null-regularised)", "union_pooled_big": "wider adapter\n(accepted on teacher / V0)",
-                "critic_para_p3 @3500": "paraphrase-augmented\ncritic @3500", "critic_v3b_fbpc s8000": "0.6B critic, decayed lr\n@8000 (best calibrated)"}
+CRITIC_LABEL = {"pooled_n (frozen)": "headline critic\n(pooled, null-regularised)", "union_pooled_big": "wider adapter\n(accepted on teacher / verbalizer text)",
+                "critic_para_p3 @3500": "paraphrase-augmented\ncritic (step 3500)", "critic_v3b_fbpc s8000": "0.6B critic, decaying\nlearning rate (step 8000)"}
 REG_LABEL = {"teacher_v1": "(a) Sonnet teacher sentences (+lens +final token)", "v0_ao_tsv1": "(b) the VERBALIZER's own sentences (activations only)"}
 
 
