@@ -44,6 +44,7 @@ def get_args():
     p.add_argument("--shard-coarse", action="store_true", help="FSDP with one unit per CondMLPBlock (FAILS: prior.layers[i] is also blocks[i].base, the root meets DTensors -> 'value was None'); default = the train_cond pattern (every called sub-module of the prior block sharded separately)")
     p.add_argument("--no-fsdp", action="store_true", help="single process / CPU test: plain tensors"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cpu-test", action="store_true", help="tiny random prior + random encoder weights on CPU (tests/CI)")
+    p.add_argument("--export-latest", action="store_true", help="no training: load <out>/latest (DCP; same world size as the run), evaluate, write a loadable snapshot <out>/snap_<samples>M, exit")
     return p.parse_args()
 
 
@@ -279,6 +280,14 @@ def main():
     held = torch.load(a.heldout, map_location="cpu")["acts"][: a.eval_n].float() if (a.heldout and os.path.exists(a.heldout)) else None
     clean = load_clean1(a.clean1) if (a.clean1 and os.path.exists(a.clean1)) else None
     if a.cpu_test and clean is not None: held = clean[:64]; clean = clean[64:128]
+    if a.export_latest:   # snapshot from the resumable checkpoint (the run's end writes only latest/ unless --snap-at-end)
+        assert step > 0, f"no {latest} to export"
+        ev = evaluate(model, enc, norm, held, clean, a, dev)
+        if is0: print(f"[eval@{step}] " + " ".join(f"{k}={v:.4f}" for k, v in ev.items() if "_t0." not in k and not k.startswith("_")), flush=True)
+        save_snapshot(os.path.join(a.out, f"snap_{int(samples/1e6):06d}M"), model, a, cfg, d_e, step, samples, ev, fsdp, rank)
+        if is0: print(f"[dec] exported {latest} -> snap_{int(samples/1e6):06d}M (step {step}, {samples/1e6:.0f}M samples)", flush=True); print("[dec] done", flush=True)
+        if ddp: dist.destroy_process_group()
+        return
     if a.shard_dir: feeder = ShardFeeder(a.shard_dir, norm, a.batch, dev, a.stop_file, a.stream_timeout)
     elif a.parquet_glob: feeder = StaticFeeder(a.parquet_glob, norm, a.batch, dev, rank, world, a.max_rows, a.seed)
     else: raise SystemExit("--shard-dir or --parquet-glob")
