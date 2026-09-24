@@ -31,12 +31,20 @@ def stats(v):
     v = np.asarray(v, dtype=np.float64); return {"mean": float(v.mean()), "median": float(np.median(v)), "sem": float(v.std() / math.sqrt(len(v))), "p10": float(np.percentile(v, 10)), "p90": float(np.percentile(v, 90)), "n": int(len(v))}
 
 
+def match_norm(v, ref):
+    """rescale each row of v to the norm of the corresponding row of ref (direction kept): the decoder is judged on cosine, magnitude is taken from h"""
+    return v * (ref.norm(dim=-1, keepdim=True) / v.norm(dim=-1, keepdim=True).clamp_min(1e-6))
+
+
 def recon(h, hh, msf):
+    """PRIMARY: cosine to the true activation. Secondary: FVE (NLA unit-L2 convention, scale-free by construction), FVE after matching ||h|| (raw-unit
+    MSE relative to the predict-mean baseline), norm ratio, relative error."""
     from nla.schema import normalize_activation, compute_predict_mean_baselines
     _, base = compute_predict_mean_baselines(h, msf)
     mse = ((normalize_activation(hh, msf) - normalize_activation(h, msf)) ** 2).mean(-1)
-    return {"fve": float(100 * (1 - mse.mean().item() / base)), "cos": stats(F.cosine_similarity(hh, h, dim=-1).cpu()), "norm_ratio": stats((hh.norm(dim=-1) / h.norm(dim=-1)).cpu()),
-            "rel_err": stats(((hh - h).norm(dim=-1) / h.norm(dim=-1)).cpu())}
+    hm = match_norm(hh, h); base_raw = ((h - h.mean(0, keepdim=True)) ** 2).mean().item(); mse_raw = ((hm - h) ** 2).mean().item()
+    return {"cos": stats(F.cosine_similarity(hh, h, dim=-1).cpu()), "fve": float(100 * (1 - mse.mean().item() / base)), "fve_normmatched_raw": float(100 * (1 - mse_raw / base_raw)),
+            "norm_ratio": stats((hh.norm(dim=-1) / h.norm(dim=-1)).cpu()), "rel_err": stats(((hh - h).norm(dim=-1) / h.norm(dim=-1)).cpu()), "rel_err_normmatched": stats(((hm - h).norm(dim=-1) / h.norm(dim=-1)).cpu())}
 
 
 def main():
@@ -44,6 +52,7 @@ def main():
     p.add_argument("--snap", required=True); p.add_argument("--out", default=None); p.add_argument("--n", type=int, default=256); p.add_argument("--n-kl", type=int, default=128); p.add_argument("--n-var", type=int, default=32); p.add_argument("--k-var", type=int, default=4)
     p.add_argument("--tests", default="fm,exact,recon,kl,var"); p.add_argument("--cfgs", default="1,2,4"); p.add_argument("--sample-steps", type=int, default=50); p.add_argument("--exact-steps", type=int, default=32); p.add_argument("--fm-draws", type=int, default=4)
     p.add_argument("--var-cfg", type=float, default=2.0); p.add_argument("--seed", type=int, default=0); p.add_argument("--lm-device", default="cuda:1"); p.add_argument("--encoder-json", default=None); p.add_argument("--max-new", type=int, default=200)
+    p.add_argument("--splice-norm", default="match", choices=["match", "raw"], help="match (default): every decoded / edited h' is rescaled to the ORIGINAL activation's norm ||h|| before it is spliced into the LM (downstream KL) or read back by the verbalizer (variations); the decoder is judged on DIRECTION (cosine). raw: as decoded")
     p.add_argument("--ref-prior", default="/vol_glp/glp27b_main/ckpts/snap_001966M", help="exact test: also log p(h) under this FIXED unconditional prior (the warm start), so the PMI does not depend on the co-trained model's own unconditional branch drifting; '' = off")
     a = p.parse_args(); tests = set(a.tests.split(",")); cfgs = [float(x) for x in a.cfgs.split(",")]; t0 = time.time(); d0 = "cuda:0"
     from nla.unclip.decoder import Decoder
@@ -105,10 +114,10 @@ def main():
         S["mean_act"] = Hg.mean(0, keepdim=True).expand_as(Hg).contiguous(); S["other_row"] = Hg[[(i + 1) % a.n for i in range(a.n)]]
         rc = {}
         for k, v in S.items():
-            rc[k] = recon(Hg, v, msf); rc[k]["e_cos"] = stats(((dec.encode(v) * E).sum(-1) / dec.d_e).cpu())
+            rc[k] = recon(Hg, v, msf); rc[k]["e_cos"] = stats(((dec.encode(v) * E).sum(-1) / dec.d_e).cpu()); rc[k]["e_cos_normmatched"] = stats(((dec.encode(match_norm(v, Hg)) * E).sum(-1) / dec.d_e).cpu())
         rc["h_stored"] = {"e_cos": stats(((dec.encode(Hg.to(torch.bfloat16).float()) * E).sum(-1) / dec.d_e).cpu())}
-        res["recon"] = {"sample_steps": a.sample_steps, "cfgs": cfgs, **rc}
-        print("[dec-eval] recon: " + " | ".join(f"{k}: FVE {rc[k]['fve']:.1f} cos {rc[k]['cos']['mean']:.3f} norm {rc[k]['norm_ratio']['mean']:.2f} e-cos {rc[k]['e_cos']['mean']:.3f}" for k in S), flush=True); dump()
+        res["recon"] = {"sample_steps": a.sample_steps, "cfgs": cfgs, "primary_metric": "cos", **rc}
+        print("[dec-eval] recon (PRIMARY cos; FVE raw / after matching ||h||; norm ratio): " + " | ".join(f"{k}: cos {rc[k]['cos']['mean']:.3f} FVE {rc[k]['fve']:.1f}/{rc[k]['fve_normmatched_raw']:.1f} norm {rc[k]['norm_ratio']['mean']:.2f} e-cos {rc[k]['e_cos_normmatched']['mean']:.3f}" for k in S), flush=True); dump()
 
     lm = tok = None; st = {"cap": None, "vec": None, "pos": None}
     def load_lm():
@@ -139,22 +148,30 @@ def main():
             enc = ctok([tmpl.format(explanation=z)], return_tensors="pt", add_special_tokens=False)
             with torch.no_grad(): return critic_predict(critic, enc["input_ids"].to(dl), enc["attention_mask"].to(dl), cmsf).float()[0]
         conds = ["h_stored"] + [f"cfg{w:g}" for w in cfgs] + ["uncond", "ar_pred", "mean_act", "other_row"]; KL = {c: [] for c in conds}; TOP = {c: [] for c in conds}; live_cos = []
+        raw_conds = [f"cfg{w:g}" for w in cfgs] if a.splice_norm == "match" else []; KLraw = {c: [] for c in raw_conds}; TOPraw = {c: [] for c in raw_conds}   # secondary: the decoded vector at its OWN norm
         n_kl = min(a.n_kl, a.n)
         for i in range(n_kl):
             ids = tok(TXT[i], return_tensors="pt", add_special_tokens=False)["input_ids"][:, -1024:].to(dl); T = ids.shape[1] - 1
             st.update(cap=[], vec=None, pos=T)
             with torch.no_grad(): base = lm(input_ids=ids).logits[0, T].float()
             h_live = st["cap"][0][0]; st["cap"] = None; live_cos.append(F.cosine_similarity(h_live, Hg[i].to(dl), dim=0).item())
-            vecs = {"h_stored": Hg[i], "uncond": S["uncond"][i], "ar_pred": ar_pred(Z[i]), "mean_act": S["mean_act"][i], "other_row": S["other_row"][i]} | {f"cfg{w:g}": S[f"cfg{w:g}"][i] for w in cfgs}
+            vecs_raw = {"h_stored": Hg[i], "uncond": S["uncond"][i], "ar_pred": ar_pred(Z[i]), "mean_act": S["mean_act"][i], "other_row": S["other_row"][i]} | {f"cfg{w:g}": S[f"cfg{w:g}"][i] for w in cfgs}
+            vecs = {c: (v if (c == "h_stored" or a.splice_norm == "raw") else match_norm(v[None].to(Hg.device), Hg[i:i + 1])[0]) for c, v in vecs_raw.items()}   # direction from the decoder, magnitude from h
             lb = torch.log_softmax(base, -1)
-            for c in conds:
-                st.update(vec=vecs[c][None].to(dl), pos=T)
+            def patched(vec):
+                st.update(vec=vec[None].to(dl), pos=T)
                 with torch.no_grad(): lg = lm(input_ids=ids).logits[0, T].float()
-                st["vec"] = None
-                KL[c].append(F.kl_div(torch.log_softmax(lg, -1), lb, log_target=True, reduction="sum").item()); TOP[c].append(int(lg.argmax() == base.argmax()))
+                st["vec"] = None; return lg
+            for c in conds:
+                lg = patched(vecs[c]); KL[c].append(F.kl_div(torch.log_softmax(lg, -1), lb, log_target=True, reduction="sum").item()); TOP[c].append(int(lg.argmax() == base.argmax()))
+            for c in raw_conds:
+                lg = patched(vecs_raw[c]); KLraw[c].append(F.kl_div(torch.log_softmax(lg, -1), lb, log_target=True, reduction="sum").item()); TOPraw[c].append(int(lg.argmax() == base.argmax()))
             if (i + 1) % 16 == 0: print(f"[dec-eval] kl {i + 1}/{n_kl}: " + " ".join(f"{c} {np.mean(KL[c]):.3f}" for c in conds) + f" | live-vs-stored cos {np.mean(live_cos):.4f} ({time.time() - t0:.0f}s)", flush=True)
-        res["kl"] = {"n": n_kl, "conds": conds, "kl": {c: stats(KL[c]) for c in conds}, "top1_agree": {c: float(np.mean(TOP[c])) for c in conds}, "live_vs_stored_cos": stats(live_cos), "per_row_kl": {c: KL[c] for c in conds}}
-        print("[dec-eval] KL(base || patched) at the cut: " + " | ".join(f"{c} {res['kl']['kl'][c]['mean']:.3f} (med {res['kl']['kl'][c]['median']:.3f}, top1 {100 * res['kl']['top1_agree'][c]:.0f}%)" for c in conds), flush=True); dump()
+        res["kl"] = {"n": n_kl, "conds": conds, "splice_norm": a.splice_norm, "kl": {c: stats(KL[c]) for c in conds}, "top1_agree": {c: float(np.mean(TOP[c])) for c in conds}, "live_vs_stored_cos": stats(live_cos), "per_row_kl": {c: KL[c] for c in conds},
+                     "kl_raw_norm": {c: stats(KLraw[c]) for c in raw_conds}, "top1_agree_raw_norm": {c: float(np.mean(TOPraw[c])) for c in raw_conds}}
+        print(f"[dec-eval] KL(base || patched) at the cut (spliced vectors {'rescaled to ||h||' if a.splice_norm == 'match' else 'at their own norm'}): " + " | ".join(f"{c} {res['kl']['kl'][c]['mean']:.3f} (med {res['kl']['kl'][c]['median']:.3f}, top1 {100 * res['kl']['top1_agree'][c]:.0f}%)" for c in conds), flush=True)
+        if raw_conds: print("[dec-eval] KL secondary, decoder samples at their OWN norm: " + " | ".join(f"{c} med {res['kl']['kl_raw_norm'][c]['median']:.3f} (top1 {100 * res['kl']['top1_agree_raw_norm'][c]:.0f}%)" for c in raw_conds), flush=True)
+        dump()
         del critic; torch.cuda.empty_cache()
 
     if "var" in tests:
@@ -181,14 +198,16 @@ def main():
             return [(extract_explanation(o) or o).strip() for o in outs]
         torch.manual_seed(a.seed)
         VS = [dec.sample(E[:n_v], n_steps=a.sample_steps, cfg=a.var_cfg, seed=100 + k) for k in range(K)]      # K variations per e
+        if a.splice_norm == "match": VS = [match_norm(v, Hg[:n_v]) for v in VS]                                  # direction from the decoder, magnitude from h (read-back sees ||h||)
         Vs = torch.stack(VS, 1)                                                                                   # [n_v, K, d]
+        U_read = match_norm(S["uncond"][:n_v], Hg[:n_v]) if a.splice_norm == "match" else S["uncond"][:n_v]
         pair = [];
         for i in range(n_v):
             C = F.cosine_similarity(Vs[i][:, None], Vs[i][None], dim=-1); pair.append(C[~torch.eye(K, dtype=bool, device=C.device)].mean().item())
-        var = {"n": n_v, "K": K, "cfg": a.var_cfg, "pairwise_cos_between_variations": stats(pair), "cos_to_h": stats(F.cosine_similarity(Vs, Hg[:n_v, None], dim=-1).flatten().cpu()),
+        var = {"n": n_v, "K": K, "cfg": a.var_cfg, "splice_norm": a.splice_norm, "pairwise_cos_between_variations": stats(pair), "cos_to_h": stats(F.cosine_similarity(Vs, Hg[:n_v, None], dim=-1).flatten().cpu()),
                "e_cos": stats(((dec.encode(Vs.reshape(-1, d)) * E[:n_v].repeat_interleave(K, 0)).sum(-1) / dec.d_e).cpu()),
                "cos_between_other_rows": stats(F.cosine_similarity(Hg[:n_v], Hg[[(i + 1) % a.n for i in range(n_v)]], dim=-1).cpu())}
-        z_h = verbalize(Hg[:n_v]); z_var = [verbalize(Vs[:, k]) for k in range(K)]; z_unc = verbalize(S["uncond"][:n_v])
+        z_h = verbalize(Hg[:n_v]); z_var = [verbalize(Vs[:, k]) for k in range(K)]; z_unc = verbalize(U_read)
         C = ClipCritic(dec.enc.spec["ckpt_dir"], "/root/base_snap", d0, stats=dec.enc.spec["normaliser"])          # text side g on cuda:0 (frozen trunk)
         g_gold = C.text_emb(Z[:n_v]); g_h = C.text_emb(z_h); g_unc = C.text_emb(z_unc); g_var = [C.text_emb(zk) for zk in z_var]
         eu = dec.enc.unit(Hg[:n_v]); sc = C.heads.scale().item()

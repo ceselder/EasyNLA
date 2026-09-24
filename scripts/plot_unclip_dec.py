@@ -41,12 +41,12 @@ def main(paths, stem="unclip_decoder"):
     a = ax[0, 1]; r = runs[0]
     if "recon" in r:
         keys = [k for k in r["recon"] if isinstance(r["recon"][k], dict) and "fve" in r["recon"][k]]; order = [k for k in keys if k.startswith("cfg")] + [k for k in keys if not k.startswith("cfg")]
-        cos = [r["recon"][k]["cos"]["mean"] for k in order]; fve = [r["recon"][k]["fve"] for k in order]; x = np.arange(len(order))
-        b1 = a.bar(x - .2, cos, .4, color=C["cond"], label="cos(h', h)"); a.set_ylim(-.1, 1.05); a.set_ylabel("cosine to the true activation")
-        a2 = a.twinx(); b2 = a2.bar(x + .2, fve, .4, color=C["base"], alpha=.7, label="FVE (%)"); a2.set_ylabel("FVE (%)"); a2.set_ylim(min(-20, min(fve) - 5), 100)
+        cos = [r["recon"][k]["cos"]["mean"] for k in order]; fk = "fve_normmatched_raw" if "fve_normmatched_raw" in r["recon"][order[0]] else "fve"; fve = [r["recon"][k][fk] for k in order]; x = np.arange(len(order))
+        b1 = a.bar(x - .2, cos, .4, color=C["cond"], label="cos(h', h)  [primary]"); a.set_ylim(-.1, 1.05); a.set_ylabel("cosine to the true activation")
+        a2 = a.twinx(); b2 = a2.bar(x + .2, fve, .4, color=C["base"], alpha=.7, label="FVE after matching ‖h‖ (%)" if fk != "fve" else "FVE (%)"); a2.set_ylabel("FVE (%)"); a2.set_ylim(min(-20, min(fve) - 5), 100)
         a.set_xticks(x); a.set_xticklabels([k.replace("cfg", "CFG ").replace("uncond", "uncond.\nsample").replace("mean_act", "mean\nact.").replace("other_row", "other\nrow") for k in order], fontsize=10)
         a.legend(handles=[b1, b2], loc="upper right"); a.set_title(f"Samples h' ~ p(h|e) reconstruct h ({r['recon']['sample_steps']} Heun steps):\ncos and FVE per CFG scale vs baselines")
-        data["recon"] = {k: {"cos": r["recon"][k]["cos"]["mean"], "fve": r["recon"][k]["fve"], "e_cos": r["recon"][k]["e_cos"]["mean"]} for k in order}
+        data["recon"] = {k: {"cos": r["recon"][k]["cos"]["mean"], "fve": r["recon"][k]["fve"], "fve_normmatched_raw": r["recon"][k].get("fve_normmatched_raw"), "norm_ratio": r["recon"][k]["norm_ratio"]["mean"], "e_cos": r["recon"][k]["e_cos"]["mean"]} for k in order}
     # (3) downstream KL
     a = ax[1, 0]
     if "kl" in r:
@@ -55,7 +55,7 @@ def main(paths, stem="unclip_decoder"):
         a.bar(x, med, color=cols); a.errorbar(x, med, yerr=[np.array(med) - np.array(lo), np.array(hi) - np.array(med)], fmt="none", ecolor="k", capsize=3, lw=1)
         a.set_xticks(x); a.set_xticklabels([c.replace("cfg", "CFG ").replace("h_stored", "h itself").replace("ar_pred", "MSE recon.\nfrom gold z").replace("mean_act", "mean act.").replace("other_row", "other row").replace("uncond", "uncond.\nsample") for c in conds], fontsize=9)
         a.set_ylabel("next-token KL(base ‖ patched), nats\n(median, p10–p90 bars, top-1 agreement %)"); a.set_yscale("log"); a.tick_params(axis="x", labelrotation=25)
-        a.set_title(f"Splicing h' into the LM at layer 42: next-token KL\nto the original ({r['kl']['n']} clean1 prefixes)")
+        a.set_title(f"Splicing h' (rescaled to ‖h‖) into the LM at layer 42:\nnext-token KL to the original ({r['kl']['n']} clean1 prefixes)" if r["kl"].get("splice_norm", "raw") == "match" else f"Splicing h' into the LM at layer 42: next-token KL\nto the original ({r['kl']['n']} clean1 prefixes)")
         for i, c in enumerate(conds): a.text(i, med[i], f"{100 * r['kl']['top1_agree'][c]:.0f}%", ha="center", va="bottom", fontsize=9)
         data["kl"] = {c: {"median": r["kl"]["kl"][c]["median"], "mean": r["kl"]["kl"][c]["mean"], "top1": r["kl"]["top1_agree"][c]} for c in conds}
     # (4) exact PMI histogram
