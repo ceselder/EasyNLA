@@ -77,6 +77,7 @@ def main():
     p.add_argument("--param", default="x0", choices=["x0", "v", "x0res"], help="x0: predict the unnoised target (paper); v: velocity (plain FM); x0res: x0 loss with the velocity parametrisation")
     p.add_argument("--t-min", type=float, default=0.02); p.add_argument("--bidir-tail", type=int, default=0); p.add_argument("--x0-scale", type=float, default=0.0, help="constant target rescale inside the net (0 = set from the data rms)")
     p.add_argument("--steps", type=int, default=4000); p.add_argument("--batch", type=int, default=1024); p.add_argument("--micro-batch", type=int, default=256, help="rows per backward pass (gradient accumulation up to --batch)"); p.add_argument("--lr", type=float, default=1.2e-4); p.add_argument("--warmup", type=int, default=300); p.add_argument("--wd", type=float, default=0.01)
+    p.add_argument("--null-dm", type=float, default=0.0, help="DECISIONS v1.16 null-dm regulariser weight: at the SAME (x_t, t, eps), the velocity under a depth-matched WRONG text (another row of the micro-batch with the same (i,j), else same j, else rolled) is pulled to the no-text velocity (detached), so a wrong text earns no bits")
     p.add_argument("--beta2", type=float, default=0.999); p.add_argument("--ema", type=float, default=0.999); p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-floor", type=float, default=0.05)
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=512); p.add_argument("--eval-offset", type=int, default=4096); p.add_argument("--spot-exact-n", type=int, default=128); p.add_argument("--spot-ode-steps", type=int, default=16)
@@ -136,7 +137,7 @@ def main():
         opt.zero_grad(set_to_none=True); keep = torch.rand(a.batch, device=dev) >= a.p_uncond                       # text dropout -> unconditional rows
         if a.micro_batch < a.batch:                                                                                  # sort the step's rows by text length so each micro-batch pads to ITS OWN longest text (mean over the step is unchanged)
             order = sorted(range(a.batch), key=lambda q: len(texts[q])); rows, i, j = rows[order], i[order], j[order]; texts = [texts[q] for q in order]; keep = keep[torch.tensor(order, device=dev)]
-        l_all = torch.zeros(a.batch, device=dev); v_all = torch.zeros(a.batch, device=dev); mask_T = 0
+        l_all = torch.zeros(a.batch, device=dev); v_all = torch.zeros(a.batch, device=dev); mask_T = 0; null_acc = 0.0
         for s0 in range(0, a.batch, a.micro_batch):                                                                  # gradient accumulation: same batch, bounded activation memory
             sl = slice(s0, min(a.batch, s0 + a.micro_batch)); nb = sl.stop - sl.start
             h_i, x0, _, _ = make_x0(norm, store.gather(rows[sl], i[sl], dev), store.gather(rows[sl], j[sl], dev), "delta", False, 0.0)
@@ -144,7 +145,14 @@ def main():
             mask = mask & keep[sl][:, None]; mask_T = max(mask_T, int(mask.shape[1]))
             t = torch.rand(nb, device=dev); eps = torch.randn_like(x0)
             with torch.autocast("cuda", dtype=torch.bfloat16): l, v_mse = model.loss(x0, h_i, t, eps, enc, mask)
-            (l.mean() * nb / a.batch).backward(); l_all[sl] = l.detach(); v_all[sl] = v_mse
+            step_loss = l.mean()
+            if a.null_dm > 0:
+                perm = torch.tensor(dm_partner(i[sl], j[sl]), device=dev); x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.no_grad(): v_null = model(x_t, t, h_i)
+                    v_dm = model(x_t, t, h_i, enc=enc[perm], enc_mask=mask[perm])
+                nl = ((v_dm - v_null.detach()) ** 2).mean(-1) / (model.x0_scale ** 2); null_acc += float(nl.mean()) * nb / a.batch; step_loss = step_loss + a.null_dm * nl.mean()
+            (step_loss * nb / a.batch).backward(); l_all[sl] = l.detach(); v_all[sl] = v_mse
         l, v_mse = l_all, v_all; loss = l.mean()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip); opt.step()
         with torch.no_grad():
@@ -152,7 +160,7 @@ def main():
         rows_seen += a.batch; ema_loss = loss.item() if ema_loss is None else 0.98 * ema_loss + 0.02 * loss.item()
         if step % 25 == 0:
             el = time.time() - t0; log = {"train/loss": loss.item(), "train/loss_ema": ema_loss, "train/v_mse": float(v_mse.mean()), "train/loss_cond": float(l[keep].mean()) if keep.any() else float("nan"), "train/loss_uncond": float(l[~keep].mean()) if (~keep).any() else float("nan"),
-                                          "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/rows_per_s": (step - step0 + 1) * a.batch / max(1e-6, el), "train/rows_seen": rows_seen, "train/step_s": el / max(1, step - step0 + 1), "train/seq_len": mask_T + 3 * a.k_chunks + 2, "train/pool": (names[0] if pools is not None else "synth")}
+                                          "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/null_dm_loss": null_acc, "train/rows_per_s": (step - step0 + 1) * a.batch / max(1e-6, el), "train/rows_seen": rows_seen, "train/step_s": el / max(1, step - step0 + 1), "train/seq_len": mask_T + 3 * a.k_chunks + 2, "train/pool": (names[0] if pools is not None else "synth")}
             wandb.log(log, step=step)
             if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} v_mse {float(v_mse.mean()):.4f} cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']}", flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
