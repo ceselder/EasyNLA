@@ -20,7 +20,7 @@ IGNORE = list(REPO_IGNORE) + ["*.log", "**/logs/**", "logs", "*.npy", "*.pt", "*
 image = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=IGNORE)
 app = modal.App(os.environ.get("NLT_APP", "nlt-path"), image=image)
 GPU = os.environ.get("NLT_GPU", "H100")
-COMMON = dict(volumes={"/vol": vol}, secrets=SECRETS, cpu=16, memory=256 * 1024, ephemeral_disk=256 * 1024)
+COMMON = dict(volumes={"/vol": vol}, secrets=SECRETS, cpu=16, memory=256 * 1024, ephemeral_disk=512 * 1024)
 
 
 def _run(cmd):
