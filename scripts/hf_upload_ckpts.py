@@ -74,11 +74,11 @@ def main():
     ap.add_argument("--desc", action="append", default=[], help="name=description for the model card table")
     ap.add_argument("--with-critic", action="store_true")
     ap.add_argument("--work", default="/tmp/hf_up")
-    ap.add_argument("--private", action="store_true")
+    ap.add_argument("--public", action="store_true", help="DANGER: public repo; requires explicit user approval")
     a = ap.parse_args()
     from huggingface_hub import HfApi
     api = HfApi()
-    api.create_repo(a.repo, repo_type="model", exist_ok=True, private=a.private)
+    api.create_repo(a.repo, repo_type="model", exist_ok=True, private=not a.public)
     descs = dict(d.split("=", 1) for d in a.desc)
     done = []
     for it in a.items:
