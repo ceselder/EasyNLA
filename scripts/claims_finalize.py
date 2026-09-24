@@ -104,8 +104,10 @@ class Embedder:
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--root", default="/vol_glp/claims"); ap.add_argument("--dup-cos", type=float, default=0.95)
-    ap.add_argument("--cap-frac", type=float, default=0.005); ap.add_argument("--sample", type=int, default=50000); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--cap-frac", type=float, default=0.005); ap.add_argument("--sample", type=int, default=10000); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--min-claims", type=int, default=2)
+    ap.add_argument("--dedupe-val-only", action=argparse.BooleanOptionalAction, default=True,
+                    help="near-duplicate removal (sentence embeddings) only on held-out anchors: training keeps ONE claim per activation, so within-anchor dedupe is moot there")
     ap.add_argument("--names", default="*", help="glob over anchor-file names (e.g. 'v2_*'): finalize only these (streaming shards)")
     ap.add_argument("--skip-done", action="store_true", help="skip anchor files whose final_<name>.parquet exists")
     ap.add_argument("--stats-tag", default="", help="write stats_<tag>.json / examples_<tag>.json (stats.json is written only when absent or tag empty)")
@@ -148,7 +150,9 @@ def main():
         tbl = pq.read_table(f"{a.root}/anchors/anchors_{n}.parquet", columns=["anchor_id", "doc_id", "source", "is_val", "n_raw_tokens", "prefix_text", "cont_text", "activation_vector"])
         ids = tbl.column("anchor_id").to_pylist(); flat = [(i, c, f, t) for i, aid in enumerate(ids) for c, f, t, _ in meta[aid]]
         twin_given = {(i, c): tw for i, aid in enumerate(ids) for c, _, _, tw in meta[aid] if tw}
-        E = emb([c for _, c, _, _ in flat]); keep_rows = [[] for _ in ids]; start = 0
+        isv = tbl.column("is_val").to_pylist()
+        ek = [k for k, (i, _, _, _) in enumerate(flat) if isv[i] or not a.dedupe_val_only]; epos = {k: j for j, k in enumerate(ek)}   # rows that get embeddings
+        E = emb([flat[k][1] for k in ek]); keep_rows = [[] for _ in ids]; start = 0
         by = collections.defaultdict(list)
         for k, (i, c, f, t) in enumerate(flat): by[i].append(k)
         for i, ks in by.items():
@@ -157,7 +161,8 @@ def main():
                 _, c, f, t = flat[k]; st["pooled"] += 1; nc = _norm(c)
                 if f == "semantic" and nc in over and rng.random() > cap / over[nc]: st["capped"] += 1; continue
                 if any(_norm(flat[j][1]) == nc for j in kept): st["exact_dup"] += 1; continue
-                if not t.endswith("/paraphrase") and kept and float((E[kept] @ E[k]).max()) > a.dup_cos: st["near_dup"] += 1; continue
+                if k in epos and not t.endswith("/paraphrase") and kept and any(j in epos for j in kept) and \
+                        float((E[[epos[j] for j in kept if j in epos]] @ E[epos[k]]).max()) > a.dup_cos: st["near_dup"] += 1; continue
                 kept.append(k)
             own = [flat[k][1] for k in kept]; kr = []
             for k in kept:
