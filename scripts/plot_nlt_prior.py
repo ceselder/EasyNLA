@@ -138,8 +138,8 @@ def main():
     ax[0].axhline(0, color=C_GRAY, lw=1); ax[1].axhline(0.5, color=C_GRAY, lw=1, ls="--"); ax[1].set_ylim(0.3, 1.0)
     ax[0].set_xlabel("training rows seen (millions)"); ax[1].set_xlabel("training rows seen (millions)")
     ax[0].set_ylabel("content bits: PMI(true text) - PMI(wrong text, same depth)"); ax[1].set_ylabel("P(true text beats depth-matched wrong text)")
-    ax[0].set_title("Content bits keep rising with rows and with size\n(held-out lens-diff L1, spot exact Heun 16, n=128)"); ax[1].set_title("Win rate over a depth-matched wrong text\n(same rows)")
-    ax[0].set_ylabel("content bits (true − wrong text, same depth)"); ax[1].set_ylabel("P(true text beats the wrong text)")
+    ax[0].set_title("Content bits rise with rows and with size\n(held-out lens L1, spot exact Heun 16, n=128)"); ax[1].set_title("Win rate over a depth-matched\nwrong text (same rows)")
+    ax[0].set_ylabel("content bits (true − wrong text)"); ax[1].set_ylabel("P(true text beats the wrong text)")
     ax[0].legend(fontsize=9, loc="upper left"); savefig(fig, "fig_prior_curves")
     # ---------------- final tables (Heun 64, last night's rows)
     base = load_baseline(); bits = {t: load_bits(a.results, t) for t in arms}; twins = {t: load_twins(a.results, t) for t in arms + [x for x in a.twin_arms.split(",") if x]}; twins = {t: v for t, v in twins.items() if v}
@@ -179,9 +179,9 @@ def main():
             for q, (src, alpha) in enumerate(((main_sets, 1.0), (base["sets"], 0.45))):
                 v = [src.get(s, {}).get("bands", {}).get(b, {}).get("content", np.nan) for s in srcs]; e = [src.get(s, {}).get("bands", {}).get(b, {}).get("content_sem", 0) or 0 for s in srcs]
                 ax[q].bar(xb + (k - 1) * w, v, w, yerr=e, color=[C_PRIOR, C_THIRD, "#4a3aa7"][k], label=bnice[b], capsize=2, edgecolor="white", linewidth=1.5)
-        for q, ttl in enumerate(("Diffusion prior: the workspace band carries the bits", "Last night's adapter critic, same rows")):
+        for q, ttl in enumerate(("Diffusion prior (480M): the workspace\nband carries the bits", "Last night's adapter critic,\nsame rows")):
             ax[q].set_xticks(xb); ax[q].set_xticklabels([NICE.get(s, s) for s in srcs], rotation=25, ha="right"); ax[q].axhline(0, color=C_GRAY, lw=1); ax[q].set_title(ttl)
-        ax[0].set_ylabel("content bits (true − depth-matched wrong text)")
+        ax[0].set_ylabel("content bits (true − wrong text)")
         ax[0].legend(fontsize=9); savefig(fig, "fig_prior_bands")
     # twins figure
     tw = twins.get(a.arm, {})
@@ -243,7 +243,7 @@ def write_section(a, arms, meta, bits, base, twins, smoke, curves):
         arm_rows.append(f"<tr><td>{t}</td><td>{meta[t].get('n_params_M') or '–'}M</td><td>{fmt(last.get('rows') / 1e6 if last else None, 2)}M</td><td>{fmt(meta[t].get('rows_per_s'), 0)}</td><td>{fmt(last.get('lens_L1/exact_content_bits'))} @ {fmt(last.get('lens_L1/exact_p_z_gt_dm'), 2)}</td><td>{fmt(last.get('lens_L1/exact_rp_bits'))}</td><td>{fmt(b.get('lens_L1', {}).get('content'))} @ {fmt(b.get('lens_L1', {}).get('p_z_gt_dm'), 2)}</td><td>{fmt(b.get('teacher_v1', {}).get('content'))} @ {fmt(b.get('teacher_v1', {}).get('p_z_gt_dm'), 2)}</td></tr>")
     html = f"""
 <section id="diffusion-prior">
-<h2>Diffusion-prior critic (DALL·E 2 recipe): the text pathway works, the claims still don't</h2>
+<h2>Diffusion-prior critic (DALL·E 2 recipe): ~3× the content bits of last night's adapter, claim-flip sensitivity clears 0.65 on lens and teacher text, not yet on V0 near-twins or bullet flips</h2>
 <p>A new critic for p(h<sub>j</sub> | h<sub>i</sub>, z): a decoder-only Transformer with a causal mask over
 <code>[text token states (frozen Qwen3-0.6B, layer 20) | pooled text | h<sub>i</sub> as 8 chunk tokens | timestep | noised target as 8 chunk tokens | 8 output tokens]</code>,
 trained from scratch as in the DALL·E 2 prior (Ramesh et al. 2022): text dropped 10 % of the time so one network gives both the conditional and the unconditional density,
@@ -259,6 +259,7 @@ x<sub>0</sub> errors by 1/t near t = 0 and the exact ODE log-likelihood of the x
 <figure><img src="fig_prior_smoke.png" alt="smoke gate"><figcaption>Exact bits for the depth tag as training proceeds (left) and for a wrong-depth tag (right); Heun 16, 128 held-out rows.</figcaption></figure>
 
 <h3>Real text: exact bits on last night's rows</h3>
+<p><b>Presence bonus, and why it is not in these numbers.</b> Between ~0.7M and ~2M rows (the peak-lr phase) every arm developed a large text-presence bonus: a random pair's text earned +7…+49 bits because the unconditional path (the 10 % dropped rows) lagged the conditional one. It vanished as the cosine schedule decayed (168M: rp −5 bits at the end; 480M: −14); neither more text dropout (0.3 / 0.5: content falls to 1.0 / 0.7 bits at 1M rows with the same transient) nor the v1.16 null-dm regulariser (content 4.0 vs 8.3 at 1.5M rows, rp still +20) removed it earlier. The 1.25B arm was stopped by the time cap before its schedule decayed and still carries rp ≈ +33, so only its <em>paired</em> numbers (content, P, twins) are comparable. Content = PMI(z) − PMI(z<sub>dm</sub>) is paired per row and therefore unaffected by any uniform bonus; rp is reported next to it in every table.</p>
 <p>Trained on a mix of lens-diff texts (35 %), teacher-Sonnet prose (25 %), paraphrases (15 %), Sonnet bullets (15 %) and raw J-lens top-20 lists (10 %); one pool per step so short registers stay short.
 Held-out = the fixed 4096-row val set (doc-disjoint), same 512 paired rows, same controls and the same Heun-64 estimator as last night's accepted critic (critic_v3b_fbpc s8000, "adapter" below).
 <b>Content</b> = PMI(true text) − PMI(another pair's text at the same (i, j)); <b>P(z &gt; dm)</b> = the pairwise win rate of the true text over that depth-matched wrong text; <b>rp</b> = bits a random pair's text earns (the text-presence bonus; should be ≤ 0).</p>
@@ -269,7 +270,8 @@ Held-out = the fixed 4096-row val set (doc-disjoint), same 512 paired rows, same
 <figure><img src="fig_prior_bands.png" alt="bands"></figure>
 
 <h3>Claim sensitivity: the headline question</h3>
-<p>Does P(true text &gt; claim-flipped twin) finally clear 0.65? Twins are redteam's generator-independent <code>twin_next</code> edits (the named final token replaced by a rank 2–4 / rank ≥ 8 alternative from the model's own distribution) and, for the Sonnet bullets, one bullet's claim flipped by Sonnet.</p>
+<p>Does P(true text &gt; claim-flipped twin) finally clear 0.65? Twins are redteam's generator-independent <code>twin_next</code> edits (the named final token replaced by a rank 2–4 / rank ≥ 8 alternative from the model's own distribution) and, for the Sonnet bullets, one bullet's claim flipped by Sonnet.
+With the 480M prior: lens-diff L1 far 0.79 / near 0.70, teacher far 0.70 / near 0.69, V0 far 0.66 / near 0.63, Sonnet bullet flip 0.58 (last night's adapter, held-out: lens 0.71 / 0.66, teacher 0.62 / 0.61, V0 0.59 / 0.51; the MSE bullet reconstructor 0.60). Five of seven cells clear the bar (last night: two of six); the V0 near-twin and the bullet flip do not. Every twin edit costs the text 3–9 bits on average, so the critic does read the claim word, just not decisively for every pair.</p>
 <figure><img src="fig_prior_twins.png" alt="twins"></figure>
 <table><thead><tr><th>arm (checkpoint)</th><th>source</th><th>twin</th><th>P(true &gt; twin), prior</th><th>last night</th><th>Δ bits (true − twin)</th><th>n</th></tr></thead><tbody>{''.join(twin_rows) or '<tr><td colspan=7>manifest scoring pending</td></tr>'}</tbody></table>
 
@@ -297,8 +299,10 @@ def write_standalone(a, arms, meta, bits, base, twins, s_last, section_html):
     best_twin = max(tps) if tps else float("nan")
     rps = [m[s]["z_rp"] for s in shared] if shared else []
     kpi_cls = lambda good: ' good' if good else ' bad'
-    tldr = (f"The DALL·E-2-style diffusion prior reads text (depth-tag smoke: +{fmt(s_last.get('depthtag/exact_pmi_bits'))} exact bits at 205k rows; the LoRA trunk got 0) and runs at ~{fmt(meta.get(a.arm, {}).get('rows_per_s'), 0)} rows/s, "
-            f"but on real text its content bits ({fmt(mc)} vs {fmt(bc)} for last night's adapter, mean over {len(shared)} shared sources) and its claim sensitivity (best P(true &gt; twin) {fmt(best_twin, 2)}, bar 0.65) do not beat the adapter critic; the claim-reading problem is not a critic-architecture problem." if shared else
+    verdict = ("beats" if mc > bc else "does not beat")
+    tldr = (f"A from-scratch DALL·E-2-style diffusion prior ({meta.get(a.arm, {}).get('n_params_M')}M params, {fmt(meta.get(a.arm, {}).get('rows_per_s'), 0)} rows/s, 1.2 h on one B200) {verdict} last night's adapter critic on every text source: "
+            f"content {fmt(mc)} vs {fmt(bc)} bits (mean over {len(shared)} shared sources, exact Heun 64, same 512 held-out rows), P(true &gt; depth-matched wrong text) {fmt(mp, 2)} vs {fmt(bp, 2)}, and claim-flip twins clear the 0.65 bar on lens and teacher text (best cell {fmt(best_twin, 2)}); the V0 near-twin (0.63) and Sonnet bullet flips (0.58) still do not. "
+            f"The depth-tag smoke gate passed at 205k rows (+{fmt(s_last.get('depthtag/exact_pmi_bits'))} exact bits; the LoRA trunk got 0). A large text-presence bonus appears during the peak-lr phase and disappears with the cosine decay; paired metrics are unaffected." if shared else
             f"Smoke gate passed (+{fmt(s_last.get('depthtag/exact_pmi_bits'))} exact bits from a depth tag at 205k rows); real-text Heun-64 tables pending.")
     kpis = f"""<div class="kpis">
   <div class="kpi good"><div class="v">+{fmt(s_last.get('depthtag/exact_pmi_bits'))}</div><div class="l">exact bits from a depth tag (smoke gate, 205k rows)</div></div>
