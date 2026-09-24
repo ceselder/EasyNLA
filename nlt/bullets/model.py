@@ -89,10 +89,17 @@ def rel_mse(pred, target, eps=1e-6):
     return ((pred - target) ** 2).sum(-1) / ((target ** 2).sum(-1) + eps)
 
 
-def recon_loss(pred, target, cos_w=0.5):
+def recon_loss(pred, target, cos_w=0.5, mode="energy"):
+    """mode 'energy' (round 2 default): batch energy-weighted MSE  sum||pred-target||^2 / sum||target||^2  (= 1 - batch FVE, the reported
+    metric; every pair contributes in proportion to its energy, so small-delta pairs cannot dominate) + cos_w * energy-weighted (1 - cos).
+    mode 'relmse' (round 1): mean per-example ||pred-target||^2/||target||^2 + cos_w * mean (1 - cos)."""
     rm = rel_mse(pred, target)
     cos = F.cosine_similarity(pred, target, dim=-1, eps=1e-3)
-    return rm.mean() + cos_w * (1 - cos).mean(), rm, cos
+    if mode == "relmse":
+        return rm.mean() + cos_w * (1 - cos).mean(), rm, cos
+    en = (target ** 2).sum(-1); w = en / en.sum().clamp_min(1e-6)
+    ew_mse = ((pred - target) ** 2).sum(-1).sum() / en.sum().clamp_min(1e-6)
+    return ew_mse + cos_w * (w * (1 - cos)).sum(), rm, cos
 
 
 def build(args_or_dict, device="cuda"):
