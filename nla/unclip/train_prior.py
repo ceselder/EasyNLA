@@ -69,17 +69,18 @@ def load_acts_striped(globs, rank, world, max_rows, encode, log_every=20):
     return E
 
 
-def load_pairs_all(globs, rank, world, max_rows, seed, render_pick):
+def load_pairs_all(globs, rank, world, max_rows, seed, render_pick, para_col="", with_ladders=False):
     """rank-disjoint by document (crc32(doc_id) % world, as train_clip.load_rows), val rows dropped; returns UNIQUE activations + a pair index so
     several renderings of one activation cost no extra activation RAM: A fp16 [n_act, 5120], texts [n_pairs], aidx [n_pairs].
     render_pick: canonical (the `explanation` column) | random (one random QC-passing rendering per activation, shards with explanations/qc) |
     all (EVERY QC-passing rendering becomes its own pair; identical renderings deduplicated)"""
     import zlib, pyarrow.parquet as pq
     from nla.contrastive.train_clip import _files, _qc_ok
-    acts, texts, aidx = [], [], []; n_act = 0; rng = np.random.default_rng(seed + 17 * rank); files = _files(globs); t0 = time.time()
+    acts, texts, aidx, lads = [], [], [], []; n_act = 0; rng = np.random.default_rng(seed + 17 * rank); files = _files(globs); t0 = time.time()
     for fi, f in enumerate(files):
         names = pq.ParquetFile(f).schema_arrow.names; multi = render_pick in ("random", "all") and "explanations" in names and "qc" in names
-        cols = ["activation_vector", "explanation", "is_val", "doc_id"] + (["explanations", "qc"] if multi else [])
+        has_par = bool(para_col) and para_col in names; has_lad = with_ladders and "fact_ladders" in names
+        cols = ["activation_vector", "explanation", "is_val", "doc_id"] + (["explanations", "qc"] if multi else []) + ([para_col] if has_par else []) + (["fact_ladders"] if has_lad else [])
         t = pq.read_table(f, columns=cols)
         dids = t.column("doc_id").to_pylist(); isv = t.column("is_val").to_pylist()
         keep = [i for i, (d, v) in enumerate(zip(dids, isv)) if not v and zlib.crc32(str(d).encode()) % world == rank]
@@ -88,19 +89,23 @@ def load_pairs_all(globs, rank, world, max_rows, seed, render_pick):
         acts.append(torch.from_numpy(np.asarray(av.values.to_numpy(zero_copy_only=False), dtype=np.float32).reshape(len(keep), -1)).to(torch.float16))
         ex = t.column("explanation").take(keep).to_pylist()
         exs = t.column("explanations").take(keep).to_pylist() if multi else None; qcs = t.column("qc").take(keep).to_pylist() if multi else None
+        pars = t.column(para_col).take(keep).to_pylist() if has_par else None; lad = t.column("fact_ladders").take(keep).to_pylist() if has_lad else None
         for j in range(len(keep)):
             cands = [(ex[j] or "").strip()]
             if multi:
                 ok = [e.strip() for e, q in zip(exs[j] or [], qcs[j] or []) if e and _qc_ok(q)]
                 if ok: cands = ok if render_pick == "all" else [ok[int(rng.integers(len(ok)))]]
+            if pars is not None and pars[j]:   # paraphrase augmentation: all of them as extra pairs, or one random paraphrase replaces the text with prob 0.5
+                pp = [x.strip() for x in pars[j] if x and x.strip()]
+                if pp: cands = cands + pp if render_pick == "all" else ([pp[int(rng.integers(len(pp)))]] if rng.random() < 0.5 else cands)
             for z in dict.fromkeys(cands):
-                if z: texts.append(z); aidx.append(n_act + j)
+                if z: texts.append(z); aidx.append(n_act + j); lads.append(lad[j] if lad is not None else None)
         n_act += len(keep); del t
         if (fi + 1) % 25 == 0: log(f"[prior] data: {fi + 1}/{len(files)} files, {n_act} activations / {len(texts)} pairs on rank {rank}, {time.time() - t0:.0f}s")
         if max_rows and len(texts) >= max_rows: break
     A = torch.cat(acts) if acts else torch.zeros(0, 5120, dtype=torch.float16)
-    if max_rows: texts, aidx = texts[:max_rows], aidx[:max_rows]
-    return A, texts, torch.tensor(aidx, dtype=torch.long)
+    if max_rows: texts, aidx, lads = texts[:max_rows], aidx[:max_rows], lads[:max_rows]
+    return A, texts, torch.tensor(aidx, dtype=torch.long), (lads if with_ladders else None)
 
 
 def main():
@@ -126,6 +131,9 @@ def main():
     p.add_argument("--uncond-max-rows", type=int, default=0, help="cap on extra pool rows per rank (0 = all)"); p.add_argument("--uncond-weight", type=float, default=1.0, help="weight of the unconditional block's mean FM loss")
     p.add_argument("--uncond-pretrain-steps", type=int, default=0, help="before the main loop (fresh runs only): unconditional-only steps on the e-pool at --uncond-pretrain-batch / --uncond-pretrain-lr (warm-up 100, then constant)")
     p.add_argument("--uncond-pretrain-batch", type=int, default=2048); p.add_argument("--uncond-pretrain-lr", type=float, default=3e-4)
+    p.add_argument("--neg-frac", type=float, default=0.0, help="in-flow HARD NEGATIVES: this fraction of the labelled batch also gets a detail-swapped explanation z' (g2 wrong-exact twins where the shard has fact_ladders, else nla.flow.negatives.make_negative: number / quote / name swap); at the SAME (t, eps) the true e must be denser under z than under z': hinge relu(margin - (L_neg - L_pos)) on the per-row FM loss (DiffusionITM-style clipped)")
+    p.add_argument("--neg-margin", type=float, default=0.02, help="per-dim FM-loss gap asked for (0.02 x d/2 = ~10 nats at d 1024)"); p.add_argument("--neg-lambda", type=float, default=2.0)
+    p.add_argument("--para-col", default="", help="optional list column of PARAPHRASES of the explanation in the shards (posted by the scale fork); with --render-pick all every paraphrase becomes its own pair, else one random one is used with prob 0.5")
     a = p.parse_args()
     ddp = "RANK" in os.environ
     if ddp:
@@ -180,10 +188,11 @@ def main():
     log(f"[prior] world {world}; denoiser {model.n_params()/1e6:.0f}M params ({a.n_layers} blocks x d {a.d_model}, {a.n_tok} e-tokens, tokens={use_tokens}, g={use_g}); trunk LoRA {sum(p_.numel() for p_ in lora)/1e6:.0f}M at lr {a.lr_lora}; denoiser lr {a.lr}")
 
     # ---------------- data
-    t0 = time.time(); A, Z, AIDX = load_pairs_all(a.train_globs, rank, world, a.max_rows, a.seed, a.render_pick)
+    t0 = time.time(); A, Z, AIDX, LAD = load_pairs_all(a.train_globs, rank, world, a.max_rows, a.seed, a.render_pick, para_col=a.para_col, with_ladders=a.neg_frac > 0)
     n_loc = torch.tensor([len(Z)], device=dev); n_all = n_loc.clone(); n_act_all = torch.tensor([A.shape[0]], device=dev)
     if ddp: dist.all_reduce(n_loc, op=dist.ReduceOp.MIN); dist.all_reduce(n_all); dist.all_reduce(n_act_all)
-    N = len(Z); NA = A.shape[0]; log(f"[prior] pairs: {int(n_all)} total ({int(n_loc)} min per rank; rank 0 {N}) over {int(n_act_all)} unique activations (render_pick={a.render_pick}) from {a.train_globs[:200]}{'...' if len(a.train_globs) > 200 else ''} in {time.time()-t0:.0f}s")
+    N = len(Z); NA = A.shape[0]; log(f"[prior] pairs: {int(n_all)} total ({int(n_loc)} min per rank; rank 0 {N}) over {int(n_act_all)} unique activations (render_pick={a.render_pick}{', paraphrase col ' + a.para_col if a.para_col else ''}) from {a.train_globs[:200]}{'...' if len(a.train_globs) > 200 else ''} in {time.time()-t0:.0f}s"
+        + (f"; rows with g2 twin ladders (rank 0) {sum(1 for x in LAD if x)}" if LAD is not None else ""))
     steps = a.steps if a.steps > 0 else start_step + (a.steps_add if a.steps_add > 0 else int(a.epochs * int(n_loc) / a.batch))   # continuation: epochs / steps-add count from the checkpoint
     # validation rows (clean1: one row per doubly-held-out document)
     vt = pq.read_table(a.val_parquet, columns=["activation_vector", "response"]).slice(0, a.eval_n)
@@ -313,6 +322,9 @@ def main():
         if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0
         cursor += a.batch
     pairs = start_pairs; t_start = time.time(); t_log = time.time(); loss_acc = 0.0; n_acc = 0; lu_acc = 0.0
+    from nla.flow.negatives import make_negative
+    from nla.contrastive.ladders import twin_negative
+    neg_rng = random.Random(a.seed * 31 + 7 + rank); Z_POOL = Z[:200000] if len(Z) > 200000 else Z   # pool for quote / name swaps
     log(f"[prior] steps {start_step} -> {steps} x {a.batch} x {world} = {(steps-start_step)*a.batch*world} draws this phase ({(steps-start_step)*a.batch*world/int(n_all):.2f} passes over {int(n_all)} rows); pairs so far {start_pairs}; schedule {'ANNEAL cosine 1.0 -> 0.1' if a.anneal else ('warm-up + const' if a.lr_const else 'warm-up + cosine')}; snapshots at {snaps}")
     model.train(); (arvec.crit if arvec.crit is not None else arvec.lm).train()
     for step in range(start_step + 1, steps + 1):
@@ -329,6 +341,22 @@ def main():
             total = loss
             if POOL is not None and a.uncond_mult > 0:   # unlabelled unconditional block: no text, no trunk forward, ~free on the denoiser
                 loss_u, _ = fm_loss(model, uncond_batch(int(round(a.uncond_mult * a.batch)))); total = loss + a.uncond_weight * loss_u; lu_acc += loss_u.item()
+        hn_stats = {}
+        if a.neg_frac > 0:   # in-flow hard negatives: same e, same (t, eps); the detail-swapped text must score WORSE by a margin (hinge = clipped)
+            nb = max(1, int(round(a.neg_frac * a.batch))); sel = idx[:nb].tolist(); zp, zn, rows, kinds = [], [], [], []
+            for k_, i in enumerate(sel):
+                z = Z[i]; zneg, kind = (None, None)
+                if LAD is not None and LAD[i]: zneg, kind = twin_negative(z, LAD[i], neg_rng); kind = f"twin_{kind}" if zneg else None
+                if not zneg: zneg, kind = make_negative(z, neg_rng, Z_POOL)
+                if zneg: zp.append(z); zn.append(zneg); rows.append(k_); kinds.append(kind)
+            if rows:
+                xn = x0[rows].detach(); n2 = len(rows); e2, m2, g2 = cond(zp + zn, grad=False)
+                tt = torch.rand(n2, device=dev); ee = torch.randn_like(xn); x_t = (1 - tt)[:, None] * xn + tt[:, None] * ee; tgt = (ee - xn).float()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    v2 = model(torch.cat([x_t, x_t]), torch.cat([tt, tt]), e2 if use_tokens else None, m2 if use_tokens else None, g2)
+                lrow = ((v2.float() - torch.cat([tgt, tgt])) ** 2).mean(-1); gap = lrow[n2:] - lrow[:n2]
+                hn = a.neg_lambda * F.relu(a.neg_margin - gap).mean(); total = total + hn
+                hn_stats = {"train/hn_loss": hn.item(), "train/hn_gap": gap.mean().item(), "train/hn_win": (gap > 0).float().mean().item(), "train/hn_n": n2, "train/hn_frac_twin": sum(1 for k in kinds if k and k.startswith("twin")) / n2}
         opt.zero_grad(set_to_none=True); total.backward()
         if ddp: allreduce_grads(trainable)
         gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); opt.step()
@@ -336,7 +364,8 @@ def main():
         if step % a.log_every == 0 or step == start_step + 1:
             dt = (time.time() - t_log) / n_acc; t_log = time.time()
             log(f"[prior] step {step}/{steps} pairs {pairs} loss {loss_acc/n_acc:.4f}" + (f" uncond {lu_acc/n_acc:.4f}" if POOL is not None and a.uncond_mult > 0 else "") + f" gn {gn.item():.3f} lr_f {f_:.3f} {dt:.2f}s/step | peak {torch.cuda.max_memory_allocated()/2**30:.0f} GiB")
-            if use_wandb: wandb.log({"train/loss": loss_acc / n_acc, "train/loss_uncond_block": lu_acc / n_acc, "train/gn": gn.item(), "train/lr_f": f_, "train/pairs": pairs, "time/step_s": dt}, step=step)
+            if hn_stats: log(f"  [hn] hinge {hn_stats['train/hn_loss']:.4f} gap {hn_stats['train/hn_gap']:.4f} win {100*hn_stats['train/hn_win']:.0f}% (n {hn_stats['train/hn_n']}, twins {100*hn_stats['train/hn_frac_twin']:.0f}%)")
+            if use_wandb: wandb.log({"train/loss": loss_acc / n_acc, "train/loss_uncond_block": lu_acc / n_acc, "train/gn": gn.item(), "train/lr_f": f_, "train/pairs": pairs, "time/step_s": dt, **hn_stats}, step=step)
             loss_acc = 0.0; n_acc = 0; lu_acc = 0.0
         hit = [q for q in snaps if pairs >= q and q not in done]
         timeout = (time.time() - t_start) / 3600 > a.max_hours; last = step == steps
