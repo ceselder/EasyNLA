@@ -44,7 +44,7 @@ def parse(path):
 
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--out", required=True); p.add_argument("--arm", action="append", default=[], help="tag=logpath"); p.add_argument("--plot", default=None, help="output stem for the figure"); p.add_argument("--title", default=None)
+    p = argparse.ArgumentParser(); p.add_argument("--out", required=True); p.add_argument("--arm", action="append", default=[], help="tag=logpath"); p.add_argument("--plot", default=None, help="output stem for the figure"); p.add_argument("--title", default=None); p.add_argument("--ylim", default=None, help="lo,hi for the curve panel"); p.add_argument("--single-source", action="store_true", help="right panel = final loss per arm only (one SFT source)")
     p.add_argument("--merge", action="append", default=[], help="dst:src -- copy src's per-source val losses into dst (e.g. v0b:v0b_evalonly) and drop src")
     a = p.parse_args(); arms = []
     for spec in a.arm:
@@ -69,10 +69,10 @@ def main():
         for k, d in enumerate(arms):
             if len(d["curve"]) < 2: continue
             xs, ys = zip(*d["curve"]); ax.plot(xs, ys, color=SERIES[k % len(SERIES)], lw=2, label=d["label"], marker="o", ms=3.5)
-        yl = YLIM["pf"] if all(d["tag"].startswith("pf_") for d in arms) else YLIM["v0b"]
+        yl = tuple(float(x) for x in a.ylim.split(",")) if a.ylim else (YLIM["pf"] if all(d["tag"].startswith("pf_") for d in arms) else YLIM["v0b"])
         ax.set_xlabel("SFT step (batch 32)"); ax.set_ylabel("held-out CE, nats / token"); ax.set_ylim(*yl); ax.grid(color="#e6e5e1", lw=0.8); ax.set_axisbelow(True)
         ax.spines[["top", "right"]].set_visible(False); ax.legend(frameon=False, fontsize=9.5, loc="upper right"); ax.set_title("Held-out loss during the 1-epoch SFT", loc="left", fontsize=12, color=INK2)
-        ax = axes[1]; src = [("val_loss_lenslist-v0b", "J-lens list-sentences"), ("val_loss_teacher-sonnet-v1", "teacher prose"), ("val_loss", "all rows")]
+        ax = axes[1]; src = [("val_loss", "held-out rows")] if a.single_source else [("val_loss_lenslist-v0b", "J-lens list-sentences"), ("val_loss_teacher-sonnet-v1", "teacher prose"), ("val_loss", "all rows")]
         fin = [d for d in arms if d.get("val_loss") is not None and d["tag"] != "v0b_evalonly" or (d["tag"] == "v0b_evalonly")]
         w = 0.8 / max(1, len(fin))
         for k, d in enumerate(fin):
@@ -80,11 +80,12 @@ def main():
             xs = [q + (k - (len(fin) - 1) / 2) * w for q in range(len(src))]
             ax.bar(xs, vals, width=w * 0.92, color=SERIES[arms.index(d) % len(SERIES)], edgecolor=SURFACE, linewidth=1.5, label=d["label"])
             for x_, v in zip(xs, vals):
-                if v == v: ax.text(x_, v + 0.01, f"{v:.2f}", ha="center", va="bottom", fontsize=8.5, color=INK, rotation=90)
+                if v == v: ax.text(x_, v + (0.001 if a.single_source else 0.01), f"{v:.3f}" if a.single_source else f"{v:.2f}", ha="center", va="bottom", fontsize=9 if a.single_source else 8.5, color=INK, rotation=0 if a.single_source else 90)
         ax.set_xticks(range(len(src))); ax.set_xticklabels([lab for _, lab in src]); ax.set_ylabel("final held-out CE, nats / token")
         allv = [d.get(kk) for d in fin for kk, _ in src if d.get(kk) is not None]
-        if allv: ax.set_ylim(max(0, min(allv) - 0.4), max(allv) + 0.45)
-        ax.grid(axis="y", color="#e6e5e1", lw=0.8); ax.set_axisbelow(True); ax.spines[["top", "right"]].set_visible(False); ax.set_title("Final loss by SFT source", loc="left", fontsize=12, color=INK2)
+        if allv: ax.set_ylim(max(0, min(allv) - (0.02 if a.single_source else 0.4)), max(allv) + (0.02 if a.single_source else 0.45))
+        if a.single_source: ax.set_xticks([0]); ax.set_xticklabels(["final held-out CE"]); ax.legend(frameon=False, fontsize=9, loc="upper right")
+        ax.grid(axis="y", color="#e6e5e1", lw=0.8); ax.set_axisbelow(True); ax.spines[["top", "right"]].set_visible(False); ax.set_title("Final loss per arm" if a.single_source else "Final loss by SFT source", loc="left", fontsize=12, color=INK2)
         fig.suptitle(a.title or "Do the intermediate attention / MLP writes help the verbalizer?\nHeld-out SFT loss: same rows, same init, same hyper-parameters, only the input differs", fontsize=13, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.90)); fig.savefig(a.plot + ".png", dpi=150); fig.savefig(a.plot + ".pdf"); print("->", a.plot + ".png")
 
