@@ -9,7 +9,7 @@ Manifest: scripts/hf_release_manifest.json (repo_id -> type, files/folders on th
 Cards: scripts/hf_cards/<name>.md with {placeholders} filled from the manifest's `card_vars` and from the report's data/*.json (mounted at /report_data).
 Datasets always ship parquet (user rule). Repos are created with private=True and exist_ok=True; re-running only re-uploads changed files.
 """
-import json, os, sys
+import json, os, re, sys
 import modal
 
 for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.join(os.environ.get("PYTHONPATH", "/root/easyNLA").split(":")[0], "scripts")):
@@ -61,8 +61,10 @@ def _build_dataset_files(repo: dict, work: str, plan_only: bool = False) -> list
             for src in b["src"]:
                 if src.startswith("BEST:"):             # the run's exact-selected checkpoint, named inside <dir>/BEST.txt (a path; fallback: ckpt_latest.pt with a note)
                     bf = src[5:]; d_ = os.path.dirname(bf)
-                    if os.path.exists(bf):
-                        named = open(bf).read().strip().split()[0]; src = named if os.path.isabs(named) else os.path.join(d_, named)
+                    toks = [t for t in re.split(r"[\s,;:'\"]+", open(bf).read()) if t.endswith(".pt")] if os.path.exists(bf) else []
+                    if toks:
+                        named = toks[0]; src = named if os.path.isabs(named) else os.path.join(d_, named)
+                        if not os.path.exists(src): print(f"   NOTE {bf} names {named} which does not exist -> skipped", flush=True); src = src + ".MISSING"
                     else:
                         src = os.path.join(d_, "ckpt_latest.pt"); print(f"   NOTE {bf} missing -> using ckpt_latest.pt (not exact-selected)", flush=True)
                 dst = os.path.join(work, b["dst"], os.path.basename(os.path.dirname(src)), os.path.basename(src)); os.makedirs(os.path.dirname(dst), exist_ok=True)
