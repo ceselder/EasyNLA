@@ -14,6 +14,8 @@ and (main variant) the model's final next-token top-10 -- but NEVER the true con
 Columns: `pair_id` (`<split>:<pos_idx>:<i>:<j>`, joins the NLT pair lists), `text`, `n_tokens` (Qwen3 tokenizer), `verbosity` (0 = ~9-token phrase,
 1 = ~40-token sentence, 2 = ~80-token two sentences), `source`, `sample_idx`, `copy_rate`.
 
+`data/teacher-dossier-v1/{val,train}` (DECISIONS v1.33): the same teacher prompted with the featurizer's per-pair FEATURE DOSSIER (SAE / transcoder / MAEMM / NLA / J-lens readouts of the change) instead of the lens top-k alone; same schema; val landed ~03:40 UTC, train after the 04:05 cut (parts present = what existed at upload time).
+
 Splits (parquet): `data/train` (train pairs of the NLT store), `data/val` (the fixed 4096 evaluation pairs, first rows of `pairs_val`),
 `data/val_nofinal` (teacher without the model's final top-10), `data/val_nolens` (passage only, no lens readouts -- grounding ablation).
 

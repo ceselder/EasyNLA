@@ -114,6 +114,16 @@ def _plan_repo(repo: dict, work: str, plan_only: bool = False):
         for root, _, fs in os.walk(fo["src"]):
             for fn in fs:
                 p = os.path.join(root, fn); items.append((p, os.path.join(fo["dst"], os.path.relpath(p, fo["src"]))))
+    for fg in repo.get("folder_globs", []):            # late additions whose exact run names are not known in advance: <run>/lora -> dst_fmt.format(run=<run dir name>)
+        for src in sorted(glob.glob(fg["src_glob"])):
+            run = os.path.basename(os.path.dirname(src.rstrip("/"))); dst = fg["dst_fmt"].format(run=run)
+            for root, _, fs in os.walk(src):
+                for fn in fs:
+                    p = os.path.join(root, fn); items.append((p, os.path.join(dst, os.path.relpath(p, src))))
+    for fg in repo.get("file_globs", []):
+        for src in sorted(glob.glob(fg["src_glob"])):
+            run = os.path.basename(os.path.dirname(src)); items.append((src, os.path.join(fg["dst_fmt"].format(run=run), os.path.basename(src))))
+    seen = set(); items = [it for it in items if not (it[1] in seen or seen.add(it[1]))]
     items += _build_dataset_files(repo, work, plan_only=plan_only)
     return items
 

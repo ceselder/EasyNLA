@@ -20,6 +20,8 @@ given to the model; z must be natural language, must not restate the context, an
 
 RL checkpoints (`rl_<run>_step<NN>/lora` + `meta.json`; the co-trained listener `critic.pt` of each step stays on the project volume): one headline and one record checkpoint per arm of the referential-RL night (DECISIONS v1.13+): `ref_v1` (arm A, union_pooled_big listener; step 20 = record, NO improvement claim: A4 twin_far FAIL (-0.06 vs step 0) and Y1 FAIL at 20, readers next-token 0.656 -> 0.633 -> 0.595 at 0/20/40; step 50 = last), `ref_v2` (arm B, enc_e2 listener; step 40, negative record: the paired term rose as the absolute likelihood fell), `ref_v1p` / `ref_v1p2` (arm C, paraphrase-scored reward; readers up on all four tasks at step 40, lengths 88 tokens), `ref_v3` (arm D, same-document-only reward; negative), `ref_v4` (neighbour distractors) and `ref_v5` (critic_para_p3 listener) where they exist, and `prelim_v1n` (pre-referential rehearsal). No RL checkpoint passed the full acceptance (Y1/Y2/Y4 + A4) as of 02:00 UTC; see the report for the per-dump gate tables.
 
+Late additions (DECISIONS v1.33): `v0c*/lora` = V0c, the SFT verbalizer warm-started on the teacher-dossier-v1 sentences, and its matched V0 control (`*control*/lora`, same rows/steps on teacher-sonnet-v1), when present.
+
 `meta.json` in each folder records the exact SFT / RL arguments. Injection code: `nlt/verbalizer/inject.py` (`TwoMarkerInjector`), prompt in
 `nlt/verbalizer/prompt.py`, loader `nlt/verbalizer/model.py::load_policy(init="lora:<dir>")` in the easyNLA repo (branch
 `natural-language-transcoder`). A vLLM rollout path with the same injection (`nlt/verbalizer/vllm_rollout.py`) agrees with HF to |dlogp| ~0.03.

@@ -148,7 +148,35 @@
     }
    ],
    "card_vars": {},
-   "note": "rl #690: one headline + one record checkpoint per RL arm; the co-trained listener critic.pt of each step is NOT shipped (GBs each; on the volume)"
+   "note": "rl #690: one headline + one record checkpoint per RL arm; the co-trained listener critic.pt of each step is NOT shipped (GBs each; on the volume) | DECISIONS v1.33 (#841): V0c + matched-V0-control SFT LoRAs (rl, ~04:40; exact paths on topic teacher-dossier) via folder_globs; re-run the upload by ~05:15, skip + post if absent",
+   "folder_globs": [
+    {
+     "src_glob": "/vol/rl/sft/v0c*/lora",
+     "dst_fmt": "{run}/lora"
+    },
+    {
+     "src_glob": "/vol/rl/sft/*control*/lora",
+     "dst_fmt": "{run}/lora"
+    },
+    {
+     "src_glob": "/vol/rl/sft/v0*dossier*/lora",
+     "dst_fmt": "{run}/lora"
+    }
+   ],
+   "file_globs": [
+    {
+     "src_glob": "/vol/rl/sft/v0c*/meta.json",
+     "dst_fmt": "{run}"
+    },
+    {
+     "src_glob": "/vol/rl/sft/*control*/meta.json",
+     "dst_fmt": "{run}"
+    },
+    {
+     "src_glob": "/vol/rl/sft/v0*dossier*/meta.json",
+     "dst_fmt": "{run}"
+    }
+   ]
   },
   {
    "name": "nlt-teacher-sonnet-v1",
@@ -182,9 +210,24 @@
       "/vol/z/teacher-sonnet-v1-nolens/val/*.parquet"
      ],
      "dst": "data/val_nolens"
+    },
+    {
+     "kind": "copy_parquet",
+     "src": [
+      "/vol/z/teacher-dossier-v1/val/*.parquet"
+     ],
+     "dst": "data/teacher-dossier-v1/val"
+    },
+    {
+     "kind": "copy_parquet",
+     "src": [
+      "/vol/z/teacher-dossier-v1/train/*.parquet"
+     ],
+     "dst": "data/teacher-dossier-v1/train"
     }
    ],
-   "card_vars": {}
+   "card_vars": {},
+   "note": "DECISIONS v1.33 (#841): teacher-dossier-v1 (val ~03:40, train after the 04:05 cut) ships as the subfolder data/teacher-dossier-v1/; re-run the upload (idempotent) when the parts land"
   },
   {
    "name": "nlt-lensdiff-v1-sample",
