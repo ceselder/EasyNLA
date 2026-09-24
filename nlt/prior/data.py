@@ -42,8 +42,11 @@ class TextPools:
         w = np.asarray(self.weights, dtype=np.float64); self.p = w / w.sum()
         self.n_rows = sum(len(p["text"]) for p in self.pools)
 
-    def sample(self, B, gen=None):
-        counts = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,), generator=gen))).multinomial(B, self.p)
+    def sample(self, B, gen=None, mode="pool"):
+        """mode 'pool': ONE pool per step (drawn by weight) so a batch pads to its own register's length (bullets ~200 tokens would otherwise
+        pad every mixed batch); 'mixed': rows drawn per pool by weight within the batch."""
+        rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,), generator=gen)))
+        counts = rng.multinomial(B, self.p) if mode == "mixed" else np.bincount([rng.choice(len(self.p), p=self.p)], minlength=len(self.p)) * B
         rows, ii, jj, texts, names = [], [], [], [], []
         for c, name, pool in zip(counts, self.names, self.pools):
             if c == 0: continue
