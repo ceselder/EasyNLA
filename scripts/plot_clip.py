@@ -10,7 +10,9 @@ from scipy.stats import spearmanr
 from scipy.special import logsumexp
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 os.chdir(os.environ.get("NLA_REPORT_DIR", "/home/celeste/shared/reports/nla-flow-prior")); F = "data/flow_noise"; C = "data/clip"   # report folder (data/ in, figures out)
-TAGS = sys.argv[1:] or sorted(os.path.basename(f)[:-len("_offline.json")] for f in glob.glob(f"{C}/*_offline.json"))
+# tags to plot: argv, else data/clip/figure_tags.json (build_html.py runs every plot_*.py with no arguments), else every scored snapshot
+TAGS = sys.argv[1:] or (json.load(open(f"{C}/figure_tags.json")) if os.path.exists(f"{C}/figure_tags.json") else sorted(os.path.basename(f)[:-len("_offline.json")] for f in glob.glob(f"{C}/*_offline.json")))
+if sys.argv[1:]: json.dump(TAGS, open(f"{C}/figure_tags.json", "w"))
 gen = json.load(open(f"{F}/gen.json")); J = json.load(open(f"{F}/judge.json")); rows = gen["rows"]; G = gen["G"]; RL = [0, 2, 4, 6, 8]   # t = 0.1 .. 0.9 of the 9-point grid
 rng = np.random.default_rng(0)
 
@@ -18,6 +20,17 @@ rng = np.random.default_rng(0)
 def wc(x, y):
     r = [spearmanr(x[n], y[n])[0] for n in range(len(x)) if np.ptp(x[n]) > 0 and np.ptp(y[n]) > 0]
     return (float(np.mean(r)), float(np.std(r) / np.sqrt(len(r))), len(r)) if r else (float("nan"), float("nan"), 0)
+
+
+def indist(n, test):
+    """which evals share a generator with this contrastive run's training negatives: 'in' (hatch //), 'related' (hatch ..), None"""
+    t = n.split("|")[0]
+    if t not in CL and t not in TAGS: return None
+    run = t.partition("__")[0]
+    if run.endswith("_plain"): return None
+    if run.endswith("_twins"): return {"ladder": "in", "wrong_detail": "related"}.get(test)
+    return {"wrong_detail": "in", "detector": "in", "ladder": "related"}.get(test)   # make_negative swaps names/quotes from other explanations ~ the ladders' wrong-exact twins
+HATCH = {"in": "//", "related": "..", None: ""}
 
 
 def per_group(x, y): return np.array([spearmanr(x[n], y[n])[0] if (np.ptp(x[n]) > 0 and np.ptp(y[n]) > 0) else np.nan for n in range(len(x))])
@@ -42,7 +55,9 @@ for f in glob.glob(f"{F}/score_*.json") + glob.glob(f"{F}/pg/score_*.json"):
         L = np.array(v["L"], dtype=np.float64); REW.setdefault(c, {})[av] = -L[..., RL].mean(-1).mean(2) if L.shape[-1] == 9 else -L.mean(-1).mean(2)
 def clab(t):
     run, _, snap = t.partition("__"); kind = "frozen trunk" if "frozen" in run else ("LoRA top-12" if "top12" in run else ("Qwen3-8B" if "8b" in run else run))
-    data = "Opus" if "opus" in run else ("Opus+Gemma" if ("g1" in run or "g2" in run) else "")
+    if run.endswith("_plain"): kind += ", no hard negatives"
+    if run.endswith("_twins"): kind += ", g2 twins + ladders"
+    data = "Opus" if "opus" in run else ("Gemma+6% Opus" if "g12" in run else "")
     sz = snap.replace("snap_", "")
     sz = "final" if snap in ("latest", "") else (f"{int(sz) / 1e6:.2g}M pairs" if sz.isdigit() else sz)
     return f"contrastive, {kind} ({data}, {sz})"
@@ -84,6 +99,19 @@ for t, d in CL.items():
     if "val" in d: out["wrong_detail"][t] = {("acc" if k == "neg_detect_acc" else k.replace("neg_detect_acc_", "")): v for k, v in d["val"].items() if k.startswith("neg_detect_acc")}; out["retrieval"][t] = {k: v for k, v in d["val"].items() if not k.startswith("neg_")}
     if "pmi" in d: out["pmi"][t] = d["pmi"]
 ex = json.load(open("data/exact_pmi_adapters.json")); out["pmi"].update({c: {"pmi_bits_mean": ex[c]["pmi_bits_mean"], "shuf_bits_mean": ex[c]["shuf_bits_mean"]} for c in ("sw_tokar", "trunk_dn64", "sw_scratch_tokbase") if c in ex})
+# ---- held-out hedge ladders (g2 pilot Opus-overlap positions; scripts/hedge_ladder_eval.py template)
+LP = ["P(exact>twin)", "P(category>twin)", "P(omit>twin)", "P(exact>omit)"]
+out["ladder"] = {}
+for f in sorted(glob.glob("data/scale_evals/ladder_scaleP_opus__snap_*.json")):
+    d = json.load(open(f)); nm = "flow 644-bit recipe, Opus " + os.path.basename(f).split("snap_")[1][:-5]; out["ladder"][nm] = {k: d["summary"]["all"].get(k) for k in LP}
+for t, d in CL.items():
+    if d.get("ladder"):
+        for kind in ("raw",):
+            its = d["ladder"]; m = {}
+            for k in LP:
+                hi, lo = k[2:-1].split(">"); w = [it[kind][hi] > it[kind][lo] for it in its if hi in it[kind] and lo in it[kind]]
+                m[k] = float(np.mean(w)) if w else None
+            out["ladder"][f"{t}|{kind}"] = m
 # ---- twins + deletion
 ct = json.load(open("data/contrastive_twins.json"))["critics"]
 for c in ("sw_tokar", "trunk_dn64"):
@@ -115,8 +143,21 @@ for c in ("sw_tokar", "trunk_dn64"):
     if c in out["deletion"]: dl = ct[c]["deletion"]["uniform"]; out["deletion"][c].update(false_per_claim=-dl["remove_false_per_claim"][0], true_per_claim=-dl["remove_true_per_claim"][0])   # same sign convention: value of a claim
 
 # ---------------- figure: 2 x 2, phone-legible
+import textwrap
+def flab(n):
+    """short 2-line tick label for the figure"""
+    t = n.split("|")[0]
+    if t in CL or t in TAGS:
+        run, _, snap = t.partition("__"); sz = snap.replace("snap_", "")
+        sz = "final" if snap in ("latest", "") else (f"{int(sz) / 1e6:.2g}M" if sz.isdigit() else sz)
+        data = "Opus" if "opus" in run else "Gemma"
+        neg = "plain InfoNCE" if run.endswith("_plain") else ("g2 twins+ladders" if run.endswith("_twins") else "edit negatives")
+        return f"contrastive, {data}\n{neg}, {sz}"
+    return "\n".join(textwrap.wrap({"sw_tokar exact PMI": "flow 644-bit (exact log p)", "sw_tokar": "flow 644-bit", "trunk_dn64": "flow whole-trunk",
+                                     "sw_scratch_tokbase": "flow scratch, isotropic", "sw_scratch_tokbase_pg": "flow scratch, whitened B", "sw_scratch_tokbase_pgA": "flow scratch, cov. noise A",
+                                     "sw_scratch_tokar_pg": "flow scratch, whitened B (critic reads)", "mse": "MSE reconstructor"}.get(t, LAB.get(n, n)), 24))
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 14})
-fig, ax = plt.subplots(2, 2, figsize=(14, 12)); ax = ax.ravel()
+fig, ax = plt.subplots(2, 2, figsize=(15, 13)); ax = ax.ravel()
 ctags = list(CL)
 def colr(n): return "#9ca3af" if n.startswith("mse") else ("#15803d" if (n in CL or n.split("|")[0] in CL) else "#2563eb")
 # (a) truth ranking
@@ -126,7 +167,7 @@ for k, av in enumerate(("warm", "trunk400")):
     v = [out["truth"][n][av] for n in names]
     ax[0].barh(y + (k - 0.5) * h, [q[0] for q in v], h, xerr=[q[1] for q in v], color=[colr(n) for n in names], alpha=1.0 if k == 0 else 0.45, error_kw=dict(lw=1),
                label=("warm-start explanations" if k == 0 else "step-400 RL-policy explanations"))
-ax[0].set_yticks(y); ax[0].set_yticklabels([LAB[n] for n in names], fontsize=11); ax[0].invert_yaxis(); ax[0].axvline(0, color="k", lw=.8); ax[0].grid(alpha=.3, axis="x")
+ax[0].set_yticks(y); ax[0].set_yticklabels([flab(n) for n in names], fontsize=11); ax[0].invert_yaxis(); ax[0].axvline(0, color="k", lw=.8); ax[0].grid(alpha=.3, axis="x")
 ax[0].legend(fontsize=10, loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=2, frameon=False)
 ax[0].set_title("(a) does the score rank truer explanations higher?"); ax[0].set_xlabel("within-group Spearman with (− false claims), ± 1 s.e.\n40 activations × 8 sampled explanations")
 # (b) number edits
@@ -134,37 +175,42 @@ dn = [n for n in ["mse", "sw_tokar exact PMI", "sw_tokar", "sw_scratch_tokbase_p
 DL = dict(LAB, **{"sw_tokar exact PMI": "flow 644-bit, exact log p", "sw_tokar": "flow 644-bit, RL reward", "sw_scratch_tokbase_pg": "flow scratch, whitened (B)"})
 yy = np.arange(len(dn)); hh = 0.27
 for k, (m, c_) in enumerate((("orig>near", "#dc2626"), ("orig>far", "#7f1d1d"), ("hedge>near", "#7c3aed"))):
-    ax[1].barh(yy + (k - 1) * hh, [out["detector"][n][m] for n in dn], hh, color=c_, hatch=["//" if "|" in n else "" for n in dn], edgecolor="white", label={"orig>near": "true number > near-miss", "orig>far": "true number > far-off number", "hedge>near": "'true or near-miss' hedge > near-miss"}[m])
-ax[1].axvline(0.5, color="k", lw=.8); ax[1].set_yticks(yy); ax[1].set_yticklabels([DL.get(n, n) for n in dn], fontsize=11); ax[1].invert_yaxis(); ax[1].set_xlim(0.3, 1.0); ax[1].grid(alpha=.3, axis="x")
+    ax[1].barh(yy + (k - 1) * hh, [out["detector"][n][m] for n in dn], hh, color=c_, hatch=[HATCH[indist(n, "detector")] for n in dn], edgecolor="white", label={"orig>near": "true number > near-miss", "orig>far": "true number > far-off number", "hedge>near": "'true or near-miss' hedge > near-miss"}[m])
+ax[1].axvline(0.5, color="k", lw=.8); ax[1].set_yticks(yy); ax[1].set_yticklabels([flab(n) for n in dn], fontsize=11); ax[1].invert_yaxis(); ax[1].set_xlim(0.3, 1.0); ax[1].grid(alpha=.3, axis="x")
 ax[1].legend(fontsize=10, loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=2, frameon=False)
-ax[1].set_title("(b) one number edited (512 held-out items)"); ax[1].set_xlabel("P(first variant scores higher); 0.5 = chance\nhatched: critic trained on this edit generator (in-distribution)")
+ax[1].set_title("(b) one number edited (512 held-out items)"); ax[1].set_xlabel("P(first variant scores higher); 0.5 = chance\n// trained on this edit generator (in-distribution)")
 # (c) wrong-detail detection
 wn = [n for n in ["sw_scratch_tokbase_pg", "sw_scratch_tokbase_pgA", "sw_scratch_tokar_pg"] if n in out["wrong_detail"]] + [t for t in ctags if t in out["wrong_detail"]]
 yw = np.arange(len(wn)); hw = 0.2
 for k, kind in enumerate(("acc", "quote", "number", "name")):
-    ax[2].barh(yw + (k - 1.5) * hw, [out["wrong_detail"][n].get(kind, np.nan) for n in wn], hw, hatch=["//" if n in CL else "" for n in wn], edgecolor="white", label={"acc": "all 1,023", "quote": "quote swapped", "number": "number changed", "name": "name swapped"}[kind],
+    ax[2].barh(yw + (k - 1.5) * hw, [out["wrong_detail"][n].get(kind, np.nan) for n in wn], hw, hatch=[HATCH[indist(n, "wrong_detail")] for n in wn], edgecolor="white", label={"acc": "all 1,023", "quote": "quote swapped", "number": "number changed", "name": "name swapped"}[kind],
                color=["#111827", "#2563eb", "#dc2626", "#d97706"][k])
-ax[2].axvline(0.5, color="k", lw=.8); ax[2].set_yticks(yw); ax[2].set_yticklabels([LAB.get(n, n) for n in wn], fontsize=11); ax[2].invert_yaxis(); ax[2].set_xlim(0.45, 1.0)
+ax[2].axvline(0.5, color="k", lw=.8); ax[2].set_yticks(yw); ax[2].set_yticklabels([flab(n) for n in wn], fontsize=11); ax[2].invert_yaxis(); ax[2].set_xlim(0.45, 1.0)
 ax[2].grid(alpha=.3, axis="x"); ax[2].legend(fontsize=10, loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=4, frameon=False)
-ax[2].set_title("(c) wrong-detail detection (same 1,023 negatives)"); ax[2].set_xlabel("P(true explanation > its one-detail-changed copy)\nhatched: critic trained on this edit generator (in-distribution)")
+ax[2].set_title("(c) wrong-detail detection (same 1,023 negatives)"); ax[2].set_xlabel("P(true explanation > its one-detail-changed copy)\n// same generator as training negatives; .. related (other-document values)")
 # (d) fabricated claim value + twins
 dd = [n for n in ["sw_tokar", "trunk_dn64"] if n in out["deletion"]] + [f"{t}|raw" for t in ctags if f"{t}|raw" in out["deletion"]]; yd = np.arange(len(dd))
 rat = [out["deletion"][n]["false_per_claim"] / out["deletion"][n]["true_per_claim"] for n in dd]
 ax[3].barh(yd, rat, color=[colr(n) for n in dd]); ax[3].axvline(0, color="k", lw=.8); ax[3].set_yticks(yd)
-ax[3].set_yticklabels([LAB.get(n, n) + (f"\ntwin win rate {100 * out['twins'][n.split('|')[0]]:.0f} % (chance 50 %)" if out["twins"].get(n.split("|")[0]) is not None else "") for n in dd], fontsize=10.5); ax[3].invert_yaxis(); ax[3].grid(alpha=.3, axis="x")
+ax[3].set_yticklabels([flab(n) + (f"\ntwins {100 * out['twins'][n.split('|')[0]]:.0f} % (chance 50)" if out["twins"].get(n.split("|")[0]) is not None else "") for n in dd], fontsize=10.5); ax[3].invert_yaxis(); ax[3].grid(alpha=.3, axis="x")
 ax[3].set_xlim(min(-0.1, min(rat) - 0.05), max(rat) + 0.12)
 for i_, n in enumerate(dd):
     ax[3].text(rat[i_] + 0.01, i_, f"{rat[i_]:+.2f}", va="center", fontsize=11)
 ax[3].set_title("(d) does a fabricated claim cost score?"); ax[3].set_xlabel("value of one false claim / value of one true claim\n(> 0: a fabrication still earns score; 97 deletion items)")
-best = [f"{t}|raw" for t in ctags][-1] if ctags else None
-if best:
-    tb = out["truth"][best]; tf = out["truth"]["sw_tokar"]; bt = best.split("|")[0]; rt_ = out["retrieval"].get(bt, {})
-    head = (f"A contrastive critic identifies the activation almost perfectly ({100 * rt_.get('ret_a2t_top1_n10000', float('nan')):.0f} % top-1 among 10k) and still ranks truer explanations higher after RL\n"
-            f"(ρ {tb['trunk400'][0]:+.2f} vs {tf['trunk400'][0]:+.2f} for the flow), but a fabricated claim still earns {rat[-1]:.2f} of a true claim's score and twins stay at chance")
+plain = [t for t in ctags if t.partition("__")[0].endswith("_plain")]
+if plain:
+    pl = plain[-1]; wdp = out["wrong_detail"].get(pl, {}).get("acc", float("nan")); wdf = [v.get("acc") for k, v in out["wrong_detail"].items() if k.startswith("sw_scratch")]
+    tp = out["truth"][f"{pl}|raw"]["trunk400"][0]; tf = out["truth"]["sw_tokar"]["trunk400"][0]
+    head = (f"Plain in-batch contrastive training does not sharpen detail detection (wrong-detail {wdp:.2f} vs {min(wdf):.2f}–{max(wdf):.2f} for flow critics); the gains come from\n"
+            f"training on the test's edit generators (hatched). Truth ranking on RL-policy explanations: ρ {tp:+.2f} vs {tf:+.2f} (flow), not significant")
+elif ctags:
+    best = [f"{t}|raw" for t in ctags][-1]; tb = out["truth"][best]; tf = out["truth"]["sw_tokar"]
+    head = f"Contrastive critic vs density critics: truth ρ on RL-policy explanations {tb['trunk400'][0]:+.2f} vs {tf['trunk400'][0]:+.2f} (flow)"
 else: head = "Contrastive critic vs density critics on hallucination tests"
 fig.suptitle(head + "\nExperiment: in-batch InfoNCE critic, scored on the same held-out rows as the flow and MSE critics", fontsize=13.5, y=0.998)
 fig.tight_layout(rect=(0, 0, 1, 0.93), h_pad=3.0)
 for e_ in ("png", "pdf"): fig.savefig(f"clip_compare.{e_}", dpi=150 if e_ == "png" else None, bbox_inches="tight", pad_inches=0.25)
+out["indist"] = {n: {k: indist(n, k) for k in ("wrong_detail", "detector", "ladder")} for n in list(REW) + list(out["wrong_detail"]) + list(out["ladder"])}
 out["labels"] = LAB; out["caveat"] = "the contrastive critics were trained with detail-swap negatives (make_negative) and a number-hedge ranking term (perturb) from the SAME generators as the wrong-detail and number-edit tests (on different rows); those two tests are in-distribution for them and not for the flow critics. Truth ranking, twins, deletion, retrieval are not."
 json.dump(out, open("data/clip_compare.json", "w"), indent=1)
 print(json.dumps({"truth_warm": {n: round(v["warm"][0], 3) for n, v in out["truth"].items()}, "detector": {n: {k: round(x, 3) for k, x in v.items()} for n, v in out["detector"].items()},
