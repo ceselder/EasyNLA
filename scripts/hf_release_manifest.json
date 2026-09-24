@@ -87,6 +87,14 @@
     {
      "src": "/vol/rl/runs/prelim_v1n/step_00040/lora",
      "dst": "rl_prelim_v1n_step40/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v4/step_00060/lora",
+     "dst": "rl_ref_v4_step60/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v5/step_00060/lora",
+     "dst": "rl_ref_v5_step60/lora"
     }
    ],
    "files": [
@@ -145,6 +153,14 @@
     {
      "src": "/vol/rl/runs/prelim_v1n/step_00040/meta.json",
      "dst": "rl_prelim_v1n_step40"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v4/step_00060/meta.json",
+     "dst": "rl_ref_v4_step60"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v5/step_00060/meta.json",
+     "dst": "rl_ref_v5_step60"
     }
    ],
    "card_vars": {},
@@ -349,7 +365,11 @@
       "/vol/z/ref_v5_20/val/*.parquet",
       "/vol/z/ref_v5_40/val/*.parquet",
       "/vol/z/prelim_v1n_20/val/*.parquet",
-      "/vol/z/prelim_v1n_40/val/*.parquet"
+      "/vol/z/prelim_v1n_40/val/*.parquet",
+      "/vol/z/ref_v4_40/val/*.parquet",
+      "/vol/z/ref_v4_60/val/*.parquet",
+      "/vol/z/ref_v5_60/val/*.parquet",
+      "/vol/z/ref_v1_50/val/*.parquet"
      ],
      "root": "/vol/z",
      "dst": "data/rl_dumps"
