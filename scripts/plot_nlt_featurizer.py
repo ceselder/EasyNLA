@@ -256,6 +256,20 @@ def main():
         ax.set_title("MAEMM inversions are not direction-specific:\nthe generated text fits another pair's direction just as well"); ax.legend(loc="upper right")
         ax.set_ylim(0, max(0.5, 1.15 * max(res[k]["cos_own_mean"] for k in kinds)))
         save(fig, a.report_dir, "featurizer_maemm_specificity")
+    # ------------------------------------------------------------------ Fig 7: readers, dossier vs the other sources (numbers from data/featurizer_scores.json)
+    sp = os.path.join(a.report_dir, "data", "featurizer_scores.json")
+    if os.path.exists(sp):
+        sc = json.load(open(sp))["readers_sonnet_512pairs"]
+        metrics = sc.pop("metrics"); names = [k for k in sc if isinstance(sc[k], list)]
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = np.arange(len(metrics)); w = 0.8 / len(names)
+        cols = plt.cm.tab10(np.linspace(0, 1, len(names)))
+        for i_, n in enumerate(names):
+            ax.bar(x + (i_ - len(names) / 2 + 0.5) * w, sc[n], w, color=(C["sae"] if n.startswith("dossier") else cols[i_]), label=n, edgecolor="black" if n.startswith("dossier") else "none")
+        ax.set_xticks(x); ax.set_xticklabels(["final top-1\n(among 4)", "direction", "position\n(among 5 cuts)", "makes a\ncheckable claim"])
+        ax.set_ylabel("reader accuracy (Sonnet 5 sees one description)"); ax.set_ylim(0.4, 1.0)
+        ax.set_title("Dossier descriptions read like the lens sentence: best claim rate,\nbut no passage-derived next-token or position knowledge"); ax.legend(fontsize=9, loc="lower left")
+        save(fig, a.report_dir, "featurizer_readers_vs_sources")
     json.dump(out, open(os.path.join(a.report_dir, "data", f"featurizer_analysis_{a.split}.json"), "w"), indent=1)
     print(json.dumps({k: v for k, v in out.items() if k in ("fig1", "fig2", "fig3")}, indent=1)[:3000])
 
