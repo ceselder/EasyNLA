@@ -134,9 +134,14 @@ def run(task: str = "plan", only: str = "", dry_run: int = 1):
                 print(f"   REFUSING {repo_id}: it exists and is PUBLIC -- make it private first", flush=True); continue
             open(os.path.join(work, "README.md"), "w").write(card)
             api.upload_file(path_or_fileobj=os.path.join(work, "README.md"), path_in_repo="README.md", repo_id=repo_id, repo_type=repo["type"])
+            n_ok = 0
             for (p, d), s in zip(items, sizes):
                 if s < 0: print("   skip missing", p, flush=True); continue
-                api.upload_file(path_or_fileobj=p, path_in_repo=d, repo_id=repo_id, repo_type=repo["type"]); print("   uploaded", d, flush=True)
+                try:
+                    api.upload_file(path_or_fileobj=p, path_in_repo=d, repo_id=repo_id, repo_type=repo["type"]); n_ok += 1; print(f"   uploaded {d} ({s/1e6:.0f} MB)", flush=True)
+                except Exception as e:                                  # quota / transient: report and continue with the next file (priority order in the manifest)
+                    print(f"   FAILED {d}: {str(e)[:300]}", flush=True)
+            print(f"   {n_ok} files uploaded", flush=True)
             info = api.repo_info(repo_id, repo_type=repo["type"]); assert info.private, f"{repo_id} is not private!"
             print(f"   DONE {repo_id} private={info.private}", flush=True)
         shutil.rmtree(work, ignore_errors=True)

@@ -39,6 +39,54 @@
     {
      "src": "/vol/rl/sft/v0b_mix/lora",
      "dst": "v0b_mix/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1/step_00020/lora",
+     "dst": "rl_ref_v1_step20/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1/step_00050/lora",
+     "dst": "rl_ref_v1_step50/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v2/step_00040/lora",
+     "dst": "rl_ref_v2_step40/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1p/step_00040/lora",
+     "dst": "rl_ref_v1p_step40/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1p2/step_00060/lora",
+     "dst": "rl_ref_v1p2_step60/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1p2/step_00080/lora",
+     "dst": "rl_ref_v1p2_step80/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v3/step_00020/lora",
+     "dst": "rl_ref_v3_step20/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v4/step_00020/lora",
+     "dst": "rl_ref_v4_step20/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v4/step_00040/lora",
+     "dst": "rl_ref_v4_step40/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v5/step_00020/lora",
+     "dst": "rl_ref_v5_step20/lora"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v5/step_00040/lora",
+     "dst": "rl_ref_v5_step40/lora"
+    },
+    {
+     "src": "/vol/rl/runs/prelim_v1n/step_00040/lora",
+     "dst": "rl_prelim_v1n_step40/lora"
     }
    ],
    "files": [
@@ -49,10 +97,58 @@
     {
      "src": "/vol/rl/sft/v0b_mix/meta.json",
      "dst": "v0b_mix"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1/step_00020/meta.json",
+     "dst": "rl_ref_v1_step20"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1/step_00050/meta.json",
+     "dst": "rl_ref_v1_step50"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v2/step_00040/meta.json",
+     "dst": "rl_ref_v2_step40"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1p/step_00040/meta.json",
+     "dst": "rl_ref_v1p_step40"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1p2/step_00060/meta.json",
+     "dst": "rl_ref_v1p2_step60"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v1p2/step_00080/meta.json",
+     "dst": "rl_ref_v1p2_step80"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v3/step_00020/meta.json",
+     "dst": "rl_ref_v3_step20"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v4/step_00020/meta.json",
+     "dst": "rl_ref_v4_step20"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v4/step_00040/meta.json",
+     "dst": "rl_ref_v4_step40"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v5/step_00020/meta.json",
+     "dst": "rl_ref_v5_step20"
+    },
+    {
+     "src": "/vol/rl/runs/ref_v5/step_00040/meta.json",
+     "dst": "rl_ref_v5_step40"
+    },
+    {
+     "src": "/vol/rl/runs/prelim_v1n/step_00040/meta.json",
+     "dst": "rl_prelim_v1n_step40"
     }
    ],
    "card_vars": {},
-   "note": "reuses rl's existing repo (created 00:30, flipped to private by the orchestrator at 00:51); the upload only adds/updates files"
+   "note": "rl #690: one headline + one record checkpoint per RL arm; the co-trained listener critic.pt of each step is NOT shipped (GBs each; on the volume)"
   },
   {
    "name": "nlt-qwen3-8b-critics",
@@ -78,7 +174,7 @@
     }
    ],
    "card_vars": {
-    "critic_list": "Per infra (board #383): priors none_v1_pooled (pooled space) and none_v1_squash (squash space, the v3b space; exact 0.647 bits/dim, +1.50 vs N(0,I)), none_v2 (4.4B, 1.37M positions, squash) if final; told-depth depth_v1_pooled (gain 29.7 exact bits vs blind, 3.4 vs p_mix); text critics union_pooled_null, union_pooled_big (first to pass A1/A1b/A2 on lens text), critic_v3a_{nd,nr,nn} (3-way null test, pooled), critic_v3b_{n03,nn,e2} (squash space, full pool; e2 = Qwen3-8B L24 encoder). Which v3 arm is THE critic was decided by the exact tables + redteam acceptance ~00:00-02:30 (see the report)."
+    "critic_list": "Priority order: none_v1_pooled (the blind prior every text critic sits on), depth_v1_pooled (told-depth diagnostic / p_mix), text_union_pooled_big (first natural-language sources over the content gate), enc_e2 (Qwen3-8B-L24 encoder adapter; the first critic to pass the RL acceptance on lens text), critic_para_p3 (paraphrase-augmented adapter; the first MEANING-reading critic: PMI(orig) +9..+12, paraphrase retention 0.74/0.84, twin_far 0.66), critic_v3b_fbp (v3 recipe, pooled, full pool), then none_v1_squash, text_union_pooled_n, critic_v3b_e2p / e2sentp, none_v2 (4.4B prior, stopped early), critic_v3a_nd (record). Steps are in each folder's best.json / eval_latest.json."
    },
    "builders": [
     {
@@ -90,20 +186,21 @@
      ],
      "src": [
       "/vol/critic/none_v1_pooled/ckpt_final.pt",
-      "/vol/critic/none_v1_squash/ckpt_final.pt",
-      "/vol/critic/none_v2/ckpt_final.pt",
       "/vol/critic/depth_v1_pooled/ckpt_final.pt",
-      "/vol/critic/text_union_pooled_n/ckpt_best.pt",
       "/vol/critic/text_union_pooled_big/ckpt_best.pt",
-      "/vol/critic/critic_v3a_nd/ckpt_best.pt",
-      "/vol/critic/critic_v3a_nr/ckpt_best.pt",
-      "/vol/critic/critic_v3a_nn/ckpt_best.pt",
-      "/vol/critic/critic_v3b_n03/ckpt_best.pt",
-      "/vol/critic/critic_v3b_nn/ckpt_best.pt",
-      "/vol/critic/critic_v3b_e2/ckpt_best.pt"
+      "/vol/critic/enc_e2/ckpt_best.pt",
+      "/vol/critic/critic_para_p3/ckpt_latest.pt",
+      "/vol/critic/critic_v3b_fbp/ckpt_best.pt",
+      "/vol/critic/none_v1_squash/ckpt_final.pt",
+      "/vol/critic/text_union_pooled_n/ckpt_best.pt",
+      "/vol/critic/critic_v3b_e2p/ckpt_best.pt",
+      "/vol/critic/critic_v3b_e2sentp/ckpt_best.pt",
+      "/vol/critic/none_v2/ckpt_latest.pt",
+      "/vol/critic/critic_v3a_nd/ckpt_best.pt"
      ]
     }
-   ]
+   ],
+   "note": "priority order (quota): pooled prior, told-depth, union_pooled_big, enc_e2 (first accepted critic), critic_para_p3 (first meaning-reading critic), v3b_fbp, then the rest; optimizer states stripped"
   },
   {
    "name": "nlt-teacher-sonnet-v1",
@@ -203,6 +300,30 @@
       "/vol/z/v0-ao-tsv1/val/*.parquet",
       "/vol/z/twins-v1/val/*.parquet"
      ]
+    },
+    {
+     "kind": "copy_tree",
+     "src": [
+      "/vol/z/ref_v1_0/val/*.parquet",
+      "/vol/z/ref_v1_20/val/*.parquet",
+      "/vol/z/ref_v1_40/val/*.parquet",
+      "/vol/z/ref_v2_0/val/*.parquet",
+      "/vol/z/ref_v2_20/val/*.parquet",
+      "/vol/z/ref_v2_40/val/*.parquet",
+      "/vol/z/ref_v1p_0/val/*.parquet",
+      "/vol/z/ref_v1p_20/val/*.parquet",
+      "/vol/z/ref_v1p_40/val/*.parquet",
+      "/vol/z/ref_v1p2_60/val/*.parquet",
+      "/vol/z/ref_v1p2_80/val/*.parquet",
+      "/vol/z/ref_v3_20/val/*.parquet",
+      "/vol/z/ref_v4_20/val/*.parquet",
+      "/vol/z/ref_v5_20/val/*.parquet",
+      "/vol/z/ref_v5_40/val/*.parquet",
+      "/vol/z/prelim_v1n_20/val/*.parquet",
+      "/vol/z/prelim_v1n_40/val/*.parquet"
+     ],
+     "root": "/vol/z",
+     "dst": "data/rl_dumps"
     },
     {
      "kind": "copy_tree",
