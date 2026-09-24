@@ -114,13 +114,20 @@ def build_dossiers(a):
         if len(t):
             ao[kind] = t.groupby("pair_id").text.apply(lambda s: [x for x in s.tolist() if x][:2]).to_dict()
     lens = pd.DataFrame()
+    need_pids = set(sae.index)
     for p in a.lens_feats:
         for f in glob.glob(os.path.expanduser(p)):
             import pyarrow.parquet as pq
-            t = pq.read_table(f, columns=["pair_id", "source", "top_i", "top_j", "emerging", "fading", "top1_i", "top1_j", "p1_i", "p1_j"]).to_pandas()
-            t = t[t.source == "lensdiff-v1-jlens"]
-            lens = pd.concat([lens, t])
+            import pyarrow.compute as pc
+            pf = pq.ParquetFile(f)
+            cols = ["pair_id", "source", "top_i", "top_j", "emerging", "fading", "top1_i", "top1_j", "p1_i", "p1_j"]
+            for batch in pf.iter_batches(batch_size=65536, columns=cols):          # streamed: the train feats files are large
+                t = batch.to_pandas()
+                t = t[(t.source == "lensdiff-v1-jlens") & t.pair_id.isin(need_pids)]
+                if len(t):
+                    lens = pd.concat([lens, t])
     lens = lens.drop_duplicates("pair_id").set_index("pair_id") if len(lens) else lens
+    print(f"[dossier] lens feats for {len(lens)} of {len(need_pids)} pairs", flush=True)
     labels = Labels(a.labels_dir)
     os.makedirs(f"{a.out}/{split}", exist_ok=True)
     out_path = f"{a.out}/{split}/dossier_{a.start:07d}_{a.end:07d}.jsonl"
@@ -225,7 +232,7 @@ def parse_json(text):
             mm = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % k, text, re.S)
             if mm:
                 d[k] = mm.group(1).replace('\\"', '"')
-    return d if "short" in d and "sentence" in d else None
+    return d if ("short" in d or "sentence" in d) else None
 
 
 def run_sonnet(a):
@@ -241,14 +248,14 @@ def run_sonnet(a):
     if int(os.environ.get("FEAT_SYNC", "0")):
         from nlt.featurizer.labels import run_sync
         reqs = [(r["pair_id"].replace(":", "_"), SYSTEM, USER_TMPL.format(body=r["dossier"])) for r in rows]
-        results = run_sync(reqs, log=lambda m: print(m, flush=True), max_tokens=220)
+        results = run_sync(reqs, log=lambda m: print(m, flush=True), max_tokens=320)
         rows_iter = []
     else:
         rows_iter = range(0, len(rows), a.chunk)
     for s in rows_iter:
         chunk = rows[s:s + a.chunk]
         reqs = [{"custom_id": r["pair_id"].replace(":", "_"),
-                 "params": dict(model=MODEL, max_tokens=220, system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+                 "params": dict(model=MODEL, max_tokens=320, system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
                                 messages=[{"role": "user", "content": USER_TMPL.format(body=r["dossier"])}])} for r in chunk]
         b = c.messages.batches.create(requests=reqs)
         print(f"[sonnet] batch {b.id}: {len(reqs)} ({s}-{s + len(chunk)})", flush=True)
@@ -272,8 +279,13 @@ def run_sonnet(a):
         txt = results.get(r["pair_id"].replace(":", "_"))
         d = parse_json(txt) if txt else None
         if not d:
-            n_bad += 1; continue
+            n_bad += 1
+            if n_bad <= 3:
+                print(f"[sonnet] unparsable: {str(txt)[:300]!r}", flush=True)
+            continue
         for key, v in VERBOSITY.items():
+            if key not in d:
+                continue
             t = " ".join(str(d[key]).split()).strip().strip('"')
             if not t:
                 continue
