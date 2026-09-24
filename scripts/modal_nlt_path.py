@@ -53,6 +53,12 @@ def dump(tag: str, extra: str = "", data: str = DATA):
     return _run([sys.executable, "-m", "nlt.path.dump", "--data-dir", data, "--source", tag, "--out", f"/vol/z/{tag}/val/part_0000000_0004096.parquet"] + extra.split())
 
 
+@app.function(timeout=3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=64 * 1024)
+def facts(tag: str, extra: str = "", data: str = DATA):
+    """CPU: path-dependent SFT targets from the extracted writes (nlt.path.facts) -> /vol/z/<tag>/<split>/rows.parquet"""
+    return _run([sys.executable, "-m", "nlt.path.facts", "--data-dir", data, "--path-dir", "/vol/path/qwen3_8b"] + extra.split())
+
+
 @app.function(timeout=1800, volumes={"/vol": vol}, cpu=2, memory=8 * 1024)
 def cat(path: str):
     vol.reload(); print(open(f"/vol/{path}").read())
@@ -61,7 +67,7 @@ def cat(path: str):
 @app.local_entrypoint()
 def main(task: str = "extract", tag: str = "dev", extra: str = "", data: str = DATA, path: str = ""):
     if task == "cat": cat.remote(path); return
-    fn = {"extract": extract, "sft": sft, "dump": dump}.get(task)
+    fn = {"extract": extract, "sft": sft, "dump": dump, "facts": facts}.get(task)
     if fn is None: raise SystemExit(f"unknown task {task}")
     rc = fn.remote(tag, extra, data); print(f"rc {rc}")
     if rc != 0: raise SystemExit(f"task {task} {tag} failed rc={rc}")

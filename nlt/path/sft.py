@@ -18,7 +18,7 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="path_sft")
     p.add_argument("--text", required=True); p.add_argument("--val-text", default=None)
     p.add_argument("--base", default="Qwen/Qwen3-8B"); p.add_argument("--init", default="ao"); p.add_argument("--question", default=None)
-    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b"); p.add_argument("--fixed-markers", type=int, default=0, help="pad the middle with zero markers to this fixed count (count carries no gap info)"); p.add_argument("--ablate-mid", default="none", choices=["none", "zero", "shuffle", "noise"], help="eval-time ablation of the middle vectors (diagnostic; applies to train too, so use with --eval-only)")
+    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b"); p.add_argument("--fixed-markers", type=int, default=0, help="pad the middle with zero markers to this fixed count (count carries no gap info)"); p.add_argument("--rows-direct", action="store_true", help="text parquets already carry pos_idx/i/j (nlt.path.facts): skip the pairs join and the copy filter"); p.add_argument("--ablate-mid", default="none", choices=["none", "zero", "shuffle", "noise"], help="eval-time ablation of the middle vectors (diagnostic; applies to train too, so use with --eval-only)")
     p.add_argument("--epochs", type=float, default=1.0); p.add_argument("--lr", type=float, default=3e-5); p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--batch", type=int, default=32); p.add_argument("--micro", type=int, default=8); p.add_argument("--max-resp-tokens", type=int, default=96)
     p.add_argument("--max-rows", type=int, default=None); p.add_argument("--copy-thresh", type=float, default=0.05)
@@ -44,6 +44,12 @@ def main():
         files = sorted(sum([_glob.glob(x) if any(c in x for c in "*?[") else [x] for x in paths.split(",")], []))
         assert files, f"no text files match {paths}"
         verb = [int(v) for v in a.verbosity.split(",")] if a.verbosity else None
+        if a.rows_direct:
+            import pandas as pd, pyarrow.parquet as pq
+            df = pd.concat([pq.read_table(f).to_pandas() for f in files], ignore_index=True); df = df[df["pos_idx"].isin(store.row_of)]
+            n0 = len(df); df = df[~df["text"].astype(str).map(lambda t: bool(hard_hits(t)))]
+            print(f"[path-sft:{split}] direct rows {n0} -> regex {len(df)} used; sources {df['source'].value_counts().to_dict()}", flush=True)
+            return df.reset_index(drop=True)
         df = load_text_pairs(files, os.path.join(a.data_dir, f"pairs_{split}.parquet"), verbosity=verb); df = df[df["pos_idx"].isin(store.row_of)]
         if a.sources: df = df[df["source"].isin(a.sources.split(","))]
         n0 = len(df); df = df[~df["text"].astype(str).map(lambda t: bool(hard_hits(t)))]; n1 = len(df)
