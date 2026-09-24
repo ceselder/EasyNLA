@@ -885,8 +885,9 @@ def main():
                 grps += [uniq[g0: g0 + G] for g0 in range(0, len(uniq) - G + 1, G)]
             ng = torch.tensor([len(grps)], device=dev)
             if ddp: dist.all_reduce(ng, op=dist.ReduceOp.MIN)                 # equal forward/backward counts on every rank (FSDP collectives)
-            grps = grps[: int(ng.item())]; tau = log_tau.exp().clamp(1.0, 100.0); ce_s = ar_s = ac_s = 0.0
+            grps = grps[: int(ng.item())]; ce_s = ar_s = ac_s = 0.0; tau = log_tau.detach().exp().clamp(1.0, 100.0)
             for g_i, grp in enumerate(grps):
+                tau = log_tau.exp().clamp(1.0, 100.0)                           # rebuilt per group: each group has its own backward
                 G = len(grp); xs = x0[grp].detach(); eg, mkg, cvg = enc_batch([_txt[p_] for p_ in grp], grad=a.ctr_enc_grad)
                 tt = torch.rand(G, device=dev); ee = torch.randn_like(xs); x_t = (1 - tt)[:, None] * xs + tt[:, None] * ee; tgt = (ee - xs).float()
                 with torch.autocast("cuda", dtype=torch.bfloat16):
