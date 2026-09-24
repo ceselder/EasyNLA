@@ -30,7 +30,9 @@ VERDICT = ("Negative for tonight: with <= ~130k distinct (pair, text) rows (<= 1
            "(1.5x the rows at which the 0.6B cross-read adapter recovered +38 bits from the same tag) the trunk still does not read the tag (+1.2 vs +0.8 control). "
            "Positive by-product: the trunk's empty-prefix null path is a much better BLIND density than the 1.89B pooled prior it sits on -- +885 +- 44 exact "
            "bits/pair at 128k rows (NLL 0.403 vs 0.742 bits/dim on the same rows; pre-workspace +1784, workspace +753, motor +442; gap 1-3 +1417, 11-25 +218), "
-           "i.e. the pooled prior under-uses the source activation, most of all at small gaps; the trunk sees the source as [h_i/rms(h_i), log rms(h_i)].")
+           "on all 4096 rows +880 +- 11. Checks (data/trunk_null_checks.json): train rows +859 (no memorisation, docs disjoint), N(0,I) targets -299 (not a probe/divergence "
+           "artefact), SHUFFLED pairs +692 -> most of the gain is a generically better denoiser (the readout also sees x_t and t through the activation tokens); only "
+           "~190 bits/pair need the matching h_i. So the 1.89B MLP prior is ~900 bits/pair short of the density a stronger denoiser reaches in 128k rows, i.e. prior capacity/steps.")
 
 
 def wandb_runs():
