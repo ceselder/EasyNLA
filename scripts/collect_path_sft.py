@@ -12,10 +12,12 @@ import matplotlib.pyplot as plt
 
 LABELS = {"v0b": "V0b: h_i, h_j (2 markers)", "v0b_evalonly": "V0b re-evaluated (same code path)", "v0b_path_d": "path-delta: h_i, d_k = h_k - h_{k-1}, h_j",
           "v0b_path": "path: h_i, a_k, m_k (attn + MLP writes), h_j", "v0b_path_c": "count control: h_i, (j-i) empty markers, h_j",
-          "v0b_path_f": "path, fixed 50 markers (count carries no gap)"}
+          "v0b_path_f": "path, fixed 50 markers (count carries no gap)",
+          "pf_none": "path-facts targets: endpoints only", "pf_count": "path-facts targets: endpoints + empty markers", "pf_path": "path-facts targets: endpoints + attention / MLP writes"}
 SERIES = ["#52514e", "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
 INK, INK2, SURFACE = "#0b0b0b", "#52514e", "#fcfcfb"
 RX_STEP = re.compile(r"^(?:path-)?sft\s+(\d+)/(\d+) \| loss/tok ([\d.]+) \| val ([\d.]+)")
+YLIM = {"v0b": (1.9, 3.0), "pf": (0.0, 0.5)}
 RX_FINAL = re.compile(r"final eval (\{.*\})")
 RX_EVALONLY = re.compile(r"EVAL-ONLY (\{.*\})")
 
@@ -39,7 +41,7 @@ def parse(path):
 
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--out", required=True); p.add_argument("--arm", action="append", default=[], help="tag=logpath"); p.add_argument("--plot", default=None, help="output stem for the figure")
+    p = argparse.ArgumentParser(); p.add_argument("--out", required=True); p.add_argument("--arm", action="append", default=[], help="tag=logpath"); p.add_argument("--plot", default=None, help="output stem for the figure"); p.add_argument("--title", default=None)
     p.add_argument("--merge", action="append", default=[], help="dst:src -- copy src's per-source val losses into dst (e.g. v0b:v0b_evalonly) and drop src")
     a = p.parse_args(); arms = []
     for spec in a.arm:
@@ -64,7 +66,8 @@ def main():
         for k, d in enumerate(arms):
             if len(d["curve"]) < 2: continue
             xs, ys = zip(*d["curve"]); ax.plot(xs, ys, color=SERIES[k % len(SERIES)], lw=2, label=d["label"], marker="o", ms=3.5)
-        ax.set_xlabel("SFT step (batch 32)"); ax.set_ylabel("held-out CE, nats / token"); ax.set_ylim(1.9, 3.0); ax.grid(color="#e6e5e1", lw=0.8); ax.set_axisbelow(True)
+        yl = YLIM["pf"] if all(d["tag"].startswith("pf_") for d in arms) else YLIM["v0b"]
+        ax.set_xlabel("SFT step (batch 32)"); ax.set_ylabel("held-out CE, nats / token"); ax.set_ylim(*yl); ax.grid(color="#e6e5e1", lw=0.8); ax.set_axisbelow(True)
         ax.spines[["top", "right"]].set_visible(False); ax.legend(frameon=False, fontsize=9.5, loc="upper right"); ax.set_title("Held-out loss during the 1-epoch SFT", loc="left", fontsize=12, color=INK2)
         ax = axes[1]; src = [("val_loss_lenslist-v0b", "J-lens list-sentences"), ("val_loss_teacher-sonnet-v1", "teacher prose"), ("val_loss", "all rows")]
         fin = [d for d in arms if d.get("val_loss") is not None and d["tag"] != "v0b_evalonly" or (d["tag"] == "v0b_evalonly")]
@@ -79,7 +82,7 @@ def main():
         allv = [d.get(kk) for d in fin for kk, _ in src if d.get(kk) is not None]
         if allv: ax.set_ylim(max(0, min(allv) - 0.4), max(allv) + 0.45)
         ax.grid(axis="y", color="#e6e5e1", lw=0.8); ax.set_axisbelow(True); ax.spines[["top", "right"]].set_visible(False); ax.set_title("Final loss by SFT source", loc="left", fontsize=12, color=INK2)
-        fig.suptitle("Do the intermediate attention / MLP writes help the verbalizer?\nHeld-out SFT loss: same rows, same init, same hyper-parameters, only the input differs", fontsize=13, x=0.01, ha="left")
+        fig.suptitle(a.title or "Do the intermediate attention / MLP writes help the verbalizer?\nHeld-out SFT loss: same rows, same init, same hyper-parameters, only the input differs", fontsize=13, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.90)); fig.savefig(a.plot + ".png", dpi=150); fig.savefig(a.plot + ".pdf"); print("->", a.plot + ".png")
 
 
