@@ -723,6 +723,7 @@ def main():
     p.add_argument("--quant", choices=["none", "4bit"], default="none",
                    help="4bit = bitsandbytes nf4 (QLoRA). Required for models too "
                         "big for bf16; validates the GLM-5 path on Qwen3-8B.")
+    p.add_argument("--init-adapter", default=None, help="AV + --use-lora: start from this saved LoRA adapter dir instead of a fresh LoRA")
     p.add_argument("--use-lora", action="store_true", default=False,
                    help="Train a LoRA adapter on a frozen base instead of full-FT. "
                         "Mandatory for 4bit. (AR value_head stays fully trainable.)")
@@ -852,11 +853,16 @@ def main():
             from nla.utils.arch_adapters import resolve_lora_target_modules
             _tm = resolve_lora_target_modules(model.config, args.lora_scope)
             print(f"[av] LoRA scope={args.lora_scope} → {len(_tm)} module types: {_tm}")
-            model = get_peft_model(model, LoraConfig(
-                r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
-                bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=_tm,
-            ))
+            if getattr(args, "init_adapter", None):   # continue an existing AV LoRA on the raw base (its r / alpha / rsLoRA / targets come from adapter_config.json)
+                from peft import PeftModel
+                model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
+                print(f"[av] LoRA initialised from {args.init_adapter}")
+            else:
+                model = get_peft_model(model, LoraConfig(
+                    r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
+                    bias="none", task_type="CAUSAL_LM", use_rslora=True,
+                    target_modules=_tm,
+                ))
             model.print_trainable_parameters()
         vectors_ref = [None]
         register_karvonen_hook(

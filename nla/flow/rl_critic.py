@@ -122,6 +122,10 @@ class FlowCritic:
             self.norm = maybe_whiten(self.norm, aa["whiten"]).to(device)
             if aa.get("whiten_loss") == "original": self.err_map = self.norm.W_inv   # arm A: reward + co-training loss = squared error mapped back to the standardised space
             print(f"[flow-critic] WHITENED critic ({aa['whiten']}, loss in the {aa.get('whiten_loss', 'whitened')} space)", flush=True)
+        if aa.get("unit_norm"):   # --unit-norm critics were trained on direction only: every activation is rescaled to the RMS norm before the normaliser
+            from nla.flow.unitnorm import maybe_unit_norm
+            self.norm = maybe_unit_norm(self.norm, True, stats_path).to(device)
+            print(f"[flow-critic] UNIT-NORM critic (|h| -> {self.norm.r:.1f})", flush=True)
         # build the 13.7B prior on the meta device and stream the checkpoint in with mmap: no 55 GB fp32 CPU copy per rank
         if prior_override:      # e.g. a stage-2 co-trained prior (prior_cotrained_latest.pt: {"model": prior state dict, "args": cfg})
             m = torch.load(prior_override, map_location="cpu", mmap=True); cfg = m["args"]; sd = m["model"]

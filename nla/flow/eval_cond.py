@@ -76,6 +76,7 @@ def main():
     sd = m.get("model") or torch.load(os.path.join(a.prior, "ema.pt"), map_location="cpu")["ema"]
     prior = Denoiser(cfg["d_input"], cfg["d_model"], cfg["d_mlp"], cfg["n_layers"]); prior.load_state_dict({k: v.float() for k, v in sd.items()}); prior = prior.to(torch.bfloat16).to(dev).requires_grad_(False)
     ad = torch.load(a.adapter, map_location="cpu"); aa = ad["args"]
+    assert not aa.get("unit_norm") and not aa.get("whiten"), "unit-norm / whitened adapters: score with nla.flow.scoring.FlowBundle (this loader uses the raw normaliser)"
     assert aa.get("cond_mode", "tokens") == "tokens", f"this loader only supports tokens-mode adapters (frozen base-trunk encoder); adapter is cond_mode={aa.get('cond_mode')} -> use nla.flow.scoring.FlowBundle"
     model = CondDenoiser(prior, cfg["d_input"], aa["n_slots"], aa["n_heads"], aa["d_head"], aa.get("gate_rank", 128)).to(dev)
     for blk in model.blocks: blk.read.float(); blk.gate_mod.float()

@@ -375,6 +375,7 @@ def main():
     p.add_argument("--ctr-k", type=int, default=32, help="negatives per activation (group size K+1)"); p.add_argument("--ctr-weight", type=float, default=1.0)
     p.add_argument("--ctr-tau-init", type=float, default=20.0, help="InfoNCE temperature in nats of FM-proxy PMI"); p.add_argument("--ctr-fixed-tau", action="store_true")
     p.add_argument("--ctr-tau-lr", type=float, default=1e-3, help="learning rate of log tau"); p.add_argument("--ctr-tau-max", type=float, default=100.0, help="tau clamp (nats)")
+    p.add_argument("--unit-norm", action="store_true", help="direction-only critic: rescale every activation to the RMS training norm before the normaliser (stored in the adapter args; FlowBundle / FlowCritic apply it automatically)")
     p.add_argument("--rewarm", type=int, default=0, help="continuation runs: linear lr re-warm-up over this many steps after --start-step (AdamW state is not restored under FSDP)")
     p.add_argument("--ctr-global", type=int, default=0, help="N > 0: ONE same-template group of N distinct-answer activations spread over all ranks (N/world rows each), full N x N "
                    "InfoNCE matrix (every claim is a negative for every other activation); rows sharded, logits all-gathered, gradient by chunked recompute (GradCache)")
@@ -420,6 +421,10 @@ def main():
     assert not (a.unfreeze_prior and a.cond_mode == "trunk"), "--cond-mode trunk keeps the prior frozen (its velocity is the residual base)"
     is0 = rank == 0
     norm = maybe_whiten(Normalizer.load(a.stats), a.whiten).to(dev)   # --whiten: PriorGrad-style covariance-matched noise (flow trained in whitened space)
+    from nla.flow.unitnorm import maybe_unit_norm
+    norm = maybe_unit_norm(norm, a.unit_norm, a.stats).to(dev)       # --unit-norm: direction only (h -> h r / |h| before the normaliser / whitening); saved in args
+    if a.unit_norm and rank == 0: print(f"[cond] UNIT-NORM model space: every activation rescaled to |h| = {norm.r:.2f} (RMS norm of {a.stats}) before the normaliser", flush=True)
+    if a.unit_norm and a.whiten: assert "unitnorm" in os.path.basename(a.whiten), "--unit-norm with --whiten needs a whitening fitted on unit-norm activations (scripts/fit_whitening_unitnorm.py)"
     assert not a.whiten or a.prior_init == "random", "--whiten needs --prior-init random (a pretrained prior was trained in the unwhitened space)"
     err_map = norm.W_inv if (a.whiten and a.whiten_loss == "original") else None   # A arm: same whitened inputs + noise, loss = squared error mapped back to the standardised space
     if a.whiten and rank == 0: print(f"[cond] WHITENED model space from {a.whiten} (logdet_W {norm.logdet_w:.1f} nats; exact log p in standardised space = log p_model + logdet_W); training loss measured in the {a.whiten_loss} space", flush=True)

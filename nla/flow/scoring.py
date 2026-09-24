@@ -19,6 +19,8 @@ class FlowBundle:
         prior = prior.to_empty(device=dev).to(torch.bfloat16); prior.load_state_dict(sd, strict=True); prior.requires_grad_(False)
         ad = torch.load(adapter_path, map_location="cpu"); aa = ad["args"]; self.aa = aa; self.d = cfg["d_input"]
         self.norm = maybe_whiten(self.norm, aa.get("whiten")).to(dev)   # --whiten runs: the flow lives in whitened coordinates; exact log p_std = log p_model + norm.logdet_w
+        from nla.flow.unitnorm import maybe_unit_norm
+        self.norm = maybe_unit_norm(self.norm, aa.get("unit_norm"), stats_path).to(dev)   # --unit-norm critics: direction only (h -> h r / |h| before the normaliser)
         self.err_map = self.norm.W_inv if (aa.get("whiten") and aa.get("whiten_loss") == "original") else None   # the metric the critic was trained with (see fm_err)
         self.cond_mode = aa.get("cond_mode", "tokens")
         if self.cond_mode == "trunk":

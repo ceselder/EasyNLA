@@ -347,6 +347,20 @@ def claims_compose_variants(adapter: str, tag: str, extra: str = ""):
     return _claims([f"{REPO_REMOTE}/scripts/claims_compose_variants.py", "--adapter", adapter, "--tag", tag] + extra.split())
 
 
+@app.function(gpu="B200", timeout=3 * 3600, **COMMON)
+def fit_whiten_unitnorm(extra: str = ""):
+    """ZCA whitening on unit-norm L42 activations -> /vol_glp/whiten/l42_zca_unitnorm.pt (scripts/fit_whitening_unitnorm.py)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/fit_whitening_unitnorm.py"] + extra.split())
+
+
+@app.function(gpu="B200", timeout=2 * 3600, **COMMON)
+def claims_hubness(adapter: str, tag: str, extra: str = ""):
+    """claim->activation hubness vs activation norm on same-template retrieval matrices (scripts/claims_hubness.py)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_hubness.py", "--adapter", adapter, "--tag", tag] + extra.split())
+
+
 @app.function(gpu="B200", timeout=4 * 3600, **COMMON)
 def claims_controls(adapter: str, tag: str, extra: str = ""):
     """twin detection with a wrong-activation control, claim-only LM baseline, same-template retrieval (N = 16/64/256)"""
@@ -359,6 +373,41 @@ def ws_score(adapter: str, critic_tag: str, parts: str):
     """verbalizer warm start: single-claim PMI of candidate bullets under a critic (scripts/claims_warmstart.py score)"""
     vol_glp.reload()
     return _claims([f"{REPO_REMOTE}/scripts/claims_warmstart.py", "score", "--adapter", adapter, "--critic-tag", critic_tag, "--parts", parts])
+
+
+@app.function(gpu="B200", timeout=12 * 3600, max_containers=8, **COMMON)
+def ws_margin(adapter: str, critic_tag: str, parts: str, extra: str = ""):
+    """verbalizer warm start v2: contrastive margin of candidate bullets (own activation vs K same-template activations of other documents)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_warmstart.py", "score_margin", "--adapter", adapter, "--critic-tag", critic_tag, "--parts", parts] + extra.split())
+
+
+@app.function(timeout=2 * 3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=128 * 1024)
+def ws_sft_subset(src: str, dst: str, n_train: int = 20000, n_val: int = 512):
+    """random subset of a warm-start SFT set (nla-glp) -> nla-exp:<dst>/av_sft_{train,test}.parquet + sidecars, readable by modal_nla_exp.py --task sft"""
+    import random, shutil, pyarrow as pa, pyarrow.parquet as pq
+    vol_glp.reload(); os.makedirs(dst, exist_ok=True); rng = random.Random(0)
+    sch = pa.schema([("prompt", pa.list_(pa.struct([("content", pa.string()), ("role", pa.string())]))), ("response", pa.string()),
+                     ("activation_vector", pa.list_(pa.float32(), 5120)), ("activation_layer", pa.int64()), ("doc_id", pa.string()), ("source", pa.string())])
+    for split, n, name in (("train", n_train, "av_sft_train"), ("val", n_val, "av_sft_test")):
+        pf = pq.ParquetFile(f"{src}/{split}.parquet"); tot = pf.metadata.num_rows; frac = min(1.0, 1.3 * n / tot); rows = []
+        for rb in pf.iter_batches(batch_size=2048, columns=["prompt", "response", "activation_vector", "doc_id", "source"]):   # row groups hold > 2^31 floats
+            keep = [i for i in range(rb.num_rows) if rng.random() < frac]
+            if keep: rows += rb.take(keep).to_pylist()
+            if len(rows) >= 1.2 * n: break
+        rng.shuffle(rows); rows = rows[:n]
+        for r in rows: r["activation_layer"] = 42; r["prompt"] = [{"content": m["content"], "role": m["role"]} for m in r["prompt"]]
+        pq.write_table(pa.Table.from_pylist(rows, schema=sch), f"{dst}/{name}.parquet", compression="zstd")
+        shutil.copy2("/vol_q36/data/sft/av_sft_train.parquet.nla_meta.yaml", f"{dst}/{name}.parquet.nla_meta.yaml")
+        print(f"[ws-sft-subset] {split}: {len(rows)} of {tot} rows -> {dst}/{name}.parquet", flush=True)
+    vol_exp.commit(); return 0
+
+
+@app.function(timeout=2 * 3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=128 * 1024)
+def ws_margin_stats(critic_tag: str):
+    """margin distributions by family / type + kept counts per threshold -> scores_margin_<critic>/margin_stats.json"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_warmstart.py", "margin_stats", "--critic-tag", critic_tag])
 
 
 @app.function(timeout=4 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=256 * 1024)
@@ -440,11 +489,22 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", claims_gates.remote(ckpt, tag, extra))
     elif task == "claims_compose_variants":   # --ckpt = adapter path, --tag = output tag
         print("rc", claims_compose_variants.remote(ckpt, tag, extra))
+    elif task == "fit_whiten_unitnorm":
+        print("rc", fit_whiten_unitnorm.remote(extra))
+    elif task == "claims_hubness":
+        print("rc", claims_hubness.remote(ckpt, tag, extra))
     elif task == "claims_controls":   # --ckpt = adapter path, --tag = output tag
         print("rc", claims_controls.remote(ckpt, tag, extra))
     elif task == "ws_score":   # --ckpt adapter, --tag critic tag, --sets comma list of parts (gold:<shard> / syn:<text shard>), split over --nshards containers
         ps = [x for x in sets.split(",") if x]; k = min(nshards, len(ps))
         print("rc", _gather([ws_score.spawn(ckpt, tag, ",".join(ps[i::k])) for i in range(k)]))
+    elif task == "ws_margin":   # --ckpt adapter, --tag critic tag, --sets parts, --nshards containers (<= 8), --extra e.g. "--K 64"
+        ps = [x for x in sets.split(",") if x]; k = min(nshards, len(ps), 8)
+        print("rc", _gather([ws_margin.spawn(ckpt, tag, ",".join(ps[i::k]), extra) for i in range(k)]))
+    elif task == "ws_sft_subset":   # --sets <src dir on nla-glp>, --root <dst dir on nla-exp>
+        print("rc", ws_sft_subset.remote(sets, root))
+    elif task == "ws_margin_stats":
+        print("rc", ws_margin_stats.remote(tag))
     elif task == "ws_build":
         print("rc", ws_build.remote(tag, extra))
     elif task == "claims_finalize":
