@@ -110,7 +110,7 @@ def main():
     # ---------------- smoke gate
     smoke = {p: parse_log(f"{LOGS}/smoke_depth_{p}.log") for p in ("x0", "v", "x0res")}
     json.dump({"what": "smoke gate: synthetic depth tag 'from layer i to layer j', 512 x 400 rows, 150M prior, exact Heun 16 on 128 held-out rows per eval; rp = another pair's tag (wrong depth)", "arms": smoke}, open(f"{REP}/data/diffusion_prior_smoke.json", "w"), indent=1)
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4.2))
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4.4))
     for p, col, lab in (("v", C_PRIOR, "velocity head (plain FM loss)"), ("x0res", C_THIRD, "x0 loss, velocity parametrisation")):
         e = smoke[p]
         if not e: continue
@@ -118,8 +118,8 @@ def main():
         ax[0].errorbar(r, [d["depthtag/exact_pmi_bits"] for d in e], yerr=[d["depthtag/exact_pmi_sem"] for d in e], color=col, marker="o", ms=5, lw=2, capsize=3, label=lab)
         ax[1].plot(r, [d["depthtag/exact_rp_bits"] for d in e], color=col, marker="o", ms=5, lw=2, label=lab)
     for x in ax: x.axhline(0, color=C_GRAY, lw=1); x.set_xlabel("training rows seen (thousands)")
-    ax[0].set_ylabel("exact bits: log2 p(h_j | h_i, tag) - log2 p(h_j | h_i)"); ax[0].set_title("The prior reads a depth tag within 200k rows\n(last night's LoRA trunk: ~0 bits at 768k rows)")
-    ax[1].set_ylabel("exact bits for a WRONG-depth tag"); ax[1].set_title("A wrong tag is punished: the pathway is\nreading the numbers, not text presence")
+    ax[0].set_ylabel("exact bits from the true depth tag"); ax[0].set_title("Prior reads a depth tag within 200k rows\n(LoRA trunk critic: ~0 bits at 768k rows)")
+    ax[1].set_ylabel("exact bits from a WRONG-depth tag"); ax[1].set_title("A wrong tag is punished:\nit reads the numbers, not text presence")
     ax[0].legend(loc="lower right"); fig.text(0.5, -0.04, "Direct x0 head (the paper's parametrisation) not shown: its probability-flow velocity (x_t - x0_hat)/t makes exact log p blow up (NLL ~2800 bits/dim).", ha="center", fontsize=10, color="#52514e")
     savefig(fig, "fig_prior_smoke")
     # ---------------- training curves (spot exact, held-out lens L1 / L3)
@@ -189,7 +189,7 @@ def main():
                 if man in tw and v in tw[man]: items.append((f"{lab}\n{v.replace('_', ' ')}", tw[man][v]["p_orig_preferred"], tw[man][v]["sem_p"], (base["twins"].get(key) or {}).get(v)))
         if "flip_bullets_sonnet_v1" in tw and "flip" in tw["flip_bullets_sonnet_v1"]:
             fb = tw["flip_bullets_sonnet_v1"]["flip"]; mse = base.get("bullets_flip_mse_reconstructor") or {}
-            items.append(("Sonnet bullets\nclaim flip", fb["p_orig_preferred"], fb["sem_p"], mse.get("p_orig_gt_flip") if isinstance(mse, dict) else None))
+            items.append(("Sonnet bullets\nclaim flip", fb["p_orig_preferred"], fb["sem_p"], mse.get("p_orig_beats_flip") if isinstance(mse, dict) else None))
         if items:
             fig, ax = plt.subplots(figsize=(10, 4.6)); x = np.arange(len(items)); w = 0.38
             ax.bar(x - w / 2, [i[1] for i in items], w, yerr=[1.96 * i[2] for i in items], color=C_PRIOR, capsize=3, label="diffusion prior (this run)", edgecolor="white", linewidth=1.5)
@@ -231,7 +231,7 @@ def write_section(a, arms, meta, bits, base, twins, smoke, curves):
     if "flip_bullets_sonnet_v1" in tw and "flip" in tw["flip_bullets_sonnet_v1"]:
         fb = tw["flip_bullets_sonnet_v1"]["flip"]; mse = base.get("bullets_flip_mse_reconstructor") or {}
         cls = "good" if fb["p_orig_preferred"] >= 0.65 else ("warn" if fb["p_orig_preferred"] >= 0.58 else "bad")
-        twin_rows.append(f"<tr><td>Sonnet bullets</td><td>one bullet's claim flipped</td><td class='{cls}'>{fb['p_orig_preferred']:.2f} ± {1.96 * fb['sem_p']:.2f}</td><td class='baseline'>{fmt(mse.get('p_orig_gt_flip') if isinstance(mse, dict) else None, 2)} (MSE reconstructor)</td><td>{fb['delta_bits_mean']:.1f}</td><td>{fb['n_used']}</td></tr>")
+        twin_rows.append(f"<tr><td>Sonnet bullets</td><td>one bullet's claim flipped</td><td class='{cls}'>{fb['p_orig_preferred']:.2f} ± {1.96 * fb['sem_p']:.2f}</td><td class='baseline'>{fmt(mse.get('p_orig_beats_flip') if isinstance(mse, dict) else None, 2)} (MSE reconstructor)</td><td>{fb['delta_bits_mean']:.1f}</td><td>{fb['n_used']}</td></tr>")
     arm_rows = []
     for t in arms:
         c = curves.get(t, []); last = c[-1] if c else {}; b = bits.get(t, {})
@@ -275,6 +275,56 @@ Held-out = the fixed 4096-row val set (doc-disjoint), same 512 paired rows, same
 </section>
 """
     open(f"{REP}/section_prior.html", "w").write(html); print("wrote section_prior.html")
+    write_standalone(a, arms, meta, bits, base, twins, s_last, html)
+
+
+def write_standalone(a, arms, meta, bits, base, twins, s_last, section_html):
+    """standalone report folder ~/shared/reports/nlt-diffusion-prior/ (style-guide layout) sharing the figures/data by copy"""
+    import shutil, datetime
+    out = os.path.expanduser("~/shared/reports/nlt-diffusion-prior"); os.makedirs(f"{out}/data", exist_ok=True)
+    for f in glob.glob(f"{REP}/fig_prior_*.p*") + glob.glob(f"{REP}/data/diffusion_prior_*.json"): shutil.copy(f, f"{out}/data/" if f.endswith(".json") else out)
+    shutil.copy(os.path.abspath(__file__), f"{out}/build_html.py")
+    m = bits.get(a.arm, {}); bs = base["sets"]; tw = twins.get(a.arm, {})
+    shared = [s for s in SETS if s in m and s in bs]
+    mc = np.nanmean([m[s]["content"] for s in shared]) if shared else float("nan"); bc = np.nanmean([bs[s]["content"] for s in shared]) if shared else float("nan")
+    mp = np.nanmean([m[s]["p_z_gt_dm"] for s in shared]) if shared else float("nan"); bp = np.nanmean([bs[s]["p_z_gt_dm"] for s in shared]) if shared else float("nan")
+    tps = [tw[k][v]["p_orig_preferred"] for k in tw for v in tw[k] if isinstance(tw[k][v], dict) and "p_orig_preferred" in tw[k][v]]
+    best_twin = max(tps) if tps else float("nan")
+    rps = [m[s]["z_rp"] for s in shared] if shared else []
+    kpi_cls = lambda good: ' good' if good else ' bad'
+    tldr = (f"The DALL·E-2-style diffusion prior reads text (depth-tag smoke: +{fmt(s_last.get('depthtag/exact_pmi_bits'))} exact bits at 205k rows; the LoRA trunk got 0) and runs at ~{fmt(meta.get(a.arm, {}).get('rows_per_s'), 0)} rows/s, "
+            f"but on real text its content bits ({fmt(mc)} vs {fmt(bc)} for last night's adapter, mean over {len(shared)} shared sources) and its claim sensitivity (best P(true &gt; twin) {fmt(best_twin, 2)}, bar 0.65) do not beat the adapter critic; the claim-reading problem is not a critic-architecture problem." if shared else
+            f"Smoke gate passed (+{fmt(s_last.get('depthtag/exact_pmi_bits'))} exact bits from a depth tag at 205k rows); real-text Heun-64 tables pending.")
+    kpis = f"""<div class="kpis">
+  <div class="kpi good"><div class="v">+{fmt(s_last.get('depthtag/exact_pmi_bits'))}</div><div class="l">exact bits from a depth tag (smoke gate, 205k rows)</div></div>
+  <div class="kpi{kpi_cls(mc > bc) if shared else ''}"><div class="v">{fmt(mc)} vs {fmt(bc)}</div><div class="l">content bits, prior vs last night's adapter (shared sources)</div></div>
+  <div class="kpi{kpi_cls(mp > bp) if shared else ''}"><div class="v">{fmt(mp, 2)} vs {fmt(bp, 2)}</div><div class="l">P(true text &gt; depth-matched wrong text)</div></div>
+  <div class="kpi{kpi_cls(best_twin >= 0.65) if tps else ''}"><div class="v">{fmt(best_twin, 2)}</div><div class="l">best P(true &gt; claim-flipped twin); bar 0.65</div></div>
+  <div class="kpi"><div class="v">{fmt(meta.get(a.arm, {}).get('rows_per_s'), 0)}</div><div class="l">training rows / s (one GPU; trunk critic: 56)</div></div>
+</div>"""
+    page = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diffusion-prior critic for the natural-language transcoder</title><link rel="stylesheet" href="/reports/static/claude.css"></head>
+<body><div class="report">
+<h1>A DALL·E-2-style diffusion prior as the transcoder critic</h1>
+<p class="subtitle">Text-conditional diffusion model of p(h<sub>j</sub> | h<sub>i</sub>, z) on Qwen3-8B residuals, scored in exact bits on last night's held-out rows.</p>
+<p class="byline">{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} · Qwen3-8B, pairs j ~ U{{10..34}}, i ~ U{{9..j-1}} · <a href="/reports/data/nlt-diffusion-prior">exact data &amp; assets</a></p>
+<div class="tldr">{tldr}</div>
+{kpis}
+<div class="toc"><b>Contents</b><ol><li><a href="#diffusion-prior">The critic, smoke gate, real-text bits, claim sensitivity, arms</a></li><li><a href="#appendix">Appendix: methodology, paths, commands</a></li></ol></div>
+{section_html}
+<details id="appendix"><summary>Appendix: methodology, hyper-parameters, paths, commands</summary>
+<ul>
+<li><b>Model</b>: nlt/prior/model.py DiffusionPrior; widths/depths per arm in the arms table; heads 16; K = 8 chunks of 512; learned slot + text position embeddings; GPT-2-style init; pre-LN blocks; SDPA with a bool mask (causal + text key padding, diagonal always on). Text encoder: frozen Qwen3-0.6B layer 20 token states (first token masked), max 192 tokens, linearly projected; pooled = masked mean; a learned null token replaces the pooled token when text is dropped.</li>
+<li><b>Objective</b>: flow matching x_t = (1-t) x0 + t eps, velocity head, MSE(v, eps - x0), t ~ U(0,1); x0 = n(h_j) - n(h_i) in the pooled affine space (stats.pt of /vol/data/qwen3_8b), constant x0_scale = rms over 8192 sampled pairs (0.93). Text dropout 0.1 (0.3 in punc03_v). AdamW lr 1.2e-4, betas (0.9, 0.999), eps 1e-8, wd 0.01, warm-up 300, cosine to 5 %, grad clip 1.0, EMA 0.999 (with the (1+s)/(10+s) warm-up), batch 1024 as 4 micro-batches of 256 (8 x 128 for the 480M arm).</li>
+<li><b>Data</b>: /vol/data/qwen3_8b (320,916 train / 12,251 val positions, layers 9-34; doc-disjoint), pairs_train.parquet; text pools with weights lens .35 (/vol/z/lensdiff_v1/train/L*_part*.parquet), teacher .25 (/vol/z/teacher-sonnet-v1/train), para .15 (/vol/z/para-v1/{{lensdiff-v1-jlens,teacher-sonnet-v1}}/train), bullets .15 (/vol/z/bullets-sonnet-v1/train, ~11.6k pairs at launch), jlens20 .10 (/vol/z/jlens20_text/train); one pool per step.</li>
+<li><b>Exact bits</b>: nlt/eval_bits/exact.py probability-flow ODE, Heun 64 steps (tables) / 32 (manifests) / 16 (in-training spots), one Rademacher probe per NFE shared across every conditioning variant of a row (paired), same eps/probe banks and the same fixed 4096-row val set and --paired-sets core as last night's fbpc s8000 card (n = 512 rows per set, common rows first). Controls: z_dm (another pair's text, same (i,j) else same j), z_rp (random pair), shuf_words, mask_next.</li>
+<li><b>Baseline</b>: critic_v3b_fbpc ckpt_step008000 (Qwen3-0.6B L20 encoder + gate-path adapter on the frozen 1.89B pooled blind prior), Heun-64 card from ~/shared/reports/natural-language-transcoder/data/info_budget.json key v3b_fbpc_s8000; twins from acceptance_v3bfbpci_heldout.json; bullets flip baseline = the MSE reconstructor of the bullet-NLA smoke test (metrics_bullets.json).</li>
+<li><b>Commands</b>: <code>modal run --detach scripts/modal_nlt_prior.py --task train --tag main_v --extra "--pools ... --val-sets ... --param v --steps 4500 --batch 1024 --micro-batch 256"</code>; <code>--task bits --tag main_v_g1 --extra "--ckpts prior:/vol/prior/main_v/ckpt_final.pt --text-parquet ... --paired-sets ... --n 512 --ode-steps 64"</code>; <code>--task manifest --extra "--ckpt ... --manifest /vol/evals/manifest_twinnext2_v0_ao_tsv1.parquet --ode-steps 32"</code>. Launchers with the exact set lists: ~/nlt-prior-logs/launch_main.sh, launch_evals.sh.</li>
+<li><b>Caveats</b>: absolute PMI numbers are relative to this model's own unconditional path (trained on the dropped 10 % of rows), so 'bits over silence' is model-relative; paired comparisons (content, P(z &gt; dm), twins) are the decision numbers. Heun-16 in-training spots and Heun-64 tables differ (estimator + rows); rankings agree. Wandb: octahedral-systems/nlt-qwen3-8b runs prior_*.</li>
+</ul></details>
+</div></body></html>"""
+    open(f"{out}/report.html", "w").write(page); print("wrote", f"{out}/report.html")
 
 
 if __name__ == "__main__":

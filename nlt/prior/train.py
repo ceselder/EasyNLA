@@ -134,6 +134,8 @@ def main():
         else: rows, i, j = store.sample_pairs(a.batch, gen); texts = depth_tag_texts(i, j)
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
         opt.zero_grad(set_to_none=True); keep = torch.rand(a.batch, device=dev) >= a.p_uncond                       # text dropout -> unconditional rows
+        if a.micro_batch < a.batch:                                                                                  # sort the step's rows by text length so each micro-batch pads to ITS OWN longest text (mean over the step is unchanged)
+            order = sorted(range(a.batch), key=lambda q: len(texts[q])); rows, i, j = rows[order], i[order], j[order]; texts = [texts[q] for q in order]; keep = keep[torch.tensor(order, device=dev)]
         l_all = torch.zeros(a.batch, device=dev); v_all = torch.zeros(a.batch, device=dev); mask_T = 0
         for s0 in range(0, a.batch, a.micro_batch):                                                                  # gradient accumulation: same batch, bounded activation memory
             sl = slice(s0, min(a.batch, s0 + a.micro_batch)); nb = sl.stop - sl.start
