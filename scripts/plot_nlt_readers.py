@@ -20,7 +20,13 @@ TASKS = [("top1", "model's final top-1 among 4", 25), ("posmatch", "position amo
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--data", required=True); ap.add_argument("--out-dir", required=True); ap.add_argument("--stem", default="reader_usefulness")
-    a = ap.parse_args(); d = json.load(open(a.data)); srcs = [(k, l, c) for k, l, c in SOURCES if k in d]
+    a = ap.parse_args(); d = json.load(open(a.data))
+    # the late SFT arms may carry a step suffix (reader_v0d-dos or reader_v0d-dos_0): resolve each v0-prefixed source key to the first matching row
+    resolved, seen = [], set()
+    for k, l, c in SOURCES:
+        kk = k if k in d else (next((x for x in sorted(d) if k.startswith("reader_v0") and x.startswith(k)), None) if k.startswith("reader_v0") else None)
+        if kk and kk not in seen: resolved.append((kk, l, c)); seen.add(kk)
+    srcs = resolved
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2})
     fig, axes = plt.subplots(2, 2, figsize=(17, 12), dpi=150, gridspec_kw={"wspace": 0.16, "hspace": 0.78}); axes = axes.ravel()
     x = np.arange(len(srcs))
