@@ -207,8 +207,9 @@ def build_dossiers(a):
                 a_s = sum(json.loads(r.attn_share)); m_s = sum(json.loads(r.mlp_share))
                 tot = abs(a_s) + abs(m_s) + 1e-6
                 mech.append(f"attention {100 * abs(a_s) / tot:.0f}% vs MLP {100 * abs(m_s) / tot:.0f}% of the change")
-            mech.append(f"cosine(before, after) = {float(r.cos_ij):.2f}; the change is {float(r.delta_norm) / max(1e-6, float(r.hi_norm)):.2f}x the size of the before-state")
-            mech.append(f"interpretable features explain {100 * max(0.0, float(r.fve_top20)):.0f}% of the change")
+            if not a.no_magnitude:            # these two numbers grow with the gap and let the describer hint at it (redteam #675: gap-leak ratio 0.81 on v0)
+                mech.append(f"cosine(before, after) = {float(r.cos_ij):.2f}; the change is {float(r.delta_norm) / max(1e-6, float(r.hi_norm)):.2f}x the size of the before-state")
+                mech.append(f"interpretable features explain {100 * max(0.0, float(r.fve_top20)):.0f}% of the change")
             lines.append("MECHANISM: " + "; ".join(mech) + ".")
             dtexts = []
             for name, tag in ((f"delta:{pid}", "change direction"), (f"attn:{pid}", "largest attention write"), (f"mlp:{pid}", "largest MLP write")):
@@ -325,6 +326,7 @@ def main():
     ap.add_argument("--out", default=os.path.expanduser("~/nlt-feat-data/dossier-sonnet-v1"))
     ap.add_argument("--start", type=int, default=0); ap.add_argument("--end", type=int, default=0)
     ap.add_argument("--topn", type=int, default=6); ap.add_argument("--topn-tc", type=int, default=5)
+    ap.add_argument("--no-magnitude", type=int, default=0, help="drop cos / relative size / FVE from the MECHANISM line (gap-leak control)")
     ap.add_argument("--maemm-pairs", type=int, default=0, help="include MAEMM texts of Delta / largest writes (verified NOT direction-specific; off by default)")
     ap.add_argument("--chunk", type=int, default=4096); ap.add_argument("--max-wait-min", type=int, default=50)
     a = ap.parse_args()
