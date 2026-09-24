@@ -79,6 +79,12 @@ def train4(tag: str, extra: str = ""):
     return _train(tag, extra, 4)
 
 
+@app.function(gpu="B200:3", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=640 * 1024, ephemeral_disk=600 * 1024)
+def train3(tag: str, extra: str = ""):
+    """3 ranks: leaves one B200 of the prior's 4-GPU budget free for self-checks / API tests on early snapshots while training runs"""
+    return _train(tag, extra, 3)
+
+
 @app.function(gpu="B200:2", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=512 * 1024, ephemeral_disk=600 * 1024)
 def train2(tag: str, extra: str = ""):
     return _train(tag, extra, 2)
@@ -110,6 +116,7 @@ def main(task: str = "probe", tag: str = "", extra: str = "", prior_dir: str = "
     if task == "probe": probe.remote()
     elif task == "count": print(count_rows.remote(extra or "/vol_q36/data/acts_qwen36_L42/shard_*.parquet,/vol_glp/scale/g1/shards/shard_*.parquet,/vol_glp/scale/g2/shards/shard_*.parquet"))
     elif task == "train4": print(train4.remote(tag, extra))
+    elif task == "train3": print(train3.remote(tag, extra))
     elif task == "train2": print(train2.remote(tag, extra))
     elif task == "train1": print(train1.remote(tag, extra))
     elif task == "selfcheck": print(selfcheck.remote(prior_dir, extra))
