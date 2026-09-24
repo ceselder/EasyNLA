@@ -602,6 +602,59 @@ def tc_dossier(split: str = "val", start: int = 0, end: int = 4096, layers: str 
     return out
 
 
+
+@app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=3600, cpu=8, memory=40 * 1024)
+def tc_diag(split: str = "val", start: int = 0, end: int = 256, layer: int = 18, data_dir: str = DATA_DIR, writes_dir: str = WRITES_DIR) -> str:
+    """Which input convention do the transcoders expect? FVE of m_k under several candidate inputs."""
+    import numpy as np
+    import pyarrow.parquet as pq
+    import torch
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    vol.reload()
+    pairs = pq.read_table(os.path.join(data_dir, f"pairs_{split}.parquet")).to_pandas().iloc[start:end].reset_index(drop=True)
+    row_of, _ = load_split_index(data_dir, split)
+    wrow = writes_index(writes_dir, split)
+    H = gather_all_layers(pairs, row_of); A, M, have = gather_writes(pairs, wrow)
+    k = layer
+    sel = np.where(have)[0]
+    Hg = torch.from_numpy(H[sel]).cuda().float(); Ag = torch.from_numpy(A[sel]).cuda().float(); Mg = torch.from_numpy(M[sel]).cuda().float()
+    bt = base_tensors([f"model.layers.{k}.post_attention_layernorm.weight", f"model.layers.{k}.input_layernorm.weight"])
+    w_ln = bt[f"model.layers.{k}.post_attention_layernorm.weight"].cuda().float()
+    path = _retry(lambda: hf_hub_download(TC_REPO, f"layer_{k}.safetensors"))
+    with safe_open(path, framework="pt", device="cuda") as fh:
+        W_enc = fh.get_tensor("W_enc").float(); b_enc = fh.get_tensor("b_enc").float(); W_dec = fh.get_tensor("W_dec").float(); b_dec = fh.get_tensor("b_dec").float()
+    print(f"[diag] L{k}: W_enc {tuple(W_enc.shape)} |W_enc| row norms mean {W_enc.norm(dim=1).mean():.3f}; W_dec row norms mean {W_dec.norm(dim=1).mean():.3f}; b_enc mean {b_enc.mean():.3f} min {b_enc.min():.3f}; |b_dec| {b_dec.norm():.2f}", flush=True)
+    mid = Hg[:, k - 1 - K_LO] + Ag[:, k - K_LO]          # h_{k-1} + a_k = resid mid
+    m = Mg[:, k - K_LO]
+    hk = Hg[:, k - K_LO]
+    print(f"[diag] identity check |h_k - (mid + m)| / |h_k| = {((hk - mid - m).norm(dim=-1) / hk.norm(dim=-1)).mean():.4f}; |m| mean {m.norm(dim=-1).mean():.2f}; |mid| {mid.norm(dim=-1).mean():.2f}", flush=True)
+    def rms(x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+    cands = {"ln_w(mid)": rms(mid) * w_ln, "rms(mid) no weight": rms(mid), "mid raw": mid, "h_k raw": hk, "ln_w(h_k)": rms(hk) * w_ln, "ln_w(h_{k-1})": rms(Hg[:, k - 1 - K_LO]) * w_ln}
+    mn2 = (m * m).sum(-1)
+    res = {}
+    with torch.no_grad():
+        for name, x in cands.items():
+            for use_thr in (False,):
+                act = torch.relu(x @ W_enc.T + b_enc)
+                mhat = act @ W_dec + b_dec
+                fve = 1 - ((m - mhat) ** 2).sum(-1) / mn2
+                mhat0 = act @ W_dec
+                fve0 = 1 - ((m - mhat0) ** 2).sum(-1) / mn2
+                l0 = (act > 0).float().sum(-1).mean()
+                res[name] = dict(fve_mean=float(fve.mean()), fve_median=float(fve.median()), fve_nobdec=float(fve0.median()), l0=float(l0), act_max=float(act.max()))
+                print(f"[diag] {name:22s} FVE mean {fve.mean():.3f} median {fve.median():.3f} (no b_dec {fve0.median():.3f}) L0 {l0:.0f} act_max {act.max():.1f}", flush=True)
+        # scale sweep on the ln_w(mid) input
+        x = cands["ln_w(mid)"]
+        for sc in (0.5, 2.0, 4.0):
+            act = torch.relu(sc * x @ W_enc.T + b_enc); mhat = act @ W_dec + b_dec
+            print(f"[diag] ln_w(mid) x{sc}: FVE median {(1 - ((m - mhat) ** 2).sum(-1) / mn2).median():.3f} L0 {(act > 0).float().sum(-1).mean():.0f}", flush=True)
+        # baseline: predict the mean m
+        print(f"[diag] mean-m baseline FVE {(1 - ((m - m.mean(0)) ** 2).sum(-1) / mn2).median():.3f}", flush=True)
+    return json.dumps(res)
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 # 4. MAEMM inversion (direction -> text) + verification
 # ----------------------------------------------------------------------------------------------------------------------
@@ -832,6 +885,8 @@ def main(task: str = "sae", split: str = "val", start: int = 0, end: int = 4096,
         print(tc_dossier.remote(split=split, start=start, end=end, layers=layers, perm_seed=perm_seed, with_records=with_records))
     elif task == "maemm":
         print(maemm_invert.remote(spec=spec, out_path=out, prompt_variant=prompt_variant))
+    elif task == "tcdiag":
+        print(tc_diag.remote(split=split, start=start, end=end, layer=int(layers.split("-")[0])))
     elif task == "spec":
         print(build_maemm_spec.remote(split=split, start=start, end=end))
     else:

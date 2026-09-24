@@ -238,7 +238,14 @@ def run_sonnet(a):
     print(f"[sonnet] {len(rows)} dossiers", flush=True)
     c = client()
     results = {}
-    for s in range(0, len(rows), a.chunk):
+    if int(os.environ.get("FEAT_SYNC", "0")):
+        from nlt.featurizer.labels import run_sync
+        reqs = [(r["pair_id"].replace(":", "_"), SYSTEM, USER_TMPL.format(body=r["dossier"])) for r in rows]
+        results = run_sync(reqs, log=lambda m: print(m, flush=True), max_tokens=220)
+        rows_iter = []
+    else:
+        rows_iter = range(0, len(rows), a.chunk)
+    for s in rows_iter:
         chunk = rows[s:s + a.chunk]
         reqs = [{"custom_id": r["pair_id"].replace(":", "_"),
                  "params": dict(model=MODEL, max_tokens=220, system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],

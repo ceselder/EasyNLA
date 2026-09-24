@@ -67,10 +67,51 @@ def fmt_examples(examples, max_n=10):
     return "\n".join(lines)
 
 
+SYNC = int(os.environ.get("FEAT_SYNC", "0"))          # 1 = concurrent sync Messages calls instead of the Batch API
+SYNC_CONC = int(os.environ.get("FEAT_SYNC_CONC", "16"))
+
+
+def run_sync(reqs, log=print, max_tokens=60, conc=None):
+    """Concurrent sync path (same request format as run_batch). -> {custom_id: text or None}."""
+    import asyncio
+    import random
+    import anthropic
+    hdr = {"anthropic-workspace-id": os.environ["ANTHROPIC_WORKSPACE_ID"]} if os.environ.get("ANTHROPIC_WORKSPACE_ID") else {}
+    client_ = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], default_headers=hdr, max_retries=2)
+    sem = asyncio.Semaphore(conc or SYNC_CONC)
+    out = {}
+    done = [0]
+
+    async def one(cid, sysm, user):
+        async with sem:
+            for a in range(8):
+                try:
+                    msg = await client_.messages.create(model=MODEL, max_tokens=max_tokens,
+                                                        system=[{"type": "text", "text": sysm, "cache_control": {"type": "ephemeral"}}],
+                                                        messages=[{"role": "user", "content": user}])
+                    out[cid] = "".join(x.text for x in msg.content if getattr(x, "type", None) == "text").strip()
+                    break
+                except Exception as e:
+                    if a == 7:
+                        out[cid] = None; log(f"[sync] {cid} failed: {str(e)[:120]}")
+                    else:
+                        await asyncio.sleep(min(60, 2 ** a + random.random()))
+            done[0] += 1
+            if done[0] % 500 == 0:
+                log(f"[sync] {done[0]}/{len(reqs)}")
+
+    async def main_():
+        await asyncio.gather(*[one(*r) for r in reqs])
+    asyncio.run(main_())
+    return out
+
+
 def run_batch(reqs, poll_s=20, max_wait_min=60, log=print):
     """reqs: list of (custom_id, system, user). -> {custom_id: text or None}."""
     if not reqs:
         return {}
+    if SYNC:
+        return run_sync(reqs, log=log)
     c = client()
     out = {}
     for s in range(0, len(reqs), 10000):
