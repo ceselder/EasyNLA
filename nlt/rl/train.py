@@ -59,6 +59,7 @@ def parse():
     p.add_argument("--class-j-min", type=int, default=None, help="redteam #442: sample only classes with j >= this for the first --class-j-min-until steps (e.g. 14 = skip the pre band)")
     p.add_argument("--class-j-min-until", type=int, default=40)
     p.add_argument("--dist-types", default="samedoc,crossdoc", help="redteam #228 H1: comma list of distractor types filling the --n-dist slots in order: samedoc (other position of the SAME document, same (i,j)), crossdoc (in-class other document), wrongj (own position, other j; pays for depth cues -- off by default), neighbor (same document, position p+-k from --neighbor-dir: same topic and place, different next token -- the hard negative for next-token content, board #535). Remaining slots = crossdoc.")
+    p.add_argument("--dist-weights", default=None, help="comma list of per-slot weights for the content term: content = own - sum_k w_k PMI(dist_k) / sum_k w_k (default: equal). E.g. '1,0' with samedoc,crossdoc = position/local content only; crossdoc still scored + logged (board #555: all gain so far is crossdoc = topic)")
     p.add_argument("--neighbor-dir", default=None, help="ActStore-layout dir (split 'train': acts_*.npy + meta_*.parquet) of NEIGHBOUR positions; meta needs anchor_pos_idx (the anchor's pos_idx in --data-dir train) and offset")
     p.add_argument("--content-abs", type=float, default=0.2, help="redteam #228 H2: reward = content + content_abs x PMI(own), so junk that hurts distractors more than itself does not win")
     p.add_argument("--content-abs-clip", action="store_true", help="DECISIONS v1.23: use max(PMI(own), 0) in the absolute term (a mismatcher critic gives negative PMI(own) on true text)")
@@ -302,6 +303,10 @@ def main():
     scorer = make_scorer(a, cdev)
     para = Paraphraser(a.paraphrase_model, gpu_mem=a.paraphrase_gpu_mem, gpu_index=cidx, seed=a.seed) if a.paraphrase_p > 0 else None
     sampler = StratifiedSampler(store, a.n_classes, a.per_class)
+    dist_w = None
+    if a.dist_weights:
+        dist_w = torch.tensor([float(x) for x in a.dist_weights.split(",")], dtype=torch.float32); assert dist_w.numel() == a.n_dist and float(dist_w.sum()) > 0, "--dist-weights needs one weight per --n-dist slot"
+        print(f"[rl] distractor weights {dist_w.tolist()} over slots {a.dist_types}", flush=True)
     nstore = None
     if a.neighbor_dir:
         nstore = ActStore(a.neighbor_dir, "train", device="cpu")
@@ -419,6 +424,7 @@ def main():
         texts_for_score = [z if not viol["empty"][k] else None for k, z in enumerate(scored)]
         if a.referential:
             own_b, dist_b, content_b = referential_score(scorer, ext_h_i, ext_h_j, texts_for_score, groups, dist_idx, seed=step)
+            if dist_w is not None: content_b = own_b - (dist_b * dist_w).sum(1) / dist_w.sum()          # weighted distractor mean (--dist-weights)
             bits = content_b + a.content_abs * (own_b.clamp_min(0.0) if a.content_abs_clip else own_b); proxy = torch.full_like(bits, float("nan"))   # H2 (+ v1.23 clip)
         else:
             sc = scorer.score(h_i[groups], h_j[groups], texts_for_score, groups.tolist(), seed=step); bits, proxy = sc["exact_bits"].float(), sc["proxy_bits"].float(); own_b = bits; dist_b = None; content_b = bits
