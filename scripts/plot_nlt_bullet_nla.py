@@ -44,7 +44,7 @@ def fig_gain_bits(d, rep, out):
     if "mlp_nodepth_extra" in bl: ax.axhline(bl["mlp_nodepth_extra"]["fve"], color=INK, ls=":", lw=2, label=f"h_i-only MLP, no depth, 100k pairs: {bl['mlp_nodepth_extra']['fve']:.3f}")
     ax.axhline(0, color=INK, lw=0.8)
     ax.set_xticks(xs); ax.set_xticklabels([n.replace(" ", "\n", 1) for _, n, _ in srcs]); ax.set_ylabel("FVE of Δ = h_j − h_i on held-out pairs")
-    ax.set_title("Text buys a few % of the variance of Δ,\nabout what the forbidden depth input is worth"); ax.legend(frameon=False, fontsize=9, loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
+    ax.set_title("Text buys a few % of the variance of Δ; only lens text\nreaches what the forbidden depth input alone is worth"); ax.legend(frameon=False, fontsize=9, loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
     ax = axes[1]
     b_pair = [d[k]["overall"]["bits_median"] for k, _, _ in srcs]; nb = [d[k]["bullets_per_row"] for k, _, _ in srcs]; nt = [d[k].get("tokens_per_row") or np.nan for k, _, _ in srcs]
     b_bul = [b / n for b, n in zip(b_pair, nb)]; b_tok = [b / t if t and np.isfinite(t) else 0 for b, t in zip(b_pair, nt)]
@@ -54,7 +54,7 @@ def fig_gain_bits(d, rep, out):
     for x, b in zip(xs, b_pair): ax.text(x - w, b + 0.03 * max(1e-3, max(b_pair)), f"{b:.2f}", ha="center", fontsize=11)
     ax.axhline(0, color=INK, lw=0.8); d_eff = np.mean([d[k]["d_eff"] for k, _, _ in srcs])
     ax.set_xticks(xs); ax.set_xticklabels([n.replace(" ", "\n", 1) for _, n, _ in srcs]); ax.set_ylabel(f"Gaussian-equivalent bits (d_eff = {d_eff:.0f} of 4096)")
-    ax.set_title("A text is worth a few bits about Δ at the residual's\neffective dimension (d = 4096 would say ~20x more)"); ax.legend(frameon=False, fontsize=9); ax.spines[["top", "right"]].set_visible(False)
+    ax.set_title("A text is worth a few bits about Δ at the residual's\neffective dimension (d = 4096 would inflate ~20x)"); ax.legend(frameon=False, fontsize=9); ax.spines[["top", "right"]].set_visible(False)
     save(fig, rep, "fig_gain_bits")
     out["fig_gain_bits"] = {"sources": [k for k, _, _ in srcs], "fve_empty": emp, "fve_own": own, "fve_dm": dm, "bits_median_per_text": b_pair, "bits_per_bullet": b_bul, "bits_per_token": b_tok, "d_eff": d_eff,
                             "baseline_lines": {k: bl[k]["fve"] for k in ("mlp_depth_extra", "mlp_nodepth_extra") if k in bl}}
@@ -70,15 +70,15 @@ def fig_controls(d, rep, out):
     ax.bar(xs + 0.2, p_dm, 0.4, color=[c for _, _, c in srcs], label="P(own text beats depth-matched wrong text)")
     ax.axhline(0.5, color=INK, ls="--", lw=1); ax.set_ylim(0.3, 1.0)
     ax.set_xticks(xs); ax.set_xticklabels([n.replace(" ", "\n", 1) for _, n, _ in srcs]); ax.set_ylabel("share of held-out pairs")
-    ax.set_title("Own text beats a depth-matched wrong text\non most pairs (pair-specific content)"); ax.legend(frameon=False, fontsize=10, loc="lower right"); ax.spines[["top", "right"]].set_visible(False)
+    ax.set_title("Own text beats a depth-matched wrong text\non most pairs (pair-specific content)"); ax.legend(frameon=False, fontsize=10, loc="upper right"); ax.spines[["top", "right"]].set_visible(False)
     ax = axes[1]; fl = [(k, n, c) for k, n, c in srcs if d[k].get("flip")]
     if fl:
         ys = [d[k]["flip"]["p_orig_beats_flip"] for k, _, _ in fl]; ci = np.array([d[k]["flip"]["p_ci"] for k, _, _ in fl]).T
-        xs2 = np.arange(len(fl)); ax.bar(xs2, ys, 0.5, color=[c for _, _, c in fl], yerr=[np.array(ys) - ci[0], ci[1] - np.array(ys)], capsize=6)
+        xs2 = np.arange(len(fl)); ax.bar(xs2, ys, 0.45, color=[c for _, _, c in fl], yerr=[np.array(ys) - ci[0], ci[1] - np.array(ys)], capsize=6); ax.set_xlim(-0.8, len(fl) - 0.2)
         for x, y in zip(xs2, ys): ax.text(x, y + 0.02, f"{y:.2f}", ha="center", fontsize=12)
         ax.axhline(0.5, color=INK, ls="--", lw=1, label="chance"); ax.axhspan(0.47, 0.68, color=GREY, alpha=0.15, label="flow critics last night (0.47–0.68)")
         ax.set_ylim(0.3, 1.0); ax.set_xticks(xs2); ax.set_xticklabels([n.replace(" ", "\n", 1) for _, n, _ in fl]); ax.set_ylabel("P(original list beats the flipped list)")
-        ax.set_title("Claim flip: one bullet rewritten into a plausible\nwrong counter-claim raises the reconstruction error"); ax.legend(frameon=False, fontsize=10, loc="lower right"); ax.spines[["top", "right"]].set_visible(False)
+        ax.set_title("Claim flip: a plausible wrong counter-claim raises\nthe error on 60% of pairs (chance 50%)"); ax.legend(frameon=False, fontsize=10, loc="lower right"); ax.spines[["top", "right"]].set_visible(False)
         out["fig_controls"] = {"sources": [k for k, _, _ in srcs], "p_text_beats_empty": p_emp, "p_own_beats_dm": p_dm, "flip": {k: d[k]["flip"] for k, _, _ in fl}}
     save(fig, rep, "fig_controls")
 
@@ -97,7 +97,7 @@ def fig_crux(d, rep, out):
         ax.hist(df["d_swap_slot"], bins=bins, color=GREY, alpha=0.5, label="swap control: value of a random depth-matched bullet in that slot")
         ax.axvline(cr["noise95_shuffle"], color=INK, ls="--", lw=1.2, label=f"noise (95th pct of order-shuffle effect) = {cr['noise95_shuffle']:.3f}")
         ax.set_yscale("log"); ax.set_xlabel("change in relative squared error"); ax.set_ylabel("bullets (log)")
-    ax.set_title(f"{100 * cr['frac_cruxy']:.0f}% of bullets are cruxy: removing them hurts\nbeyond noise and more than a random bullet helps"); ax.legend(frameon=False, fontsize=9, loc="upper right"); ax.spines[["top", "right"]].set_visible(False)
+    ax.set_title(f"Only {100 * cr['frac_cruxy']:.0f}% of bullets are cruxy: single-bullet effects\nsit inside the order-shuffle noise of this reconstructor"); ax.legend(frameon=False, fontsize=9, loc="upper right"); ax.spines[["top", "right"]].set_visible(False)
     ax = axes[1]
     if ty:
         types = [t for t in ty["types"] if ty["types"][t]["n"]]
