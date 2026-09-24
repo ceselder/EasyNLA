@@ -48,16 +48,17 @@ def _prep():
 
 
 def _sync_daemon(every: float):
-    """commit + reload the volume every `every` s while the trainer runs: makes checkpoints / dumps visible to other containers mid-run
-    (lens #520 found commits only happened at job end) and makes STOP / SWAP files written from outside visible to the run (ref_v1 had
-    to be stopped with `modal app stop` because the in-loop STOP check never saw the file). Errors are logged, never fatal."""
+    """COMMIT the volume every `every` s while the trainer runs, so checkpoints / dumps are visible to other containers mid-run (lens #520
+    found commits only happened at job end). Commit ONLY: a vol.reload() in this thread made the mounted view transiently inconsistent
+    for the trainer subprocess (ref_v3's first launch died with FileNotFoundError on an existing /vol/data/.../stats.pt), so files written
+    from outside (STOP / SWAP) are NOT visible to a running job -- stop a run with `modal app stop -y <app-id>` (loses <= 10 steps, the
+    save interval). Errors are logged, never fatal."""
     import threading, time
     def loop():
         while True:
             time.sleep(every)
-            for name, fn in (("commit", vol.commit), ("reload", vol.reload)):
-                try: fn()
-                except Exception as e: print(f"[modal] vol.{name} (daemon): {str(e)[:160]}", flush=True)
+            try: vol.commit()
+            except Exception as e: print(f"[modal] vol.commit (daemon): {str(e)[:160]}", flush=True)
     threading.Thread(target=loop, daemon=True).start()
 
 
