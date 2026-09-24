@@ -351,6 +351,7 @@ def main():
     p.add_argument("--snap-pairs", default="", help="comma list of global pair counts (e.g. 64e3,128e3,...,8e6): at each, eval + save a loadable snapshot dir <out>/snap_<pairs>/ (adapter_latest.pt [+ prior_cotrained_latest.pt / ar_encoder_latest.pt] + eval.json)")
     p.add_argument("--render-pick", default="canonical", choices=["canonical", "random"], help="shards with k renderings per activation (g2): canonical column or one random QC-passing rendering per activation")
     p.add_argument("--resume-opt", action="store_true", help="also restore the AdamW state from <resume-from>/opt_latest.pt (replicated DDP / single GPU)")
+    p.add_argument("--cfm-lambda", type=float, default=0.0, help="Contrastive Flow Matching weight: loss = ||v - (eps_i - x_i)||^2 - lambda ||v - (eps_j - x_j)||^2, j = batch rolled by one")
     p.add_argument("--snap-final", action="store_true", help="also save a snapshot dir at the last step (snap_<pairs seen>)")
     p.add_argument("--start-pairs", type=int, default=0, help="pairs already seen when resuming (keeps the snapshot schedule on the global pair count)")
     p.add_argument("--one-pass", action="store_true", help="steps = min(--steps, training anchors per rank // (batch * grad_accum)): every activation seen at most once, no re-shuffle")
@@ -795,7 +796,7 @@ def main():
             x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch(_txt, grad=True)
             if step == a.start_step + 1 and _acc == 0 and is0: print(f"[cond] model-space scale check: |x0|^2/d = {float((x0.float() ** 2).mean()):.3f} (1.0 = matches the N(0, I) noise)", flush=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift, err_map=err_map)
+                loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift, err_map=err_map, cfm_lambda=a.cfm_lambda)
             (loss / a.grad_accum).backward(); loss_acc += loss.item() / a.grad_accum
         loss = torch.tensor(loss_acc)
         closs = None; neg_stats = {}
@@ -851,7 +852,9 @@ def main():
         gn = torch.tensor(gn2 ** 0.5); opt.step()
         if step % 50 == 0 and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step | peak mem {torch.cuda.max_memory_allocated()/2**30:.0f} GiB", flush=True)
-            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats}, step=step)
+            cfm_st = {f"train/cfm_{k}": float(v) for k, v in getattr(cond_fm_loss, "last", {}).items()} if a.cfm_lambda > 0 else {}
+            if cfm_st and is0: print(f"  [cfm] fm {cfm_st['train/cfm_fm']:.4f} | distance to another sample's flow {cfm_st['train/cfm_cfm_neg']:.4f} (lambda {a.cfm_lambda})", flush=True)
+            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats, **cfm_st}, step=step)
             if gstats and is0: print(f"  [samedoc] ce {gstats['train/samedoc_ce']:.3f} acc row {100*gstats['train/samedoc_acc_row']:.0f}% col {100*gstats['train/samedoc_acc_col']:.0f}% (chance {100/a.group_size:.0f}%)", flush=True)
             if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
         pairs_seen = a.start_pairs + (step - a.start_step) * a.batch * a.grad_accum * world      # global (activation, text) draws so far

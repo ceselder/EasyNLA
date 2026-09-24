@@ -175,7 +175,7 @@ def fm_mse(v, tgt, err_map=None):
         return (((v.float() - tgt.float()) @ err_map.T) ** 2).mean()
 
 
-def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=None, shift=None, err_map=None):
+def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=None, shift=None, err_map=None, cfm_lambda=0.0):
     """Conditional flow-matching loss with PER-SAMPLE condition dropout: a dropped sample gets an all-False token mask and cvec_has=False,
     so the adapter contributes exactly the prior for it (keeps the unconditional path alive for the shuffle / no-text controls).
     shift [B, d] (optional, 'start from the prediction'): the flow models the RESIDUAL x0 - shift(z); dropped samples keep x0 (no shift)."""
@@ -194,4 +194,10 @@ def cond_fm_loss(model, x0, enc, enc_mask, t=None, eps=None, p_uncond=0.0, cvec=
     if shift is not None: x0 = x0 - shift * keep[:, None].to(x0.dtype)
     x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
     v = model(x_t, t, enc, enc_mask, cvec, cvec_has)
-    return fm_mse(v, eps - x0, err_map), t, True
+    tgt = eps - x0; fm = fm_mse(v, tgt, err_map)
+    if cfm_lambda > 0 and B > 1:
+        # Contrastive Flow Matching (Stoica et al. 2025, arXiv 2506.05350): also push the prediction AWAY from another sample's target velocity
+        # (batch rolled by one: a different activation, explanation and noise), same forward pass -> sharper condition-specific flows
+        neg = fm_mse(v, tgt.roll(1, 0), err_map); cond_fm_loss.last = {"fm": fm.detach(), "cfm_neg": neg.detach()}   # floats only when logged (no per-step sync)
+        return fm - cfm_lambda * neg, t, True
+    return fm, t, True
