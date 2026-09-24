@@ -18,7 +18,7 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="path_sft")
     p.add_argument("--text", required=True); p.add_argument("--val-text", default=None)
     p.add_argument("--base", default="Qwen/Qwen3-8B"); p.add_argument("--init", default="ao"); p.add_argument("--question", default=None)
-    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b"); p.add_argument("--fixed-markers", type=int, default=0, help="pad the middle with zero markers to this fixed count (count carries no gap info)"); p.add_argument("--rows-direct", action="store_true", help="text parquets already carry pos_idx/i/j (nlt.path.facts): skip the pairs join and the copy filter"); p.add_argument("--ablate-mid", default="none", help="eval-time ablation of the middle vectors: none|zero|shuffle|noise, comma list allowed with --eval-only (diagnostic; applies to train too)")
+    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b"); p.add_argument("--fixed-markers", type=int, default=0, help="pad the middle with zero markers to this fixed count (count carries no gap info)"); p.add_argument("--mid-scale", default="none", choices=["none", "relmax"], help="relmax: middle markers injected at ||w_k|| / max_k ||w_k|| of the norm-matched strength (relative magnitudes kept)"); p.add_argument("--rows-direct", action="store_true", help="text parquets already carry pos_idx/i/j (nlt.path.facts): skip the pairs join and the copy filter"); p.add_argument("--ablate-mid", default="none", help="eval-time ablation of the middle vectors: none|zero|shuffle|noise, comma list allowed with --eval-only (diagnostic; applies to train too)")
     p.add_argument("--epochs", type=float, default=1.0); p.add_argument("--lr", type=float, default=3e-5); p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--batch", type=int, default=32); p.add_argument("--micro", type=int, default=8); p.add_argument("--max-resp-tokens", type=int, default=96)
     p.add_argument("--max-rows", type=int, default=None); p.add_argument("--copy-thresh", type=float, default=0.05)
@@ -34,7 +34,7 @@ def main():
     from nlt.verbalizer.prompt import response_ids
     from nlt.verbalizer.model import load_tokenizer, load_policy, save_adapter
     from nlt.path.prompt import build_path_prompt
-    from nlt.path.inject import MultiMarkerInjector, pack_slot
+    from nlt.path.inject import MultiMarkerInjector, pack_slot, mid_scales
     from nlt.path.vectors import PathStore, path_inputs, n_mid_of
     dev = "cuda"; tok = load_tokenizer(a.base); pad = tok.pad_token_id
     spec0 = build_path_prompt(tok, 0 if a.path_mode == "none" else 2, a.question); print(f"[path-sft] mode {a.path_mode}; example prompt ({spec0.n} tokens, markers at {spec0.positions}): {spec0.text!r}", flush=True)
@@ -97,10 +97,10 @@ def main():
             seqs.append(torch.tensor(sp.ids + response_ids(tok, str(t), a.max_resp_tokens))); poss.append(sp.positions); plens.append(sp.n)
         L = max(s.numel() for s in seqs); ids = torch.full((len(seqs), L), pad, dtype=torch.long); lab = torch.full((len(seqs), L), -100, dtype=torch.long); am = torch.zeros_like(ids)
         for r, s in enumerate(seqs): ids[r, : s.numel()] = s; am[r, : s.numel()] = 1; lab[r, plens[r]: s.numel()] = s[plens[r]:]
-        return ids, am, lab, pack_slot(vecs, poss)
+        return ids, am, lab, pack_slot(vecs, poss, scale_list=[mid_scales(v) for v in vecs] if a.mid_scale == "relmax" else None)
 
     def loss_on(ids, am, lab, slot, grad=True):
-        ids, am, lab = ids.to(dev), am.to(dev), lab.to(dev); inj.ref[0] = (slot[0].to(dev), slot[1].to(dev)); inj.reset_count()
+        ids, am, lab = ids.to(dev), am.to(dev), lab.to(dev); inj.ref[0] = tuple(t.to(dev) for t in slot); inj.reset_count()
         try:
             ctx = torch.enable_grad() if grad else torch.no_grad()
             with ctx:
@@ -150,7 +150,7 @@ def main():
         if run is not None: run.log(log, step=step)
         if (step + 1) % a.save_every == 0 or step == n_steps - 1:
             save_adapter(policy, os.path.join(a.out, "lora"))
-            json.dump({"step": step + 1, "rows": len(df), "init": a.init, "path_mode": a.path_mode, "question": a.question, "example_prompt": spec0.text, "text": a.text, "last_eval": last_eval, "args": vars(a)},
+            json.dump({"step": step + 1, "rows": len(df), "init": a.init, "path_mode": a.path_mode, "mid_scale": a.mid_scale, "question": a.question, "example_prompt": spec0.text, "text": a.text, "last_eval": last_eval, "args": vars(a)},
                       open(os.path.join(a.out, "meta.json"), "w"), indent=1)
     if run is not None: run.finish()
     print(f"done -> {a.out}/lora; final eval {json.dumps(last_eval)}", flush=True)

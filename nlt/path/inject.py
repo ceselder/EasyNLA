@@ -2,7 +2,9 @@
 
     h'_p = h_p + ||h_p|| * v_p / ||v_p||     at the OUTPUT of decoder block `layer` (default 1), at every marker position p of every row
 
-Slot: injector.ref[0] = (vecs [B, Nmax, d] (fp32/bf16), pos [B, Nmax] long with -1 padding) or None. Positions are ABSOLUTE positions in the
+Slot: injector.ref[0] = (vecs [B, Nmax, d] (fp32/bf16), pos [B, Nmax] long with -1 padding[, scale [B, Nmax] float]) or None.
+With a scale, h'_p = h_p + scale_p * ||h_p|| * v_p / ||v_p||: `--mid-scale relmax` keeps the RELATIVE magnitudes of the writes (largest write
+in the stretch = 1, endpoints = 1), the variant redteam #660 asked for. Positions are ABSOLUTE positions in the
 input_ids of the current forward (so with left padding add the pad offset); every position is checked to hold the marker token. Decode steps
 (seq_len 1 with a KV cache) are skipped: the markers are prompt tokens and were injected during prefill.
 
@@ -36,7 +38,7 @@ class MultiMarkerInjector:
     def _layer_hook(self, module, args, output):
         slot = self.ref[0]
         if slot is None: return output
-        vecs, pos = slot
+        vecs, pos = slot[0], slot[1]; scale = slot[2] if len(slot) > 2 else None
         resid = output[0] if isinstance(output, tuple) else output
         ids = self._ids
         if ids is None or resid.shape[1] < 2: return output                 # decode step
@@ -53,7 +55,11 @@ class MultiMarkerInjector:
             raise RuntimeError(f"marker token not at the given positions, e.g. rows {[int(bidx[x]) for x in bad]} pos {[int(p[x]) for x in bad]}")
         v = vecs[bidx, kidx].to(resid.device)
         h = resid[bidx, p]
-        out = resid.clone(); out[bidx, p] = norm_matched_add(h, v)
+        out = resid.clone()
+        if scale is None: out[bidx, p] = norm_matched_add(h, v)
+        else:
+            sc = scale.to(resid.device)[bidx, kidx].float().unsqueeze(-1); hf, vf = h.float(), v.float()
+            out[bidx, p] = (hf + sc * hf.norm(dim=-1, keepdim=True) * vf / (vf.norm(dim=-1, keepdim=True) + 1e-8)).to(h.dtype)
         self.n_writes += int(bidx.numel())
         return (out, *output[1:]) if isinstance(output, tuple) else out
 
@@ -62,12 +68,22 @@ class MultiMarkerInjector:
         return n
 
 
-def pack_slot(vec_list, pos_list, offsets=None, d=None, device="cpu"):
+def mid_scales(v: torch.Tensor) -> torch.Tensor:
+    """per-marker injection scale for one row's [n, d] inputs: endpoints 1, middle markers ||w_k|| / max_k ||w_k|| (relative magnitude kept)"""
+    s = torch.ones(v.shape[0], dtype=torch.float32)
+    if v.shape[0] > 2:
+        nm = v[1:-1].float().norm(dim=-1); s[1:-1] = nm / nm.max().clamp_min(1e-6)
+    return s
+
+
+def pack_slot(vec_list, pos_list, offsets=None, d=None, device="cpu", scale_list=None):
     """vec_list: per-row [n_b, d] tensors; pos_list: per-row lists of n_b marker positions (prompt-relative); offsets: per-row int added to the
     positions (left-pad amount), default 0. Returns (vecs [B, Nmax, d] fp32, pos [B, Nmax] long, -1 padded)."""
     B = len(vec_list); Nmax = max(v.shape[0] for v in vec_list); d = d or vec_list[0].shape[1]
     vecs = torch.zeros((B, Nmax, d), dtype=torch.float32, device=device); pos = torch.full((B, Nmax), -1, dtype=torch.long, device=device)
+    scale = torch.ones((B, Nmax), dtype=torch.float32, device=device) if scale_list is not None else None
     for b, (v, ps) in enumerate(zip(vec_list, pos_list)):
         assert v.shape[0] == len(ps), (v.shape, len(ps))
         vecs[b, : v.shape[0]] = v.float().to(device); pos[b, : len(ps)] = torch.as_tensor(ps, dtype=torch.long, device=device) + (offsets[b] if offsets is not None else 0)
-    return vecs, pos
+        if scale is not None: scale[b, : v.shape[0]] = scale_list[b].float().to(device)
+    return (vecs, pos) if scale is None else (vecs, pos, scale)
