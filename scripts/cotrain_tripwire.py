@@ -24,19 +24,21 @@ def main():
     p = argparse.ArgumentParser(); p.add_argument("--arms", default=",".join(ARMS)); p.add_argument("--no-score", action="store_true")
     a = p.parse_args(); os.makedirs(TMP, exist_ok=True)
     out = json.load(open(OUT)) if os.path.exists(OUT) else {}
-    for arm in a.arms.split(","):
-        if not any("tripwire" in x for x in vol_ls(f"ckpts/qwen36_27b/{arm}")):
-            print(f"[tripwire] {arm}: no tripwire dumps yet", flush=True); continue
+    arms = [x for x in a.arms.split(",") if any("tripwire" in y for y in vol_ls(f"ckpts/qwen36_27b/{x}"))]
+    if not arms:
+        print("[tripwire] no arm has tripwire dumps yet", flush=True)
+    if arms and not a.no_score:
+        # ONE 1-GPU shell container scores every (arm, variant) dir under the frozen SFT critic only (score_dumps is incremental per step)
+        loop = " ; ".join(f"[ -d {C}/{x}/tripwire/{v} ] && python -m nla.flow.score_dumps --dumps-dir {C}/{x}/tripwire/{v} --out {C}/{x}/tripwire_frozen_{v}.json "
+                          f"--critic {C}/ar_sft_merged --sidecar /vol_q36/data/rl/rl_shuf.parquet" for x in arms for v in V)
+        env = dict(os.environ, NLA_APP_NAME="nla-tripwire")
+        r = subprocess.run(["modal", "run", "scripts/modal_nla_exp.py", "--task", "shell", "--gpus", "1", "--cmd", loop], cwd=REPO, env=env,
+                           capture_output=True, text=True, timeout=7200)
+        print(f"[tripwire] frozen scoring rc {r.returncode}; tail: {r.stdout[-400:]}", flush=True)
+    for arm in arms:
         res = {}
         for v in V:
-            remote = f"{C}/{arm}/tripwire_frozen_{v}.json"
-            if not a.no_score:   # one modal client at a time (box RAM)
-                cmd = ["modal", "run", "scripts/modal_nla_exp.py", "--task", "score_dumps", "--tag", arm, "--model-tag", "qwen36_27b",
-                       "--glob", f"{C}/{arm}/tripwire/{v}", "--out", remote]
-                env = dict(os.environ, NLA_APP_NAME="nla-tripwire")
-                r = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True, timeout=5400)
-                if r.returncode != 0: print(f"[tripwire] {arm}/{v}: score_dumps rc {r.returncode}: {r.stderr[-300:]}", flush=True)
-            loc = f"{TMP}/{arm}_{v}.json"
+            remote = f"{C}/{arm}/tripwire_frozen_{v}.json"; loc = f"{TMP}/{arm}_{v}.json"
             subprocess.run(["modal", "volume", "get", "nla-exp", remote.replace("/vol/", ""), loc, "--force"], capture_output=True, timeout=300)
             if os.path.exists(loc): res[v] = json.load(open(loc))
         steps = sorted({int(s) for v in res for s in res[v] if s.isdigit()})
