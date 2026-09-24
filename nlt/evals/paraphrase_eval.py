@@ -57,9 +57,12 @@ if __name__ == "__main__":
     from nlt.evals.common import load_table
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("build"); p.add_argument("--z", required=True); p.add_argument("--pairs", required=True); p.add_argument("--light"); p.add_argument("--strong"); p.add_argument("--twin"); p.add_argument("--mask"); p.add_argument("--out", required=True)
-    p = sub.add_parser("summarize"); p.add_argument("--scored", required=True); p.add_argument("--out")
+    p = sub.add_parser("summarize"); p.add_argument("--scored", required=True); p.add_argument("--out"); p.add_argument("--exclude-pair-ids")
     a = ap.parse_args()
     if a.cmd == "build": build(a)
     else:
-        out = summarize(load_table(a.scored)); print(json.dumps(out, indent=1))
+        _t = load_table(a.scored)
+        if getattr(a, "exclude_pair_ids", None):
+            _ex = set(l.strip() for l in open(a.exclude_pair_ids) if l.strip()); _t = _t[~_t["pair_id"].astype(str).isin(_ex)].copy()
+        out = summarize(_t); out["held_out_of_selection_slice"] = bool(getattr(a, "exclude_pair_ids", None)); print(json.dumps(out, indent=1))
         if a.out: json.dump(out, open(a.out, "w"), indent=1)

@@ -33,8 +33,11 @@ def summarize(scored):
 
 if __name__ == "__main__":
     from nlt.evals.common import load_table
-    ap = argparse.ArgumentParser(); ap.add_argument("--scored", required=True); ap.add_argument("--out")
-    a = ap.parse_args(); summ = summarize(load_table(a.scored))
+    ap = argparse.ArgumentParser(); ap.add_argument("--scored", required=True); ap.add_argument("--out"); ap.add_argument("--exclude-pair-ids", help="file with one pair_id per line to drop (e.g. a critic's checkpoint-selection slice, so the acceptance read is held-out)")
+    a = ap.parse_args(); _t = load_table(a.scored)
+    if a.exclude_pair_ids:
+        _ex = set(l.strip() for l in open(a.exclude_pair_ids) if l.strip()); _n0 = len(_t); _t = _t[~_t["pair_id"].astype(str).isin(_ex)].copy(); print(f"excluded selection-slice pair_ids: {_n0} -> {len(_t)} rows")
+    summ = summarize(_t); summ["held_out_of_selection_slice"] = bool(a.exclude_pair_ids)
     print(json.dumps({k: v for k, v in summ.items() if k.startswith("verdict") or k in ("proxy_over_exact_orig", "workspace_share_of_positive_bits")}, indent=1))
     print({v: round(summ[v]["bits_mean"], 2) for v in summ if isinstance(summ.get(v), dict) and "bits_mean" in summ[v]})
     if a.out: json.dump(summ, open(a.out, "w"), indent=1, default=str)
