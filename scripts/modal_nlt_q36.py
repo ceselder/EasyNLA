@@ -90,6 +90,11 @@ def run_vllm(script: str, args: str = ""):
     return _run(f"python {Q36}/{script} {args}", script.replace(".py", ""))
 
 
+@app.function(image=image_hf, volumes=VOLS, timeout=6 * 60 * 60, cpu=8.0, memory=96 * 1024, secrets=SECRETS)
+def run_cpu(script: str, args: str = ""):
+    return _run(f"python {Q36}/{script} {args}", script.replace(".py", ""))
+
+
 @app.function(image=image_hf, volumes=VOLS, timeout=2 * 60 * 60, cpu=4.0, memory=32 * 1024, secrets=SECRETS)
 def pyrun(code: str):
     import textwrap
@@ -111,6 +116,8 @@ def main(task: str, script: str = "", args: str = "", code: str = "", gpus: int 
         fn = run_mod.with_options(gpu=f"{GPU_TYPE}:{gpus}")
         for a in ([args] if task == "mod" else [x.strip() for x in args.split(";;") if x.strip()]):
             h = fn.spawn(module, a); print(f"SPAWNED {h.object_id} :: {a[:90]}", flush=True)
+    elif task == "cpu":
+        h = run_cpu.spawn(script, args); print(f"SPAWNED {h.object_id} :: {args[:90]}", flush=True)
     elif task == "pyrun":
         h = pyrun.spawn(code); print(f"SPAWNED {h.object_id}", flush=True)
     else:
