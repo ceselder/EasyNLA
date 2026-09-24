@@ -72,8 +72,8 @@ def main():
         allv = [d.get(kk) for d in fin for kk, _ in src if d.get(kk) is not None]
         if allv: ax.set_ylim(max(0, min(allv) - 0.4), max(allv) + 0.45)
         ax.grid(axis="y", color="#e6e5e1", lw=0.8); ax.set_axisbelow(True); ax.spines[["top", "right"]].set_visible(False); ax.set_title("Final loss by SFT source", loc="left", fontsize=12, color=INK2)
-        fig.suptitle("Do the intermediate attention / MLP writes help the verbalizer? Held-out SFT loss, same rows, same init, same hparams", fontsize=13, x=0.01, ha="left")
-        fig.tight_layout(rect=(0, 0, 1, 0.94)); fig.savefig(a.plot + ".png", dpi=150); fig.savefig(a.plot + ".pdf"); print("->", a.plot + ".png")
+        fig.suptitle("Do the intermediate attention / MLP writes help the verbalizer?\nHeld-out SFT loss: same rows, same init, same hyper-parameters, only the input differs", fontsize=13, x=0.01, ha="left")
+        fig.tight_layout(rect=(0, 0, 1, 0.90)); fig.savefig(a.plot + ".png", dpi=150); fig.savefig(a.plot + ".pdf"); print("->", a.plot + ".png")
 
 
 if __name__ == "__main__":

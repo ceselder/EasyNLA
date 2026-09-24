@@ -64,7 +64,11 @@ def main():
     dev = "cuda"; torch.backends.cuda.matmul.allow_tf32 = True
     model, state = build(a.base, dev); d = model.config.hidden_size
     out_dir = os.path.join(a.out_dir, a.split); os.makedirs(out_dir, exist_ok=True)
-    keep = set(json.load(open(a.pos_idx_file))) if a.pos_idx_file else None
+    keep = None
+    if a.pos_idx_file:   # json list OR one int per line (featurizer's /vol/feat/train20k_pos_idx.txt)
+        txt = open(a.pos_idx_file).read().strip()
+        keep = set(int(x) for x in (json.loads(txt) if txt.startswith("[") else txt.split()))
+        print(f"[writes:{a.split}] keeping {len(keep)} pos_idx from {a.pos_idx_file}", flush=True)
     metas = sorted(glob.glob(os.path.join(a.data_dir, a.split, "meta_*.parquet")))
     if a.shards: want = {int(x) for x in a.shards.split(",")}; metas = [m for i, m in enumerate(metas) if i in want]
     rms_attn = np.zeros(N_LAYERS); rms_mlp = np.zeros(N_LAYERS); rms_res = np.zeros(N_LAYERS); n_tot = 0; ident_err = []; t0 = time.time()
