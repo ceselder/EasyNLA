@@ -1,0 +1,24 @@
+{
+ "mode": "offline",
+ "warmup": 300,
+ "engine_kwargs": {
+  "model": "google/gemma-4-26B-A4B-it",
+  "dtype": "bfloat16",
+  "max_model_len": 8192,
+  "gpu_memory_utilization": 0.95,
+  "limit_mm_per_prompt": {
+   "image": 0
+  },
+  "max_num_seqs": 2048,
+  "max_num_batched_tokens": 65536,
+  "enable_prefix_caching": true,
+  "seed": 0,
+  "attention_backend": "TRITON_FLASHINFER",
+  "compilation_config": {
+   "max_cudagraph_capture_size": 2048
+  }
+ },
+ "env": {
+  "VLLM_CACHE_ROOT": "/vol_glp/scale/bench/vllm_cache/v30"
+ }
+}

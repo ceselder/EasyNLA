@@ -1,0 +1,104 @@
+{
+ "mode": "server",
+ "port": 8000,
+ "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+ "concurrency": 4096,
+ "warmup": 400,
+ "prompt_col": "prompt_ds",
+ "startup_timeout": 5400,
+ "hf_models": [
+  "deepseek-ai/DeepSeek-V4-Flash-0731"
+ ],
+ "sets": [
+  "plain",
+  "g2a",
+  "g2b",
+  "judge"
+ ],
+ "cmd": [
+  "vllm",
+  "serve",
+  "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "--trust-remote-code",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "8000",
+  "--kv-cache-dtype",
+  "fp8",
+  "--block-size",
+  "256",
+  "--data-parallel-size",
+  "8",
+  "--enable-expert-parallel",
+  "--moe-backend",
+  "deep_gemm_mega_moe",
+  "--attention_config.indexer_kv_dtype",
+  "mxfp4",
+  "--compilation-config",
+  "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}",
+  "--max-model-len",
+  "16384",
+  "--gpu-memory-utilization",
+  "0.88",
+  "--max-num-seqs",
+  "512",
+  "--max-num-batched-tokens",
+  "16384",
+  "--tokenizer-mode",
+  "deepseek_v4",
+  "--enable-prefix-caching",
+  "--disable-log-requests"
+ ],
+ "env": {
+  "VLLM_CACHE_ROOT": "/vol_glp/scale/bench/vllm_cache/v30ds"
+ },
+ "variants": [
+  [
+   "dspark7",
+   {
+    "cmd": [
+     "vllm",
+     "serve",
+     "deepseek-ai/DeepSeek-V4-Flash-0731",
+     "--trust-remote-code",
+     "--host",
+     "127.0.0.1",
+     "--port",
+     "8000",
+     "--kv-cache-dtype",
+     "fp8",
+     "--block-size",
+     "256",
+     "--data-parallel-size",
+     "8",
+     "--enable-expert-parallel",
+     "--moe-backend",
+     "deep_gemm_mega_moe",
+     "--attention_config.indexer_kv_dtype",
+     "mxfp4",
+     "--compilation-config",
+     "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}",
+     "--max-model-len",
+     "16384",
+     "--gpu-memory-utilization",
+     "0.88",
+     "--max-num-seqs",
+     "512",
+     "--max-num-batched-tokens",
+     "16384",
+     "--tokenizer-mode",
+     "deepseek_v4",
+     "--enable-prefix-caching",
+     "--disable-log-requests",
+     "--speculative-config",
+     "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"greedy\"}"
+    ]
+   }
+  ],
+  [
+   "nospec",
+   {}
+  ]
+ ]
+}
