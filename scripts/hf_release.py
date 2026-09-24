@@ -59,14 +59,14 @@ def _build_dataset_files(repo: dict, work: str, plan_only: bool = False) -> list
         kind = b["kind"]
         if kind == "strip_ckpt":                        # critic checkpoint without optimizer states (22-39 GB -> 4-13 GB); keeps model/args/config/step/d_enc
             for src in b["src"]:
-                if src.startswith("BEST:"):             # the run's exact-selected checkpoint, named inside <dir>/BEST.txt (a path; fallback: ckpt_latest.pt with a note)
-                    bf = src[5:]; d_ = os.path.dirname(bf)
+                if src.startswith("BEST:"):             # the run's exact-selected checkpoint, named inside <dir>/BEST.txt (a path; fallback: 'BEST:<file>|<fallback ckpt>' or ckpt_latest.pt, with a note)
+                    bf, _, fb = src[5:].partition("|"); d_ = os.path.dirname(bf)
                     toks = [t for t in re.split(r"[\s,;:'\"]+", open(bf).read()) if t.endswith(".pt")] if os.path.exists(bf) else []
                     if toks:
                         named = toks[0]; src = named if os.path.isabs(named) else os.path.join(d_, named)
                         if not os.path.exists(src): print(f"   NOTE {bf} names {named} which does not exist -> skipped", flush=True); src = src + ".MISSING"
                     else:
-                        src = os.path.join(d_, "ckpt_latest.pt"); print(f"   NOTE {bf} missing -> using ckpt_latest.pt (not exact-selected)", flush=True)
+                        src = fb or os.path.join(d_, "ckpt_latest.pt"); print(f"   NOTE {bf} missing -> using {os.path.basename(src)} (manifest fallback)", flush=True)
                 dst = os.path.join(work, b["dst"], os.path.basename(os.path.dirname(src)), os.path.basename(src)); os.makedirs(os.path.dirname(dst), exist_ok=True)
                 if plan_only or not os.path.exists(src):
                     out.append((src if os.path.exists(src) else src + ".MISSING", os.path.relpath(dst, work))); continue
