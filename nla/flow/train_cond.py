@@ -35,28 +35,58 @@ def load_encoder(base, layer, device):
     return encode, tok
 
 
-def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False):
-    """All (activation, Opus explanation) rows of the raw extraction shards (cols activation_vector / explanation / is_val), val rows excluded;
-    `skip` non-val rows are passed over first (rank-disjoint subsets). Comma-separated globs are allowed."""
-    import glob as _glob, pyarrow.parquet as pq
-    acts, zs, docs = [], [], []; to_skip = skip
-    files = sorted(f for g in glob_pat.strip("\x27\"").split(",") for f in _glob.glob(g.strip()))
-    for f in files:
-        pf = pq.ParquetFile(f)
-        for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "explanation", "is_val"] + (["doc_id"] if with_doc else [])):
-            keep = [i for i, v in enumerate(rb.column("is_val").to_pylist()) if not (skip_val and v)]
-            if to_skip >= len(keep): to_skip -= len(keep); continue
-            if to_skip: keep = keep[to_skip:]; to_skip = 0
-            if not keep: continue
-            import numpy as _np
-            a = torch.tensor(_np.stack(rb.column("activation_vector").to_numpy(zero_copy_only=False)), dtype=torch.float16)[keep]
-            z = [(rb.column("explanation")[i].as_py() or "").strip() for i in keep]
-            acts.append(a); zs += z
-            if with_doc: docs += [rb.column("doc_id")[i].as_py() for i in keep]
-            if sum(x.shape[0] for x in acts) >= n: break
-        if sum(x.shape[0] for x in acts) >= n: break
-    acts = torch.cat(acts)[:n]; zs = zs[:n]
-    return (acts, zs, docs[:n]) if with_doc else (acts, zs)
+def _shard_files(glob_pat):
+    import glob as _glob
+    return sorted(f for g in glob_pat.strip("\x27\"").split(",") for f in _glob.glob(g.strip()))
+
+
+def count_shard_rows(glob_pat, skip_val=True):
+    """[(file, non-val rows)] from the is_val column only (cheap)"""
+    import pyarrow.parquet as pq
+    out = []
+    for f in _shard_files(glob_pat):
+        v = pq.read_table(f, columns=["is_val"]).column(0).to_pylist()
+        out.append((f, sum(1 for x in v if not (skip_val and x))))
+    return out
+
+
+def _qc_ok(q):
+    try: d = json.loads(q)
+    except Exception: return False
+    return not any(d.get(k, 0) for k in ("exact_missing", "leaked", "unsupported_numbers", "parse_fail"))
+
+
+def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False, counts=None, render_pick="canonical", seed=0):
+    """(activation, explanation) rows of raw extraction shards (cols activation_vector / explanation / is_val), val rows excluded; rows
+    [skip, skip + n) of the concatenated non-val rows (files sorted; comma-separated globs allowed). Files entirely outside the range are never
+    read. render_pick='random': shards with k renderings per activation (columns explanations / qc, the g2 synthetic data) use ONE rendering per
+    activation drawn uniformly among those passing every deterministic QC check (deterministic per row and seed); else the canonical column."""
+    import numpy as _np, pyarrow.parquet as pq
+    counts = counts or count_shard_rows(glob_pat, skip_val)
+    acts, zs, docs = [], [], []; g0 = 0; lo, hi = skip, skip + n; n_rand = 0
+    for f, c in counts:
+        if g0 + c <= lo: g0 += c; continue
+        if g0 >= hi: break
+        names = pq.ParquetFile(f).schema_arrow.names; multi = render_pick == "random" and "explanations" in names and "qc" in names
+        cols = ["activation_vector", "explanation", "is_val"] + (["doc_id"] if with_doc else []) + (["explanations", "qc"] if multi else [])
+        t = pq.read_table(f, columns=cols)
+        keep = [i for i, v in enumerate(t.column("is_val").to_pylist()) if not (skip_val and v)]
+        a0, a1 = max(lo - g0, 0), min(hi - g0, c); keep = keep[a0:a1]; g0 += c
+        if not keep: continue
+        av = t.column("activation_vector").combine_chunks().take(keep)
+        acts.append(torch.from_numpy(_np.asarray(av.values.to_numpy(zero_copy_only=False), dtype=_np.float32).reshape(len(keep), -1)).to(torch.float16))
+        ex = t.column("explanation").take(keep).to_pylist()
+        if multi:
+            import zlib as _zlib; rng = _np.random.default_rng([seed, _zlib.crc32(os.path.basename(f).encode())])   # process-independent (str hash is salted)
+            for j, (es, qs) in enumerate(zip(t.column("explanations").take(keep).to_pylist(), t.column("qc").take(keep).to_pylist())):
+                ok = [e for e, q in zip(es or [], qs or []) if e and _qc_ok(q)]
+                if ok: ex[j] = ok[int(rng.integers(len(ok)))]; n_rand += 1
+        zs += [(z or "").strip() for z in ex]
+        if with_doc: docs += t.column("doc_id").take(keep).to_pylist()
+        del t
+    acts = torch.cat(acts) if acts else torch.zeros(0, 5120, dtype=torch.float16)
+    if render_pick == "random": print(f"[cond] load_shards: {n_rand}/{len(zs)} rows with a random QC-passing rendering", flush=True)
+    return (acts, zs, docs) if with_doc else (acts, zs)
 
 
 def load_claims_dir(root, n, n_val, weights=None, balance=0.0, balance_clip=10.0, one_claim=False, families=None, rank=0, world=1, glob_pat=None, seed=0):
@@ -319,6 +349,9 @@ def main():
     p.add_argument("--draw-families", default="", help="--one-claim: only training anchors whose drawn family is in this comma list (e.g. internal,text); default all")
     p.add_argument("--claims-glob", default=None, help="which synthetic final files (default <claims-dir>/final/final_*.parquet)")
     p.add_argument("--snap-pairs", default="", help="comma list of global pair counts (e.g. 64e3,128e3,...,8e6): at each, eval + save a loadable snapshot dir <out>/snap_<pairs>/ (adapter_latest.pt [+ prior_cotrained_latest.pt / ar_encoder_latest.pt] + eval.json)")
+    p.add_argument("--render-pick", default="canonical", choices=["canonical", "random"], help="shards with k renderings per activation (g2): canonical column or one random QC-passing rendering per activation")
+    p.add_argument("--resume-opt", action="store_true", help="also restore the AdamW state from <resume-from>/opt_latest.pt (replicated DDP / single GPU)")
+    p.add_argument("--snap-final", action="store_true", help="also save a snapshot dir at the last step (snap_<pairs seen>)")
     p.add_argument("--start-pairs", type=int, default=0, help="pairs already seen when resuming (keeps the snapshot schedule on the global pair count)")
     p.add_argument("--one-pass", action="store_true", help="steps = min(--steps, training anchors per rank // (batch * grad_accum)): every activation seen at most once, no re-shuffle")
     p.add_argument("--lr-const", action="store_true", help="linear warm-up then CONSTANT lr (no cosine decay): for phases that continue each other on fresh shards")
@@ -435,8 +468,11 @@ def main():
     if is0: print(f"[cond] prior {cfg['n_layers']} blocks ({a.prior_weights} weights from {a.prior}); adapter {n_ad/1e6:.1f}M params; encoder layer {a.enc_layer}; unfreeze_prior={a.unfreeze_prior} world={world}", flush=True)
     want_doc = a.group_contrast > 0 or a.eval_samedoc; tr_doc = va_doc = None
     if a.train_shards_glob:
-        _per = a.max_train // world if (ddp and not a.unfreeze_prior) else a.max_train; _skip = rank * _per if (ddp and not a.unfreeze_prior) else 0   # replicated DDP: rank-disjoint gold rows
-        out_ = load_shards(a.train_shards_glob, max(_per, 1), skip=_skip, with_doc=want_doc); tr_acts, tr_z = out_[0], out_[1]; tr_doc = out_[2] if want_doc else None
+        _cnt = count_shard_rows(a.train_shards_glob); _tot = sum(c for _, c in _cnt)
+        _use = _tot if a.max_train < 0 else min(a.max_train, _tot)                                # exact split: never ask for rows that do not exist
+        _per = _use // world if (ddp and not a.unfreeze_prior) else _use; _skip = rank * _per if (ddp and not a.unfreeze_prior) else 0   # replicated DDP: rank-disjoint rows, equal slices
+        if is0: print(f"[cond] shards: {len(_cnt)} files, {_tot} non-val rows available, using {_use} ({_per} per rank)", flush=True)
+        out_ = load_shards(a.train_shards_glob, max(_per, 1), skip=_skip, with_doc=want_doc, counts=_cnt, render_pick=a.render_pick, seed=a.seed); tr_acts, tr_z = out_[0], out_[1]; tr_doc = out_[2] if want_doc else None
         if a.max_train == 0: tr_acts, tr_z = tr_acts[:0], []
         if is0: print(f"[cond] loaded {len(tr_z)} Opus pairs from shards {a.train_shards_glob}", flush=True)
     else:
@@ -533,6 +569,8 @@ def main():
         if is0: print(f"[cond] trunk LoRA params: {sum(p_.numel() for p_ in model.lora_parameters())/1e6:.1f}M at lr {a.ar_lr}", flush=True)
     if is0 and arvec is not None: print(f"[cond] AR encoder trainable params: {sum(p_.numel() for p_ in arvec.trainable_parameters())/1e6:.1f}M (LoRA + value head)", flush=True)
     opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.0)
+    if a.resume_opt and a.resume_from and os.path.exists(os.path.join(a.resume_from, "opt_latest.pt")) and not a.unfreeze_prior:
+        opt.load_state_dict(torch.load(os.path.join(a.resume_from, "opt_latest.pt"), map_location="cpu")); print(f"[cond] rank {rank}: AdamW state restored from {a.resume_from}", flush=True)
     trainable = [p_ for g_ in groups for p_ in g_["params"]]
     if ddp and not a.unfreeze_prior:   # replicated DDP: every rank starts from rank 0's adapter / encoder weights
         with torch.no_grad():
@@ -818,6 +856,7 @@ def main():
             if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
         pairs_seen = a.start_pairs + (step - a.start_step) * a.batch * a.grad_accum * world      # global (activation, text) draws so far
         snap_now = [q for q in snap_pairs if q <= pairs_seen and q not in snaps_done]
+        if a.snap_final and step == a.steps and pairs_seen not in snaps_done and pairs_seen not in snap_now: snap_now.append(pairs_seen)   # endpoint snapshot
         is_eval = step % a.eval_every == 0 or step == a.steps or (time.time() - t0) / 3600 > a.max_hours
         if is_eval or snap_now:
             ev = evaluate(step)
@@ -829,6 +868,7 @@ def main():
             for d_ in dirs:
                 if is0: os.makedirs(d_, exist_ok=True)
                 save_ckpt(d_, step)
+                if d_ == a.out and is0 and not a.unfreeze_prior: torch.save(opt.state_dict(), os.path.join(a.out, "opt_latest.pt"))   # replicated: identical on every rank
                 if is0 and d_ != a.out: json.dump({**ev, "pairs_seen": pairs_seen, "step": step}, open(os.path.join(d_, "eval.json"), "w"), indent=1)
             snaps_done.update(snap_now)
             if (time.time() - t0) / 3600 > a.max_hours: break

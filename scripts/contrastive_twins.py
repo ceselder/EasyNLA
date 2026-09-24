@@ -82,7 +82,8 @@ def stage_score(a):
         res["rows"][str(row)] = rec
         print(f"[score {a.critic}] row {g + 1}/{len(gen['rows'])} ({len(acts)} activations) {time.time() - t0:.0f}s", flush=True)
     od = a.out_dir or OUT; os.makedirs(od, exist_ok=True); res["metric"] = a.metric; sfx = "" if a.metric == "train" else "_model_space"
-    json.dump(res, open(f"{od}/contrastive_{a.critic}{sfx}.json", "w")); print(f"[score] wrote {od}/contrastive_{a.critic}{sfx}.json in {time.time() - t0:.0f}s", flush=True)
+    fn = f"{od}/contrastive_{a.critic.replace('/', '__')}{sfx}.json"   # snapshot tags <run>/snap_<pairs> -> flat file names
+    json.dump(res, open(fn, "w")); print(f"[score] wrote {fn} in {time.time() - t0:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

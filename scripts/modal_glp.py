@@ -193,11 +193,11 @@ def train_cond_ddp(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "
 
 @app.function(gpu="B200:2", timeout=3 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=512 * 1024, ephemeral_disk=600 * 1024)
 def train_cond_ddp2(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = ""):
-    """2-rank smoke of train_cond_ddp"""
-    return _ddp(tag, prior_tag, prior_ckpt, extra, 2)
+    """2-rank smoke of train_cond_ddp (volume commits every 60 s)"""
+    return _ddp(tag, prior_tag, prior_ckpt, extra, 2, commit_every=60)
 
 
-def _ddp(tag, prior_tag, prior_ckpt, extra, nproc):
+def _ddp(tag, prior_tag, prior_ckpt, extra, nproc, commit_every=600):
     import subprocess
     from playground_app import resolve_base
     base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
@@ -207,9 +207,29 @@ def _ddp(tag, prior_tag, prior_ckpt, extra, nproc):
            "--out", out, "--tag", tag, "--mined-acts-parquet", "/vol_q36/data/rl/rl_shuf.parquet"] + extra.split()
     env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
     os.makedirs(out, exist_ok=True); logf = open(os.path.join(out, "train.log"), "ab")
+    import time as _t
+    logf.write(f"[modal] container started {_t.strftime('%Y-%m-%d %H:%M:%S UTC', _t.gmtime())}, {nproc} ranks\n".encode()); logf.flush(); vol_glp.commit()   # watchers: started = train.log exists
     proc = subprocess.Popen(cmd, cwd=REPO_REMOTE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    stop = _commit_loop(commit_every)                                            # snapshots / train.log visible to other containers mid-run
     for line in proc.stdout: sys.stdout.buffer.write(line); sys.stdout.flush(); logf.write(line); logf.flush()
-    rc = proc.wait(); logf.close(); vol_glp.commit(); return rc
+    rc = proc.wait(); logf.close(); stop.set(); vol_glp.commit(); return rc
+
+
+def _commit_loop(every):
+    """background vol_glp.commit() every `every` seconds until the returned Event is set"""
+    import threading
+    ev = threading.Event()
+    def loop():
+        while not ev.wait(every):
+            try: vol_glp.commit()
+            except Exception as e: print(f"[modal] periodic commit failed: {str(e)[:120]}", flush=True)
+    threading.Thread(target=loop, daemon=True).start(); return ev
+
+
+@app.function(gpu="B200:4", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=768 * 1024, ephemeral_disk=600 * 1024)
+def train_cond_ddp4(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = ""):
+    """train_cond_ddp on 4 B200 (fallback when an 8-GPU container stays pending; pass --batch x2 or --grad-accum 2 for the same global batch)"""
+    return _ddp(tag, prior_tag, prior_ckpt, extra, 4)
 
 
 @app.function(gpu="B200:4", timeout=23 * 3600, **COMMON)
@@ -347,6 +367,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", _gather(calls))
     elif task == "train_cond_g4":
         print("rc", train_cond_g4.remote(tag or "cond_cotrain", prior_tag, ckpt, extra))
+    elif task == "train_cond_ddp4":
+        print("rc", train_cond_ddp4.remote(tag or "cond_ddp4", prior_tag, ckpt, extra))
     elif task == "train_cond_ddp":   # 8 ranks on B200:8 (--nshards 2 -> the B200:2 smoke function)
         f_ = train_cond_ddp2 if nshards == 2 else train_cond_ddp
         print("rc", (f_.remote(tag or "cond_ddp", prior_tag, ckpt, extra) if nshards == 2 else f_.remote(tag or "cond_ddp", prior_tag, ckpt, extra, nproc=min(nshards, 8))))

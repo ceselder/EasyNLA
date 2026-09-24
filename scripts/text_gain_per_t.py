@@ -42,7 +42,8 @@ for tag in sys.argv[1:]:
                             v = fb.model(xt, tv, enc, mk, cv) if (enc is not None or cv is not None) else fb.model(xt, tv)
                         for m in ("train", "model"): L[m][b][i:i + n, j] += fb.fm_err(v, tgt, metric=m).cpu() / D
             print(f"[tg {tag}] rows {i + n}/{N}", flush=True)
-    torch.save({m: {b: L[m][b] for b in L[m]} for m in L}, f"{OUT}/{tag}_raw.pt")                                           # raw per-row losses first
+    fn = tag.replace("/", "__")                                                                  # snapshot tags -> flat names
+    torch.save({m: {b: L[m][b] for b in L[m]} for m in L}, f"{OUT}/{fn}_raw.pt")                                           # raw per-row losses first
     ts = np.array(TS); w = (1 - ts) / ts
     res = {"tag": tag, "ts": TS, "N": N, "D": D, "d": d, "whiten": aa.get("whiten"), "whiten_loss": aa.get("whiten_loss"), "cond_mode": fb.cond_mode}
     for m in ("train", "model"):
@@ -57,6 +58,6 @@ for tag in sys.argv[1:]:
     res["elbo_shuf_bits_mean"] = float(integ(dens_s).mean())
     res["bits_density_per_t"] = dens.mean(0).tolist(); res["bits_density_per_t_sem"] = (dens.std(0) / math.sqrt(N)).tolist()
     cum = [float(integ(dens[:, :j + 1]).mean()) for j in range(len(TS))]; res["bits_cumulative"] = cum
-    json.dump(res, open(f"{OUT}/{tag}.json", "w"), indent=1)
-    print(f"[tg {tag}] ELBO PMI {res['elbo_pmi_bits_mean']:.0f} +- {res['elbo_pmi_bits_sem']:.0f} bits; shuffled {res['elbo_shuf_bits_mean']:.0f}; wrote {OUT}/{tag}.json", flush=True)
+    json.dump(res, open(f"{OUT}/{fn}.json", "w"), indent=1)
+    print(f"[tg {tag}] ELBO PMI {res['elbo_pmi_bits_mean']:.0f} +- {res['elbo_pmi_bits_sem']:.0f} bits; shuffled {res['elbo_shuf_bits_mean']:.0f}; wrote {OUT}/{fn}.json", flush=True)
     del fb; gc.collect(); torch.cuda.empty_cache()
