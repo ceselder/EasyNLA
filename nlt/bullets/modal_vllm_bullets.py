@@ -55,7 +55,11 @@ def gen_files(files: list[str], split: str, limit: int = 0, part_rows: int = 250
     G.SOURCE = SOURCE                                                # rows are tagged with the open-model source
     vol.reload(); t0 = time.time()
     snap = snapshot_download(MODEL, token=os.environ.get("HF_TOKEN"))
-    llm = LLM(model=snap, dtype="bfloat16", max_model_len=3072, gpu_memory_utilization=0.90, enable_prefix_caching=True, seed=0, max_num_seqs=256)
+    try:                                                              # vLLM >= 0.20 ignores VLLM_ATTENTION_BACKEND; the auto-picked FLASHINFER backend JIT-compiles (needs nvcc) on Blackwell
+        from vllm.config.attention import AttentionConfig; attn = {"attention_config": AttentionConfig(backend="FLASH_ATTN")}
+    except Exception:
+        attn = {}
+    llm = LLM(model=snap, dtype="bfloat16", max_model_len=3072, gpu_memory_utilization=0.90, enable_prefix_caching=True, seed=0, max_num_seqs=256, **attn)
     sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens, seed=0)
     tok = load_tokenizer()
     print(f"[vllm-bullets] {MODEL} up in {time.time() - t0:.0f}s; {len(files)} files", flush=True)
