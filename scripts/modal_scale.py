@@ -159,10 +159,13 @@ def _g2_rows(llm, texts, keys, docs, k=G2_K):
                     use_tqdm=False, chat_template_kwargs=ck)
     tA = time.time() - t0; nA_in = sum(len(r.prompt_token_ids) for r in resA); nA_out = sum(len(r.outputs[0].token_ids) for r in resA)
     facts, vstats = [], []
+    n_bad = 0
     for r, c in zip(resA, ctxs):
         f = G.parse_facts(r.outputs[0].text)
         if f is None: facts.append(None); vstats.append(None); continue
-        v, st = G.validate(f, c); facts.append(v); vstats.append(st)
+        try: v, st = G.validate(f, c); G.fact_list(v)
+        except Exception: n_bad += 1; facts.append(None); vstats.append(None); continue          # one malformed fact sheet must never fail the shard
+        facts.append(v); vstats.append(st)
     pool = {}
     for d, v in zip(docs, facts):
         if v is None: continue
@@ -179,7 +182,8 @@ def _g2_rows(llm, texts, keys, docs, k=G2_K):
                 if dd != d and vv != x["value"]: tv = vv; break
             tw.append(tv)
         for j in range(k):
-            st_ = G.sample_style(rng); pr, plan = G.build_render(v, fl, tw, st_, lib, rng)
+            try: st_ = G.sample_style(rng); pr, plan = G.build_render(v, fl, tw, st_, lib, rng)
+            except Exception: n_bad += 1; continue
             jobs.append((i, j, pr, G.RENDER_MAX_TOKENS[st_["length"]])); plans.append((st_, plan, fl, tw))
     t0 = time.time()
     resB = llm.chat([[{"role": "user", "content": pr}] for _, _, pr, _ in jobs], [SamplingParams(temperature=0.9, top_p=0.95, max_tokens=mt) for *_, mt in jobs],
@@ -195,7 +199,7 @@ def _g2_rows(llm, texts, keys, docs, k=G2_K):
     for rc in recs:                             # canonical explanation: first rendering passing every deterministic check
         good = [t for t, q in zip(rc["renders"], rc["qc"]) if t and not any(json.loads(q).get(kk, 0) for kk in ("exact_missing", "leaked", "unsupported_numbers", "parse_fail"))]
         rc["explanation"] = good[0] if good else None; rc["n_pass"] = len(good)          # no passing rendering -> the position is dropped at join
-    stats = dict(n=len(texts), facts_ok=sum(f is not None for f in facts), stageA_s=tA, stageA_prefill_tok_s=nA_in / tA, stageA_decode_tok_s=nA_out / tA,
+    stats = dict(n=len(texts), facts_ok=sum(f is not None for f in facts), malformed_skipped=n_bad, stageA_s=tA, stageA_prefill_tok_s=nA_in / tA, stageA_decode_tok_s=nA_out / tA,
                  stageA_mean_out=nA_out / len(texts), renders=len(jobs), stageB_s=tB, stageB_prefill_tok_s=nB_in / tB, stageB_decode_tok_s=nB_out / tB,
                  stageB_mean_out=nB_out / max(1, len(jobs)), positions_per_s=len(texts) / (tA + tB), renders_per_s=len(jobs) / (tA + tB))
     return recs, stats

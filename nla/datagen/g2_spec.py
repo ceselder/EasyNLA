@@ -73,6 +73,9 @@ def validate(f, ctx):
     out = {k: clip(f.get(k, ""), n) for k, n in (("topic", 15), ("genre", 12), ("voice", 12), ("doing", 20), ("next", 15), ("sentiment", 6), ("format", 8))}
     lw = _norm(f.get("last_words", ""))
     out["last_words"] = lw if (lw and len(lw.split()) <= 12 and (C.endswith(lw) or lw in C[-300:])) else ""
+    def lst(x):   # Gemma sometimes returns an object or a string where a list is asked for (slicing a dict raised KeyError and failed whole shards)
+        return x if isinstance(x, list) else ([x] if isinstance(x, dict) else [])
+    f = {k: (lst(v) if k in ("entities", "numbers", "dates", "quotes") else v) for k, v in f.items()}
     def keep(v):
         v = _norm(v); ok = bool(v) and len(v) <= 120 and v in C
         st["kept" if ok else "dropped"] += 1; return ok
