@@ -15,7 +15,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--split", default="val")
     p.add_argument("--base", default="Qwen/Qwen3-8B"); p.add_argument("--init", required=True); p.add_argument("--source", required=True); p.add_argument("--question", default=None)
-    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b")
+    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b"); p.add_argument("--fixed-markers", type=int, default=0, help="pad the middle with zero markers to this fixed count (count carries no gap info)")
     p.add_argument("--n-pairs", type=int, default=4096); p.add_argument("--n-samples", type=int, default=1); p.add_argument("--batch", type=int, default=64)
     p.add_argument("--temperature", type=float, default=0.7); p.add_argument("--max-new-tokens", type=int, default=96); p.add_argument("--seed", type=int, default=0); p.add_argument("--verbosity", type=int, default=1)
     a = p.parse_args(); torch.manual_seed(a.seed); dev = "cuda"
@@ -35,12 +35,12 @@ def main():
     policy = load_policy(a.base, a.init, device=dev); policy.eval(); inj = MultiMarkerInjector(policy, build_path_prompt(tok, 0).marker_id)
     eos_ids = sorted(set([tok.convert_tokens_to_ids("<|im_end|>"), tok.convert_tokens_to_ids("<|endoftext|>")]))
     I = vp["i"].values.astype(int); J = vp["j"].values.astype(int)
-    n_mid = np.array([n_mid_of(i_, j_, a.path_mode) for i_, j_ in zip(I, J)]); order = np.argsort(n_mid, kind="stable")
+    n_mid = np.array([n_mid_of(i_, j_, a.path_mode, a.fixed_markers) for i_, j_ in zip(I, J)]); order = np.argsort(n_mid, kind="stable")
     print(f"[path-dump] {N} pairs, markers per prompt {int(n_mid.min()) + 2}..{int(n_mid.max()) + 2}, mode {a.path_mode}, init {a.init}", flush=True)
     t0 = time.time(); out_rows = {}; n_writes = 0; n_expected = 0
     for s in range(0, N, a.batch):
         idx = order[s: s + a.batch]; sub = vp.iloc[idx]
-        vecs = path_inputs(store, sub["pos_idx"].values, sub["i"].values, sub["j"].values, a.path_mode, pstore)
+        vecs = path_inputs(store, sub["pos_idx"].values, sub["i"].values, sub["j"].values, a.path_mode, pstore, a.fixed_markers)
         specs = [build_path_prompt(tok, int(n_mid[q]), a.question) for q in idx]
         L = max(sp.n for sp in specs); B = len(idx)
         ids = torch.full((B, L), pad, dtype=torch.long); am = torch.zeros((B, L), dtype=torch.long); offs = []

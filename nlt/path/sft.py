@@ -18,7 +18,7 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="path_sft")
     p.add_argument("--text", required=True); p.add_argument("--val-text", default=None)
     p.add_argument("--base", default="Qwen/Qwen3-8B"); p.add_argument("--init", default="ao"); p.add_argument("--question", default=None)
-    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b")
+    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b"); p.add_argument("--fixed-markers", type=int, default=0, help="pad the middle with zero markers to this fixed count (count carries no gap info)")
     p.add_argument("--epochs", type=float, default=1.0); p.add_argument("--lr", type=float, default=3e-5); p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--batch", type=int, default=32); p.add_argument("--micro", type=int, default=8); p.add_argument("--max-resp-tokens", type=int, default=96)
     p.add_argument("--max-rows", type=int, default=None); p.add_argument("--copy-thresh", type=float, default=0.05)
@@ -82,10 +82,10 @@ def main():
         run = wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=f"sft_{a.tag}", group="sft", config=vars(a))
 
     def batch_tensors(sub, st, ps):
-        vecs = path_inputs(st, sub["pos_idx"].values, sub["i"].values, sub["j"].values, a.path_mode, ps)
+        vecs = path_inputs(st, sub["pos_idx"].values, sub["i"].values, sub["j"].values, a.path_mode, ps, a.fixed_markers)
         seqs, poss, plens = [], [], []
         for b, (i_, j_, t) in enumerate(zip(sub["i"].values, sub["j"].values, sub["text"].values)):
-            sp = build_path_prompt(tok, n_mid_of(i_, j_, a.path_mode), a.question); assert len(sp.positions) == vecs[b].shape[0]
+            sp = build_path_prompt(tok, n_mid_of(i_, j_, a.path_mode, a.fixed_markers), a.question); assert len(sp.positions) == vecs[b].shape[0]
             seqs.append(torch.tensor(sp.ids + response_ids(tok, str(t), a.max_resp_tokens))); poss.append(sp.positions); plens.append(sp.n)
         L = max(s.numel() for s in seqs); ids = torch.full((len(seqs), L), pad, dtype=torch.long); lab = torch.full((len(seqs), L), -100, dtype=torch.long); am = torch.zeros_like(ids)
         for r, s in enumerate(seqs): ids[r, : s.numel()] = s; am[r, : s.numel()] = 1; lab[r, plens[r]: s.numel()] = s[plens[r]:]
