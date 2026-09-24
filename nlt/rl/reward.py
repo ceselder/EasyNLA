@@ -25,11 +25,37 @@ class StubScorer:
         return {"exact_bits": out, "proxy_bits": pr, "logp_cond": torch.zeros(B), "logp_uncond": torch.zeros(B), "proxy_over_exact": 3.0}
 
 
+def ensure_d_enc(ckpt: str) -> str:
+    """A text critic checkpoint whose d_enc is 0/missing (the RL trainer's critic.pt files saved before 01:30 UTC Sep 24 wrote
+    getattr(model, 'd_enc_', 0) = 0, and infra's load_critic asserts d_enc > 0) gets a fixed copy with d_enc = the text encoder's hidden
+    size (from its HF config; enc_model lives in the saved args). Returns the path to load (the original when nothing is wrong)."""
+    import os, tempfile
+    try:
+        ck = torch.load(ckpt, map_location="cpu", mmap=True, weights_only=False)
+        cond = (ck.get("config") or {}).get("cond"); d_enc = int(ck.get("d_enc", 0) or 0)
+        if cond != "text" or d_enc > 0: return ckpt
+        from transformers import AutoConfig
+        enc_model = (ck.get("args") or {}).get("enc_model", "Qwen/Qwen3-0.6B")
+        d_enc = int(AutoConfig.from_pretrained(enc_model).hidden_size)
+        fixed = os.path.join(tempfile.gettempdir(), f"critic_fixed_{hashlib.md5(ckpt.encode()).hexdigest()[:10]}.pt")
+        ck = dict(ck); ck["d_enc"] = d_enc; torch.save(ck, fixed)
+        print(f"[reward] critic {ckpt} had d_enc 0 -> set {d_enc} from {enc_model}; loading the fixed copy {fixed}", flush=True)
+        return fixed
+    except Exception as e:
+        print(f"[reward] ensure_d_enc({ckpt}) skipped: {type(e).__name__}: {str(e)[:160]}", flush=True); return ckpt
+
+
+def critic_d_enc(cot) -> int:
+    """d_enc for saving a co-trained listener: the model attribute when the lens trainer set it, else the loaded encoder's width."""
+    enc = getattr(cot, "enc", None) or getattr(getattr(cot, "sc", None), "encoder", None)      # Listener.enc = CriticScorer.encoder (TextEncoder)
+    return int(getattr(cot.model, "d_enc_", 0) or getattr(enc, "d_enc", 0) or 0)
+
+
 class ExactScorer:
     """thin wrapper over infra's CriticScorer (keeps the trainer independent of its constructor details)"""
     def __init__(self, ckpt: str, data_dir: str, device="cuda", ode_steps: int = 32, probes: int = 1, batch: int = 64, **kw):
         from nlt.eval_bits.scorer import CriticScorer
-        self.inner = CriticScorer(ckpt, data_dir, device=device, ode_steps=ode_steps, probes=probes, batch=batch, **kw)
+        self.inner = CriticScorer(ensure_d_enc(ckpt), data_dir, device=device, ode_steps=ode_steps, probes=probes, batch=batch, **kw)
         self.ckpt = ckpt
 
     def score(self, h_i, h_j, texts, group_ids, seed: int = 0, **kw):

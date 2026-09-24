@@ -266,7 +266,7 @@ def main():
     from nlt.verbalizer.inject import TwoMarkerInjector
     from nlt.verbalizer.vllm_rollout import make_engine, rollout
     from nlt.rl.filters import ViolationChecker, summarize_violations
-    from nlt.rl.reward import make_scorer, shape_rewards, group_advantages, within_group_std, corr, referential_score, referential_accuracy
+    from nlt.rl.reward import make_scorer, shape_rewards, group_advantages, within_group_std, corr, referential_score, referential_accuracy, critic_d_enc
     from nlt.rl.sampler import StratifiedSampler
     from nlt.rl.paraphrase import Paraphraser, choose_paraphrase_rows
     from nlt.rl.update import grpo_update
@@ -370,7 +370,7 @@ def main():
             try:
                 parts = open(swap_path).read().split(); new_ck = parts[-1]; new_name = parts[0] if len(parts) > 1 else os.path.basename(os.path.dirname(new_ck))
                 from nlt.rl.reward import ExactScorer
-                if cot is not None: torch.save({"model": cot.model.state_dict(), "step": step, "args": cot.sc.aa, "config": cot.model.config(), "d_enc": getattr(cot.model, "d_enc_", 0)}, os.path.join(a.out, f"critic_before_swap_{step:05d}.pt"))
+                if cot is not None: torch.save({"model": cot.model.state_dict(), "step": step, "args": cot.sc.aa, "config": cot.model.config(), "d_enc": critic_d_enc(cot)}, os.path.join(a.out, f"critic_before_swap_{step:05d}.pt"))
                 old_sc = scorer; _place(old_sc, "cpu"); cross[f"prev_{step}"] = old_sc
                 if cot is not None: del cot.opt
                 torch.cuda.empty_cache()
@@ -592,7 +592,7 @@ def main():
         if (step + 1) % a.save_every == 0 or step_rel + 1 == a.steps:
             d = os.path.join(a.out, f"step_{step + 1:05d}"); save_adapter(policy, os.path.join(d, "lora"))
             json.dump({"step": step + 1, "prompt": spec.text, "ref_prompt_len": len(ref_ids), "init": a.init}, open(os.path.join(d, "meta.json"), "w"))
-            if cot is not None: torch.save({"model": cot.model.state_dict(), "step": step + 1, "args": cot.sc.aa, "config": cot.model.config(), "d_enc": getattr(cot.model, "d_enc_", 0)}, os.path.join(d, "critic.pt"))
+            if cot is not None: torch.save({"model": cot.model.state_dict(), "step": step + 1, "args": cot.sc.aa, "config": cot.model.config(), "d_enc": critic_d_enc(cot)}, os.path.join(d, "critic.pt"))
             print(f"[save] {d}", flush=True)
             n_save = (step + 1) // a.save_every
             if dump_vp is not None and (n_save % a.dump_val_every == 0 or step_rel + 1 == a.steps): last_dump_dir = dump_val(step + 1)
