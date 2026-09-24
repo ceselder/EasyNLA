@@ -25,12 +25,14 @@ SYSTEM = """You label short claims about what a language model worked out while 
 Answer with JSON only: {"labels": ["<type for claim 0>", "<type for claim 1>", ...]} with exactly one label per claim, in order."""
 
 
-async def _one(client, sem, key, prm, out, retries=6):
+async def _one(client, sem, key, prm, out, retries=12):
     async with sem:
         for a in range(retries):
             try:
                 msg = await client.messages.create(**prm)
-                out[key] = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text"); return
+                txt = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+                if not txt.strip() and a < retries - 1: print(f"[cat] empty response for chunk {key} (stop {msg.stop_reason}), retrying", flush=True); continue
+                out[key] = txt; return
             except Exception as e:
                 if a == retries - 1: out[key] = None; print(f"[cat] giving up {key}: {str(e)[:100]}", flush=True); return
                 await asyncio.sleep(min(60, 2 ** a) + random.random())
@@ -58,7 +60,7 @@ def main():
     async def run():
         sem = asyncio.Semaphore(a.concurrency)
         await asyncio.gather(*[_one(client, sem, s, p, out) for s, p in items])
-    t0 = time.time(); asyncio.run(run())
+    t0 = time.time(); asyncio.run(run()); print(f"[cat] {sum(1 for s, _ in items if not out.get(s))} of {len(items)} chunks failed", flush=True)
     labels = np.array(["unlabelled"] * len(sub), dtype=object)
     for s, _ in items:
         raw = out.get(s)
@@ -67,7 +69,7 @@ def main():
         try:
             lab = json.loads(m.group(0))["labels"]
         except Exception:
-            continue
+            print(f"[cat] unparsable chunk {s}: {raw[:200]!r}", flush=True); continue
         for i, l in enumerate(lab[: a.chunk]):
             if s + i < len(sub): labels[s + i] = l if l in TYPES else "other"
     sub["type"] = labels; sub = sub[sub["type"] != "unlabelled"]

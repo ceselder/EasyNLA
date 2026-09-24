@@ -24,6 +24,7 @@ def main():
     p.add_argument("--max-train", type=int, default=None); p.add_argument("--epochs", type=float, default=0, help="if > 0, steps = epochs * n_train / batch")
     p.add_argument("--freeze-lora", action="store_true", help="frozen text encoder (no LoRA): small-data regime"); p.add_argument("--bottleneck", type=int, default=0); p.add_argument("--text-dropout", type=float, default=0.0)
     p.add_argument("--select-rows", default=None, help="a:b val rows used ONLY to pick ckpt_best.pt (report on the other rows)")
+    p.add_argument("--init-from", default=None, help="warm start from a reconstructor checkpoint (architecture args are taken from it)")
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--batch", type=int, default=64); p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--lr-lora", type=float, default=1e-4); p.add_argument("--lr-head", type=float, default=5e-4); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--warmup", type=int, default=50)
     p.add_argument("--p-drop", type=float, default=0.3); p.add_argument("--p-empty", type=float, default=0.1); p.add_argument("--cos-w", type=float, default=0.5)
@@ -59,7 +60,13 @@ def main():
         lo, hi = [int(x) for x in a.select_rows.split(":")]; sel_ids = set(pv["pair_id"].iloc[lo:hi]); sel = torch.as_tensor(va["pair_id"].isin(sel_ids).values, device=dev)
         print(f"[train] selection rows {lo}:{hi} -> {int(sel.sum())} val rows for ckpt_best; {int((~sel).sum())} rows left for the report", flush=True)
     print(f"[train] steps {a.steps} (batch {a.batch}, {a.steps * a.batch / max(1, len(tr)):.1f} epochs)", flush=True)
-    model = M.build(a, dev); model.train()
+    if a.init_from:
+        model, margs = M.load(a.init_from, dev); model.train()
+        for k in ("enc_model", "enc_layer", "lora_r", "lora_alpha", "max_len", "d_model", "n_q", "n_heads", "hidden", "n_hidden", "bottleneck", "text_dropout", "freeze_lora"):
+            if k in margs: setattr(a, k, margs[k])
+        print(f"[train] warm start from {a.init_from} (step {margs.get('best_step', 'final')})", flush=True)
+    else:
+        model = M.build(a, dev); model.train()
     opt = torch.optim.AdamW(M.trainable_groups(model, a.lr_lora, a.lr_head, a.wd), betas=(0.9, 0.95))
     base_lrs = [g["lr"] for g in opt.param_groups]
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad); print(f"[train] trainable params {n_tr / 1e6:.1f}M", flush=True)

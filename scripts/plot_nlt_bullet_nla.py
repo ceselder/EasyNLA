@@ -33,31 +33,31 @@ def save(fig, rep, stem):
 def fig_gain_bits(d, rep, out):
     srcs = [(k, n, c) for k, n, c in SRC if k in d]
     if not srcs: return
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5.2))
-    ax = axes[0]; xs = np.arange(len(srcs))
-    gains = [d[k]["overall"]["gain"] for k, _, _ in srcs]; dm = [d[k]["overall"]["gain_dm"] for k, _, _ in srcs]
-    ax.bar(xs - 0.2, gains, 0.4, color=[c for _, _, c in srcs], label="own text")
-    ax.bar(xs + 0.2, dm, 0.4, color=[c for _, _, c in srcs], alpha=0.35, hatch="//", label="depth-matched wrong text")
-    bl = d.get("baselines")
-    if bl:
-        emp = np.mean([d[k]["overall"]["fve_empty"] for k, _, _ in srcs])
-        if "mlp_depth_matched" in bl: ax.axhline(bl["mlp_depth_matched"]["fve"] - emp, color=SAGE, ls="--", lw=2, label=f"h_i-only MLP told (i, j): +{bl['mlp_depth_matched']['fve'] - emp:.3f}")
-        if "mlp_nodepth_matched" in bl: ax.axhline(bl["mlp_nodepth_matched"]["fve"] - emp, color=GREY, ls=":", lw=2, label=f"h_i-only MLP, no depth: {bl['mlp_nodepth_matched']['fve'] - emp:+.3f}")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5.4))
+    ax = axes[0]; xs = np.arange(len(srcs)); w = 0.27
+    emp = [d[k]["overall"]["fve_empty"] for k, _, _ in srcs]; own = [d[k]["overall"]["fve_all"] for k, _, _ in srcs]; dm = [d[k]["overall"]["fve_dm"] for k, _, _ in srcs]
+    ax.bar(xs - w, emp, w, color=GREY, alpha=0.5, label="no text (same net, empty string)")
+    ax.bar(xs, own, w, color=[c for _, _, c in srcs], label="own text")
+    ax.bar(xs + w, dm, w, color=[c for _, _, c in srcs], alpha=0.35, hatch="//", label="depth-matched WRONG text (another pair, same i, j)")
+    bl = d.get("baselines") or {}
+    if "mlp_depth_extra" in bl: ax.axhline(bl["mlp_depth_extra"]["fve"], color=SAGE, ls="--", lw=2, label=f"h_i-only MLP TOLD (i, j), 100k pairs: {bl['mlp_depth_extra']['fve']:.3f}")
+    if "mlp_nodepth_extra" in bl: ax.axhline(bl["mlp_nodepth_extra"]["fve"], color=INK, ls=":", lw=2, label=f"h_i-only MLP, no depth, 100k pairs: {bl['mlp_nodepth_extra']['fve']:.3f}")
     ax.axhline(0, color=INK, lw=0.8)
-    ax.set_xticks(xs); ax.set_xticklabels([n.replace(" ", "\n", 1) for _, n, _ in srcs]); ax.set_ylabel("FVE of Δ gained over the empty-text baseline")
-    ax.set_title("Text buys reconstruction of Δ = h_j − h_i\n(held-out pairs; gain over the same net with no text)"); ax.legend(frameon=False, fontsize=10); ax.spines[["top", "right"]].set_visible(False)
+    ax.set_xticks(xs); ax.set_xticklabels([n.replace(" ", "\n", 1) for _, n, _ in srcs]); ax.set_ylabel("FVE of Δ = h_j − h_i on held-out pairs")
+    ax.set_title("Text buys a few % of the variance of Δ,\nabout what the forbidden depth input is worth"); ax.legend(frameon=False, fontsize=9, loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
     ax = axes[1]
-    b_pair = [d[k]["overall"]["bits_mean"] for k, _, _ in srcs]; b_bul = [d[k]["overall"]["bits_per_bullet"] for k, _, _ in srcs]
-    b_tok = [d[k]["overall"]["bits_per_token"] or 0 for k, _, _ in srcs]
-    ax.bar(xs - 0.27, b_pair, 0.27, color=[c for _, _, c in srcs], label="per text")
-    ax.bar(xs, b_bul, 0.27, color=[c for _, _, c in srcs], alpha=0.6, label="per bullet")
-    ax.bar(xs + 0.27, np.array(b_tok) * 10, 0.27, color=[c for _, _, c in srcs], alpha=0.3, label="per 10 tokens")
+    b_pair = [d[k]["overall"]["bits_median"] for k, _, _ in srcs]; nb = [d[k]["bullets_per_row"] for k, _, _ in srcs]; nt = [d[k].get("tokens_per_row") or np.nan for k, _, _ in srcs]
+    b_bul = [b / n for b, n in zip(b_pair, nb)]; b_tok = [b / t if t and np.isfinite(t) else 0 for b, t in zip(b_pair, nt)]
+    ax.bar(xs - w, b_pair, w, color=[c for _, _, c in srcs], label="per text (median over pairs)")
+    ax.bar(xs, b_bul, w, color=[c for _, _, c in srcs], alpha=0.6, label="per bullet / sentence")
+    ax.bar(xs + w, np.array(b_tok) * 10, w, color=[c for _, _, c in srcs], alpha=0.3, label="per 10 tokens")
+    for x, b in zip(xs, b_pair): ax.text(x - w, b + 0.03 * max(1e-3, max(b_pair)), f"{b:.2f}", ha="center", fontsize=11)
     ax.axhline(0, color=INK, lw=0.8); d_eff = np.mean([d[k]["d_eff"] for k, _, _ in srcs])
-    ax.set_xticks(xs); ax.set_xticklabels([n.replace(" ", "\n", 1) for _, n, _ in srcs]); ax.set_ylabel(f"Gaussian-equivalent bits (d_eff = {d_eff:.0f})")
-    ax.set_title("Bits per text are small once the residual's\neffective dimension is used, not d = 4096"); ax.legend(frameon=False, fontsize=10); ax.spines[["top", "right"]].set_visible(False)
+    ax.set_xticks(xs); ax.set_xticklabels([n.replace(" ", "\n", 1) for _, n, _ in srcs]); ax.set_ylabel(f"Gaussian-equivalent bits (d_eff = {d_eff:.0f} of 4096)")
+    ax.set_title("A text is worth a few bits about Δ at the residual's\neffective dimension (d = 4096 would say ~20x more)"); ax.legend(frameon=False, fontsize=9); ax.spines[["top", "right"]].set_visible(False)
     save(fig, rep, "fig_gain_bits")
-    out["fig_gain_bits"] = {"sources": [k for k, _, _ in srcs], "gain_own": gains, "gain_dm": dm, "bits_per_text": b_pair, "bits_per_bullet": b_bul, "bits_per_token": b_tok, "d_eff": d_eff,
-                            "baseline_lines": {k: bl[k]["fve"] for k in ("mlp_depth_matched", "mlp_nodepth_matched") if bl and k in bl}}
+    out["fig_gain_bits"] = {"sources": [k for k, _, _ in srcs], "fve_empty": emp, "fve_own": own, "fve_dm": dm, "bits_median_per_text": b_pair, "bits_per_bullet": b_bul, "bits_per_token": b_tok, "d_eff": d_eff,
+                            "baseline_lines": {k: bl[k]["fve"] for k in ("mlp_depth_extra", "mlp_nodepth_extra") if k in bl}}
 
 
 def fig_controls(d, rep, out):
