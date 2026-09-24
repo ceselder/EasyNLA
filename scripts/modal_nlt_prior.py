@@ -55,6 +55,12 @@ def manifest(tag: str, extra: str = "", data: str = DATA):
 
 
 @app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
+def many(items: list):
+    """several `module args` strings run sequentially in ONE container (nlt.prior.run_many)"""
+    return _run([sys.executable, "-m", "nlt.prior.run_many"] + list(items))
+
+
+@app.function(gpu=GPU, timeout=6 * 3600, **COMMON)
 def script(path: str, extra: str = ""):
     return _run([sys.executable, f"{REPO_REMOTE}/{path}"] + extra.split())
 
@@ -69,6 +75,7 @@ def main(task: str = "train", tag: str = "dev", extra: str = "", data: str = DAT
     if task == "train": print("rc", train.remote(tag, extra, data))
     elif task == "bits": print("rc", bits.remote(tag, extra, data))
     elif task == "manifest": print("rc", manifest.remote(tag, extra, data))
+    elif task == "many": print("rc", many.remote([x for x in extra.split("|||") if x.strip()]))
     elif task == "script": print("rc", script.remote(path, extra))
     elif task == "cat": cat.remote(path)
     else: raise SystemExit(task)
