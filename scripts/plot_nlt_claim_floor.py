@@ -43,7 +43,7 @@ def main():
     json.dump(data, open(os.path.join(a.out_dir, "data", "claim_sensitivity_floor.json"), "w"), indent=1)
 
     crits = [c for c in CRITICS if c in data["critics"]]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5.2), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 6.2), sharey=True)
     colors = ["#9ecae1", "#4292c6", "#e6550d", "#fd8d3c", "#a63603"]
     for ax, (src, title) in zip(axes, SRCS.items()):
         rows = [c for c in crits if src in data["critics"][c]]; x = np.arange(len(rows)); w = 0.16
@@ -54,8 +54,8 @@ def main():
         ax.axhline(0.5, color="grey", ls=":", lw=1); ax.text(len(rows) - 0.5, 0.505, "chance", ha="right", fontsize=11, color="grey")
         ax.set_xticks(x); ax.set_xticklabels(rows, rotation=20, ha="right", fontsize=11); ax.set_title(title, fontsize=13); ax.set_ylim(0.3, 1.0); ax.tick_params(labelsize=12)
     axes[0].set_ylabel("P(true description scores above the variant)", fontsize=12)
-    fig.suptitle("No critic separates a claim from its counter-claim: twins sit at 0.47-0.66 while paraphrases are\nnear 0.5 (invariance) -- exact bits, all scored pairs, fixed val set", fontsize=14)
-    fig.legend(loc="lower center", ncol=5, fontsize=10.5, frameon=False, bbox_to_anchor=(0.5, -0.01)); fig.tight_layout(rect=(0, 0.06, 1, 0.94))
+    fig.suptitle("No critic separates a claim from its counter-claim: P(true > twin) is 0.47-0.66 for every critic\n(gate 0.65, chance 0.5); paraphrases score 0.5-0.7 -- exact bits, all scored pairs, fixed val set", fontsize=14)
+    fig.legend(loc="lower center", ncol=3, fontsize=11, frameon=False, bbox_to_anchor=(0.5, 0.0)); fig.tight_layout(rect=(0, 0.11, 1, 0.93))
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.out_dir, f"claim_sensitivity_floor.{ext}"), dpi=150)
     print(json.dumps({c: {s: {k: round(v["p_orig_preferred"], 3) for k, v in d.items() if isinstance(v, dict)} for s, d in cs.items()} for c, cs in data["critics"].items()}, indent=0))
 
