@@ -10,6 +10,13 @@ from nlt.data.extract import K_LO
 from nlt.data.finalize import J_LO, J_HI
 
 
+def anchor_col(nstore) -> str:
+    """meta column of a neighbour store holding the ANCHOR's pos_idx: infra's extract_neighbors.py writes nbr_of (#556); anchor_pos_idx is the alias."""
+    for c in ("nbr_of", "anchor_pos_idx"):
+        if c in nstore.meta: return c
+    raise KeyError("neighbour store meta needs nbr_of (or anchor_pos_idx)")
+
+
 class StratifiedSampler:
     def __init__(self, store, n_classes: int = 16, per_class: int = 8, j_lo: int = J_LO, j_hi: int = J_HI, i_lo: int = K_LO):
         self.store, self.n_classes, self.per_class, self.j_lo, self.j_hi, self.i_lo = store, n_classes, per_class, j_lo, j_hi, i_lo
@@ -23,8 +30,9 @@ class StratifiedSampler:
             if (i, j) in seen and len(seen) < (self.j_hi - self.j_lo + 1) * 10: continue
             seen.add((i, j)); classes.append((i, j))
         rows, I, J, cls = [], [], [], []
+        allowed = getattr(self, "allowed", None)                                  # optional row subset (e.g. anchors that have neighbours)
         for c, (i, j) in enumerate(classes):
-            r = torch.randperm(self.store.N, generator=gen)[: self.per_class]
+            r = torch.randperm(self.store.N, generator=gen)[: self.per_class] if allowed is None else allowed[torch.randperm(allowed.numel(), generator=gen)[: self.per_class]]
             rows.append(r); I += [i] * self.per_class; J += [j] * self.per_class; cls += [c] * self.per_class
         return torch.cat(rows), torch.tensor(I), torch.tensor(J), torch.tensor(cls)
 
@@ -59,7 +67,7 @@ class StratifiedSampler:
         if not hasattr(self, "_nb_rows"):
             import collections
             self._nb_rows = collections.defaultdict(list)
-            for r_, a_ in enumerate(nstore.meta["anchor_pos_idx"].values): self._nb_rows[int(a_)].append(r_)
+            for r_, a_ in enumerate(nstore.meta[anchor_col(nstore)].values): self._nb_rows[int(a_)].append(r_)
             self._pos = self.store.meta["pos_idx"].values
         out, src = [], []
         for r in rows.tolist():

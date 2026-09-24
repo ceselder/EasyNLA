@@ -60,6 +60,7 @@ def parse():
     p.add_argument("--class-j-min-until", type=int, default=40)
     p.add_argument("--dist-types", default="samedoc,crossdoc", help="redteam #228 H1: comma list of distractor types filling the --n-dist slots in order: samedoc (other position of the SAME document, same (i,j)), crossdoc (in-class other document), wrongj (own position, other j; pays for depth cues -- off by default), neighbor (same document, position p+-k from --neighbor-dir: same topic and place, different next token -- the hard negative for next-token content, board #535). Remaining slots = crossdoc.")
     p.add_argument("--dist-weights", default=None, help="comma list of per-slot weights for the content term: content = own - sum_k w_k PMI(dist_k) / sum_k w_k (default: equal). E.g. '1,0' with samedoc,crossdoc = position/local content only; crossdoc still scored + logged (board #555: all gain so far is crossdoc = topic)")
+    p.add_argument("--neighbor-only-anchors", action="store_true", help="restrict the stratified sampler to train-store rows that have neighbours in --neighbor-dir (infra #556 extracted the proposer's train20k positions)")
     p.add_argument("--neighbor-dir", default=None, help="ActStore-layout dir (split 'train': acts_*.npy + meta_*.parquet) of NEIGHBOUR positions; meta needs anchor_pos_idx (the anchor's pos_idx in --data-dir train) and offset")
     p.add_argument("--content-abs", type=float, default=0.2, help="redteam #228 H2: reward = content + content_abs x PMI(own), so junk that hurts distractors more than itself does not win")
     p.add_argument("--content-abs-clip", action="store_true", help="DECISIONS v1.23: use max(PMI(own), 0) in the absolute term (a mismatcher critic gives negative PMI(own) on true text)")
@@ -309,9 +310,13 @@ def main():
         print(f"[rl] distractor weights {dist_w.tolist()} over slots {a.dist_types}", flush=True)
     nstore = None
     if a.neighbor_dir:
-        nstore = ActStore(a.neighbor_dir, "train", device="cpu")
-        n_anch = int(nstore.meta["anchor_pos_idx"].nunique()); cover = float(store.meta["pos_idx"].isin(set(nstore.meta["anchor_pos_idx"].tolist())).mean())
-        print(f"[rl] neighbour store: {nstore.N} rows for {n_anch} anchors (covers {cover:.1%} of the train store), offsets {sorted(nstore.meta['offset'].unique().tolist()) if 'offset' in nstore.meta else '?'}", flush=True)
+        from nlt.rl.sampler import anchor_col
+        nstore = ActStore(a.neighbor_dir, "train", device="cpu"); acol = anchor_col(nstore)
+        anchors = set(nstore.meta[acol].tolist()); has_nb = store.meta["pos_idx"].isin(anchors).values
+        print(f"[rl] neighbour store: {nstore.N} rows for {len(anchors)} anchors (covers {has_nb.mean():.1%} = {int(has_nb.sum())} of the train store rows), offsets {sorted(nstore.meta['offset'].unique().tolist()) if 'offset' in nstore.meta else '?'}", flush=True)
+        if a.neighbor_only_anchors:
+            sampler.allowed = torch.as_tensor(np.nonzero(has_nb)[0], dtype=torch.long); assert sampler.allowed.numel() >= 4 * a.per_class, "too few anchors with neighbours in the train store"
+            print(f"[rl] sampler restricted to the {sampler.allowed.numel()} rows that have neighbours (--neighbor-only-anchors)", flush=True)
     cot = Listener(scorer, a, store, sampler, paraphraser=para) if (a.cotrain and not a.stub_critic and a.critic) else None
     frozen = make_scorer(a, cdev) if (cot is not None and a.frozen_critic_eval) else None
     cross = {}
