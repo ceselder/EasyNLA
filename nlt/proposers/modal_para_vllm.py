@@ -121,6 +121,9 @@ def para_files(files: list[str], source: str, verbosities: list[int], out_root: 
         out = pd.DataFrame(rows)
         stem = os.path.basename(f).replace(".parquet", "")
         stem = stem[5:] if stem.startswith("part_") else stem
+        top = os.path.basename(os.path.dirname(os.path.dirname(f)))          # e.g. ref_v1_20: several dump dirs share one stem
+        if top != source and not top.startswith(source.split("-")[0]) or source == "ref_v1":
+            stem = f"{top}_{stem}"
         for ho, g in (out.groupby("heldout") if len(out) else []):
             d = f"{out_root}/heldout/{source}" if ho else f"{out_root}/{source}/{split}"
             os.makedirs(d, exist_ok=True)
