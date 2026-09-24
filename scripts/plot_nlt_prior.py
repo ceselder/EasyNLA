@@ -128,8 +128,8 @@ def main():
     cols = {arms[0]: C_PRIOR}; pal = [C_THIRD, "#eda100", "#4a3aa7", "#e87ba4", C_BASE]
     for k, t in enumerate(arms[1:]): cols[t] = pal[k % len(pal)]
     labels = {"main_v": "168M, velocity head (main)", "bidir_v": "168M, bidirectional tail", "big_v": "480M", "xl_v": "1.25B", "main_x0res": "168M, x0-loss weighting", "punc03_v": "168M, text dropout 0.3", "punc05_v": "168M, text dropout 0.5", "nulldm_v": "168M, null-dm regulariser 0.3"}
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4.2))
-    for t in arms:
+    fig, ax = plt.subplots(1, 2, figsize=(10.5, 4.4)); cols = {"main_v": C_PRIOR, "big_v": C_THIRD, "xl_v": C_BASE, "nulldm_v": "#eda100"}
+    for t in [t for t in ("main_v", "big_v", "xl_v", "nulldm_v") if t in curves]:
         e = curves[t]
         if not e or "lens_L1/exact_content_bits" not in e[0]: continue
         r = [d["rows"] / 1e6 for d in e]
@@ -138,8 +138,9 @@ def main():
     ax[0].axhline(0, color=C_GRAY, lw=1); ax[1].axhline(0.5, color=C_GRAY, lw=1, ls="--"); ax[1].set_ylim(0.3, 1.0)
     ax[0].set_xlabel("training rows seen (millions)"); ax[1].set_xlabel("training rows seen (millions)")
     ax[0].set_ylabel("content bits: PMI(true text) - PMI(wrong text, same depth)"); ax[1].set_ylabel("P(true text beats depth-matched wrong text)")
-    ax[0].set_title("Content bits on held-out lens-diff L1 keep rising with rows\n(spot exact bits, Heun 16, n=128)"); ax[1].set_title("Pairwise win rate over a depth-matched wrong text\n(same rows)")
-    ax[0].legend(fontsize=9); savefig(fig, "fig_prior_curves")
+    ax[0].set_title("Content bits keep rising with rows and with size\n(held-out lens-diff L1, spot exact Heun 16, n=128)"); ax[1].set_title("Win rate over a depth-matched wrong text\n(same rows)")
+    ax[0].set_ylabel("content bits (true − wrong text, same depth)"); ax[1].set_ylabel("P(true text beats the wrong text)")
+    ax[0].legend(fontsize=9, loc="upper left"); savefig(fig, "fig_prior_curves")
     # ---------------- final tables (Heun 64, last night's rows)
     base = load_baseline(); bits = {t: load_bits(a.results, t) for t in arms}; twins = {t: load_twins(a.results, t) for t in arms + [x for x in a.twin_arms.split(",") if x]}; twins = {t: v for t, v in twins.items() if v}
     json.dump({"what": "exact held-out bits (probability-flow ODE, Heun 64, paired Hutchinson probes, same 512 fixed-val rows and controls as last night's card); content = PMI(z) - PMI(z_dm); z_dm = another pair's text at the same (i,j); z_rp = a random pair's text; shuf_words = own words permuted",
@@ -153,32 +154,34 @@ def main():
             c = [src.get(s, {}).get("content", np.nan) for s in have]; ce = [src.get(s, {}).get("content_sem", 0) or 0 for s in have]; p = [src.get(s, {}).get("p_z_gt_dm", np.nan) for s in have]
             ax[0].bar(x + (k - 0.5) * w, c, w, yerr=ce, color=col, label=lab, capsize=2, edgecolor="white", linewidth=1.5); ax[1].bar(x + (k - 0.5) * w, p, w, color=col, label=lab, edgecolor="white", linewidth=1.5)
         for xx in ax: xx.set_xticks(x); xx.set_xticklabels([NICE.get(s, s) for s in have], rotation=35, ha="right")
-        ax[0].axhline(0, color=C_GRAY, lw=1); ax[0].set_ylabel("content bits = PMI(true text) - PMI(wrong text, same depth)"); ax[1].axhline(0.5, color=C_GRAY, ls="--", lw=1); ax[1].set_ylim(0.4, 1.0); ax[1].set_ylabel("P(true text beats depth-matched wrong text)")
+        ax[0].axhline(0, color=C_GRAY, lw=1); ax[0].set_ylabel("content bits (true text − wrong text, same depth)"); ax[1].axhline(0.5, color=C_GRAY, ls="--", lw=1); ax[1].set_ylim(0.4, 1.0); ax[1].set_ylabel("P(true text beats the wrong text)")
         mv = np.nanmean([main_sets.get(s, {}).get("content", np.nan) for s in have if s in base["sets"]]); bv = np.nanmean([base["sets"][s]["content"] for s in have if s in main_sets and s in base["sets"]])
-        ax[0].set_title(f"Content bits per text source, exact Heun 64, same 512 rows\n(mean over shared sources: prior {mv:.1f} vs adapter {bv:.1f})"); ax[1].set_title("Win rate over a depth-matched wrong text\n(0.5 = chance)")
+        ax[0].set_title(f"Content bits: prior {mv:.1f} vs adapter {bv:.1f}\n(mean over shared sources)"); ax[1].set_title("Win rate over a depth-matched wrong text\n(0.5 = chance)")
+        fig.suptitle("The diffusion prior roughly triples the content bits of every text source (exact Heun 64, same 512 held-out rows)", fontsize=14, y=1.02)
         ax[0].legend(fontsize=9, loc="upper left"); savefig(fig, "fig_prior_headline")
         # controls
-        fig, ax = plt.subplots(1, 2, figsize=(10.5, 4.6)); keys = [("pmi", "true text", C_PRIOR), ("z_dm", "wrong text, same depth", C_GRAY), ("z_rp", "random pair's text", C_GRAY2), ("shuf_words", "own words shuffled", "#e34948")]
+        fig, ax = plt.subplots(1, 2, figsize=(11.5, 4.8)); keys = [("pmi", "true text", C_PRIOR), ("z_dm", "wrong text, same depth", C_GRAY), ("z_rp", "random pair's text", C_GRAY2), ("shuf_words", "own words shuffled", "#e34948")]
         w = 0.2
         for k, (key, lab, col) in enumerate(keys):
             v = [main_sets.get(s, {}).get(key, np.nan) for s in have]; ax[0].bar(x + (k - 1.5) * w, v, w, color=col, label=lab, edgecolor="white", linewidth=1)
-        ax[0].set_xticks(x); ax[0].set_xticklabels([NICE.get(s, s) for s in have], rotation=35, ha="right"); ax[0].axhline(0, color=C_GRAY, lw=1); ax[0].set_ylabel("exact bits over the same model without text")
+        ax[0].set_xticks(x); ax[0].set_xticklabels([NICE.get(s, s) for s in have], rotation=35, ha="right"); ax[0].axhline(0, color=C_GRAY, lw=1); ax[0].set_ylabel("exact bits vs the same model without text")
         lo = np.nanmin([main_sets.get(s, {}).get(k_, 0) or 0 for s in have for k_ in ("pmi", "z_dm", "z_rp")] + [-5]); ax[0].set_ylim(max(lo * 1.3, -80), None)
-        ax[0].set_title("Controls: the true text earns bits, a wrong or random\ntext loses them (word-shuffle bars clipped)"); ax[0].legend(fontsize=9, loc="lower left")
+        ax[0].set_title("True text +, shuffled words ≈ half,\nwrong or random text −"); ax[0].legend(fontsize=9, loc="lower left")
         for k, (src, lab, col) in enumerate(((main_sets, "diffusion prior", C_PRIOR), (base["sets"], "last night's adapter", C_BASE))):
             v = [src.get(s, {}).get("z_rp", np.nan) for s in have]; ax[1].bar(x + (k - 0.5) * 0.38, v, 0.38, color=col, label=lab, edgecolor="white", linewidth=1.5)
-        ax[1].set_xticks(x); ax[1].set_xticklabels([NICE.get(s, s) for s in have], rotation=35, ha="right"); ax[1].axhline(0, color=C_GRAY, lw=1); ax[1].set_ylabel("exact bits for a RANDOM pair's text (presence bonus)")
-        ax[1].set_title("Text-presence bonus: bits a random text earns\n(should be <= 0)"); ax[1].legend(fontsize=9); savefig(fig, "fig_prior_controls")
+        ax[1].set_xticks(x); ax[1].set_xticklabels([NICE.get(s, s) for s in have], rotation=35, ha="right"); ax[1].axhline(0, color=C_GRAY, lw=1); ax[1].set_ylabel("exact bits for a random pair's text")
+        ax[1].set_title("No presence bonus at the final weights:\na random text loses bits"); ax[1].legend(fontsize=9); savefig(fig, "fig_prior_controls")
         # bands
-        bands = ["pre<=13", "workspace14-32", "motor>=33"]; bnice = {"pre<=13": "pre (j<=13)", "workspace14-32": "workspace (14-32)", "motor>=33": "motor (j>=33)"}
+        bands = ["pre<=13", "workspace14-32", "motor>=33"]; bnice = {"pre<=13": "pre (j ≤ 13, n≈115)", "workspace14-32": "workspace (14–32, n≈395)", "motor>=33": "motor (j ≥ 33, n=2)"}
         srcs = [s for s in ("lens_L1", "teacher_v1", "v0", "bullets") if s in main_sets]
-        fig, ax = plt.subplots(1, 2, figsize=(10.5, 4.4)); xb = np.arange(len(srcs)); w = 0.26
+        fig, ax = plt.subplots(1, 2, figsize=(10.5, 4.4), sharey=True); xb = np.arange(len(srcs)); w = 0.26
         for k, b in enumerate(bands):
             for q, (src, alpha) in enumerate(((main_sets, 1.0), (base["sets"], 0.45))):
                 v = [src.get(s, {}).get("bands", {}).get(b, {}).get("content", np.nan) for s in srcs]; e = [src.get(s, {}).get("bands", {}).get(b, {}).get("content_sem", 0) or 0 for s in srcs]
                 ax[q].bar(xb + (k - 1) * w, v, w, yerr=e, color=[C_PRIOR, C_THIRD, "#4a3aa7"][k], label=bnice[b], capsize=2, edgecolor="white", linewidth=1.5)
-        for q, ttl in enumerate(("Diffusion prior: content bits by depth band", "Last night's adapter critic: same rows")):
-            ax[q].set_xticks(xb); ax[q].set_xticklabels([NICE.get(s, s) for s in srcs], rotation=25, ha="right"); ax[q].axhline(0, color=C_GRAY, lw=1); ax[q].set_title(ttl); ax[q].set_ylabel("content bits (true - depth-matched wrong text)")
+        for q, ttl in enumerate(("Diffusion prior: the workspace band carries the bits", "Last night's adapter critic, same rows")):
+            ax[q].set_xticks(xb); ax[q].set_xticklabels([NICE.get(s, s) for s in srcs], rotation=25, ha="right"); ax[q].axhline(0, color=C_GRAY, lw=1); ax[q].set_title(ttl)
+        ax[0].set_ylabel("content bits (true − depth-matched wrong text)")
         ax[0].legend(fontsize=9); savefig(fig, "fig_prior_bands")
     # twins figure
     tw = twins.get(a.arm, {})
@@ -186,7 +189,7 @@ def main():
         items = []
         for man, key, lab in (("twinnext2_lensdiff_jlens_L1", "lens_L1", "lens-diff L1"), ("twinnext2_teacher_v1", "teacher_v1", "teacher sentences"), ("twinnext2_v0_ao_tsv1", "v0", "V0 verbalizer")):
             for v in ("twin_near", "twin_far"):
-                if man in tw and v in tw[man]: items.append((f"{lab}\n{v.replace('_', ' ')}", tw[man][v]["p_orig_preferred"], tw[man][v]["sem_p"], (base["twins"].get(key) or {}).get(v)))
+                if man in tw and v in tw[man]: items.append((f"{lab.replace(' sentences', '').replace(' verbalizer', '')}\n{v.replace('twin_', '')} twin", tw[man][v]["p_orig_preferred"], tw[man][v]["sem_p"], (base["twins"].get(key) or {}).get(v)))
         if "flip_bullets_sonnet_v1" in tw and "flip" in tw["flip_bullets_sonnet_v1"]:
             fb = tw["flip_bullets_sonnet_v1"]["flip"]; mse = base.get("bullets_flip_mse_reconstructor") or {}
             items.append(("Sonnet bullets\nclaim flip", fb["p_orig_preferred"], fb["sem_p"], mse.get("p_orig_beats_flip") if isinstance(mse, dict) else None))
@@ -196,7 +199,7 @@ def main():
             ax.bar(x + w / 2, [i[3] if i[3] is not None else np.nan for i in items], w, color=C_BASE, label="last night's best (adapter critic; bullets: MSE reconstructor)", edgecolor="white", linewidth=1.5)
             ax.axhline(0.5, color=C_GRAY, ls="--", lw=1); ax.axhline(0.65, color="#e34948", ls=":", lw=1.5); ax.text(len(items) - 0.5, 0.655, "acceptance bar 0.65", color="#e34948", ha="right", fontsize=10)
             ax.set_xticks(x); ax.set_xticklabels([i[0] for i in items], fontsize=10); ax.set_ylim(0.3, 1.0); ax.set_ylabel("P(true text beats its claim-flipped twin)")
-            best = max(i[1] for i in items); ax.set_title(f"Claim sensitivity: does the true text beat a one-word claim flip?\n(best cell {best:.2f}; 0.5 = chance, exact ODE Heun 32, paired)"); ax.legend(fontsize=9, loc="upper left")
+            n_pass = sum(1 for i in items if i[1] >= 0.65); ax.set_title(f"Claim sensitivity: the prior clears the 0.65 bar on {n_pass} of {len(items)} twin sets\n(P(true text > one-word claim flip); exact ODE Heun 32, paired; 0.5 = chance)"); ax.legend(fontsize=9, loc="upper left")
             savefig(fig, "fig_prior_twins")
     # ---------------- HTML section fragment
     write_section(a, arms, meta, bits, base, twins, smoke, curves)
