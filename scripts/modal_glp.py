@@ -275,6 +275,8 @@ def claims_text(root: str, shard: int = 0, nshards: int = 1, extra: str = "", fi
     vol_glp.reload()
     rc = _claims([f"{REPO_REMOTE}/scripts/claims_text.py", "--root", root, "--shard", str(shard), "--nshards", str(nshards), "--procs", "30"] + extra.split())
     if finalize_name:
+        if not finalize_name.startswith("v1_"):   # one-claim shards: rebuild family-1 claims first (write_internal dropped training anchors before e38e932+1)
+            rc = rc or _claims([f"{REPO_REMOTE}/scripts/claims_extract.py", "internal", "--root", root, "--names", finalize_name])
         rc = rc or _claims([f"{REPO_REMOTE}/scripts/claims_finalize.py", "--root", root, "--names", finalize_name, "--min-claims", "1", "--stats-tag", finalize_name])
     return rc
 

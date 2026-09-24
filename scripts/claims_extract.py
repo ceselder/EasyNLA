@@ -369,7 +369,8 @@ def write_internal(rows, path, dec, seed=0):
             c = internal_claims(r, rng, dec); want = draw_internal_type(r["anchor_id"])
             pick = [x for x in c if x[0] == want] or [x for x in c if x[0] == "next_token"]
             c = pick[:1]
-        else: c = internal_claims(r, rng, dec); ids.append(r["anchor_id"]); cl.append([x for _, x in c]); ty.append([t for t, _ in c])
+        else: c = internal_claims(r, rng, dec)
+        if c: ids.append(r["anchor_id"]); cl.append([x for _, x in c]); ty.append([t for t, _ in c])
     os.makedirs(os.path.dirname(path), exist_ok=True)
     pq.write_table(pa.table({"anchor_id": ids, "claims": cl, "types": ty}), path, compression="zstd")
 
@@ -377,7 +378,7 @@ def write_internal(rows, path, dec, seed=0):
 def cmd_internal(a):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.base, token=os.environ.get("HF_TOKEN"))
-    for f in sorted(glob.glob(f"{a.root}/text/text_*.jsonl.gz")):
+    for f in sorted(glob.glob(f"{a.root}/text/text_{a.names}.jsonl.gz")):
         name = os.path.basename(f)[5:-9]; rows = [json.loads(l) for l in gzip.open(f, "rt")]
         write_internal(rows, f"{a.root}/claims/internal_{name}.parquet", tok.decode, seed=a.seed); print(f"[internal] {name}: {len(rows)} anchors", flush=True)
 
@@ -390,7 +391,7 @@ def main():
     x.add_argument("--nshards", type=int, default=1); x.add_argument("--tok-budget", type=int, default=24576); x.add_argument("--limit-docs", type=int, default=0); x.add_argument("--tag", default="v1")
     x.add_argument("--docs-glob", default="docs_*.parquet"); x.add_argument("--min-anchors", type=int, default=2); x.add_argument("--max-anchors", type=int, default=4)
     x.add_argument("--one-claim", action="store_true", help="sample the claim family/type per anchor BEFORE generating (nla.flow.claims.draw_family): greedy only where needed, family-1 claims only for internal-drawn training anchors (val keeps all)")
-    i = sub.add_parser("internal"); i.add_argument("--base", default=BASE)
+    i = sub.add_parser("internal"); i.add_argument("--base", default=BASE); i.add_argument("--names", default="*")
     for q in (d, x, i): q.add_argument("--root", default=ROOT); q.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); {"docs": cmd_docs, "anchors": cmd_anchors, "internal": cmd_internal}[a.cmd](a)
 
