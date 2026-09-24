@@ -123,7 +123,8 @@ def main():
         for i, dd in enumerate(VD): by.setdefault(dd, []).append(i)
         gs = [sorted(v)[:5] for v in by.values() if len(v) >= 5]; ok = tot = 0
         for gidx in gs[:64]:
-            r = C.score(None, [VZ[j] for j in gidx for _ in range(5)], x=VX[gidx].repeat_interleave(5, 0), mode="fast", seed=0, groups=[j for j in gidx for _ in range(5)])
+            # 5 x 5 block: row i = activation of cut i (repeated), column j = explanation of cut j; same noise per row (groups = row id)
+            r = C.score(None, [VZ[j] for _ in gidx for j in gidx], x=VX[gidx].repeat_interleave(5, 0), mode="fast", seed=0, groups=[i for i in gidx for _ in range(5)])
             M = r["pmi"].view(5, 5); ok += ((M >= M.diagonal()[:, None]).sum(1) == 1).sum().item(); tot += 5   # strict winner only
         res["samedoc5_a2t_proxy"] = {"acc": ok / max(tot, 1), "groups": min(len(gs), 64), "chance": 0.2}
         print(f"[retrieval proxy] val1024 a2t top1 {100*res['proxy_val1024']['a2t_top1']:.1f}% (t2a {100*res['proxy_val1024']['t2a_top1']:.1f}%) | clean1 a2t top1 {100*res['proxy_clean1']['a2t_top1']:.1f}% | same-doc 5 cuts {100*res['samedoc5_a2t_proxy']['acc']:.1f}% (chance 20%)", flush=True)
