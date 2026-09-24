@@ -147,7 +147,7 @@ def fig_scaling(rep, out):
         ax.fill_between(x, lo, hi, color=CLAY, alpha=0.15, label="95% bootstrap CI of that gain (over val pairs)")
     ax.plot(x, [r["pair_specific_gain"] for r in main], marker="s", lw=2, color=CLAY, ls="--", label="bullets: pair-specific gain (own − depth-matched wrong list)")
     if fixb: ax.plot([r["n_pairs"] for r in fixb], [r["gain"] for r in fixb], marker="v", lw=2, color=SKY, label="bullets, fixed 2,400 steps at every size")
-    if absb and gainb: ax.plot([r["n_pairs"] for r in gainb], [r["gain"] for r in gainb], marker="o", lw=1.2, color=GREY, alpha=0.6, label="checkpoint picked on gain over own empty text (artefact: empty pathway broken there)")
+    # (checkpoints picked on gain-over-own-empty are an artefact -- empty pathway broken at the picked step -- and are listed in the table, not drawn)
     for text, c, nm in (("prose", INK, "Sonnet prose"), ("lens", GREY, "lens-diff text")):
         rr = sel(text, "abs_fve") or sel(text, "gain")
         if rr: ax.plot([r["n_pairs"] for r in rr], [r["gain"] for r in rr], marker="D", ms=9, lw=1.5, ls="-.", color=c, zorder=5, label=f"{nm}, same pairs, same recipe")
