@@ -84,7 +84,9 @@ def _run_one(name, cfg):
     os.makedirs(f"{BENCH}/results", exist_ok=True); os.makedirs(f"{BENCH}/logs", exist_ok=True)
     out, vlog, plog = f"{BENCH}/results/{name}.json", f"{BENCH}/logs/{name}.log", f"/tmp/{name}.log"
     env = {**os.environ, **cfg.get("env", {})}
-    if cfg.get("profile"): env["VLLM_TORCH_PROFILER_DIR"] = "/tmp/prof"
+    if cfg.get("profile"):                                                              # vLLM >= 0.29: profiler is a config, not an env var
+        env["VLLM_TORCH_PROFILER_DIR"] = "/tmp/prof"
+        cfg = {**cfg, "engine_kwargs": {**cfg["engine_kwargs"], "profiler_config": {"profiler": "torch", "torch_profiler_dir": "/tmp/prof"}}}
     cfg = {**cfg, "server_log": plog}
     cmd = [sys.executable, f"{REPO_REMOTE}/scripts/gemma_bench/worker.py", "--set-dir", SET, "--out", out, "--cfg", json.dumps(cfg)]
     print("[run]", name, json.dumps({k: v for k, v in cfg.items() if k != "hf_models"})[:1500], flush=True)

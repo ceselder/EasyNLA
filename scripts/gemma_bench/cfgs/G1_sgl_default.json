@@ -20,10 +20,12 @@
   "1024",
   "--chunked-prefill-size",
   "32768",
-  "--mem-fraction-static",
-  "0.88",
   "--max-prefill-tokens",
-  "32768"
+  "32768",
+  "--mem-fraction-static",
+  "0.80",
+  "--scheduler-recv-interval",
+  "16"
  ],
  "env": {},
  "health_path": "/health"

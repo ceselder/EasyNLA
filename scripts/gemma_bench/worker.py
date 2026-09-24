@@ -110,8 +110,8 @@ def run_offline(cfg, S, out_path):
 def profile_offline(llm, S, pcfg, col, sp):
     """torch profiler over one batch of n prompts x max_tokens tokens (decode-heavy steady state at the real batch size) -> kernel table"""
     import glob
-    pdir = os.environ.get("VLLM_TORCH_PROFILER_DIR")
-    if not pdir: return {"error": "VLLM_TORCH_PROFILER_DIR not set"}
+    pdir = pcfg.get("dir") or os.environ.get("VLLM_TORCH_PROFILER_DIR") or "/tmp/prof"
+    os.makedirs(pdir, exist_ok=True)
     rows = (S.get("g2a") or S["plain"])[: pcfg.get("n", 1024)]
     llm.generate([r[col] for r in rows], [sp(r, 4) for r in rows], use_tqdm=False)      # prefill everything once so the prefix cache is warm
     llm.start_profile()
