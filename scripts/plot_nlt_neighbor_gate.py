@@ -30,7 +30,7 @@ def main():
     rows.sort(key=lambda r: r["order"])
     if not rows: print("no neighbour rows"); return
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2, "axes.edgecolor": GRID})
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 11), dpi=150)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 11), dpi=150)
     x = np.arange(len(rows)); w = 0.36
     lab = [f"{r['critic_label']}\n{r['source_label']}" + (f"\nPMI {r['pmi_pos']:+.1f} bits" if r["pmi_pos"] is not None else "") for r in rows]
     for ax, km, kp, ylab in ((ax1, "p_m1", "p_p1", "P(bits at the described position\n> bits one token over)"), (ax2, "share_m1", "share_p1", "position-specific share of PMI\n1 − PMI(neighbour) / PMI(position)")):
@@ -50,10 +50,11 @@ def main():
             ax.axhline(0, color=INK2, lw=0.9); ax.set_ylim(-0.05, 1.0); ax.set_title("(b) how much of the description's credit is specific to the position?", loc="left", fontsize=13, fontweight="bold")
             for i, r in enumerate(rows):
                 if r["pmi_pos"] is not None and r["pmi_pos"] <= 0: ax.text(i, 0.02, "undefined:\ntext scores\nbelow silence", ha="center", va="bottom", fontsize=8.5, color=INK2)
-        ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=9); ax.set_ylabel(ylab); ax.set_xlim(-0.6, len(rows) - 0.4)
+        ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=8.5); ax.set_ylabel(ylab); ax.set_xlim(-0.6, len(rows) - 0.4)
         ax.grid(axis="y", color=GRID, zorder=0); [ax.spines[s].set_visible(False) for s in ("top", "right")]
     h, l = ax1.get_legend_handles_labels(); fig.legend(h, l, frameon=False, fontsize=10, loc="upper left", bbox_to_anchor=(0.01, 0.895), ncol=2, columnspacing=1.6)
-    fig.suptitle("\n".join(textwrap.wrap("The critics are position-blind: with the target activations moved one token earlier or later, the wider adapter keeps 80–98% of a description's bits and even the 8B-encoder critics keep about half; the described position wins only 51–63% of pairwise comparisons (gate 65%, chance 50%) — the activation-side twin of the claim result (fixed validation pairs, neighbour store, exact ODE bits)", 100)), x=0.01, y=0.995, ha="left", va="top", fontsize=14)
+    _ps = [r[k] for r in rows for k in ("p_m1", "p_p1") if r.get(k) is not None]
+    fig.suptitle("\n".join(textwrap.wrap(f"The critics are largely position-blind: with the target activations moved one token earlier or later, the wider adapter keeps 80–98% of a description's bits on every free-text register and the better encoders keep 20–60% on lens text; the described position wins only {100*min(_ps):.0f}–{100*max(_ps):.0f}% of pairwise comparisons (gate 65%, chance 50%) — one cell of {len(rows)} clears the gate (fixed validation pairs, neighbour store, exact ODE bits)", 100)), x=0.01, y=0.995, ha="left", va="top", fontsize=14)
     fig.text(0.01, 0.004, "Redteam's EVALS 9g, data/neighbor_control_*.json (exact bits, Heun 32, paired probes; n per bar 500–1000 pairs). The same text z is scored at (h_i, h_j) of the described position and at the same layers one token earlier / later.", fontsize=9.5, color=INK2)
     fig.subplots_adjust(left=0.09, right=0.99, top=0.80, bottom=0.10, hspace=0.62)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
