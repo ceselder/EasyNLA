@@ -52,7 +52,7 @@ def sample_subset(claims, K, rng=random):
 import zlib as _zlib
 
 FAMILY_SHARES = {"internal": 0.25, "text": 0.25, "semantic": 0.50}   # Gemma-4 semantic claims are ~free: half the activations get a semantic claim (was .4/.4/.2 with Sonnet)
-INTERNAL_TYPES = {"next_token": 1.0, "top_candidates": 1.0, "entropy": 1.0, "jlens": 1.0, "greedy": 1.0}
+INTERNAL_TYPES = {"next_token": 1.0, "top_candidates": 1.0, "entropy": 1.0, "jlens": 1.0, "greedy": 0.0}   # greedy dropped Sep 24: its vLLM pass cost ~40 % of extraction time
 TEXT_TYPE_WEIGHTS = {"unfinished_word": 2.0, "last_word": 2.0, "sentence_so_far": 1.5, "position": 1.5}   # others 1.0; types drawn among those available
 
 

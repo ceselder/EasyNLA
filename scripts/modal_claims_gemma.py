@@ -5,8 +5,8 @@
 Outputs under /vol_glp/claims/gemma (own dir); reads the text shards in /vol_glp/claims/text; weights from the shared HF cache /vol_glp/hf."""
 import os, sys
 import modal
-for _p in (os.path.dirname(os.path.abspath(__file__)),):
-    if _p not in sys.path: sys.path.insert(0, _p)
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.join(os.environ.get("PYTHONPATH", "/root/easyNLA").split(":")[0], "scripts")):
+    if os.path.isdir(_p) and _p not in sys.path: sys.path.insert(0, _p)
 from modal_nla_exp import SECRETS, REPO_LOCAL, REPO_REMOTE, REPO_IGNORE  # noqa: E402
 
 vol_glp = modal.Volume.from_name("nla-glp")

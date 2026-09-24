@@ -36,9 +36,13 @@ N_CONT, N_GREEDY, MIN_PREFIX, MAX_PREFIX = 64, 16, 32, 1024
 
 
 # ------------------------------------------------------------------------------------------------------------------- docs
+SKIP_FIRST = 0   # --skip-first: pass over the first N items of every sub-stream (later tags reach fresh documents without re-reading earlier ones)
+
+
 def _hf(name, *args, **kw):
     from datasets import load_dataset
-    return load_dataset(name, *args, streaming=True, token=os.environ.get("HF_TOKEN"), **kw)
+    ds = load_dataset(name, *args, streaming=True, token=os.environ.get("HF_TOKEN"), **kw)
+    return ds.skip(SKIP_FIRST) if SKIP_FIRST else ds
 
 
 def _chat_render(turns, rng):
@@ -130,6 +134,8 @@ def _gen_source(src, n, rng, sl=(0, 1)):
 
 
 def cmd_docs(a):
+    global SKIP_FIRST
+    SKIP_FIRST = a.skip_first
     si, sk = (int(x) for x in a.slice.split("/")); rng = random.Random(a.seed * 1000 + si)
     n_src = max(1, round(a.n_docs * SOURCES[a.source]))
     if a.source not in ("ffw", "multi"): n_src = max(1, math.ceil(n_src / sk))          # sliced sub-stream lists keep the per-sub-stream count
@@ -234,6 +240,18 @@ def cmd_anchors(a):
     print(f"[anchors {a.shard}] HF forward done: {n_anc} anchors, {sum(len(w['ids']) for w in W)} tokens in {t_fwd:.0f}s", flush=True)
     del model, WU, J42, norm, layers, inner, owner; import gc; gc.collect(); torch.cuda.empty_cache()
     # ---- vLLM greedy 16-token continuation of every anchor prefix (with --one-claim: only where the claim will be used) ----
+    if a.one_claim:
+        from nla.flow.claims import INTERNAL_TYPES
+        if not INTERNAL_TYPES.get("greedy"): a.no_greedy = True
+    if getattr(a, "no_greedy", False):
+        greedy = {(wi, p): [] for wi, w in enumerate(W) for p, _ in w["anchors"]}; t_gen = 0.0; agree = float("nan")
+        print(f"[anchors {a.shard}] greedy continuation skipped (no claim type needs it)", flush=True)
+    else:
+        greedy, t_gen, agree = _greedy(a, W, rec, base, t0, t_fwd, is_val_doc)
+    _write(a, W, rec, greedy, tok, piece, docs, t0, t_fwd, t_gen, agree)
+
+
+def _greedy(a, W, rec, base, t0, t_fwd, is_val_doc):
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
     from nla.utils.vllm_steer import vllm_attn_kwargs
@@ -253,6 +271,11 @@ def cmd_anchors(a):
     t_gen = time.time() - t0 - t_fwd
     agree = float(np.mean([greedy[k][0] == rec[k][2][0] for k in keys if greedy[k]])) if keys else float("nan")
     print(f"[anchors {a.shard}] vLLM greedy done in {t_gen:.0f}s; HF top-1 == vLLM greedy first token on {100 * agree:.1f}% of anchors", flush=True)
+    return greedy, t_gen, agree
+
+
+def _write(a, W, rec, greedy, tok, piece, docs, t0, t_fwd, t_gen, agree):
+    from nla.val_split import is_val_doc
     # ---- write ----
     out, txt = [], []
     for wi, w in enumerate(W):
@@ -362,7 +385,7 @@ def cmd_internal(a):
 def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("docs"); d.add_argument("--source", required=True, choices=list(SOURCES)); d.add_argument("--n-docs", type=int, required=True)
-    d.add_argument("--part-size", type=int, default=5000); d.add_argument("--tag", default="v1"); d.add_argument("--slice", default="0/1", help="i/k: this worker's slice"); d.add_argument("--dedupe-existing", action="store_true")
+    d.add_argument("--part-size", type=int, default=5000); d.add_argument("--tag", default="v1"); d.add_argument("--slice", default="0/1", help="i/k: this worker's slice"); d.add_argument("--dedupe-existing", action="store_true"); d.add_argument("--skip-first", type=int, default=0)
     x = sub.add_parser("anchors"); x.add_argument("--base", default=BASE); x.add_argument("--layer", type=int, default=42); x.add_argument("--shard", type=int, default=0)
     x.add_argument("--nshards", type=int, default=1); x.add_argument("--tok-budget", type=int, default=24576); x.add_argument("--limit-docs", type=int, default=0); x.add_argument("--tag", default="v1")
     x.add_argument("--docs-glob", default="docs_*.parquet"); x.add_argument("--min-anchors", type=int, default=2); x.add_argument("--max-anchors", type=int, default=4)
