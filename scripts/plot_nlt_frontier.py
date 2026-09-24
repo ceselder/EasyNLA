@@ -66,7 +66,7 @@ def main():
     ax.set_title("Natural-language sources sit between 0.01 and 0.5 bits per token and gain sub-linearly with length;\nthe wider 16-slot adapter roughly doubles every source; the raw lens list at the same length is 2–4× higher still", loc="left", fontsize=12.5)
     fig.suptitle("\n".join(textwrap.wrap("The bits-per-token frontier the spec asks for is concave and low: natural-language sources buy 1–6 content bits at 0.02–0.5 bits per token under the pooled "
                                           "critics, while the raw J-lens list at 137 tokens buys 14 — PRELIMINARY, every critic below its gate", 100)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
-    fig.text(0.01, 0.005, "Fixed held-out set, n = 512 pairs per set, exact ODE Heun 32, paired probes; z_dm = another pair's text at the same (i, j). Sources: data/info_budget.json. Critics shown are pooled-space; the collided merge key and the Heun-64 duplicate table are excluded.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
+    fig.text(0.01, 0.005, "Fixed held-out set, n = 512 pairs per set, exact ODE Heun 32, paired probes; wrong-depth sentence = another pair's text at the same (i, j). Sources: data/info_budget.json. Critics shown are pooled-space; the collided merge key and the Heun-64 duplicate table are excluded.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
     fig.subplots_adjust(left=0.09, right=0.98, top=0.82, bottom=0.12)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump(out, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)

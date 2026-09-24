@@ -101,7 +101,7 @@ def main():
     n = S["step"][-1]; d_tok = S["tokens"][0] - S["tokens"][-1]
     fig.suptitle("\n".join(textwrap.wrap(f"PRELIMINARY reinforcement learning ({n} steps so far, {a.label}): a mechanics test on a critic that has not passed its gate, "
                                           f"not a result — sentences shortened by {d_tok:.0f} tokens while live-critic bits moved from {S['bits'][0]:+.1f} to {S['bits'][-1]:+.1f}", 108)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
-    fig.text(0.01, 0.005, f"Run {a.tag}: verbalizer initialised from its first supervised version; 128 pairs x 8 samples per step; per-group advantages; CISPO; KL β 0.01 to Qwen3-8B on a text-only prompt; "
+    fig.text(0.01, 0.005, f"Plain-likelihood RL run: verbalizer initialised from its first supervised version; 128 pairs x 8 samples per step; per-group advantages; CISPO; KL β 0.01 to Qwen3-8B on a text-only prompt; "
              "paraphrase-scored reward with p = 0.3; critic text adapter co-trained on best-of-group. Parsed from the trainer log.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
     fig.subplots_adjust(left=0.08, right=0.985, top=0.86, bottom=0.10, hspace=0.5, wspace=0.28)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")

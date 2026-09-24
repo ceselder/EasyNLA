@@ -63,7 +63,7 @@ def main():
     ax1.set_title("Form: a well-formed sentence in the training register is worth ~60 bits to a single-register adapter;\nthe null regulariser (score a random pair's text as the empty text) cuts it to ~7", loc="left", fontsize=12.5)
     ax1.legend(frameon=False, loc="upper center", ncol=2, bbox_to_anchor=(0.5, -0.32))
     ax2.set_ylabel("content bits = own − wrong-depth sentence, workspace"); ax2.set_ylim(min(-0.5, ax2.get_ylim()[0]), ax2.get_ylim()[1] * 1.18)
-    ax2.set_title("Content: 1–3 exact bits per sentence on most critics; the wider adapter (4000 steps) reaches 4–6 bits on J-lens descriptions and the packaged\ndecayed-learning-rate adapter 8–11 bits, at P(z beats its depth-matched partner) 0.69–0.85 (number above each bar; gate 0.75)", loc="left", fontsize=13, pad=10)
+    ax2.set_title("Content: 1–3 exact bits per sentence on most critics; the wider adapter (4000 steps) reaches 4–6 bits on J-lens descriptions and the packaged\ndecayed-learning-rate adapter 8–11 bits, at P(own beats the wrong-depth sentence) 0.69–0.85 (number above each bar; gate 0.75)", loc="left", fontsize=13, pad=10)
     ax2.axhline(0, color=INK2, lw=0.8)
     fig.suptitle("\n".join(textwrap.wrap("Exact information budget on held-out pairs: most text critics trained tonight pay for register and depth, not for what the sentence says; "
                                           "adapter capacity, training length and the learning-rate schedule move the content term (Qwen3-8B, layers 9–34, 512 fixed held-out pairs per set, exact ODE log-likelihood)", 105)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
