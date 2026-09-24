@@ -129,10 +129,43 @@ def fig_bands(d, rep, out):
     out["fig_bands"] = {k: {"by_band": {b: d[k]["by_band"].get(b, {}).get("gain") for b in bands}, "by_gap": {g: d[k]["by_gap"].get(g, {}).get("gain") for g in gaps}} for k, _, _ in srcs}
 
 
+def fig_scaling(rep, out):
+    """headline of round 2: reconstructor gain vs number of bullet train pairs, with prose / lens at the matched top size"""
+    f = os.path.join(rep, "data", "scaling.json")
+    if not os.path.exists(f): return
+    S = json.load(open(f)); pts = [r for r in S["points"] if r["text"] == "bullets" and r.get("gain") is not None]
+    if not pts: return
+    pts = sorted(pts, key=lambda r: r["n_pairs"]); x = [r["n_pairs"] for r in pts]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5.2))
+    ax = axes[0]
+    ax.plot(x, [r["gain"] for r in pts], marker="o", lw=2.5, color=CLAY, label="bullets: gain over empty text (own list)")
+    ax.plot(x, [r["pair_specific_gain"] for r in pts], marker="s", lw=2, color=CLAY, ls="--", label="bullets: pair-specific gain (own − depth-matched wrong list)")
+    if any(r.get("gain_ci") for r in pts):
+        lo = [r["gain_ci"][0] if r.get("gain_ci") else np.nan for r in pts]; hi = [r["gain_ci"][1] if r.get("gain_ci") else np.nan for r in pts]
+        ax.fill_between(x, lo, hi, color=CLAY, alpha=0.15, label="95% bootstrap CI (per-example gain)")
+    for r in S["points"]:
+        if r["text"] in ("prose", "lens") and r.get("gain") is not None:
+            c = INK if r["text"] == "prose" else GREY; ax.scatter([r["n_pairs"]], [r["gain"]], marker="D", s=80, color=c, zorder=5, label=f"{'Sonnet prose' if r['text'] == 'prose' else 'lens-diff text'} at {r['n_pairs'] // 1000}k matched pairs: {r['gain']:+.3f}")
+    ax.axhline(0, color=INK, lw=0.8); ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off()
+    ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("FVE of Δ gained over the same net with no text")
+    ax.set_title(S.get("title_left", "Does the bullet-list gain rise with data?\n(held-out val rows 0:1024, energy-weighted loss, gap ≥ 2)")); ax.legend(frameon=False, fontsize=9, loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
+    ax = axes[1]
+    ax.plot(x, [r["bits_median"] for r in pts], marker="o", lw=2.5, color=CLAY, label="median bits per list (d_eff)")
+    ax.plot(x, [r["bits_median"] / max(1e-6, r["bullets_per_row"]) for r in pts], marker="^", lw=2, color=CLAY, ls=":", label="per bullet")
+    ax2 = ax.twinx(); ax2.plot(x, [r["p_own_beats_dm"] for r in pts], marker="x", lw=1.5, color=SKY, label="P(own list beats depth-matched wrong list)")
+    if any(r.get("flip_p") for r in pts): ax2.plot(x, [r.get("flip_p") or np.nan for r in pts], marker="x", lw=1.5, color=SAGE, label="P(original beats claim-flipped list)")
+    ax2.axhline(0.5, color=INK, ls="--", lw=0.8); ax2.set_ylim(0.4, 1.0); ax2.set_ylabel("probability over held-out pairs")
+    ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off(); ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("Gaussian-equivalent bits (d_eff)")
+    ax.set_title("Bits per list and the pair-specific / claim-flip\nprobabilities along the same data-scaling curve")
+    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels(); ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=9, loc="upper left"); ax.spines[["top"]].set_visible(False)
+    save(fig, rep, "fig_scaling")
+    out["fig_scaling"] = S
+
+
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--report", default=os.path.expanduser("~/shared/reports/nlt-bullet-nla")); a = ap.parse_args()
     d = load(a.report); out = {}
-    fig_gain_bits(d, a.report, out); fig_controls(d, a.report, out); fig_crux(d, a.report, out); fig_bands(d, a.report, out)
+    fig_scaling(a.report, out); fig_gain_bits(d, a.report, out); fig_controls(d, a.report, out); fig_crux(d, a.report, out); fig_bands(d, a.report, out)
     json.dump(out, open(os.path.join(a.report, "data", "figures.json"), "w"), indent=1, default=float)
 
 
