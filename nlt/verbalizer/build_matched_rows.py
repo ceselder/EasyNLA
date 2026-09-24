@@ -24,10 +24,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True); ap.add_argument("--pool", required=True); ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--target-verbosity", default=None, help="comma list: keep only these target verbosities")
+    ap.add_argument("--out-target", default=None, help="also write the TARGET rows that received a match (same pair ids and per-(pair, verbosity) counts as the control) -> identical row counts / steps for both SFTs")
     a = ap.parse_args(); rng = np.random.default_rng(a.seed)
     tf, pf = _files(a.target), _files(a.pool)
     assert tf and pf, f"no files: target {len(tf)} pool {len(pf)}"
-    tgt = pd.concat([pq.read_table(f, columns=["pair_id", "verbosity"]).to_pandas() for f in tf], ignore_index=True)
+    tgt = pd.concat([pq.read_table(f).to_pandas() for f in tf], ignore_index=True)
     if a.target_verbosity: tgt = tgt[tgt["verbosity"].isin([int(v) for v in a.target_verbosity.split(",")])]
     tgt["pair_id"] = tgt["pair_id"].astype(str); tgt["verbosity"] = tgt["verbosity"].astype(int)          # pair_id is a string key (e.g. "val:16:10:13")
     want = tgt.groupby(["pair_id", "verbosity"]).size().rename("n").reset_index()
@@ -57,6 +58,16 @@ def main():
             used.add(r); row = g.loc[r].to_dict(); row["matched_to_verbosity"] = int(v); picked.append(row)
     out = pd.DataFrame(picked)
     os.makedirs(os.path.dirname(a.out), exist_ok=True); out.to_parquet(a.out, index=False)
+    if a.out_target:                                                                  # the matched subset of the target, same per-key counts
+        got = out.groupby(["pair_id", "matched_to_verbosity"]).size().to_dict() if len(out) else {}
+        keep = []
+        for (pid, v), g in tgt.groupby(["pair_id", "verbosity"], sort=False):
+            k = got.get((pid, int(v)), 0)
+            if k: keep.append(g.iloc[:k])
+        tsub = pd.concat(keep, ignore_index=True) if keep else tgt.iloc[:0]
+        os.makedirs(os.path.dirname(a.out_target), exist_ok=True); tsub.to_parquet(a.out_target, index=False)
+        assert len(tsub) == len(out), (len(tsub), len(out))
+        print(f"[matched] target subset with a match -> {a.out_target}: {len(tsub)} rows, {tsub['pair_id'].nunique()} pairs", flush=True)
     stats = {"target_rows": int(len(tgt)), "target_pairs": len(ids), "target_verbosity_mix": {int(k): int(v) for k, v in tgt["verbosity"].value_counts().items()},
              "matched_rows": int(len(out)), "matched_pairs": int(out["pair_id"].nunique()) if len(out) else 0, "exact_verbosity": n_exact, "nearest_verbosity": n_near,
              "target_rows_without_pool_pair": n_missing, "target_rows_without_spare_pool_row": n_short,
