@@ -29,7 +29,11 @@ def load_parts(pattern, columns=None):
     return pd.concat([pq.read_table(f, columns=columns).to_pandas() for f in fs], ignore_index=True) if fs else pd.DataFrame()
 
 
+SUFFIX = ""
+
+
 def save(fig, report_dir, stem):
+    stem = stem + SUFFIX
     fig.savefig(os.path.join(report_dir, stem + ".png"), dpi=150, bbox_inches="tight")
     fig.savefig(os.path.join(report_dir, stem + ".pdf"), bbox_inches="tight")
     plt.close(fig)
@@ -46,7 +50,10 @@ def main():
     ap.add_argument("--split", default="val")
     ap.add_argument("--report-dir", default=os.path.expanduser("~/shared/reports/natural-language-transcoder"))
     ap.add_argument("--lens-feats", default=os.path.expanduser("~/nlt-feat-data/val_feats.parquet"))
+    ap.add_argument("--suffix", default="", help="appended to every figure stem (e.g. _train)")
     a = ap.parse_args()
+    global SUFFIX
+    SUFFIX = a.suffix
     os.makedirs(os.path.join(a.report_dir, "data"), exist_ok=True)
     sae = load_parts(f"{a.data_dir}/sae_dossier/{a.split}/part_*.parquet").drop_duplicates("pair_id")
     print(f"{len(sae)} pairs in the SAE dossier")
@@ -268,7 +275,7 @@ def main():
             ax.bar(x + (i_ - len(names) / 2 + 0.5) * w, sc[n], w, color=(C["sae"] if n.startswith("dossier") else cols[i_]), label=n, edgecolor="black" if n.startswith("dossier") else "none")
         ax.set_xticks(x); ax.set_xticklabels(["final top-1\n(among 4)", "direction", "position\n(among 5 cuts)", "makes a\ncheckable claim"])
         ax.set_ylabel("reader accuracy (Sonnet 5 sees one description)"); ax.set_ylim(0.4, 1.0)
-        ax.set_title("Dossier descriptions read like the lens sentence: best claim rate,\nbut no passage-derived next-token or position knowledge"); ax.legend(fontsize=9, loc="lower left")
+        ax.set_title("Dossier descriptions read like the lens sentence: best claim rate,\nbut no passage-derived next-token or position knowledge"); ax.legend(fontsize=9, loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2)
         save(fig, a.report_dir, "featurizer_readers_vs_sources")
     json.dump(out, open(os.path.join(a.report_dir, "data", f"featurizer_analysis_{a.split}.json"), "w"), indent=1)
     print(json.dumps({k: v for k, v in out.items() if k in ("fig1", "fig2", "fig3")}, indent=1)[:3000])
