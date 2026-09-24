@@ -42,9 +42,14 @@ SYSTEM = """You describe what changed inside a language model's representation o
 
 Write a plain, concrete description of WHAT CHANGED: what the representation now encodes, predicts or has resolved that it did not before, and what it dropped. Prefer the content (topics, entities, syntax, format, the likely next token or word class) over the mechanism; mention attention-vs-MLP only if it is decisive.
 
-HARD RULES: (1) Never mention layers, depth, blocks, stages, steps, or how early/late/final/deep anything is — refer only to 'before' and 'after'/'now'. (2) Do not quote, reconstruct or guess the passage's wording; describe the representation. (3) No preamble, no meta-talk about the dossier or measurements. (4) Plain register, no bullet points.
+HARD RULES: (1) Never mention layers, depth, blocks, stages, steps, or how early/late/final/deep anything is — refer only to 'before' and 'after'/'now'. (2) Do not quote, reconstruct or guess the passage's wording; describe the representation. (3) No preamble, no meta-talk about the dossier or measurements. (4) Plain register, no bullet points.{DEGREE_RULE}
 
 Return JSON: {"short": "<= 12 words, a noun phrase naming the change", "sentence": "one or two sentences, <= 45 words"}."""
+
+DEGREE_RULE = (" (5) Never characterise the SIZE, EXTENT or DEGREE of the change: no 'slight', 'subtle', 'modest', 'minor', 'small', 'largely unchanged', "
+               "'sweeping', 'major', 'dramatic', 'strong', 'sharp', 'complete', 'partial', 'mostly', 'somewhat', no comparatives of amount; state only WHAT is present after that "
+               "was not before, and what is gone." if int(os.environ.get("FEAT_NO_DEGREE", "0")) else "")
+SYSTEM = SYSTEM.replace("{DEGREE_RULE}", DEGREE_RULE)
 
 USER_TMPL = """DOSSIER
 {body}
