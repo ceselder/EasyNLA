@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 LABELS = {"v0b": "V0b: h_i, h_j (2 markers)", "v0b_evalonly": "V0b re-evaluated (same code path)", "v0b_path_d": "path-delta: h_i, d_k = h_k - h_{k-1}, h_j",
           "v0b_path": "path: h_i, a_k, m_k (attn + MLP writes), h_j", "v0b_path_c": "count control: h_i, (j-i) empty markers, h_j",
           "v0b_path_f": "path, fixed 50 markers (count carries no gap)",
-          "pf_none": "path-facts targets: endpoints only", "pf_count": "path-facts targets: endpoints + empty markers", "pf_path": "path-facts targets: endpoints + attention / MLP writes"}
+          "pf_none": "path-facts targets: endpoints only", "pf_count": "path-facts targets: endpoints + empty markers", "pf_path": "path-facts targets: endpoints + attention / MLP writes", "pf_path_s": "path-facts targets: + writes with relative magnitudes kept"}
 SERIES = ["#52514e", "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
 INK, INK2, SURFACE = "#0b0b0b", "#52514e", "#fcfcfb"
 RX_STEP = re.compile(r"^(?:path-)?sft\s+(\d+)/(\d+) \| loss/tok ([\d.]+) \| val ([\d.]+)")
