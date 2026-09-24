@@ -225,11 +225,13 @@ def build_dossiers(a):
 
 def parse_json(text):
     m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
-        return None
-    try:
-        d = json.loads(m.group(0))
-    except Exception:
+    d = None
+    if m:
+        try:
+            d = json.loads(m.group(0))
+        except Exception:
+            d = None
+    if d is None:                                   # truncated or malformed JSON: rescue the complete fields
         d = {}
         for k in VERBOSITY:
             mm = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % k, text, re.S)
