@@ -21,9 +21,9 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 # controls-table source -> (reader key, short label, colour slot). Colours fixed per source across every figure of the report.
-SOURCES = {"teacher_v1": ("reader_teacher_v1", "teacher\n+lens\n+final", CAT[0]), "teacher_nofinal_v1": ("reader_teacher_nofinal_v1", "teacher\n+lens", CAT[1]),
-           "teacher_nolens_v1": ("reader_teacher_nolens_v1", "teacher\n(passage\nonly)", CAT[2]), "lensdiff_L1": ("reader_lensdiff_jlens_L1", "J-lens\nsen-\ntence", CAT[6]),
-           "v0_ao_tsv1": ("reader_v0_ao_tsv1", "verbalizer\n(acts\nonly)", CAT[7]), "lensdiff_L3": ("reader_lensdiff_jlens_L3", "J-lens\nlists", CAT[4])}
+SOURCES = {"teacher_v1": ("reader_teacher_v1", "+final\nteacher\n+lens", CAT[0]), "teacher_nofinal_v1": ("reader_teacher_nofinal_v1", "+lens\nteacher", CAT[1]),
+           "teacher_nolens_v1": ("reader_teacher_nolens_v1", "passage\nonly\nteacher", CAT[2]), "lensdiff_L1": ("reader_lensdiff_jlens_L1", "J-lens\nsen-\ntence", CAT[6]),
+           "v0_ao_tsv1": ("reader_v0_ao_tsv1", "verbal-\nizer", CAT[7]), "lensdiff_L3": ("reader_lensdiff_jlens_L3", "J-lens\nlists", CAT[4])}
 
 
 def style():
@@ -47,9 +47,9 @@ def main():
         rows.append({"source": src, "label": lab, "colour": col, "top1": r["top1"], "posmatch": r["posmatch"], "direction": r.get("direction"), "content": c["content"], "content_sem": sem, "p_dm": c["p_orig_gt_dm"],
                      "content_ws": (c.get("content_by_band") or {}).get("workspace"), "n_critic": c["n"], "n_reader_top1": r.get("top1_n_parsed"), "bits_per_token": c.get("bits_per_token"), "orig": c["orig"], "dm": c["dm"], "rp": c["rp"]})
     rows.sort(key=lambda r: -r["content"])
-    style(); plt.rcParams.update({"xtick.labelsize": 12.5, "ytick.labelsize": 13, "axes.labelsize": 13, "axes.titlesize": 14, "legend.fontsize": 12})
+    style(); plt.rcParams.update({"xtick.labelsize": 12, "ytick.labelsize": 13, "axes.labelsize": 13, "axes.titlesize": 14, "legend.fontsize": 12})
     x = np.arange(len(rows)); w = 0.38
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6.8), dpi=150)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 7.2), dpi=150)
     cols = [r["colour"] for r in rows]
     ax1.bar(x - w / 2, [100 * r["top1"] for r in rows], w, color=cols, label="next token among 4 (chance 25%)")
     ax1.bar(x + w / 2, [100 * r["posmatch"] for r in rows], w, color=cols, alpha=0.45, label="position among 5 cuts (chance 20%)")
