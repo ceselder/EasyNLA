@@ -309,6 +309,62 @@ def g2_async_smoke(n: int = 2000):
     print("[g2smoke]", json.dumps(out)[:3000], flush=True); return out
 
 
+PARA_ROOT = f"{ROOT}/para"
+
+
+@app.function(image=image_g, gpu="B200", timeout=4 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=128 * 1024, max_containers=2)
+def para_shard(sid: int):
+    """two Gemma paraphrases (temperature 0.7) of every explanation of Opus activation shard sid -> PARA_ROOT/opus/para_XXXX.parquet, row-aligned with
+    /vol_q36/data/acts_qwen36_L42/shard_XXXX.parquet (doc_id, n_raw_tokens, is_val, explanation, explanation_para [2], para_ok [2])"""
+    import pyarrow as pa, pyarrow.parquet as pq
+    from vllm import SamplingParams
+    from nla.datagen.scale_templates import PARA_PROMPT, clean_para
+    out = f"{PARA_ROOT}/opus/para_{sid:04d}.parquet"
+    vol_glp.reload()
+    if _exists(out): return "exists"
+    d = pq.read_table(f"/vol_q36/data/acts_qwen36_L42/shard_{sid:04d}.parquet", columns=["doc_id", "n_raw_tokens", "is_val", "explanation"]).to_pydict()
+    global _AGEN
+    if "_AGEN" not in globals(): _AGEN = _AsyncGen()
+    ex = [(z or "").strip() for z in d["explanation"]]; t0 = time.time()
+    prompts = [PARA_PROMPT.format(t=z) for z in ex for _ in range(2)]
+    sps = [SamplingParams(temperature=0.7, top_p=0.95, max_tokens=min(600, 40 + 2 * len(z.split()) * 2)) for z in ex for _ in range(2)]
+    res = _AGEN.generate(prompts, sps); dt = time.time() - t0
+    paras = [[clean_para(res[2 * i][0], z), clean_para(res[2 * i + 1][0], z)] for i, z in enumerate(ex)]
+    T = pa.table({"doc_id": d["doc_id"], "n_raw_tokens": d["n_raw_tokens"], "is_val": d["is_val"], "explanation": ex,
+                  "explanation_para": [[p or "" for p in ps] for ps in paras], "para_ok": [[p is not None for p in ps] for ps in paras]})
+    os.makedirs(f"{PARA_ROOT}/opus", exist_ok=True); pq.write_table(T, out, compression="zstd"); vol_glp.commit()
+    st = {"sid": sid, "rows": len(ex), "seconds": dt, "para_per_s": 2 * len(ex) / dt, "ok": sum(sum(p) for p in T.column("para_ok").to_pylist()) / (2 * len(ex))}
+    print("[para]", json.dumps(st), flush=True); return st
+
+
+@app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=4, memory=48 * 1024, max_containers=16)
+def para_join(sid: int):
+    """Opus shard + its paraphrases -> PARA_ROOT/opus_train/shard_XXXX.parquet: trainer schema + explanations = [original, para1, para2] (failed
+    paraphrases dropped) + qc (all pass), so train_cond --render-pick random uses a paraphrase with P = 2/3 (>= 50%) whenever both exist"""
+    import pyarrow as pa, pyarrow.parquet as pq
+    out = f"{PARA_ROOT}/opus_train/shard_{sid:04d}.parquet"
+    vol_glp.reload()
+    if _exists(out): return "exists"
+    A = pq.read_table(f"/vol_q36/data/acts_qwen36_L42/shard_{sid:04d}.parquet"); P = pq.read_table(f"{PARA_ROOT}/opus/para_{sid:04d}.parquet")
+    assert A.num_rows == P.num_rows and A.column("doc_id").equals(P.column("doc_id")), "paraphrase rows misaligned"
+    exs = [[z] + [p for p, ok in zip(ps, oks) if ok] for z, ps, oks in zip(P.column("explanation").to_pylist(), P.column("explanation_para").to_pylist(), P.column("para_ok").to_pylist())]
+    T = A.append_column("explanations", pa.array(exs)).append_column("qc", pa.array([["{}"] * len(e) for e in exs]))
+    os.makedirs(f"{PARA_ROOT}/opus_train", exist_ok=True); pq.write_table(T, out, compression="zstd"); vol_glp.commit()
+    return {"sid": sid, "rows": T.num_rows, "mean_renderings": sum(len(e) for e in exs) / len(exs)}
+
+
+@app.function(image=image_q, timeout=8 * 3600, volumes=VOLS, secrets=SECRETS, cpu=2, memory=8 * 1024)
+def run_para(n_shards: int = 30):
+    """all Opus shards: paraphrase (2 B200) then join; resumable"""
+    calls = {s: para_shard.spawn(s) for s in range(n_shards)}; out = {}
+    for s, c in calls.items():
+        try: out[s] = c.get()
+        except Exception as e: out[s] = f"ERR {str(e)[:200]}"
+        try: out[f"join{s}"] = para_join.remote(s)
+        except Exception as e: out[f"join{s}"] = f"ERR {str(e)[:200]}"
+    json.dump(out, open(f"{PARA_ROOT}/run_para_status.json", "w"), indent=1); vol_glp.commit(); return out
+
+
 @app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=64 * 1024)
 def g2_qc_stats(root: str = f"{ROOT}/g2"):
     """per-engine QC of the g2 label shards: rendering parse rate, fact-sheet parse rate, deterministic pass rates, positions passing, mean words"""

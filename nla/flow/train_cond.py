@@ -56,7 +56,7 @@ def _qc_ok(q):
     return not any(d.get(k, 0) for k in ("exact_missing", "leaked", "unsupported_numbers", "parse_fail"))
 
 
-def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False, counts=None, render_pick="canonical", seed=0):
+def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False, counts=None, render_pick="canonical", seed=0, ladders_out=None):
     """(activation, explanation) rows of raw extraction shards (cols activation_vector / explanation / is_val), val rows excluded; rows
     [skip, skip + n) of the concatenated non-val rows (files sorted; comma-separated globs allowed). Files entirely outside the range are never
     read. render_pick='random': shards with k renderings per activation (columns explanations / qc, the g2 synthetic data) use ONE rendering per
@@ -68,7 +68,8 @@ def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False, counts=None,
         if g0 + c <= lo: g0 += c; continue
         if g0 >= hi: break
         names = pq.ParquetFile(f).schema_arrow.names; multi = render_pick == "random" and "explanations" in names and "qc" in names
-        cols = ["activation_vector", "explanation", "is_val"] + (["doc_id"] if with_doc else []) + (["explanations", "qc"] if multi else [])
+        lad = ladders_out is not None and "fact_ladders" in names
+        cols = ["activation_vector", "explanation", "is_val"] + (["doc_id"] if with_doc else []) + (["explanations", "qc"] if multi else []) + (["fact_ladders"] if lad else [])
         t = pq.read_table(f, columns=cols)
         keep = [i for i, v in enumerate(t.column("is_val").to_pylist()) if not (skip_val and v)]
         a0, a1 = max(lo - g0, 0), min(hi - g0, c); keep = keep[a0:a1]; g0 += c
@@ -82,6 +83,12 @@ def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False, counts=None,
                 ok = [e for e, q in zip(es or [], qs or []) if e and _qc_ok(q)]
                 if ok: ex[j] = ok[int(rng.integers(len(ok)))]; n_rand += 1
         zs += [(z or "").strip() for z in ex]
+        if ladders_out is not None:   # g2 rows: (exact value, wrong-exact twin of the same subtype from another document) per fact; other rows: []
+            if lad:
+                for fl in t.column("fact_ladders").take(keep).to_pylist():
+                    try: ladders_out.append([(x["value"], x["twin"]) for x in json.loads(fl or "[]") if x.get("twin") and len(x.get("value") or "") >= 3])
+                    except Exception: ladders_out.append([])
+            else: ladders_out.extend([[] for _ in keep])
         if with_doc: docs += t.column("doc_id").take(keep).to_pylist()
         del t
     acts = torch.cat(acts) if acts else torch.zeros(0, 5120, dtype=torch.float16)
@@ -382,6 +389,9 @@ def main():
     p.add_argument("--snap-pairs", default="", help="comma list of global pair counts (e.g. 64e3,128e3,...,8e6): at each, eval + save a loadable snapshot dir <out>/snap_<pairs>/ (adapter_latest.pt [+ prior_cotrained_latest.pt / ar_encoder_latest.pt] + eval.json)")
     p.add_argument("--render-pick", default="canonical", choices=["canonical", "random"], help="shards with k renderings per activation (g2): canonical column or one random QC-passing rendering per activation")
     p.add_argument("--resume-opt", action="store_true", help="also restore the AdamW state from <resume-from>/opt_latest.pt (replicated DDP / single GPU)")
+    p.add_argument("--hardneg", default=None, choices=["twin", "swap"], help="hard-negative source for the --neg-frac contrast: g2 wrong-exact twins swapped into the rendering (fallback: detail swap) or detail swaps only")
+    p.add_argument("--hardneg-mode", default="hinge", choices=["hinge", "cfm"], help="hinge on the paired loss gap, or CFM-style clipped repulsion of the negative-conditioned prediction from the true velocity")
+    p.add_argument("--hardneg-rel-margin", type=float, default=0.0, help=">0: margin (hinge) / clip (cfm) relative to the positive loss, e.g. 0.05 = the negative must cost 5% more")
     p.add_argument("--lr-linear-to", type=float, default=None, help="anneal schedule: warm-up then LINEAR decay to this fraction of --lr at the last step")
     p.add_argument("--cfm-lambda", type=float, default=0.0, help="Contrastive Flow Matching weight: loss = ||v - (eps_i - x_i)||^2 - lambda ||v - (eps_j - x_j)||^2, j = batch rolled by one")
     p.add_argument("--snap-final", action="store_true", help="also save a snapshot dir at the last step (snap_<pairs seen>)")
@@ -507,7 +517,8 @@ def main():
         _use = _tot if a.max_train < 0 else min(a.max_train, _tot)                                # exact split: never ask for rows that do not exist
         _per = _use // world if (ddp and not a.unfreeze_prior) else _use; _skip = rank * _per if (ddp and not a.unfreeze_prior) else 0   # replicated DDP: rank-disjoint rows, equal slices
         if is0: print(f"[cond] shards: {len(_cnt)} files, {_tot} non-val rows available, using {_use} ({_per} per rank)", flush=True)
-        out_ = load_shards(a.train_shards_glob, max(_per, 1), skip=_skip, with_doc=want_doc, counts=_cnt, render_pick=a.render_pick, seed=a.seed); tr_acts, tr_z = out_[0], out_[1]; tr_doc = out_[2] if want_doc else None
+        tr_lad = [] if a.hardneg == "twin" else None
+        out_ = load_shards(a.train_shards_glob, max(_per, 1), skip=_skip, with_doc=want_doc, counts=_cnt, render_pick=a.render_pick, seed=a.seed, ladders_out=tr_lad); tr_acts, tr_z = out_[0], out_[1]; tr_doc = out_[2] if want_doc else None
         if a.max_train == 0: tr_acts, tr_z = tr_acts[:0], []
         if is0: print(f"[cond] loaded {len(tr_z)} Opus pairs from shards {a.train_shards_glob}", flush=True)
     else:
@@ -882,6 +893,12 @@ def main():
             nb = max(1, int(round(a.neg_frac * a.batch))); sel = idx[:nb].tolist()
             if tr_claims is not None:   # claim-set mode: the positive is this step's drawn condition, the negative swaps one claim for its false twin
                 zs_pos = _txt[:nb]; negs = [neg_of(z, tr_z, neg_rng, tr_tw[i] if tr_tw else None, tr_claims[i]) for z, i in zip(zs_pos, sel)]
+            elif a.hardneg == "twin" and tr_lad is not None:   # the rendering with one exact fact value swapped for its wrong-exact twin; else a detail swap
+                zs_pos = [tr_z[i] for i in sel]; negs = []
+                for z, i in zip(zs_pos, sel):
+                    pairs = [(v, tw) for v, tw in (tr_lad[i] if i < len(tr_lad) else []) if v in z and tw not in z]
+                    if pairs: v, tw = pairs[neg_rng.randrange(len(pairs))]; negs.append((z.replace(v, tw, 1), "twin"))
+                    else: negs.append(make_negative(z, neg_rng, tr_z))
             else:
                 zs_pos = [tr_z[i] for i in sel]; negs = [make_negative(z, neg_rng, tr_z) for z in zs_pos]
             keep_i = [k for k, (zn, _) in enumerate(negs) if zn is not None]
@@ -891,10 +908,16 @@ def main():
                 x_t = (1 - tt)[:, None] * xn + tt[:, None] * ee; tgt = (ee - xn).float()
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     v2 = model(torch.cat([x_t, x_t]), torch.cat([tt, tt]), e2, mk2, cv2)
-                lrow = ((v2.float() - torch.cat([tgt, tgt])) ** 2).mean(-1); gap = lrow[n2:] - lrow[:n2]
-                closs = a.neg_lambda * F.relu(a.neg_margin - gap).mean(); closs.backward()
+                lrow = ((v2.float() - torch.cat([tgt, tgt])) ** 2).mean(-1); gap = lrow[n2:] - lrow[:n2]; lpos = lrow[:n2].detach()
+                if a.hardneg_mode == "cfm":   # repel the negative-conditioned prediction from the TRUE velocity, clipped at (1 + margin) x L_pos (DiffusionITM-style)
+                    closs = -a.neg_lambda * torch.minimum(lrow[n2:], (1 + a.hardneg_rel_margin) * lpos).mean()
+                else:                          # hinge; with --hardneg-rel-margin the margin is relative to the positive loss (bounded, cannot run away)
+                    marg = a.hardneg_rel_margin * lpos if a.hardneg_rel_margin > 0 else a.neg_margin
+                    closs = a.neg_lambda * F.relu(marg - gap).mean()
+                closs.backward()
                 neg_stats = {"train/contrast_loss": closs.item(), "train/neg_gap": gap.mean().item(), "train/neg_win": (gap > 0).float().mean().item(), "train/neg_n": n2,
-                             "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2, "train/neg_frac_quote": sum(1 for k in keep_i if negs[k][1] == "quote") / n2}
+                             "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2, "train/neg_frac_quote": sum(1 for k in keep_i if negs[k][1] == "quote") / n2,
+                             "train/neg_frac_twin": sum(1 for k in keep_i if negs[k][1] == "twin") / n2, "train/neg_rel_gap": float((gap / lpos.clamp_min(1e-6)).mean())}
         if a.ctr_template and a.ctr_global:   # ONE same-template group of N activations across all ranks, full N x N InfoNCE (rows sharded over ranks)
             t_c = time.time(); Ng = a.ctr_global; M = Ng // world; assert M * world == Ng, "--ctr-global must be divisible by the world size"
             assert not a.ctr_enc_grad, "--ctr-global keeps the claim encodings detached"

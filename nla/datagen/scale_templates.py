@@ -86,3 +86,18 @@ def assign(key: str, seed: int = 0) -> str:
         c += p
         if u < c: return v
     return "v0_opus"
+
+
+# paraphrase augmentation of the critic's training texts (anti-steganography): the co-training fork's prompt (nla/train_rl_vllm.py PARA_PROMPT)
+PARA_PROMPT = ("Rewrite the text below so that it keeps exactly the same meaning and every fact, but uses different wording and a "
+               "different order. Do not add, remove or soften any information. Output only the rewritten text.\n\nText:\n{t}")
+
+
+def clean_para(raw, orig):
+    """strip wrappers; None if empty, a refusal, or implausibly short/long relative to the original"""
+    if not raw: return None
+    t = raw.strip().strip("`").strip()
+    for pre in ("Rewritten text:", "Rewritten:", "Here is the rewritten text:", "Text:"):
+        if t.lower().startswith(pre.lower()): t = t[len(pre):].strip()
+    n, m = len(t.split()), max(1, len(orig.split()))
+    return t if 0.5 <= n / m <= 2.0 else None
