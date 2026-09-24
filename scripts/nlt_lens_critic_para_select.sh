@@ -8,11 +8,11 @@ TAG=$1
 cd /home/celeste/nlt
 export NLT_GPU=${NLT_GPU:-H100} NLT_APP=${NLT_APP:-nlt-lens-critic}
 LOG=~/nlt-lens-logs; D=/vol/data/qwen3_8b; TSV=$LOG/critic_para_select.tsv; STOP=$LOG/critic_para_select.STOP
-mkdir -p $LOG/para_scored; touch $LOG/critic_para_select.done
+mkdir -p $LOG/para_scored; DONE=$LOG/critic_para_select.done2; touch $DONE     # keyed by TAG:ckpt (a shared name-only key made loops skip each other's checkpoints)
 [ -s $TSV ] || echo -e "tag\tckpt\tmanifest\tn_pairs\tPMI_orig\tpara_light_ret\tpara_strong_ret\tP_orig_gt_twin\ttwin_ret\tP_orig_gt_twin_far\ttwin_far_ret" > $TSV
 while [ ! -f $STOP ]; do
   for ck in $(modal volume ls nlt critic/$TAG 2>/dev/null | grep -oE "ckpt_step[0-9]+\.pt" | sort -u); do
-    grep -q "^$ck$" $LOG/critic_para_select.done && continue
+    grep -q "^$TAG:$ck$" $DONE && continue
     for m in manifest_para_teacher_v1 manifest_twinnext2_teacher_v1; do
       out=${TAG}_${ck%.pt}_$m
       modal run scripts/modal_nlt_critic.py --task manifest --tag $out --data $D --extra "--ckpt /vol/critic/$TAG/$ck --manifest /vol/evals/$m.parquet --n 1024 --ode-steps 32 --data-device cpu" > $LOG/para_scored/$out.log 2>&1
@@ -35,7 +35,7 @@ open(tsv, "a").write(f"{tag}\t{ck}\t{m}\t{len(piv)}\t{po:.2f}\t{pl:.2f}\t{ps:.2f
 EOF
       tail -1 $TSV
     done
-    echo "$ck" >> $LOG/critic_para_select.done
+    echo "$TAG:$ck" >> $DONE
   done
   sleep 180
 done
