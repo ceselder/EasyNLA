@@ -12,6 +12,7 @@ Edits per critic (flow adapter path, or 'ar' = the SFT MSE reconstructor):
 plus two references computed once: none, and the J-lens direction (positive control, jadd_b1 / jadd_on_b0.25).
 Measured per condition: J-lens rank of target / source at layer 42 on the edited anchor activation, target / source mention rate in the 40-token
 continuation (greedy + k samples, string match), clean swap (target and not source), KL at the first generated token, edit size |dh|/|h|.
+CLIP-style critics (nla.contrastive): name=clip:<ckpt dir>; the edit is gradient ascent on the contrastive score (no decoder), see clip_grad_edit.
 usage: python scripts/steer_eval_ckpt.py --critics name=path,name=path,ar [--tag T]   -> /vol_glp/cond/steer_eval/<tag>.json"""
 import argparse, json, os, sys, time
 import numpy as np, torch, torch.nn.functional as F
@@ -40,10 +41,24 @@ def flow_edits(fb, it, K, taus, ode_steps, seed):
     return out
 
 
+def clip_grad_edit(cc, it, steps, step_frac):
+    """CLIP critic has no decoder: steer by normalised gradient ascent on cos(f(h), g(z')) - cos(f(h), g(z)) in raw activation space
+    (steps x step_frac x |h| path length); returns the displacement d = h_final - h (the conditions rescale it like the conditional-mean edit)."""
+    import torch.nn.functional as F_
+    with torch.no_grad(): T = cc.text_emb([it["ze"], it["z"]])
+    h = it["_h"].to(DEV1).float(); x = h.clone(); hn = h.norm()
+    for _ in range(steps):
+        x = x.detach().requires_grad_(True); A_ = cc.act_emb(x[None], grad=True)[0]
+        J = (A_ * T[0]).sum() - (A_ * T[1]).sum(); g, = torch.autograd.grad(J, x)
+        x = x + step_frac * hn * g / g.norm().clamp_min(1e-8)
+    return (x.detach() - h).cpu()
+
+
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--critics", required=True, help="comma list of name=adapter_path, or 'ar' for the SFT MSE reconstructor")
     p.add_argument("--tag", default="steer"); p.add_argument("--n", type=int, default=24); p.add_argument("--k", type=int, default=3); p.add_argument("--n-new", type=int, default=40)
     p.add_argument("--K", type=int, default=8); p.add_argument("--ode-steps", type=int, default=16); p.add_argument("--taus", default="0.7,0.9")
+    p.add_argument("--clip-steps", type=int, default=25); p.add_argument("--clip-step", type=float, default=0.02, help="CLIP gradient steps: step size as a fraction of |h|")
     a = p.parse_args(); taus = [float(x) for x in a.taus.split(",")]; os.makedirs(OUT, exist_ok=True); t0 = time.time()
     pg._load(); lens = R.Lens(); tok = pg.S["tok"]
     items = torch.load("/vol_glp/cond/animal/cache.pt", map_location="cpu", weights_only=False)[:a.n]
@@ -56,6 +71,11 @@ def main():
         if name == "ar":
             critic = pg._critic(R.AR_NAME)
             for it in items: it.setdefault("E", {})[name] = {"_d": (pg.ar_pred(critic, it["ze"]) - pg.ar_pred(critic, it["z"])).float().cpu()}
+        elif path.startswith("clip:"):
+            from nla.contrastive.model import ClipCritic
+            cc = ClipCritic(path[len("clip:"):], pg.S["snap"], DEV1)
+            for it in items: it.setdefault("E", {})[name] = {"_d": clip_grad_edit(cc, it, a.clip_steps, a.clip_step)}
+            del cc; torch.cuda.empty_cache()
         else:
             fb = R.load_flow(path); fb.model.eval()
             for it in items: it.setdefault("E", {})[name] = flow_edits(fb, it, a.K, taus, a.ode_steps, 7 + it["n"])
