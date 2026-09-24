@@ -41,7 +41,9 @@ class TextCond:
         if self.lo > 0: self.layers[self.lo - 1].register_forward_hook(lambda m_, i_, o_: self._cap.__setitem__(0, (o_[0] if isinstance(o_, tuple) else o_).detach()))
 
     def lora(self, on):
-        for m in self.lora_layers: m.enable_adapters(bool(on))
+        """toggle the adapters WITHOUT touching requires_grad: peft's enable_adapters(True) calls set_adapter, which re-enables grads on every LoRA tensor
+        and would undo a partial-LoRA freeze; the forward only consults the _disable_adapters flag"""
+        for m in self.lora_layers: m._disable_adapters = not bool(on)
 
     def __call__(self, texts, grad=False):
         texts = [z if z else "(empty)" for z in texts]; g = None; shared = False
