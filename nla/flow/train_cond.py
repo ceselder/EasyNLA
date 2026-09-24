@@ -366,7 +366,7 @@ def main():
                    "rotation weighted by the family shares), answers deduplicated, and an InfoNCE term over FLOW scores in groups of K+1 activations x their K+1 claims: "
                    "logit_ij = -(d/2) L_FM(x_i | c_j) / tau under the same (t, eps) per activation, symmetric cross-entropy; plus the plain FM loss on every positive")
     p.add_argument("--ctr-k", type=int, default=32, help="negatives per activation (group size K+1)"); p.add_argument("--ctr-weight", type=float, default=1.0)
-    p.add_argument("--ctr-tau-init", type=float, default=10.0, help="InfoNCE temperature in nats of FM-proxy PMI"); p.add_argument("--ctr-fixed-tau", action="store_true")
+    p.add_argument("--ctr-tau-init", type=float, default=20.0, help="InfoNCE temperature in nats of FM-proxy PMI"); p.add_argument("--ctr-fixed-tau", action="store_true")
     p.add_argument("--ctr-enc-grad", action="store_true", help="let the InfoNCE term train the text encoder too (default: encodings detached, adapter/prior only)")
     p.add_argument("--fm-chunk", type=int, default=0, help="FM loss over the micro-batch in sub-batches of this size (same gradient; bounds the encoder-backward memory at large --batch)")
     p.add_argument("--rank-files", action="store_true", help="--claims-dir under DDP: whole final files round-robin to ranks (1/world of the reading) instead of row striping")
@@ -889,12 +889,15 @@ def main():
             for g_i, grp in enumerate(grps):
                 tau = log_tau.exp().clamp(1.0, 100.0)                           # rebuilt per group: each group has its own backward
                 G = len(grp); xs = x0[grp].detach(); eg, mkg, cvg = enc_batch([_txt[p_] for p_ in grp], grad=a.ctr_enc_grad)
-                tt = torch.rand(G, device=dev); ee = torch.randn_like(xs); x_t = (1 - tt)[:, None] * xs + tt[:, None] * ee; tgt = (ee - xs).float()
+                tt = torch.rand(1, device=dev).expand(G).contiguous(); ee = torch.randn_like(xs)   # one t per group: FM losses of different activations comparable
+                x_t = (1 - tt)[:, None] * xs + tt[:, None] * ee; tgt = (ee - xs).float()
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     v = model(x_t.repeat_interleave(G, 0), tt.repeat_interleave(G), eg.repeat(G, 1, 1) if eg is not None else None,
                               mkg.repeat(G, 1) if mkg is not None else None, cvg.repeat(G, 1) if cvg is not None else None)
+                    with torch.no_grad(): v0 = model(x_t, tt)                                  # unconditional baseline per activation (same t, eps)
                 Lm = ((v.float() - tgt.repeat_interleave(G, 0)) ** 2).mean(-1).view(G, G)          # [activation i, claim j], same (t, eps) along a row
-                logits = -(0.5 * x0.shape[1]) * Lm / tau; tgt_idx = torch.arange(G, device=dev)
+                L0 = ((v0.float() - tgt) ** 2).mean(-1)
+                logits = (0.5 * x0.shape[1]) * (L0[:, None] - Lm) / tau; tgt_idx = torch.arange(G, device=dev)   # FM-proxy PMI / tau: columns compare across activations
                 ce = 0.5 * (F.cross_entropy(logits, tgt_idx) + F.cross_entropy(logits.t(), tgt_idx))
                 (a.ctr_weight * ce / max(len(grps), 1)).backward()
                 ce_s += ce.item(); ar_s += (logits.argmax(1) == tgt_idx).float().mean().item(); ac_s += (logits.argmax(0) == tgt_idx).float().mean().item()
@@ -935,7 +938,7 @@ def main():
             if grp:
                 g_ = torch.nn.utils.clip_grad_norm_(grp, 1.0); g_ = g_.full_tensor() if hasattr(g_, "full_tensor") else g_; gn2 += float(g_) ** 2
         gn = torch.tensor(gn2 ** 0.5); opt.step()
-        if step % 50 == 0 and is0:
+        if (step % 50 == 0 or step <= a.start_step + 3) and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step | peak mem {torch.cuda.max_memory_allocated()/2**30:.0f} GiB", flush=True)
             cfm_st = {f"train/cfm_{k}": float(v) for k, v in getattr(cond_fm_loss, "last", {}).items()} if a.cfm_lambda > 0 else {}
             if cfm_st and is0: print(f"  [cfm] fm {cfm_st['train/cfm_fm']:.4f} | distance to another sample's flow {cfm_st['train/cfm_cfm_neg']:.4f} (lambda {a.cfm_lambda})", flush=True)
