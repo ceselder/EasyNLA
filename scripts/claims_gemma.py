@@ -167,8 +167,9 @@ def gen_stream(root, out, k, K, pattern="text_v*_*.jsonl.gz", layout="a_dp4", co
     or when {out}/STOP exists."""
     import zlib
     os.makedirs(out, exist_ok=True); mns = LAYOUT_MNS.get(layout, 512); flags = [] if layout == "single" else LAYOUTS[layout]
-    logf = open(f"{out}/server_stream_{k}.log", "w"); proc, t_start = start_server(flags, mns, 8000, logf)
-    if t_start is None: raise SystemExit("gemma server did not start: " + open(f"{out}/server_stream_{k}.log").read()[-2000:])
+    lp = f"/tmp/server_stream_{k}.log"                 # local disk: an open file on the volume blocks volume.reload()
+    logf = open(lp, "w"); proc, t_start = start_server(flags, mns, 8000, logf)
+    if t_start is None: raise SystemExit("gemma server did not start: " + open(lp).read()[-2000:])
     print(f"[gemma-stream {k}/{K}] server up in {t_start:.0f}s ({layout})", flush=True); idle_since = time.time(); n_done = 0
     try:
         while not os.path.exists(f"{out}/STOP"):
@@ -184,7 +185,10 @@ def gen_stream(root, out, k, K, pattern="text_v*_*.jsonl.gz", layout="a_dp4", co
                 n_done += 1; idle_since = time.time()
                 if commit: commit()
     finally:
-        stop_server(proc)
+        stop_server(proc); logf.close()
+        try:
+            import shutil; shutil.copy(lp, f"{out}/server_stream_{k}.log")
+        except Exception: pass
     print(f"[gemma-stream {k}/{K}] exit after {n_done} shards", flush=True)
     return n_done
 
