@@ -139,7 +139,7 @@ def fig_scaling(rep, out):
     absb, gainb, fixb = sel("bullets", "abs_fve"), sel("bullets", "gain"), sel("bullets", "abs_fve", "fixed_2400_steps")
     if not absb and not gainb: return
     main = absb if absb else gainb; x = [r["n_pairs"] for r in main]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5.4))
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.8))
     ax = axes[0]
     ax.plot(x, [r["gain"] for r in main], marker="o", lw=2.5, color=CLAY, label="bullets: gain over the same net with empty text")
     if any(r.get("gain_ci") for r in main):
@@ -153,24 +153,22 @@ def fig_scaling(rep, out):
             ax.scatter([r["n_pairs"]], [r["gain"]], marker="D", s=90, color=c, zorder=5, label=f"{nm}, same {r['n_pairs'] // 1000}k pairs, same recipe: {r['gain']:+.3f}")
     ax.axhline(0, color=INK, lw=0.8); ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off()
     ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("FVE of Δ gained over the same net with no text")
-    ax.set_title("Does the bullet-list gain rise with data?\n(held-out val rows 0:1024, gap ≥ 2, energy-weighted loss)"); ax.legend(frameon=False, fontsize=8.5, loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
+    ax.set_title("Bullet-list gain over no text vs train pairs\n(held-out val rows 0:1024, gap ≥ 2, energy-weighted loss)"); ax.legend(frameon=False, fontsize=8.5, loc="best"); ax.spines[["top", "right"]].set_visible(False)
     fb = S.get("fixed_baselines_energy_loss") or {}
-    if fb:
-        txt = "; ".join(f"{'no depth' if 'nodepth' in k else 'TOLD depth'} @ {fb[k]['n_train'] // 1000}k: {fb[k]['fve']:.3f}" for k in ("mlp_nodepth_matched", "mlp_nodepth_extra", "mlp_depth_extra") if k in fb)
-        ax.text(0.02, 0.02, "h_i-only MLP, same loss, absolute FVE(Δ): " + txt, transform=ax.transAxes, fontsize=8, color=INK, va="bottom")
     ax = axes[1]
     ax.plot(x, [r["fve_own"] for r in main], marker="o", lw=2.5, color=CLAY, label="bullets: FVE(Δ) with own list")
     ax.plot(x, [r["fve_empty"] for r in main], marker="o", lw=2, color=CLAY, ls=":", label="bullets: FVE(Δ) with empty text (same net)")
     for text, c, nm in (("prose", INK, "prose"), ("lens", GREY, "lens-diff")):
         for r in (sel(text, "abs_fve") or sel(text, "gain")):
             ax.scatter([r["n_pairs"]], [r["fve_own"]], marker="D", s=90, color=c, zorder=5, label=f"{nm} with text, same pairs"); ax.scatter([r["n_pairs"]], [r["fve_empty"]], marker="D", s=50, facecolors="none", edgecolors=c, zorder=5)
-    if "mlp_nodepth_extra" in fb: ax.axhline(fb["mlp_nodepth_extra"]["fve"], color=INK, ls="--", lw=1.2, label=f"h_i-only MLP, no depth, 100k pairs: {fb['mlp_nodepth_extra']['fve']:.3f}")
+    if "mlp_nodepth_extra" in fb: ax.axhline(fb["mlp_nodepth_extra"]["fve"], color=INK, ls="--", lw=1.2, label=f"h_i-only MLP (no text, no depth), 100k pairs: {fb['mlp_nodepth_extra']['fve']:.3f}")
+    if "mlp_depth_extra" in fb: ax.axhline(fb["mlp_depth_extra"]["fve"], color=SAGE, ls="--", lw=1.2, label=f"h_i-only MLP TOLD depth, 100k pairs: {fb['mlp_depth_extra']['fve']:.3f}")
     ax2 = ax.twinx(); ax2.plot(x, [r["p_own_beats_dm"] for r in main], marker="x", lw=1.5, color=SKY, label="P(own list beats depth-matched wrong list)")
     if any(r.get("flip_p") for r in main): ax2.plot(x, [r.get("flip_p") or np.nan for r in main], marker="x", lw=1.5, color=SAGE, label="P(original beats claim-flipped list)")
     ax2.axhline(0.5, color=INK, ls="--", lw=0.6); ax2.set_ylim(0.4, 1.0); ax2.set_ylabel("probability over held-out pairs")
     ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off(); ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("absolute FVE of Δ on held-out pairs")
-    ax.set_title("Absolute levels: text vs no text vs an h_i-only MLP,\nand the pair-specific / claim-flip probabilities")
-    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels(); ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=8, loc="upper left"); ax.spines[["top"]].set_visible(False)
+    ax.set_title("Absolute FVE(Δ): with text, without, and h_i-only MLPs;\npair-specific and claim-flip probabilities (right axis)")
+    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels(); ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=8, loc="center left"); ax.spines[["top"]].set_visible(False)
     save(fig, rep, "fig_scaling")
     out["fig_scaling"] = S
 

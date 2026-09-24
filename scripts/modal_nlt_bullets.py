@@ -15,7 +15,7 @@ from modal_nla_exp import image_base, REPO_LOCAL, REPO_REMOTE, REPO_IGNORE  # no
 vol = modal.Volume.from_name("nlt", create_if_missing=True)
 SECRETS = [modal.Secret.from_name("nla-exp-secrets")]
 DATA = os.environ.get("NLT_DATA", "/vol/data/qwen3_8b")
-IGNORE = list(REPO_IGNORE) + ["*.log", "**/logs/**", "logs", "*.npy", "*.pt", "*.jsonl", "*.out", "wandb", "*.safetensors"]
+IGNORE = list(REPO_IGNORE) + ["*.log", "**/logs/**", "logs", "*.npy", "*.pt", "*.jsonl", "*.out", "wandb", "*.safetensors", "**/plot_*.py", "**/notes/**", "**/*.png", "**/*.pdf", "**/*.html"]   # plotters / report files are edited while jobs build; keep them out of the mount
 image = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=IGNORE)
 app = modal.App(os.environ.get("NLT_APP", "nlt-bullets"), image=image)
 GPU = os.environ.get("NLT_GPU", "H100")
