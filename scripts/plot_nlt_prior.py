@@ -105,7 +105,7 @@ def load_twins(results, arm):
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--arm", default="main_v"); ap.add_argument("--arms", default="main_v,bidir_v,big_v,main_x0res,punc03_v"); ap.add_argument("--results", default=os.path.expanduser("~/nlt-prior-data/results"))
+    ap = argparse.ArgumentParser(); ap.add_argument("--arm", default="main_v"); ap.add_argument("--arms", default="main_v,big_v,xl_v,bidir_v,main_x0res,punc03_v,punc05_v,nulldm_v"); ap.add_argument("--twin-arms", default="big_v_s1500", help="extra checkpoints whose scored manifests go in the twin table"); ap.add_argument("--results", default=os.path.expanduser("~/nlt-prior-data/results"))
     a = ap.parse_args(); os.makedirs(f"{REP}/data", exist_ok=True); arms = a.arms.split(",")
     # ---------------- smoke gate
     smoke = {p: parse_log(f"{LOGS}/smoke_depth_{p}.log") for p in ("x0", "v", "x0res")}
@@ -127,7 +127,7 @@ def main():
     json.dump({"what": "in-training spot exact bits (Heun 16, 128 held-out val rows after the fixed set) on lens-diff L1 / L3 text; content = z - depth-matched wrong text", "curves": curves, "meta": meta}, open(f"{REP}/data/diffusion_prior_curves.json", "w"), indent=1)
     cols = {arms[0]: C_PRIOR}; pal = [C_THIRD, "#eda100", "#4a3aa7", "#e87ba4", C_BASE]
     for k, t in enumerate(arms[1:]): cols[t] = pal[k % len(pal)]
-    labels = {"main_v": "150M, velocity head (main)", "bidir_v": "150M, bidirectional tail", "big_v": "480M, velocity head", "main_x0res": "150M, x0-loss weighting", "punc03_v": "150M, text dropout 0.3"}
+    labels = {"main_v": "168M, velocity head (main)", "bidir_v": "168M, bidirectional tail", "big_v": "480M", "xl_v": "1.25B", "main_x0res": "168M, x0-loss weighting", "punc03_v": "168M, text dropout 0.3", "punc05_v": "168M, text dropout 0.5", "nulldm_v": "168M, null-dm regulariser 0.3"}
     fig, ax = plt.subplots(1, 2, figsize=(10, 4.2))
     for t in arms:
         e = curves[t]
@@ -141,7 +141,7 @@ def main():
     ax[0].set_title("Content bits on held-out lens-diff L1 keep rising with rows\n(spot exact bits, Heun 16, n=128)"); ax[1].set_title("Pairwise win rate over a depth-matched wrong text\n(same rows)")
     ax[0].legend(fontsize=9); savefig(fig, "fig_prior_curves")
     # ---------------- final tables (Heun 64, last night's rows)
-    base = load_baseline(); bits = {t: load_bits(a.results, t) for t in arms}; twins = {t: load_twins(a.results, t) for t in arms}
+    base = load_baseline(); bits = {t: load_bits(a.results, t) for t in arms}; twins = {t: load_twins(a.results, t) for t in arms + [x for x in a.twin_arms.split(",") if x]}; twins = {t: v for t, v in twins.items() if v}
     json.dump({"what": "exact held-out bits (probability-flow ODE, Heun 64, paired Hutchinson probes, same 512 fixed-val rows and controls as last night's card); content = PMI(z) - PMI(z_dm); z_dm = another pair's text at the same (i,j); z_rp = a random pair's text; shuf_words = own words permuted",
                "prior": bits, "meta": meta, "baseline_fbpc_s8000": base}, open(f"{REP}/data/diffusion_prior_bits.json", "w"), indent=1)
     json.dump({"what": "claim-flip twins: P(bits(true) > bits(twin)) per pair, exact ODE (Heun 32, paired); twin_near/far = the named final token replaced by rank 2-4 / rank>=8 alternatives (redteam twin_next); flip = one Sonnet bullet's claim flipped", "prior": twins, "baseline_fbpc_s8000_heldout": base["twins"], "bullets_flip_mse_reconstructor": base.get("bullets_flip_mse_reconstructor")}, open(f"{REP}/data/diffusion_prior_twins.json", "w"), indent=1)
@@ -222,16 +222,18 @@ def write_section(a, arms, meta, bits, base, twins, smoke, curves):
         rows.append(f"<tr><td>{NICE.get(s, s)}</td>{cell(p.get('content'), b.get('content'))}<td class='baseline'>{fmt(b.get('content'))}</td>{cell(p.get('p_z_gt_dm'), b.get('p_z_gt_dm'), nd=2)}<td class='baseline'>{fmt(b.get('p_z_gt_dm'), 2)}</td>"
                     f"{cell(p.get('pmi'), b.get('pmi'))}<td class='baseline'>{fmt(b.get('pmi'))}</td>{cell(p.get('z_rp'), b.get('z_rp'), higher=False)}<td class='baseline'>{fmt(b.get('z_rp'))}</td><td>{fmt(p.get('content_per_token'), 3)}</td><td class='baseline'>{fmt(b.get('content_per_token'), 3)}</td><td>{p.get('n', '–')}</td></tr>")
     twin_rows = []
-    for man, key, lab in (("twinnext2_lensdiff_jlens_L1", "lens_L1", "lens-diff L1"), ("twinnext2_teacher_v1", "teacher_v1", "teacher sentences"), ("twinnext2_v0_ao_tsv1", "v0", "V0 verbalizer")):
-        for v in ("twin_near", "twin_far"):
-            if man in tw and v in tw[man]:
-                pv = tw[man][v]["p_orig_preferred"]; bv = (base["twins"].get(key) or {}).get(v)
-                cls = "good" if pv >= 0.65 else ("warn" if pv >= 0.58 else "bad")
-                twin_rows.append(f"<tr><td>{lab}</td><td>{v.replace('_', ' ')}</td><td class='{cls}'>{pv:.2f} ± {1.96 * tw[man][v]['sem_p']:.2f}</td><td class='baseline'>{fmt(bv, 2)}</td><td>{tw[man][v]['delta_bits_mean']:.1f}</td><td>{tw[man][v]['n_used']}</td></tr>")
-    if "flip_bullets_sonnet_v1" in tw and "flip" in tw["flip_bullets_sonnet_v1"]:
-        fb = tw["flip_bullets_sonnet_v1"]["flip"]; mse = base.get("bullets_flip_mse_reconstructor") or {}
-        cls = "good" if fb["p_orig_preferred"] >= 0.65 else ("warn" if fb["p_orig_preferred"] >= 0.58 else "bad")
-        twin_rows.append(f"<tr><td>Sonnet bullets</td><td>one bullet's claim flipped</td><td class='{cls}'>{fb['p_orig_preferred']:.2f} ± {1.96 * fb['sem_p']:.2f}</td><td class='baseline'>{fmt(mse.get('p_orig_beats_flip') if isinstance(mse, dict) else None, 2)} (MSE reconstructor)</td><td>{fb['delta_bits_mean']:.1f}</td><td>{fb['n_used']}</td></tr>")
+    for arm_t in [a.arm] + [t for t in twins if t != a.arm]:
+        tw_t = twins.get(arm_t, {})
+        for man, key, lab in (("twinnext2_lensdiff_jlens_L1", "lens_L1", "lens-diff L1"), ("twinnext2_teacher_v1", "teacher_v1", "teacher sentences"), ("twinnext2_v0_ao_tsv1", "v0", "V0 verbalizer")):
+            for v in ("twin_near", "twin_far"):
+                if man in tw_t and v in tw_t[man]:
+                    pv = tw_t[man][v]["p_orig_preferred"]; bv = (base["twins"].get(key) or {}).get(v)
+                    cls = "good" if pv >= 0.65 else ("warn" if pv >= 0.58 else "bad")
+                    twin_rows.append(f"<tr><td>{arm_t}</td><td>{lab}</td><td>{v.replace('_', ' ')}</td><td class='{cls}'>{pv:.2f} ± {1.96 * tw_t[man][v]['sem_p']:.2f}</td><td class='baseline'>{fmt(bv, 2)}</td><td>{tw_t[man][v]['delta_bits_mean']:.1f}</td><td>{tw_t[man][v]['n_used']}</td></tr>")
+        if "flip_bullets_sonnet_v1" in tw_t and "flip" in tw_t["flip_bullets_sonnet_v1"]:
+            fb = tw_t["flip_bullets_sonnet_v1"]["flip"]; mse = base.get("bullets_flip_mse_reconstructor") or {}
+            cls = "good" if fb["p_orig_preferred"] >= 0.65 else ("warn" if fb["p_orig_preferred"] >= 0.58 else "bad")
+            twin_rows.append(f"<tr><td>{arm_t}</td><td>Sonnet bullets</td><td>one bullet's claim flipped</td><td class='{cls}'>{fb['p_orig_preferred']:.2f} ± {1.96 * fb['sem_p']:.2f}</td><td class='baseline'>{fmt(mse.get('p_orig_beats_flip') if isinstance(mse, dict) else None, 2)} (MSE reconstructor)</td><td>{fb['delta_bits_mean']:.1f}</td><td>{fb['n_used']}</td></tr>")
     arm_rows = []
     for t in arms:
         c = curves.get(t, []); last = c[-1] if c else {}; b = bits.get(t, {})
@@ -266,7 +268,7 @@ Held-out = the fixed 4096-row val set (doc-disjoint), same 512 paired rows, same
 <h3>Claim sensitivity: the headline question</h3>
 <p>Does P(true text &gt; claim-flipped twin) finally clear 0.65? Twins are redteam's generator-independent <code>twin_next</code> edits (the named final token replaced by a rank 2–4 / rank ≥ 8 alternative from the model's own distribution) and, for the Sonnet bullets, one bullet's claim flipped by Sonnet.</p>
 <figure><img src="fig_prior_twins.png" alt="twins"></figure>
-<table><thead><tr><th>source</th><th>twin</th><th>P(true &gt; twin), prior</th><th>last night</th><th>Δ bits (true − twin)</th><th>n</th></tr></thead><tbody>{''.join(twin_rows) or '<tr><td colspan=6>manifest scoring pending</td></tr>'}</tbody></table>
+<table><thead><tr><th>arm (checkpoint)</th><th>source</th><th>twin</th><th>P(true &gt; twin), prior</th><th>last night</th><th>Δ bits (true − twin)</th><th>n</th></tr></thead><tbody>{''.join(twin_rows) or '<tr><td colspan=7>manifest scoring pending</td></tr>'}</tbody></table>
 
 <h3>Arms</h3>
 <table><thead><tr><th>arm</th><th>params</th><th>rows seen</th><th>rows/s</th><th>spot lens L1 content @ P (Heun 16, n=128)</th><th>spot random-text bits</th><th>Heun-64 lens L1 content @ P</th><th>Heun-64 teacher content @ P</th></tr></thead><tbody>{''.join(arm_rows)}</tbody></table>
