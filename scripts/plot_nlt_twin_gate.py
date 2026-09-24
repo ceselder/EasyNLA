@@ -49,7 +49,7 @@ for k, (v, lab, c) in enumerate(variants):
     for xi, y in zip(x + (k - 1) * w, ys):
         ax.text(xi, y + 0.01, f"{y:.2f}", ha="center", fontsize=10)
 ax.axhline(0.5, color="grey", lw=1, ls="--"); ax.text(1.42, 0.505, "chance", fontsize=9, color="grey")
-ax.axhline(0.65, color="#b5532a", lw=1, ls=":"); ax.text(1.42, 0.655, "A4 line", fontsize=9, color="#b5532a")
+ax.axhline(0.65, color="#b5532a", lw=1, ls=":"); ax.text(1.42, 0.655, "claim gate", fontsize=9, color="#b5532a")
 ax.set_xticks(x); ax.set_xticklabels([lab for _, lab in srcs])
 ax.set_ylabel("P(original scores above the rewrite)")
 ax.set_ylim(0, 1.0)

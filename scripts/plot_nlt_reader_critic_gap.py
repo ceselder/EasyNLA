@@ -43,7 +43,7 @@ def main():
     for xi, r in zip(x, rows):
         lab = f"{r['content_bits']:.1f} bits" + (f"\nP(z>z_dm) {r['p_z_gt_dm']:.2f}" if not np.isnan(r["p_z_gt_dm"]) else "")
         ax2.text(xi, r["content_bits"] + r["content_sem"] + 0.08, lab, ha="center", fontsize=9.5)
-    ax2.axhline(0, color=INK2, lw=0.8); ax2.set_ylim(0, max(4, max(r["content_bits"] + r["content_sem"] for r in rows) * 1.6)); ax2.set_ylabel("content bits: log p(h_j | h_i, z) − log p(h_j | h_i, z_dm)")
+    ax2.axhline(0, color=INK2, lw=0.8); ax2.set_ylim(0, max(4, max(r["content_bits"] + r["content_sem"] for r in rows) * 1.6)); ax2.set_ylabel("content bits: log p(h_j | h_i, z) − log p(h_j | h_i, wrong-depth sentence)")
     ax2.set_xticks(x); ax2.set_xticklabels([r["label"] for r in rows], fontsize=9)
     ax2.set_title("The flow critic pays the same sentences 1-2.5 bits\nover a depth-matched generic sentence (headline critic)", loc="left")
     for ax in (ax1, ax2):

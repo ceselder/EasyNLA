@@ -14,7 +14,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--report", default=os.path.expanduser("~/shared/reports/natural-language-transcoder")); ap.add_argument("--stem", default="path_sft_loss")
     a = ap.parse_args(); D = os.path.join(a.report, "data"); d = json.load(open(os.path.join(D, "path_sft.json"))); arms = d["arms"]
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2, "axes.edgecolor": GRID})
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 7.4), dpi=150, gridspec_kw={"width_ratios": [1.2, 1]})
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8.2), dpi=150, gridspec_kw={"width_ratios": [1.2, 1]})
     for k, x in enumerate(arms):
         lab = LABEL.get(x.get("tag"), x.get("label", x.get("tag"))); c = x.get("curve") or []
         if c: ax1.plot([p[0] for p in c], [p[1] for p in c], marker="o", ms=3.5, lw=2, color=CAT[k % len(CAT)], label=lab)
