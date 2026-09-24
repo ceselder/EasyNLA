@@ -71,6 +71,15 @@ def main():
             for k in range(g):
                 acc["attn"][b[k]] += ash[k]; acc["mlp"][b[k]] += msh[k]; acc["n_w"][b[k]] += 1.0 / g
             attn_tot.append(ash.sum()); mlp_tot.append(msh.sum()); a_norm_frac.append(float((an ** 2).sum() / ((an ** 2).sum() + (mn ** 2).sum())))
+    onset_rel = []; riser_attn_frac = []
+    for r in sae.itertuples():
+        g = r.j - r.i
+        for o in json.loads(r.rising_onset)[:6]:
+            onset_rel.append((o - r.i) / g)
+        if r.rising_attn and r.rising_attn not in ("null", None):
+            ra = json.loads(r.rising_attn); rm = json.loads(r.rising_mlp)
+            for x_, y_ in zip(ra[:6], rm[:6]):
+                riser_attn_frac.append(abs(x_) / (abs(x_) + abs(y_) + 1e-6))
     n_pairs = len(sae); n_w = len(attn_tot)
     delta_by_pos = acc["delta"] / n_pairs; fchg_by_pos = acc["fchg"] / n_pairs
     attn_by_pos = acc["attn"] / max(1, n_w); mlp_by_pos = acc["mlp"] / max(1, n_w)
@@ -78,7 +87,11 @@ def main():
                        sae_feature_change_by_relpos=fchg_by_pos.tolist(), attn_share_by_relpos=attn_by_pos.tolist(), mlp_share_by_relpos=mlp_by_pos.tolist(),
                        n_pairs=n_pairs, n_pairs_with_writes=n_w, attn_share_of_delta_mean=float(np.mean(attn_tot)) if n_w else None,
                        mlp_share_of_delta_mean=float(np.mean(mlp_tot)) if n_w else None, attn_norm2_fraction_mean=float(np.mean(a_norm_frac)) if n_w else None,
-                       last_layer_share_mean=float(np.mean(abs_last)), last_layer_share_median=float(np.median(abs_last)))
+                       last_layer_share_mean=float(np.mean(abs_last)), last_layer_share_median=float(np.median(abs_last)),
+                       riser_onset_relpos_hist=np.histogram(onset_rel, bins=nb, range=(0, 1.0001))[0].tolist(), riser_onset_relpos_mean=float(np.mean(onset_rel)) if onset_rel else None,
+                       riser_onset_in_last_block_frac=float(np.mean(np.array(onset_rel) >= 0.999)) if onset_rel else None,
+                       riser_attn_fraction_mean=float(np.mean(riser_attn_frac)) if riser_attn_frac else None,
+                       riser_attn_dominant_frac=float(np.mean(np.array(riser_attn_frac) > 0.5)) if riser_attn_frac else None)
     fig, axs = plt.subplots(1, 2, figsize=(12, 5)); fig.subplots_adjust(wspace=0.3)
     x = np.arange(nb); w = 0.38
     axs[0].bar(x - w / 2, delta_by_pos, w, color=C["grey"], label="share of Δ (projection of d_k on Δ)")
@@ -182,29 +195,45 @@ def main():
         axs[0].set_title(f"Transcoders reconstruct the MLP writes (median FVE {tc.fve_tc.median():.2f});\n8 features already give {tc.fve_top.median():.2f}")
         axs[0].legend()
         axs[1].hist(pp.clip(-0.2, 1.2), bins=40, color=C["tc"])
-        axs[1].set_xlabel("share of Δ explained by the top-8 transcoder features of every MLP write in (i, j]"); axs[1].set_ylabel("val pairs")
+        axs[1].set_xlabel("share of Δ from the top-8 transcoder features\nof every MLP write in (i, j]"); axs[1].set_ylabel("val pairs")
         axs[1].set_title(f"Top MLP features account for {100 * pp.median():.0f}% (median) of Δ")
         save(fig, a.report_dir, "featurizer_transcoder_mlp")
 
     # ------------------------------------------------------------------ Fig 5: MAEMM verification
-    mm = load_parts(f"{a.data_dir}/maemm/{a.split}/*.parquet")
-    if len(mm):
+    mm = load_parts(f"{a.data_dir}/maemm/{a.split}/gen_*.parquet")
+    if len(mm) and "verify_act" in mm.columns:
+        # ratio to the feature's recorded max activation (transcoder repo records) where available
+        rec = {}
+        for f in glob.glob(f"{a.data_dir}/tc_dossier/{a.split}/features_L*_*.parquet"):
+            t = pd.read_parquet(f, columns=["layer", "feature", "rec_act_max"])
+            for r in t.itertuples():
+                if r.rec_act_max is not None and r.rec_act_max == r.rec_act_max:
+                    rec[(int(r.layer), int(r.feature))] = float(r.rec_act_max)
+        mm["act_max"] = [rec.get((int(r.layer), int(r.feature))) for r in mm.itertuples()]
+        mm["ratio"] = mm.verify_act / mm.act_max
         v = mm.dropna(subset=["verify_act"])
         res = {}
         for kind, g in v.groupby("kind"):
             res[kind] = {"n": int(len(g)), "p_act_gt0": float((g.verify_act > 0).mean()), "median_act": float(g.verify_act.median())}
             by_layer = g.groupby("layer").verify_act.apply(lambda s: float((s > 0).mean())).to_dict()
             res[kind]["p_act_gt0_by_layer"] = {int(k): float(x) for k, x in by_layer.items()}
+            if g.ratio.notna().any():
+                res[kind]["p_ratio_ge_025"] = float((g.ratio >= 0.25).mean()); res[kind]["p_ratio_ge_05"] = float((g.ratio >= 0.5).mean())
+                res[kind]["p_ratio_ge_025_by_layer"] = {int(k): float(x) for k, x in g.groupby("layer").ratio.apply(lambda s: float((s >= 0.25).mean())).to_dict().items()}
         out["fig5"] = res
         if "tc" in res or "sae" in res:
             fig, ax = plt.subplots(figsize=(8, 4.6))
             for kind, col in (("tc", C["tc"]), ("sae", C["sae"])):
                 if kind in res:
                     d = res[kind]["p_act_gt0_by_layer"]; ks = sorted(d)
-                    ax.plot(ks, [d[k] for k in ks], marker="o", color=col, label=f"{'transcoder' if kind == 'tc' else 'SAE'} features (n={res[kind]['n']})")
-            ax.axvline(27, color=C["grey"], ls="--", label="the inverter's training layer (27)")
-            ax.set_xlabel("layer of the feature"); ax.set_ylabel("P(generated text activates the feature at its own layer)"); ax.set_ylim(0, 1.02)
-            ax.set_title("MAEMM texts trigger the features they were inverted from\nat most layers, not only at the training layer"); ax.legend()
+                    ax.plot(ks, [d[k] for k in ks], marker="o", color=col, label=f"activation > 0 ({'transcoder' if kind == 'tc' else 'SAE'} features, n={res[kind]['n']})")
+                    if "p_ratio_ge_025_by_layer" in res[kind]:
+                        d2 = res[kind]["p_ratio_ge_025_by_layer"]
+                        ax.plot(ks, [d2.get(k, np.nan) for k in ks], marker="s", ls="--", color=col, label="activation >= 25% of the feature's max")
+            ax.axvline(27, color=C["grey"], ls=":", label="the inverter's training layer (27)")
+            ax.set_xlabel("layer of the feature"); ax.set_ylabel("fraction of features whose MAEMM text\nactivates them at their own layer"); ax.set_ylim(0, 1.02)
+            r_ = res.get("tc", {})
+            ax.set_title(f"MAEMM texts rarely trigger the transcoder feature they invert:\n{100 * r_.get('p_act_gt0', 0):.0f}% activate it at all, {100 * r_.get('p_ratio_ge_025', 0):.0f}% reach a quarter of its max"); ax.legend(fontsize=10)
             save(fig, a.report_dir, "featurizer_maemm_verify")
 
     # ------------------------------------------------------------------ Fig 6: MAEMM direction specificity (cos at layer 27, own vs control)
