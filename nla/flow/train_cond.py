@@ -368,6 +368,7 @@ def main():
     p.add_argument("--ctr-k", type=int, default=32, help="negatives per activation (group size K+1)"); p.add_argument("--ctr-weight", type=float, default=1.0)
     p.add_argument("--ctr-tau-init", type=float, default=20.0, help="InfoNCE temperature in nats of FM-proxy PMI"); p.add_argument("--ctr-fixed-tau", action="store_true")
     p.add_argument("--ctr-tau-lr", type=float, default=1e-3, help="learning rate of log tau"); p.add_argument("--ctr-tau-max", type=float, default=100.0, help="tau clamp (nats)")
+    p.add_argument("--rewarm", type=int, default=0, help="continuation runs: linear lr re-warm-up over this many steps after --start-step (AdamW state is not restored under FSDP)")
     p.add_argument("--ctr-global", type=int, default=0, help="N > 0: ONE same-template group of N distinct-answer activations spread over all ranks (N/world rows each), full N x N "
                    "InfoNCE matrix (every claim is a negative for every other activation); rows sharded, logits all-gathered, gradient by chunked recompute (GradCache)")
     p.add_argument("--ctr-groups", type=int, default=1, help="with --ctr-global: global groups per step (same template, different activations)")
@@ -397,6 +398,8 @@ def main():
     p.add_argument("--enc-bidir", action="store_true", help="encoder's full-attention layers attend bidirectionally over the explanation (linear-attention layers stay causal)")
     p.add_argument("--enc-bidir-check", action="store_true", help="at start-up, verify that an early token's state depends on a later token iff --enc-bidir")
     a = p.parse_args(); torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
+    if a.start_step < 0:   # continuation: start where the checkpoint in --resume-from stopped
+        a.start_step = int(torch.load(os.path.join(a.resume_from, "adapter_latest.pt"), map_location="cpu")["step"])
     import torch.distributed as dist
     ddp = "RANK" in os.environ
     if ddp: dist.init_process_group("nccl"); rank, world = dist.get_rank(), dist.get_world_size(); dev = torch.device("cuda", int(os.environ["LOCAL_RANK"])); torch.cuda.set_device(dev)
@@ -843,9 +846,12 @@ def main():
                 take = pools[t_][: nb - len(out)]; del pools[t_][: len(take)]
                 chunks.append((t_, list(range(len(out), len(out) + len(take))))); out += take
             return out, chunks
+        if a.start_step:   # continuation: replay the same-template sampler so each activation is still drawn once across the runs
+            for _ in range(a.start_step * a.grad_accum): next_ctr_batch(a.batch)
+            if is0: print(f"[cond] same-template sampler replayed {a.start_step} steps; {sum(len(v) for v in pools.values())} fresh activations left on rank 0", flush=True)
     ctr_stats = {}
     for step in range(a.start_step + 1, a.steps + 1):
-        sched = min(1.0, step / a.warmup) * (1.0 if a.lr_const else (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1))
+        sched = min(1.0, step / a.warmup, (step - a.start_step) / a.rewarm if a.rewarm > 0 else 1.0) * (1.0 if a.lr_const else (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1))
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
         lr = a.lr * sched
         opt.zero_grad(set_to_none=True); loss_acc = 0.0
