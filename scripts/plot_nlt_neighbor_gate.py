@@ -1,47 +1,64 @@
-"""Neighbour-position control (EVALS 9g): does a critic pay less for a description when the target activation is one token away?
+"""EVALS 9g, the neighbour-position control: the same description scored against (h_i, h_j) taken one token earlier / later.
 
-Reads data/neighbor_control_<critic>.json (written by nlt.evals.neighbor_control summarize) and draws two panels:
-  left  -- P(PMI at the described position > PMI at pos-1 / pos+1) per critic x source, with the 0.65 gate and the 0.5 chance line
-  right -- position-specific share (PMI_pos - PMI_nbr) / PMI_pos: 0 = the critic pays the same bits anywhere, 1 = all bits are position-specific
-Usage: python scripts/plot_nlt_neighbor_gate.py --report-dir ~/shared/reports/natural-language-transcoder
+Reads every data/neighbor_control_*.json (redteam) and writes neighbor_gate.{png,pdf} + data/neighbor_gate.json.
+Panel (a): P(bits at the described position > bits one token over); (b): position-specific share of PMI = 1 − PMI_nbr / PMI_pos
+(only meaningful when PMI_pos > 0; sources the critic scores below silence are shown hatched with no share bar).
 """
-import argparse, glob, json, os
+import argparse, glob, json, os, textwrap
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-NAMES = {"big": "union_pooled_big", "critic_para_p3_ckpt_step003500": "critic_para_p3 @3500", "enc_e2": "enc_e2 (8B L24)", "v3bfbpci": "critic_v3b_fbpc s8000"}
-SRC = {"teacher_v1": "teacher", "v0_ao_tsv1": "V0 verbalizer", "lensdiff_jlens_L1": "lens L1", "dossier_sonnet_v1_v1": "dossier v1"}
+SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
+CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+CRITIC = {"big": ("wider adapter", 0), "union_pooled_big": ("wider adapter", 0), "enc_e2": ("8B-encoder critic", 1), "critic_para_p3_ckpt_step003500": ("paraphrase critic", 2),
+          "critic_para_p3": ("paraphrase critic", 2), "v3bfbpci": ("decayed-lr critic", 3), "critic_v3b_fbpc": ("decayed-lr critic", 3), "pooled_n": ("headline critic", 4), "union_pooled_n": ("headline critic", 4)}
+SOURCE = {"teacher_v1": ("teacher", 0), "v0_ao_tsv1": ("verbalizer", 1), "lensdiff_jlens_L1": ("J-lens L1", 2), "dossier_sonnet_v1_v1": ("dossier v1", 3), "dossier_sonnet_v1_v0": ("dossier v1 phrases", 4)}
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--report-dir", required=True); a = ap.parse_args()
-    rows = []
-    for f in sorted(glob.glob(os.path.join(a.report_dir, "data", "neighbor_control_*.json"))):
-        d = json.load(open(f)); crit = d["critic"]
-        for src, r in d["sources"].items():
-            for side, tag in (("nbr_m1", "pos-1"), ("nbr_p1", "pos+1")):
-                s = r["sides"].get(side, {})
-                if s.get("n", 0): rows.append({"critic": NAMES.get(crit, crit), "source": SRC.get(src, src), "side": tag, "p": s["p_pos_gt_nbr"], "share": s["position_specific_share"], "n": s["n"], "pmi_pos": s["pmi_pos_bits_mean"], "pmi_nbr": s["pmi_nbr_bits_mean"]})
-    json.dump({"rows": rows, "gate": "P >= 0.65 PASS, 0.55-0.65 WARN, < 0.55 FAIL"}, open(os.path.join(a.report_dir, "data", "neighbor_gate_plot.json"), "w"), indent=1)
-    labels = sorted({(r["critic"], r["source"]) for r in rows}, key=lambda t: (list(NAMES.values()).index(t[0]) if t[0] in NAMES.values() else 9, t[1]))
-    x = np.arange(len(labels)); w = 0.38
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6.4))
-    for ax, key, ylab in ((axes[0], "p", "P(bits at the described position > bits one token away)"), (axes[1], "share", "position-specific share of PMI  (1 - PMI_nbr / PMI_pos)")):
-        for k, (side, col) in enumerate((("pos-1", "#6baed6"), ("pos+1", "#08519c"))):
-            vals = [next((r[key] for r in rows if (r["critic"], r["source"]) == lab and r["side"] == side), np.nan) for lab in labels]
-            ax.bar(x + (k - 0.5) * w, vals, w, color=col, label=f"target moved to {side}")
-        ax.set_xticks(x); ax.set_xticklabels([f"{c}\n{s}" for c, s in labels], rotation=30, ha="right", fontsize=10); ax.set_ylabel(ylab, fontsize=12); ax.tick_params(labelsize=11)
-        if key == "p":
-            ax.axhline(0.65, color="k", ls="--", lw=1); ax.axhline(0.5, color="grey", ls=":", lw=1); ax.set_ylim(0.3, 1.0)
-            ax.text(x[-1] + 0.5, 0.655, "gate 0.65", ha="right", fontsize=11); ax.text(x[-1] + 0.5, 0.505, "chance", ha="right", fontsize=11, color="grey")
+    ap = argparse.ArgumentParser(); ap.add_argument("--report", default=os.path.expanduser("~/shared/reports/natural-language-transcoder")); ap.add_argument("--stem", default="neighbor_gate")
+    a = ap.parse_args(); D = os.path.join(a.report, "data"); rows = []
+    for f in sorted(glob.glob(os.path.join(D, "neighbor_control_*.json"))):
+        N = json.load(open(f)); c = N.get("critic", os.path.basename(f)[17:-5]); clab, corder = CRITIC.get(c, (c, 9))
+        for src, S in (N.get("sources") or {}).items():
+            slab, sorder = SOURCE.get(src, (src, 9)); sides = S.get("sides") or {}
+            m1, p1 = sides.get("nbr_m1") or {}, sides.get("nbr_p1") or {}
+            rows.append({"critic": c, "critic_label": clab, "source": src, "source_label": slab, "order": (corder, sorder), "pmi_pos": S.get("pmi_pos_bits_mean"),
+                         "pmi_m1": m1.get("pmi_nbr_bits_mean"), "pmi_p1": p1.get("pmi_nbr_bits_mean"), "p_m1": m1.get("p_pos_gt_nbr"), "p_p1": p1.get("p_pos_gt_nbr"),
+                         "share_m1": m1.get("position_specific_share"), "share_p1": p1.get("position_specific_share"), "n_m1": m1.get("n"), "n_p1": p1.get("n"), "verdict": S.get("verdict_9g"), "verdict_m1": m1.get("verdict_9g"), "verdict_p1": p1.get("verdict_9g")})
+    rows.sort(key=lambda r: r["order"])
+    if not rows: print("no neighbour rows"); return
+    plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2, "axes.edgecolor": GRID})
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 11), dpi=150)
+    x = np.arange(len(rows)); w = 0.36
+    lab = [f"{r['critic_label']}\n{r['source_label']}" + (f"\nPMI {r['pmi_pos']:+.1f} bits" if r["pmi_pos"] is not None else "") for r in rows]
+    for ax, km, kp, ylab in ((ax1, "p_m1", "p_p1", "P(bits at the described position\n> bits one token over)"), (ax2, "share_m1", "share_p1", "position-specific share of PMI\n1 − PMI(neighbour) / PMI(position)")):
+        for k, (key, side_lab, col) in enumerate(((km, "target moved one token EARLIER (pos − 1)", "#9fbde6"), (kp, "target moved one token LATER (pos + 1)", CAT[0]))):
+            ys = []
+            for r in rows:
+                v = r.get(key)
+                if ax is ax2 and (r["pmi_pos"] is None or r["pmi_pos"] <= 0): v = np.nan  # share undefined below silence
+                ys.append(np.nan if v is None else v)
+            bars = ax.bar(x + (k - 0.5) * w, ys, w, color=col, label=side_lab, zorder=3)
+            for b, y in zip(bars, ys):
+                if y == y: ax.text(b.get_x() + b.get_width() / 2, y + (0.004 if ax is ax1 else 0.01), f"{y:.2f}", ha="center", va="bottom", fontsize=8.5, color=INK2, rotation=90)
+        if ax is ax1:
+            ax.axhline(0.5, color=INK2, lw=1.0, ls=(0, (4, 2)), label="chance 0.50"); ax.axhline(0.65, color=CAT[7], lw=1.2, ls=(0, (4, 2)), label="gate 9g: P ≥ 0.65 both sides")
+            ax.set_ylim(0.40, 0.80); ax.set_title("(a) does the critic prefer the described position over its neighbour?", loc="left", fontsize=13, fontweight="bold")
         else:
-            ax.axhline(0, color="grey", lw=0.8); ax.set_ylim(-0.2, 1.05)
-    axes[0].legend(fontsize=11, frameon=False, loc="upper left")
-    fig.suptitle("Critics keep most of a description's bits when the target activation is moved one token over:\nneighbour-position control on the fixed val pairs (exact ODE bits, neighbour store pos+-1)", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
-    for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report_dir, f"neighbor_position_gate.{ext}"), dpi=150)
-    for r in rows: print(f"{r['critic']:24s} {r['source']:14s} {r['side']}  P {r['p']:.3f}  share {r['share']:.2f}  PMI {r['pmi_pos']:.1f} -> {r['pmi_nbr']:.1f}  n {r['n']}")
+            ax.axhline(0, color=INK2, lw=0.9); ax.set_ylim(-0.05, 1.0); ax.set_title("(b) how much of the description's credit is specific to the position?", loc="left", fontsize=13, fontweight="bold")
+            for i, r in enumerate(rows):
+                if r["pmi_pos"] is not None and r["pmi_pos"] <= 0: ax.text(i, 0.02, "undefined:\ntext scores\nbelow silence", ha="center", va="bottom", fontsize=8.5, color=INK2)
+        ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=9); ax.set_ylabel(ylab); ax.set_xlim(-0.6, len(rows) - 0.4)
+        ax.grid(axis="y", color=GRID, zorder=0); [ax.spines[s].set_visible(False) for s in ("top", "right")]
+    h, l = ax1.get_legend_handles_labels(); fig.legend(h, l, frameon=False, fontsize=10, loc="upper left", bbox_to_anchor=(0.01, 0.895), ncol=2, columnspacing=1.6)
+    fig.suptitle("\n".join(textwrap.wrap("The critics are position-blind: with the target activations moved one token earlier or later, the wider adapter keeps 80–98% of a description's bits and even the 8B-encoder critics keep about half; the described position wins only 51–63% of pairwise comparisons (gate 65%, chance 50%) — the activation-side twin of the claim result (fixed validation pairs, neighbour store, exact ODE bits)", 100)), x=0.01, y=0.995, ha="left", va="top", fontsize=14)
+    fig.text(0.01, 0.004, "Redteam's EVALS 9g, data/neighbor_control_*.json (exact bits, Heun 32, paired probes; n per bar 500–1000 pairs). The same text z is scored at (h_i, h_j) of the described position and at the same layers one token earlier / later.", fontsize=9.5, color=INK2)
+    fig.subplots_adjust(left=0.09, right=0.99, top=0.80, bottom=0.10, hspace=0.62)
+    for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
+    json.dump({"gate": "EVALS 9g: P(PMI at pos > PMI at pos±1) ≥ 0.65 both sides PASS, 0.55–0.65 WARN, < 0.55 FAIL", "rows": [{k: v for k, v in r.items() if k != "order"} for r in rows]}, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)
+    print("saved", os.path.join(a.report, f"{a.stem}.png"), "rows", [(r["critic_label"], r["source_label"]) for r in rows])
 
 
 if __name__ == "__main__":

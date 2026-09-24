@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 ARMS = [("fbp", "0.6B encoder, full pool, frozen POOLED prior", CAT[0], "-"), ("fbpc", "… the step-7000 checkpoint continued with a DECAYING learning rate", CAT[3], "--"), ("e2p", "Qwen3-8B encoder, full pool, frozen POOLED prior", CAT[6], "-"),
-        ("e2sentp", "Qwen3-8B encoder, prose-only pool, frozen POOLED prior", CAT[2], "-"), ("fb", "0.6B encoder, full pool, frozen SQUASH prior (stopped)", CAT[7], ":")]
+        ("e2sentp", "Qwen3-8B encoder, prose-only pool, frozen POOLED prior", CAT[2], "-"), ("e2sentpc", "… the prose-only 8B arm continued with a DECAYING learning rate (stopped under the freeze)", CAT[5], "--"), ("fb", "0.6B encoder, full pool, frozen SQUASH prior (stopped)", CAT[7], ":")]
 SETS = [("lens_L1", "J-lens description, 1 sentence"), ("v0", "the VERBALIZER's sentence (activations only)"), ("jlens20", "raw J-lens top-20 lists as text")]
 
 
