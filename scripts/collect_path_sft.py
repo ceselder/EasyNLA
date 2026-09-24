@@ -40,12 +40,19 @@ def parse(path):
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--out", required=True); p.add_argument("--arm", action="append", default=[], help="tag=logpath"); p.add_argument("--plot", default=None, help="output stem for the figure")
+    p.add_argument("--merge", action="append", default=[], help="dst:src -- copy src's per-source val losses into dst (e.g. v0b:v0b_evalonly) and drop src")
     a = p.parse_args(); arms = []
     for spec in a.arm:
         tag, path = spec.split("=", 1)
         if not os.path.exists(path): print(f"[collect] missing {path}"); continue
         d = parse(path); d["tag"] = tag; d["label"] = LABELS.get(tag, tag); d["log"] = path; arms.append(d)
         print(f"[collect] {tag}: {len(d['curve'])} evals, final val {d.get('val_loss')}, per-source {[ (k, round(v, 4)) for k, v in d.items() if k.startswith('val_loss_')]}")
+    for spec in a.merge:
+        dst, src = spec.split(":"); D = {x["tag"]: x for x in arms}
+        if dst in D and src in D:
+            for k, v in D[src].items():
+                if k.startswith("val_loss"): D[dst][k] = v
+            D[dst]["per_source_from"] = D[src]["log"]; arms = [x for x in arms if x["tag"] != src]
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     json.dump({"arms": arms, "note": "held-out CE in nats per response token on the first 768 rows of /vol/z/v0b_mix/val/rows.parquet (same rows, same filters for every arm); "
                                      "all arms = V0 LoRA init + 1 epoch on V0b's 20,126 rows, lr 3e-5, batch 32, warmup 20, cosine, r64 a16 rsLoRA; only the input differs"}, open(a.out, "w"), indent=1)
