@@ -810,6 +810,64 @@ def maemm_invert(spec: str, out_path: str, max_new_tokens: int = 40, batch_size:
 
 
 
+@app.function(gpu=GPU_BIG, volumes=VOLS, secrets=SECRETS, timeout=2 * 3600, cpu=8, memory=40 * 1024)
+def maemm_verify_cos(gen_path: str, spec: str, out_path: str, read_layer: int = 27, max_rows: int = 0) -> str:
+    """Direction-specificity of MAEMM texts: base model (no adapter) on each generated text, residual after block `read_layer`
+    (the inverter's training objective); cos_own = max_t cos(h_t, v_own), cos_ctrl = the same against another item's direction
+    (rolled by 1 within the same kind). Also cos between the direction and the mean state. Writes parquet [name, kind, cos_own, cos_ctrl, cos_mean_own]."""
+    import numpy as np
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    vol.reload()
+    items = {it["name"]: it for it in json.load(open(spec))}
+    gen = pq.read_table(gen_path).to_pandas()
+    gen = gen[gen.sample_idx == 0].reset_index(drop=True)
+    if max_rows:
+        gen = gen.iloc[:max_rows]
+    bp = base_path()
+    tok = AutoTokenizer.from_pretrained(bp); tok.padding_side = "right"
+    model = AutoModelForCausalLM.from_pretrained(bp, torch_dtype=torch.bfloat16, device_map={"": 0}).eval()
+    cache = {}
+    def vec(it):
+        if "vec" in it:
+            return np.asarray(it["vec"], np.float32)
+        if it["vec_path"] not in cache:
+            cache[it["vec_path"]] = np.load(it["vec_path"], mmap_mode="r")
+        return np.asarray(cache[it["vec_path"]][int(it["row"])], np.float32)
+    V = torch.from_numpy(np.stack([vec(items[n]) for n in gen.name])).cuda()          # [N, d]
+    V = torch.nn.functional.normalize(V, dim=-1)
+    # control: roll within kind
+    ctrl_idx = np.arange(len(gen))
+    for kind, g in gen.groupby("kind"):
+        idx = g.index.to_numpy(); ctrl_idx[idx] = np.roll(idx, 1)
+    captured = {}
+    h = model.model.layers[read_layer].register_forward_hook(lambda m, a, o: captured.__setitem__("h", (o[0] if isinstance(o, tuple) else o).detach()))
+    cos_own, cos_ctrl, cos_mean = [], [], []
+    with torch.no_grad():
+        for s in range(0, len(gen), 32):
+            texts = [t if t else " " for t in gen.text.iloc[s:s + 32].tolist()]
+            enc = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False, truncation=True, max_length=64).to("cuda")
+            model(**enc)
+            H = torch.nn.functional.normalize(captured["h"].float(), dim=-1)          # [b, T, d]
+            mask = enc.attention_mask.bool()
+            vo = V[s:s + 32]; vc = V[torch.as_tensor(ctrl_idx[s:s + 32])]
+            co = torch.einsum("btd,bd->bt", H, vo); cc = torch.einsum("btd,bd->bt", H, vc)
+            co[~mask] = -1; cc[~mask] = -1
+            cos_own += co.max(1).values.tolist(); cos_ctrl += cc.max(1).values.tolist()
+            hm = (captured["h"].float() * mask[..., None]).sum(1) / mask.sum(1, keepdim=True)
+            cos_mean += torch.nn.functional.cosine_similarity(hm, vo, dim=-1).tolist()
+    h.remove()
+    df = pd.DataFrame(dict(name=gen.name, kind=gen.kind, layer=gen.layer, feature=gen.feature, cos_own=cos_own, cos_ctrl=cos_ctrl, cos_mean_own=cos_mean))
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), out_path)
+    vol.commit()
+    for kind, g in df.groupby("kind"):
+        print(f"[cos] {kind}: n={len(g)} cos_own {g.cos_own.mean():.3f} cos_ctrl {g.cos_ctrl.mean():.3f} P(own>ctrl) {(g.cos_own > g.cos_ctrl).mean():.2f} cos_mean_own {g.cos_mean_own.mean():.3f}", flush=True)
+    return out_path
+
+
 @app.function(volumes=VOLS, secrets=SECRETS, timeout=2 * 3600, cpu=8, memory=64 * 1024)
 def build_maemm_spec(split: str = "val", start: int = 0, end: int = 4096, n_sae: int = 1500, n_tc: int = 300, data_dir: str = DATA_DIR,
                      writes_dir: str = WRITES_DIR, out_dir: str = f"{OUT}/maemm") -> str:
@@ -885,6 +943,8 @@ def main(task: str = "sae", split: str = "val", start: int = 0, end: int = 4096,
         print(tc_dossier.remote(split=split, start=start, end=end, layers=layers, perm_seed=perm_seed, with_records=with_records))
     elif task == "maemm":
         print(maemm_invert.remote(spec=spec, out_path=out, prompt_variant=prompt_variant))
+    elif task == "cos":
+        print(maemm_verify_cos.remote(gen_path=spec.split(",")[0], spec=spec.split(",")[1], out_path=out))
     elif task == "tcdiag":
         print(tc_diag.remote(split=split, start=start, end=end, layer=int(layers.split("-")[0])))
     elif task == "spec":
