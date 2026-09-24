@@ -33,9 +33,10 @@ def parse(text: str) -> dict:
 def score(facts: pd.DataFrame, dump: pd.DataFrame, name: str) -> dict:
     d = dump.drop_duplicates("pair_id").merge(facts, on="pair_id", suffixes=("", "_true"), how="inner")
     P = pd.DataFrame([parse(t) for t in d["text"].values]); res = {"arm": name, "n": int(len(d))}
+    multi = (d["when"].values != "single")                        # the peak facts are only stated for stretches of more than one step
     for fact in RX:
-        true = d[fact].values; pred = P[fact].values
-        res[f"acc_{fact}"] = float(np.mean(pred == true)); res[f"parsed_{fact}"] = float(np.mean([p is not None for p in pred]))
+        true = d[fact].values; pred = P[fact].values; m = multi if fact.startswith("peak") else np.ones(len(d), bool)
+        res[f"acc_{fact}"] = float(np.mean((pred == true)[m])); res[f"parsed_{fact}"] = float(np.mean([p is not None for p in pred[m]])); res[f"n_{fact}"] = int(m.sum())
     if "attn_share" in d:
         tp = np.clip(d["attn_share"].values, 0, 1) * 100; pp = P["pct"].values.astype(float)
         ok = ~np.isnan(pp); res["pct_mae"] = float(np.mean(np.abs(pp[ok] - tp[ok]))) if ok.any() else None; res["pct_parsed"] = float(ok.mean())
@@ -45,11 +46,13 @@ def score(facts: pd.DataFrame, dump: pd.DataFrame, name: str) -> dict:
 
 def baselines(facts: pd.DataFrame) -> dict:
     out = {"arm": "baselines", "n": int(len(facts))}
-    g = facts["j"].astype(int) - facts["i"].astype(int)
     for fact in RX:
-        v = facts[fact].values; classes, counts = np.unique(v, return_counts=True)
+        F = facts[facts["when"] != "single"] if fact.startswith("peak") else facts
+        g = F["j"].astype(int) - F["i"].astype(int)
+        v = F[fact].values; classes, counts = np.unique(v, return_counts=True)
         out[f"chance_{fact}"] = float(1 / len(classes)); out[f"majority_{fact}"] = float(counts.max() / len(v))
-        out[f"gapmajority_{fact}"] = float(sum(facts[fact][g == gg].value_counts().max() for gg in np.unique(g)) / len(v))
+        out[f"gapmajority_{fact}"] = float(sum(F[fact][g == gg].value_counts().max() for gg in np.unique(g)) / len(v)); out[f"n_{fact}"] = int(len(F))
+    g = facts["j"].astype(int) - facts["i"].astype(int)
     tp = np.clip(facts["attn_share"].values, 0, 1) * 100; out["pct_mae_predict_mean"] = float(np.mean(np.abs(tp - tp.mean())))
     out["pct_mae_predict_gap_mean"] = float(np.mean([abs(x - tp[g == gg].mean()) for x, gg in zip(tp, g)]))
     return out
@@ -62,7 +65,7 @@ def main():
     for spec in a.dump:
         name, path = spec.split("=", 1); rows.append(score(facts, pd.read_parquet(path), name))
     json.dump({"rows": rows, "facts": a.facts, "note": "exact accuracy of each categorical fact parsed from the generated text vs the fact computed from the writes; "
-                                                "gapmajority = per-gap majority class = what a model knowing only j-i could reach"}, open(a.out, "w"), indent=1)
+                                                "gapmajority = per-gap majority class = what a model knowing only j-i could reach; peak facts scored on stretches of > 1 step only"}, open(a.out, "w"), indent=1)
     cols = ["arm", "n"] + [f"acc_{f}" for f in RX] + ["pct_mae"]
     print("\t".join(cols))
     for r in rows:
