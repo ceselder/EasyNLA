@@ -48,11 +48,16 @@ def main():
             ax2.plot(x, [q["content"] for q in rows], marker="o", ms=6, lw=2, color=col, ls=ls, label=alab)
             for q in rows:
                 if q.get("p_z_gt_dm") is not None: ax2.annotate(f"P {q['p_z_gt_dm']:.2f}", (q["step"], q["content"]), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=8.5, color=col)
-        ax1.axhline(0, color=INK2, lw=0.9); ax1.text(0.99, 0.97, "silence (the empty text)", transform=ax1.transAxes, ha="right", va="top", fontsize=9.5, color=INK2)
+        pooled = [q["pmi"] for arm, _, _, _ in ARMS if arm != "fb" for q in (traj.get(arm, {}).get(st) or []) if q.get("pmi") is not None]
+        lo = min(pooled) if pooled else -100; ax1.set_ylim(min(lo * 1.25, -20), 22)
+        off = [q for q in (traj.get("fb", {}).get(st) or []) if q.get("pmi") is not None and q["pmi"] < ax1.get_ylim()[0]]
+        if off: ax1.text(off[0]["step"], ax1.get_ylim()[0] * 0.97, f"squash arm: {off[0]['pmi']:.0f} (off scale)", ha="center", va="bottom", fontsize=9, color=CAT[7])
+        ax1.axhline(0, color=INK2, lw=0.9); ax1.text(0.99, 0.60, "silence (the empty text)", transform=ax1.transAxes, ha="right", va="bottom", fontsize=9.5, color=INK2)
         if st in refs and refs[st][1] is not None:
             ax1.axhline(refs[st][1], color="#87867F", lw=1.2, ls=(0, (4, 2))); ax1.text(0.01, 0.97, f"{refs[st][0]}: {refs[st][1]:+.1f}", transform=ax1.transAxes, ha="left", va="top", fontsize=9.5, color=INK2)
-        ax1.set_title(f"({'abc'[r]}1) {slab}: exact PMI of the TRUE text vs the blind prior", loc="left", fontsize=11.5)
-        ax2.set_title(f"({'abc'[r]}2) {slab}: paired content = bits(z) − bits(z_dm)", loc="left", fontsize=11.5)
+        fig.text(0.01, 0.905 - r * 0.318, f"({'abc'[r]}) {slab}", fontsize=12.5, fontweight="bold", ha="left", va="bottom")
+        ax1.set_title("exact PMI of the TRUE text vs the blind prior", loc="left", fontsize=11.5)
+        ax2.set_title("paired content = bits(z) − bits(z_dm)", loc="left", fontsize=11.5)
         ax1.set_ylabel("exact bits (true text vs empty text)"); ax2.set_ylabel("content bits (label = P(z beats z_dm))"); ax2.axhline(0, color=INK2, lw=0.9)
         for ax in (ax1, ax2):
             ax.set_xlabel("training step (checkpoint)"); ax.grid(color=GRID)
@@ -60,7 +65,7 @@ def main():
         if r == 0: ax2.legend(frameon=False, fontsize=9.5, loc="lower right")
     fig.suptitle("\n".join(textwrap.wrap("The scaled-up critics on the pooled prior: the exact presence penalty of the TRUE text shrinks with training while paired content grows — but at 2000–3000 steps every true text is still 35–90 bits below silence, so no checkpoint is a listener candidate yet (Qwen3-8B, layers 9–34; 256 fixed held-out pairs per set, exact ODE Heun 32) — PRELIMINARY", 100)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
     fig.text(0.01, 0.005, "Infra's per-checkpoint exact spot checks (data/info_budget.json keys v3b<arm>_s<step>; own rows, no shuffled-words control). Read as trajectories, not endpoints (board #593). The hard condition for a listener is exact PMI(z) > 0 on the lens-sentence AND verbalizer slices with P(z > z_dm) ≥ 0.65 on the verbalizer slice.", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
-    fig.subplots_adjust(left=0.08, right=0.98, top=0.88, bottom=0.07, hspace=0.55, wspace=0.28)
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.87, bottom=0.07, hspace=0.62, wspace=0.30)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump({"arms": {arm: {"label": next((l for k, l, _, _ in ARMS if k == arm), arm), "sets": sets} for arm, sets in traj.items()}, "references": refs}, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)
     print("saved", os.path.join(a.report, f"{a.stem}.png"), "arms:", {k: {s: len(v) for s, v in d.items()} for k, d in traj.items()})
