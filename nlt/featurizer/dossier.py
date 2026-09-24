@@ -30,7 +30,7 @@ from nlt.featurizer.labels import load_cache, client, MODEL  # noqa: E402
 from nlt.lens.describe import FORBIDDEN, SPECIAL_NAMES  # noqa: E402
 from nlt.evals.regex_tags import hard_hits  # noqa: E402
 
-SOURCE = "dossier-sonnet-v1"
+SOURCE = os.environ.get("FEAT_SOURCE", "dossier-sonnet-v1")
 VERBOSITY = {"short": 0, "sentence": 1}
 
 SYSTEM = """You describe what changed inside a language model's representation of one position in a passage, between a FIRST reading and a SECOND reading of that same position. You never see the passage. You get a dossier of measurements:
@@ -171,6 +171,9 @@ def build_dossiers(a):
                 for rr in g.itertuples():
                     fs = json.loads(rr.feats); pdl = json.loads(rr.proj_delta); acts = json.loads(rr.acts)
                     for f, p_, ac in zip(fs, pdl, acts):
+                        fr = tc_feat[rr.k].at[f, "rec_freq"] if rr.k in tc_feat and f in tc_feat[rr.k].index else None
+                        if fr is not None and fr == fr and float(fr) > 0.1:
+                            continue                      # dense feature (fires on > 10% of tokens): not a claim about this position
                         cand.append((p_, rr.k, f, ac))
                 cand.sort(key=lambda x: -abs(x[0]))
                 shown = []

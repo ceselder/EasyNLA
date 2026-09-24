@@ -870,7 +870,7 @@ def maemm_verify_cos(gen_path: str, spec: str, out_path: str, read_layer: int = 
 
 @app.function(volumes=VOLS, secrets=SECRETS, timeout=2 * 3600, cpu=8, memory=64 * 1024)
 def build_maemm_spec(split: str = "val", start: int = 0, end: int = 4096, n_sae: int = 1500, n_tc: int = 300, data_dir: str = DATA_DIR,
-                     writes_dir: str = WRITES_DIR, out_dir: str = f"{OUT}/maemm") -> str:
+                     writes_dir: str = WRITES_DIR, out_dir: str = f"{OUT}/maemm", max_freq: float = 0.1) -> str:
     """Directions for the MAEMM inverter: Delta, largest attention write, largest MLP write per pair (from the stores) + the most frequent
     SAE (per SAE layer) and transcoder (per MLP layer) features' decoder directions from the dossier feature tables. Writes
     {out_dir}/{split}/spec_{start}_{end}_<part>.json (3 parts: pairs / sae / tc) + pair_dirs npy."""
@@ -918,11 +918,17 @@ def build_maemm_spec(split: str = "val", start: int = 0, end: int = 4096, n_sae:
     items = []
     for f in sorted(glob.glob(f"{OUT}/tc_dossier/{split}/features_L*_*.parquet")):
         k = int(os.path.basename(f).split("_")[1][1:])
-        ft = pq.read_table(f, columns=["feature", "n_hits"]).to_pandas()
+        ft = pq.read_table(f, columns=["feature", "n_hits", "rec_freq"]).to_pandas()
         dirs_path = f.replace(".parquet", "_dirs.npy"); enc_path = f.replace(".parquet", "_enc.npy")
         n_avail = np.load(dirs_path, mmap_mode="r").shape[0]
-        for row, r in enumerate(ft.head(min(n_tc, n_avail)).itertuples()):
+        n_added = 0
+        for row, r in enumerate(ft.head(n_avail).itertuples()):          # rows of the dirs/enc npy = the first n_avail rows of the table
+            if r.rec_freq is not None and not (isinstance(r.rec_freq, float) and np.isnan(r.rec_freq)) and float(r.rec_freq) > max_freq:
+                continue                                                  # dense features (fire on >10% of tokens) are not worth inverting
             items.append(dict(name=f"tc:{k}:{int(r.feature)}", kind="tc", layer=k, feature=int(r.feature), vec_path=dirs_path, row=row, enc_path=enc_path, enc_row=row))
+            n_added += 1
+            if n_added >= n_tc:
+                break
     json.dump(items, open(f"{out_dir}/{split}/spec_{start:07d}_{end:07d}_tc.json", "w"))
     vol.commit()
     msg = f"[spec] pairs {n_pairs} dirs, sae {n_sae_items}, tc {len(items)} -> {out_dir}/{split}/spec_{start:07d}_{end:07d}_*.json"
