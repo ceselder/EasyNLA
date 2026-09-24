@@ -8,7 +8,10 @@ import numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-SERIES = [("uprior_opus1", "Opus only (control)", "#2a78d6"), ("uprior_curA", "curriculum A: Gemma + 6 % Opus", "#eb6834"), ("uprior_curB", "curriculum B: 80 % Opus anneal", "#1baf7a")]
+SERIES = [("uprior_opus1", "Opus only, LoRA trunk (control)", "#2a78d6"), ("uprior_opus1_frozen", "Opus only, frozen trunk", "#4a3aa7"),
+          ("uprior_big_frozen", "Gemma x3.4 renderings + 6 % Opus, frozen, p(e) warm start", "#eb6834"), ("uprior_big_frozen_B", "  + Opus 80/20 anneal", "#e34948"),
+          ("uprior_curA", "curriculum A: Gemma + 6 % Opus (LoRA)", "#eda100"), ("uprior_curB", "curriculum B: 80 % Opus anneal (LoRA)", "#1baf7a"),
+          ("uprior_opus1u", "Opus only, LoRA + unlabelled p(e)", "#e87ba4"), ("uprior_big_frozen_hn", "big frozen + hard negatives", "#008300")]
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "axes.labelsize": 12, "legend.fontsize": 11, "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True, "grid.alpha": 0.25})
 
 
@@ -55,7 +58,7 @@ def main():
     axs[1, 0].set_title("Wrong-detail detection: gold beats the edited copy\n(1,023 negatives; thin: number -- / quote : / name -.)"); axs[1, 0].set_ylabel("paired accuracy %"); axs[1, 0].axhline(50, color="k", lw=0.8, ls=":")
     axs[1, 1].set_title("Controlled number edits: P(orig > variant), exact PMI\n(near — far -- hedge : removed -.)"); axs[1, 1].set_ylabel("%"); axs[1, 1].axhline(50, color="k", lw=0.8, ls=":")
     for ax in axs.flat: ax.set_xlabel("labelled pairs seen (M)"); ax.set_xscale("log")
-    axs[0, 0].legend(loc="best"); fig.suptitle("unCLIP prior p(e|z) self-checks vs training pairs: Opus-only control vs Gemma→Opus curriculum", fontsize=14)
+    axs[0, 0].legend(loc="best", fontsize=9); fig.suptitle("unCLIP prior p(e|z) self-checks vs labelled pairs seen: data scale and trunk treatment", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.root, f"unclip_prior_selfchecks.{ext}"))
     json.dump(out, open(os.path.join(a.root, "data/unclip/unclip_prior_selfchecks.json"), "w"), indent=1)
