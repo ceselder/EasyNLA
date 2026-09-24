@@ -135,6 +135,169 @@ def bench(name: str, cfg: dict, per_doc_variants: bool = False, n_rows: int = 20
     print("[bench]", json.dumps(st), flush=True); return st
 
 
+# ------------------------------------------------------------------------------------------------------------ g2: fact sheet -> factorised renderings
+G2_K = 4          # renderings per position
+
+
+def _g2_lib():
+    p = f"{REPO_REMOTE}/nla/datagen/g2_library.json"
+    return json.load(open(p)) if os.path.exists(p) else None
+
+
+def _g2_rows(llm, texts, keys, docs, k=G2_K):
+    """stage A fact sheets (sampled context window) + validation, programmatic ladders/twins, stage B k renderings at sampled style points + QC.
+    -> (records aligned with texts, timing stats)"""
+    import random
+    from vllm import SamplingParams
+    from nla.datagen import g2_spec as G
+    lib = _g2_lib(); ck = {"enable_thinking": False}
+    wins = [G._pick(G.WINDOWS, random.Random(f"w|{key}")) for key in keys]
+    ctxs = [G.window(t, w) for t, w in zip(texts, wins)]
+    t0 = time.time()
+    resA = llm.chat([[{"role": "user", "content": G.FACT_PROMPT.format(text=c)}] for c in ctxs], SamplingParams(temperature=0.3, top_p=0.95, max_tokens=900),
+                    use_tqdm=False, chat_template_kwargs=ck)
+    tA = time.time() - t0; nA_in = sum(len(r.prompt_token_ids) for r in resA); nA_out = sum(len(r.outputs[0].token_ids) for r in resA)
+    facts, vstats = [], []
+    for r, c in zip(resA, ctxs):
+        f = G.parse_facts(r.outputs[0].text)
+        if f is None: facts.append(None); vstats.append(None); continue
+        v, st = G.validate(f, c); facts.append(v); vstats.append(st)
+    pool = {}
+    for d, v in zip(docs, facts):
+        if v is None: continue
+        for x in G.fact_list(v): pool.setdefault(x.get("etype") or x["type"], []).append((d, x["value"]))      # twins of the same subtype
+    jobs, plans = [], []
+    for i, (key, d, v) in enumerate(zip(keys, docs, facts)):
+        if v is None: continue
+        rng = random.Random(f"s|{key}"); fl = G.fact_list(v); tw = []
+        for x in fl:
+            cands = pool.get(x.get("etype") or x["type"], []); tv = None
+            for _ in range(8):
+                if not cands: break
+                dd, vv = rng.choice(cands)
+                if dd != d and vv != x["value"]: tv = vv; break
+            tw.append(tv)
+        for j in range(k):
+            st_ = G.sample_style(rng); pr, plan = G.build_render(v, fl, tw, st_, lib, rng)
+            jobs.append((i, j, pr, G.RENDER_MAX_TOKENS[st_["length"]])); plans.append((st_, plan, fl, tw))
+    t0 = time.time()
+    resB = llm.chat([[{"role": "user", "content": pr}] for _, _, pr, _ in jobs], [SamplingParams(temperature=0.9, top_p=0.95, max_tokens=mt) for *_, mt in jobs],
+                    use_tqdm=False, chat_template_kwargs=ck)
+    tB = time.time() - t0; nB_in = sum(len(r.prompt_token_ids) for r in resB); nB_out = sum(len(r.outputs[0].token_ids) for r in resB)
+    recs = [{"window": wins[i], "facts": None if facts[i] is None else json.dumps(facts[i], ensure_ascii=False), "claims": G.claims(facts[i]) if facts[i] else [],
+             "fact_ladders": None, "renders": [], "styles": [], "qc": [], "validate": json.dumps(vstats[i]) if vstats[i] else None} for i in range(len(texts))]
+    for (i, j, _, _), r, (st_, plan, fl, tw) in zip(jobs, resB, plans):
+        txt = G.parse_render(r.outputs[0].text)
+        recs[i]["renders"].append(txt); recs[i]["styles"].append(json.dumps(st_))
+        recs[i]["qc"].append(json.dumps(G.qc_render(txt, fl, plan, ctxs[i], tw) if txt else {"parse_fail": 1}))
+        if recs[i]["fact_ladders"] is None: recs[i]["fact_ladders"] = json.dumps([{**x, "twin": t} for x, t in zip(fl, tw)], ensure_ascii=False)
+    for rc in recs:                             # canonical explanation: first rendering passing every deterministic check
+        good = [t for t, q in zip(rc["renders"], rc["qc"]) if t and not any(json.loads(q).get(kk, 0) for kk in ("exact_missing", "leaked", "unsupported_numbers", "parse_fail"))]
+        rc["explanation"] = good[0] if good else next((t for t in rc["renders"] if t), None); rc["n_pass"] = len(good)
+    stats = dict(n=len(texts), facts_ok=sum(f is not None for f in facts), stageA_s=tA, stageA_prefill_tok_s=nA_in / tA, stageA_decode_tok_s=nA_out / tA,
+                 stageA_mean_out=nA_out / len(texts), renders=len(jobs), stageB_s=tB, stageB_prefill_tok_s=nB_in / tB, stageB_decode_tok_s=nB_out / tB,
+                 stageB_mean_out=nB_out / max(1, len(jobs)), positions_per_s=len(texts) / (tA + tB), renders_per_s=len(jobs) / (tA + tB))
+    return recs, stats
+
+
+@app.function(image=image_g, gpu="B200", timeout=4 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=128 * 1024)
+def g2_pilot(overlap_rows: list, n_new: int = 4600, src: str = f"{ROOT}/g1", name: str = "g2_pilot"):
+    """g2 on the pilot's Opus-overlap rows (av_sft_val) + n_new fresh g1 positions -> ROOT/g2pilot/g2_pilot.parquet + throughput.json"""
+    import glob, pyarrow as pa, pyarrow.parquet as pq
+    vol_glp.reload()
+    t = pq.read_table("/vol_q36/data/sft/av_sft_val.parquet", columns=["doc_id", "detokenized_text_truncated", "response", "n_raw_tokens"]).take(overlap_rows).to_pydict()
+    rows = [{"src": "opus_overlap", "row": r, "doc_id": d, "n_raw_tokens": int(n), "text": x, "opus": o} for r, d, x, o, n in
+            zip(overlap_rows, t["doc_id"], t["detokenized_text_truncated"], t["response"], t["n_raw_tokens"])]
+    for f in sorted(glob.glob(f"{src}/pos/pos_*.parquet")):
+        d = pq.read_table(f).to_pydict()
+        rows += [{"src": "g1_fresh", "row": -1, "doc_id": a, "n_raw_tokens": int(b), "text": c, "opus": None} for a, b, c in zip(d["doc_id"], d["n_raw_tokens"], d["text"])][: n_new - (len(rows) - len(overlap_rows))]
+        if len(rows) - len(overlap_rows) >= n_new: break
+    t0 = time.time(); llm = _llm(); t_load = time.time() - t0
+    recs, st = _g2_rows(llm, [r["text"] for r in rows], [f"{r['doc_id']}|{r['n_raw_tokens']}" for r in rows], [r["doc_id"] for r in rows])
+    st["load_s"] = t_load; st["library"] = _g2_lib() is not None
+    os.makedirs(f"{ROOT}/g2pilot", exist_ok=True)
+    pq.write_table(pa.Table.from_pylist([{**r, **x} for r, x in zip(rows, recs)]), f"{ROOT}/g2pilot/{name}.parquet", compression="zstd")
+    json.dump(st, open(f"{ROOT}/g2pilot/{name}_throughput.json", "w"), indent=1); vol_glp.commit()
+    print("[g2pilot]", json.dumps(st), flush=True); return st
+
+
+@app.function(image=image_g, gpu="B200", timeout=8 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=128 * 1024, max_containers=8)
+def g2_label(sid: int, src: str, out_root: str):
+    """g2 labels for the positions of <src>/pos/pos_XXXX (activations are shared with the source run) -> <out_root>/lab/lab_XXXX.parquet"""
+    import pyarrow as pa, pyarrow.parquet as pq
+    out = f"{out_root}/lab/lab_{sid:04d}.parquet"
+    vol_glp.reload()
+    if _exists(out): return "exists"
+    d = pq.read_table(f"{src}/pos/pos_{sid:04d}.parquet", columns=["doc_id", "n_raw_tokens", "text"]).to_pydict()
+    global _LLM
+    if "_LLM" not in globals(): _LLM = _llm()
+    recs, st = _g2_rows(_LLM, d["text"], [f"{a}|{b}" for a, b in zip(d["doc_id"], d["n_raw_tokens"])], d["doc_id"])
+    rows = [{"doc_id": a, "n_raw_tokens": b, **r} for a, b, r in zip(d["doc_id"], d["n_raw_tokens"], recs)]
+    os.makedirs(f"{out_root}/lab", exist_ok=True); pq.write_table(pa.Table.from_pylist(rows), out, compression="zstd"); vol_glp.commit()
+    st["sid"] = sid; print("[g2label]", json.dumps(st), flush=True); return st
+
+
+@app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=4, memory=48 * 1024, max_containers=16)
+def g2_join(sid: int, src: str, out_root: str):
+    """<src> pos + acts + <out_root> g2 labels -> <out_root>/shards/shard_XXXX.parquet: trainer schema (explanation = first rendering passing every
+    deterministic check) + explanations / styles / qc (k renderings per activation) + window, facts, claims (compositional one-claim-per-fact column),
+    fact_ladders (specificity ladder + wrong-exact twin per fact)"""
+    import pyarrow as pa, pyarrow.parquet as pq, pyarrow.compute as pc
+    out = f"{out_root}/shards/shard_{sid:04d}.parquet"
+    vol_glp.reload()
+    if _exists(out): return "exists"
+    P = pq.read_table(f"{src}/pos/pos_{sid:04d}.parquet"); Lb = pq.read_table(f"{out_root}/lab/lab_{sid:04d}.parquet"); A = pq.read_table(f"{src}/acts/acts_{sid:04d}.parquet")
+    for X, nm in ((Lb, "lab"), (A, "acts")):
+        assert X.num_rows == P.num_rows and X.column("doc_id").equals(P.column("doc_id")) and X.column("n_raw_tokens").equals(P.column("n_raw_tokens")), f"{nm} rows misaligned"
+    keep = pc.invert(pc.is_null(Lb.column("explanation"))); n = int(pc.sum(keep).as_py() or 0); f = lambda c: pc.filter(c, keep)
+    cols = {"doc_id": f(P.column("doc_id")), "text": f(P.column("text")), "explanation": f(Lb.column("explanation")), "is_val": pa.array([False] * n),
+            "n_raw_tokens": f(P.column("n_raw_tokens")), "activation_layer": pa.array([LAYER] * n), "activation_vector": f(A.column("activation_vector")),
+            "variant": pa.array(["g2"] * n), "labeller": pa.array([LABELLER] * n)}
+    for c in ("renders", "styles", "qc", "window", "facts", "claims", "fact_ladders", "n_pass"): cols[{"renders": "explanations"}.get(c, c)] = f(Lb.column(c))
+    os.makedirs(f"{out_root}/shards", exist_ok=True); pq.write_table(pa.table(cols), out, compression="zstd"); vol_glp.commit()
+    return {"sid": sid, "rows": n, "pos_rows": P.num_rows}
+
+
+@app.function(image=image_q, timeout=24 * 3600, volumes=VOLS, secrets=SECRETS, cpu=2, memory=8 * 1024)
+def run_g2(src_tag: str = "g1", tag: str = "g2", max_shards: int = 0):
+    """g2 orchestrator over the source run's positions: g2 labels (8 B200) + extraction of any missing source activations (2 B200, +6 when no
+    g2 labelling is pending) + g2 joins + joins of the source run's own labelled shards (so the source slice completes after its labeller stops)"""
+    import glob, wandb
+    S, R = f"{ROOT}/{src_tag}", f"{ROOT}/{tag}"; os.makedirs(R, exist_ok=True)
+    run_ = wandb.init(project="nla-glp", entity="octahedral-systems", name=f"scale_gen_{tag}", id=f"scale_gen_{tag}", resume="allow", config=dict(src=src_tag, labeller=LABELLER, k=G2_K))
+    inflight, fails, t0 = {}, {}, time.time()
+    have = lambda root, st, s: _exists(f"{root}/{st}/{st if st != 'shards' else 'shard'}_{s:04d}.parquet")
+    while True:
+        vol_glp.reload()
+        sids = sorted(int(os.path.basename(p)[4:8]) for p in glob.glob(f"{S}/pos/pos_*.parquet"))
+        if max_shards: sids = sids[:max_shards]
+        n_lab_open = sum(1 for s in sids if not have(R, "lab", s))
+        for s in sids:
+            for key, done, ready, fn, args in ((f"g2lab|{s}", have(R, "lab", s), True, g2_label, (s, S, R)),
+                                               (f"acts|{s}", have(S, "acts", s), True, extract, (s, S)),
+                                               (f"g2join|{s}", have(R, "shards", s), have(R, "lab", s) and have(S, "acts", s), g2_join, (s, S, R)),
+                                               (f"srcjoin|{s}", have(S, "shards", s), have(S, "lab", s) and have(S, "acts", s), join, (s, S))):
+                if done: inflight.pop(key, None); continue
+                if not ready: continue
+                c = inflight.get(key)
+                if c is not None:
+                    try: c.get(timeout=0); inflight.pop(key)
+                    except TimeoutError: continue
+                    except Exception as e:
+                        inflight.pop(key); fails[key] = fails.get(key, 0) + 1; print(f"[run_g2] {key} failed #{fails[key]}: {str(e)[:200]}", flush=True)
+                if fails.get(key, 0) >= 3 or key in inflight: continue
+                if key.startswith("acts|") and n_lab_open == 0 and sum(1 for k in inflight if k.startswith("acts|")) >= 2: fn = extract_burst
+                inflight[key] = fn.spawn(*args)
+        cnt = dict(pos=len(sids), g2_lab=sum(have(R, "lab", s) for s in sids), acts=sum(have(S, "acts", s) for s in sids), g2_shards=sum(have(R, "shards", s) for s in sids),
+                   src_lab=sum(have(S, "lab", s) for s in sids), src_shards=sum(have(S, "shards", s) for s in sids))
+        st = dict(t=time.time() - t0, **cnt, inflight=len(inflight), failed=[k for k, v in fails.items() if v >= 3])
+        json.dump(st, open(f"{ROOT}/status_{tag}.json", "w")); vol_glp.commit(); run_.log({f"scale/{k}": v for k, v in st.items() if isinstance(v, (int, float))})
+        print("[run_g2]", json.dumps(st), flush=True)
+        if cnt["g2_shards"] + sum(1 for k in st["failed"] if k.startswith("g2")) >= len(sids) and not any(k.startswith(("g2", "acts")) for k in inflight): break
+        time.sleep(60)
+    run_.finish(); return st
+
+
 # ------------------------------------------------------------------------------------------------------------ pipeline stages
 def _exists(p):
     return os.path.exists(p) and os.path.getsize(p) > 0
@@ -368,6 +531,9 @@ def main(task: str = "pilot", n: int = 3000, nv: int = 400, n_docs: int = 100000
     if task == "pilot": print(pilot.remote(n, nv))
     elif task == "run": print(run.remote(n_docs, slices, tag, max_shards))
     elif task == "docs": print(docs_all.remote(n_docs, slices, tag))
+    elif task == "g2pilot":
+        rows = sorted(int(k.split("|")[1]) for k in json.load(open("/home/celeste/shared/reports/nla-flow-prior/data/scale/pilot_judge.json"))["rows"] if k.startswith("opus|"))
+        print(g2_pilot.remote(rows, n, f"{ROOT}/g1", tag))
     elif task == "bench":
         cfgs = [("A_bf16_mns512", dict(fp8=False, max_num_seqs=512), False),
                 ("B_bf16_mns1024_mbt32k", dict(fp8=False, max_num_seqs=1024, max_num_batched_tokens=32768), False),
