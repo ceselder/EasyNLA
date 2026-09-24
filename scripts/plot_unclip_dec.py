@@ -41,12 +41,14 @@ def main(paths, stem="unclip_decoder"):
     a = ax[0, 1]; r = runs[0]
     if "recon" in r:
         keys = [k for k in r["recon"] if isinstance(r["recon"][k], dict) and "fve" in r["recon"][k]]; order = [k for k in keys if k.startswith("cfg")] + [k for k in keys if not k.startswith("cfg")]
-        cos = [r["recon"][k]["cos"]["mean"] for k in order]; fk = "fve_normmatched_raw" if "fve_normmatched_raw" in r["recon"][order[0]] else "fve"; fve = [r["recon"][k][fk] for k in order]; x = np.arange(len(order))
-        b1 = a.bar(x - .2, cos, .4, color=C["cond"], label="cos(h', h)  [primary]"); a.set_ylim(-.1, 1.05); a.set_ylabel("cosine to the true activation")
+        ck = "cos_centered" if "cos_centered" in r["recon"][order[0]] else "cos"; cos = [r["recon"][k][ck]["mean"] for k in order]; rawc = [r["recon"][k]["cos"]["mean"] for k in order]
+        fk = "fve_normmatched_raw" if "fve_normmatched_raw" in r["recon"][order[0]] else "fve"; fve = [r["recon"][k][fk] for k in order]; x = np.arange(len(order))
+        b1 = a.bar(x - .2, cos, .4, color=C["cond"], label="centered cos(h'−μ, h−μ)  [primary]" if ck == "cos_centered" else "cos(h', h)  [primary]"); a.set_ylim(-.1, 1.05); a.set_ylabel("cosine to the true activation")
+        if ck == "cos_centered": a.plot(x - .2, rawc, "kv", ms=6, label="raw cos(h', h)")
         a2 = a.twinx(); b2 = a2.bar(x + .2, fve, .4, color=C["base"], alpha=.7, label="FVE after matching ‖h‖ (%)" if fk != "fve" else "FVE (%)"); a2.set_ylabel("FVE (%)"); a2.set_ylim(min(-20, min(fve) - 5), 100)
         a.set_xticks(x); a.set_xticklabels([k.replace("cfg", "CFG ").replace("uncond", "uncond.\nsample").replace("mean_act", "mean\nact.").replace("other_row", "other\nrow") for k in order], fontsize=10)
-        a.legend(handles=[b1, b2], loc="upper right"); a.set_title(f"Samples h' ~ p(h|e) reconstruct h ({r['recon']['sample_steps']} Heun steps):\ncos and FVE per CFG scale vs baselines")
-        data["recon"] = {k: {"cos": r["recon"][k]["cos"]["mean"], "fve": r["recon"][k]["fve"], "fve_normmatched_raw": r["recon"][k].get("fve_normmatched_raw"), "norm_ratio": r["recon"][k]["norm_ratio"]["mean"], "e_cos": r["recon"][k]["e_cos"]["mean"]} for k in order}
+        hnd = [b1, b2] + ([a.lines[-1]] if ck == "cos_centered" else []); a.legend(handles=hnd, loc="upper right", fontsize=10); a.set_title(f"Samples h' ~ p(h|e) reconstruct h ({r['recon']['sample_steps']} Heun steps):\n{'centered ' if ck == 'cos_centered' else ''}cos and FVE per CFG scale vs baselines")
+        data["recon"] = {k: {"cos": r["recon"][k]["cos"]["mean"], "cos_centered": r["recon"][k].get("cos_centered", {}).get("mean"), "fve": r["recon"][k]["fve"], "fve_normmatched_raw": r["recon"][k].get("fve_normmatched_raw"), "norm_ratio": r["recon"][k]["norm_ratio"]["mean"], "e_cos": r["recon"][k]["e_cos"]["mean"]} for k in order}
     # (3) downstream KL
     a = ax[1, 0]
     if "kl" in r:
