@@ -5,7 +5,7 @@ usage: python scripts/unclip_prior_plot.py [--root ~/shared/reports/nla-flow-pri
 from __future__ import annotations
 import argparse, glob, json, os, re
 import numpy as np
-import matplotlib; matplotlib.use("Agg")
+import matplotlib; matplotlib.use("Agg"); import matplotlib.ticker
 import matplotlib.pyplot as plt
 
 SERIES = [("uprior_opus1", "Opus only, LoRA trunk (control)", "#2a78d6"), ("uprior_opus1_frozen", "Opus only, frozen trunk", "#4a3aa7"),
@@ -31,7 +31,7 @@ def load(root):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--root", default=os.path.expanduser("~/shared/reports/nla-flow-prior")); a = ap.parse_args()
     rows = load(a.root); out = {"series": {}, "note": "self-checks of unCLIP prior snapshots (scripts/unclip_prior_selfcheck.py); x = labelled pairs seen (cumulative across phases)"}
-    fig, axs = plt.subplots(2, 2, figsize=(10, 8.4), dpi=150)
+    fig, axs = plt.subplots(2, 2, figsize=(11, 9), dpi=150)
     for tag, label, col in SERIES:
         rs = sorted([r for r in rows if r["tag"] == tag], key=lambda r: r["pairs"])
         if not rs: continue
@@ -53,11 +53,13 @@ def main():
         S.update({"exact_pmi_bits": pmi.tolist(), "exact_pmi_sem": sem.tolist(), "shuf_bits": shuf.tolist(), "ret_exact_a2t_top1": ret.tolist(), "ret_proxy_val1024_a2t_top1": retp.tolist(), "wrongdet_acc_exact": wd.tolist(),
                   **{f"wrongdet_acc_{k}": get("wrongdet", "summary", f"acc_exact_{k}").tolist() for k in ("number", "quote", "name")}, **{f"numbers_acc_{k}": get("numbers", "summary", "exact_acc", k).tolist() for k in ("near", "far", "hedge", "removed")}})
         out["series"][tag] = S
-    axs[0, 0].set_title("Exact PMI log p(e|z) − log p(e) grows with pairs\n(solid: gold explanation; dotted: shuffled), 256 clean1 rows"); axs[0, 0].set_ylabel("bits"); axs[0, 0].axhline(0, color="k", lw=0.8)
-    axs[0, 1].set_title("Retrieval of the true e among 256 by log p(e|z)\n(solid: exact ODE, clean1; dashed: FM proxy, 1024 val cuts)"); axs[0, 1].set_ylabel("top-1 %"); axs[0, 1].axhline(100 / 256, color="k", lw=0.8, ls=":")
-    axs[1, 0].set_title("Wrong-detail detection: gold beats the edited copy\n(1,023 negatives; thin: number -- / quote : / name -.)"); axs[1, 0].set_ylabel("paired accuracy %"); axs[1, 0].axhline(50, color="k", lw=0.8, ls=":")
-    axs[1, 1].set_title("Controlled number edits: P(orig > variant), exact PMI\n(near — far -- hedge : removed -.)"); axs[1, 1].set_ylabel("%"); axs[1, 1].axhline(50, color="k", lw=0.8, ls=":")
-    for ax in axs.flat: ax.set_xlabel("labelled pairs seen (M)"); ax.set_xscale("log")
+    axs[0, 0].set_title("Exact PMI of the gold explanation grows with pairs\n(solid: gold; dotted: shuffled explanation; 256 clean1 rows)"); axs[0, 0].set_ylabel("bits"); axs[0, 0].axhline(0, color="k", lw=0.8)
+    axs[0, 1].set_title("True e retrieved among 256 by log p(e|z)\n(solid: exact ODE; dashed: FM proxy on 1024 val cuts)"); axs[0, 1].set_ylabel("top-1 %"); axs[0, 1].axhline(100 / 256, color="k", lw=0.8, ls=":")
+    axs[1, 0].set_title("Wrong-detail detection: gold beats the edited copy\n(1,023 negatives; thin: number -- quote : name -.)"); axs[1, 0].set_ylabel("paired accuracy %"); axs[1, 0].axhline(50, color="k", lw=0.8, ls=":")
+    axs[1, 1].set_title("Number edits: P(original > edited), exact PMI\n(near — far -- hedge : removed -.)"); axs[1, 1].set_ylabel("%"); axs[1, 1].axhline(50, color="k", lw=0.8, ls=":")
+    for ax in axs.flat:
+        ax.set_xlabel("labelled pairs seen (M)"); ax.set_xscale("log"); ax.title.set_fontsize(12.5)
+        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}")); ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
     axs[0, 0].legend(loc="best", fontsize=9); fig.suptitle("unCLIP prior p(e|z) self-checks vs labelled pairs seen: data scale and trunk treatment", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.root, f"unclip_prior_selfchecks.{ext}"))
