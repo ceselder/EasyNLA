@@ -27,9 +27,10 @@ SYS_EXAMPLES = ("You label features of a language model's internal representatio
                 "feature detects or represents: the concept, pattern, token type, or context it responds to. Be specific and concrete "
                 "(e.g. 'closing parentheses in function calls', 'names of European capitals', 'legal contract clauses about liability'). "
                 "If the examples share nothing clear, say 'unclear: ' followed by your best guess. Output the label only.")
-SYS_MAEMM = ("You label features of a language model's internal representation. You get short texts that were generated to "
-             "maximally trigger the feature, plus (sometimes) tokens it promotes and tokens it fires on. Write ONE short label "
-             "(at most 12 words) for the concept, topic, or pattern the feature represents. Output the label only.")
+SYS_MAEMM = ("You label features of a language model's internal representation (features of an MLP block's output). You get the tokens "
+             "at which the feature fires most strongly (from its top activating examples), the output tokens it promotes, and sometimes short "
+             "texts generated to trigger it (these may be generic; trust the tokens more). Write ONE short label (at most 12 words) for the "
+             "pattern, token type, concept or topic the feature responds to. If unclear, start with 'unclear:'. Output the label only.")
 SYS_DIRECTION = ("You get short texts generated to maximally trigger a direction in a language model's representation, i.e. what "
                  "the direction 'means' as text. Write ONE short phrase (at most 12 words) naming the concept, topic or pattern. Output it only.")
 
@@ -191,9 +192,9 @@ def label_from_texts(items, cache_dir: str, kind: str, log=print, max_wait_min=6
         if key in cache:
             continue
         texts = [t for t in it.get("texts", []) if t]
-        if not texts:
+        if not texts and not it.get("peaks"):
             continue
-        user = "Generated texts:\n" + "\n".join(f"- {t[:300]}" for t in texts[:4])
+        user = ("Generated texts:\n" + "\n".join(f"- {t[:300]}" for t in texts[:4])) if texts else "No generated text is available for this feature; label it from the tokens below."
         if it.get("peaks"):
             user += f"\nTokens it fires on: {', '.join(repr(x) for x in it['peaks'][:10])}"
         if it.get("out_tokens"):

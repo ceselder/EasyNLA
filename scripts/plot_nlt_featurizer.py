@@ -207,6 +207,26 @@ def main():
             ax.set_title("MAEMM texts trigger the features they were inverted from\nat most layers, not only at the training layer"); ax.legend()
             save(fig, a.report_dir, "featurizer_maemm_verify")
 
+    # ------------------------------------------------------------------ Fig 6: MAEMM direction specificity (cos at layer 27, own vs control)
+    cos = load_parts(f"{a.data_dir}/maemm/{a.split}/cos_*.parquet")
+    if len(cos):
+        res = {}
+        for kind, g in cos.groupby("kind"):
+            res[kind] = {"n": int(len(g)), "cos_own_mean": float(g.cos_own.mean()), "cos_ctrl_mean": float(g.cos_ctrl.mean()),
+                         "p_own_gt_ctrl": float((g.cos_own > g.cos_ctrl).mean()), "cos_mean_own": float(g.cos_mean_own.mean())}
+        out["fig6"] = res
+        kinds = [k for k in ("delta", "attn", "mlp", "sae", "tc") if k in res]
+        fig, ax = plt.subplots(figsize=(8, 4.6))
+        x = np.arange(len(kinds)); w = 0.38
+        ax.bar(x - w / 2, [res[k]["cos_own_mean"] for k in kinds], w, color=C["tc"], label="own direction")
+        ax.bar(x + w / 2, [res[k]["cos_ctrl_mean"] for k in kinds], w, color=C["grey"], label="control: another item's direction")
+        for i_, k in enumerate(kinds):
+            ax.text(i_, max(res[k]["cos_own_mean"], res[k]["cos_ctrl_mean"]) + 0.01, f"P(own>ctrl)={res[k]['p_own_gt_ctrl']:.2f}", ha="center", fontsize=11)
+        names = {"delta": "Δ = h_j − h_i", "attn": "largest attention write", "mlp": "largest MLP write", "sae": "SAE feature", "tc": "transcoder feature"}
+        ax.set_xticks(x); ax.set_xticklabels([f"{names[k]}\n(n={res[k]['n']})" for k in kinds]); ax.set_ylabel("max over tokens of cos(h_27(t), direction)")
+        ax.set_title("MAEMM inversions are not direction-specific:\nthe generated text fits another pair's direction just as well"); ax.legend(loc="upper right")
+        ax.set_ylim(0, max(0.5, 1.15 * max(res[k]["cos_own_mean"] for k in kinds)))
+        save(fig, a.report_dir, "featurizer_maemm_specificity")
     json.dump(out, open(os.path.join(a.report_dir, "data", f"featurizer_analysis_{a.split}.json"), "w"), indent=1)
     print(json.dumps({k: v for k, v in out.items() if k in ("fig1", "fig2", "fig3")}, indent=1)[:3000])
 
