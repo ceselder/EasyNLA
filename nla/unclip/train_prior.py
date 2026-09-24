@@ -59,8 +59,11 @@ def main():
     p.add_argument("--max-len", type=int, default=224); p.add_argument("--enorm-n", type=int, default=65536)
     p.add_argument("--batch", type=int, default=64, help="per rank"); p.add_argument("--steps", type=int, default=0); p.add_argument("--epochs", type=float, default=1.0, help="steps = epochs x min rows per rank / batch when --steps is 0")
     p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--lr-lora", type=float, default=3e-5); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--warmup", type=int, default=300); p.add_argument("--lr-const", action="store_true", help="constant lr after warm-up (phases that continue each other); default cosine to 10 %")
-    p.add_argument("--eval-every", type=int, default=500); p.add_argument("--snap-pairs", default="64e3,128e3,256e3,512e3,1e6,2e6,4e6,8e6"); p.add_argument("--snap-final", action="store_true")
+    p.add_argument("--eval-every", type=int, default=500); p.add_argument("--snap-pairs", default="64e3,128e3,256e3,512e3,1e6,2e6,4e6,8e6", help="global pair counts for snapshots; '+N' entries are relative to the resume point"); p.add_argument("--snap-final", action="store_true")
     p.add_argument("--resume-from", default=None, help="dir with prior.pt (+ text_lora.pt, opt.pt)"); p.add_argument("--resume-opt", action="store_true"); p.add_argument("--start-pairs", type=int, default=-1, help="-1 = from the checkpoint")
+    p.add_argument("--steps-add", type=int, default=0, help="continuation: run this many MORE steps after the checkpoint's step (else --epochs passes over the new data)")
+    p.add_argument("--anneal", action="store_true", help="curriculum phase B: lr factor = cosine from 1.0 at the start step to 0.1 at the end (no warm-up); pair with --resume-from and new --train-globs")
+    p.add_argument("--no-replay", action="store_true", help="continuation on NEW data: do not replay the sampler to the checkpoint step (fresh permutation)")
     p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb", default="nla-glp"); p.add_argument("--max-hours", type=float, default=22.5); p.add_argument("--log-every", type=int, default=25)
     a = p.parse_args()
     ddp = "RANK" in os.environ
@@ -120,7 +123,7 @@ def main():
     n_loc = torch.tensor([A.shape[0]], device=dev); n_all = n_loc.clone()
     if ddp: dist.all_reduce(n_loc, op=dist.ReduceOp.MIN); dist.all_reduce(n_all)
     N = A.shape[0]; log(f"[prior] rows: {int(n_all)} total ({int(n_loc)} min per rank; rank 0 {N}) from {a.train_globs[:200]}{'...' if len(a.train_globs) > 200 else ''} in {time.time()-t0:.0f}s")
-    steps = a.steps if a.steps > 0 else int(a.epochs * int(n_loc) / a.batch)
+    steps = a.steps if a.steps > 0 else start_step + (a.steps_add if a.steps_add > 0 else int(a.epochs * int(n_loc) / a.batch))   # continuation: epochs / steps-add count from the checkpoint
     # validation rows (clean1: one row per doubly-held-out document)
     vt = pq.read_table(a.val_parquet, columns=["activation_vector", "response"]).slice(0, a.eval_n)
     VA = torch.tensor(np.asarray(vt.column("activation_vector").combine_chunks().flatten(), dtype=np.float32).reshape(vt.num_rows, -1))
@@ -205,16 +208,17 @@ def main():
         except Exception as e: log("[prior] wandb off:", e); use_wandb = False
     ev = evaluate(start_step, start_pairs)
     if use_wandb: wandb.log(ev, step=start_step)
-    snaps = sorted(int(float(x)) for x in a.snap_pairs.split(",") if x.strip()); done = set(q for q in snaps if q <= start_pairs)
+    snaps = sorted((start_pairs if x.strip().startswith("+") else 0) + int(float(x.strip().lstrip("+"))) for x in a.snap_pairs.split(",") if x.strip()); done = set(q for q in snaps if q <= start_pairs)   # "+N" = N pairs after the resume point
     rng = torch.Generator().manual_seed(a.seed * 1000 + rank); perm = torch.randperm(N, generator=rng); cursor = 0
-    for _ in range(start_step):   # replay the sampler so a resumed run continues the same data order
+    for _ in range(0 if a.no_replay else start_step):   # replay the sampler so a resumed run continues the same data order (crash resume); --no-replay for a data switch
         if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0
         cursor += a.batch
     pairs = start_pairs; t_start = time.time(); t_log = time.time(); loss_acc = 0.0; n_acc = 0
-    log(f"[prior] {steps} steps x {a.batch} x {world} = {steps*a.batch*world} draws ({steps*a.batch*world/int(n_all):.2f} passes over {int(n_all)} rows); start step {start_step}, pairs {start_pairs}; snapshots at {snaps}")
+    log(f"[prior] steps {start_step} -> {steps} x {a.batch} x {world} = {(steps-start_step)*a.batch*world} draws this phase ({(steps-start_step)*a.batch*world/int(n_all):.2f} passes over {int(n_all)} rows); pairs so far {start_pairs}; schedule {'ANNEAL cosine 1.0 -> 0.1' if a.anneal else ('warm-up + const' if a.lr_const else 'warm-up + cosine')}; snapshots at {snaps}")
     model.train(); (arvec.crit if arvec.crit is not None else arvec.lm).train()
     for step in range(start_step + 1, steps + 1):
-        f_ = min(1.0, step / max(a.warmup, 1)) * (1.0 if a.lr_const else (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, step / steps)))))
+        if a.anneal: f_ = 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, (step - start_step) / max(1, steps - start_step))))   # phase B: decay from the phase-A lr to 10 %
+        else: f_ = min(1.0, step / max(a.warmup, 1)) * (1.0 if a.lr_const else (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, step / steps)))))
         for g_ in opt.param_groups: g_["lr"] = g_["base"] * f_
         if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0
         idx = perm[cursor:cursor + a.batch]; cursor += a.batch
