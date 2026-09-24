@@ -156,6 +156,19 @@ def run(task: str = "plan", only: str = "", dry_run: int = 1):
     print(f"\nTOTAL {total/1e9:.2f} GB across repos", flush=True)
 
 
+@app.function(timeout=3600, volumes={"/vol": vol}, cpu=8, memory=160 * 1024, ephemeral_disk=512 * 1024)
+def strip_test(src: str = "/vol/critic/text_union_pooled_n/ckpt_best.pt"):
+    """exercise the strip_ckpt path on one checkpoint: load (mmap), drop 'opt', save to /tmp, report sizes + keys"""
+    import time, torch
+    vol.reload(); t0 = time.time()
+    ck = torch.load(src, map_location="cpu", mmap=True, weights_only=False)
+    keys = list(ck.keys()); slim = {k: ck[k] for k in ck if k != "opt"}
+    torch.save(slim, "/tmp/strip_test.pt"); del ck, slim
+    print(f"{src}: keys {keys}; on disk {os.path.getsize(src)/1e9:.2f} GB -> stripped {os.path.getsize('/tmp/strip_test.pt')/1e9:.2f} GB in {time.time()-t0:.0f}s", flush=True)
+    ck2 = torch.load("/tmp/strip_test.pt", map_location="cpu", weights_only=False); print("reload ok:", list(ck2.keys()), "step", ck2.get("step"), flush=True)
+
+
 @app.local_entrypoint()
-def main(task: str = "plan", only: str = "", dry_run: int = 1):
-    run.remote(task, only, dry_run)
+def main(task: str = "plan", only: str = "", dry_run: int = 1, src: str = ""):
+    if task == "strip-test": strip_test.remote(src or "/vol/critic/text_union_pooled_n/ckpt_best.pt")
+    else: run.remote(task, only, dry_run)
