@@ -18,7 +18,7 @@ def main():
     for f in sorted(glob.glob(os.path.join(a.scored_dir, a.pattern + ".summary.json"))):
         stem = os.path.basename(f)[: -len(".summary.json")]; s = json.load(open(f))
         pfx0 = a.pattern.split("*")[0]; rest = stem[len(pfx0):] if stem.startswith(pfx0) else stem      # test the manifest part only (a critic called critic_para_* must not be skipped as a paraphrase file)
-        if any(k in "_" + rest for k in ("_para_", "_twinnext", "_doc_", "_mask_")):      # edit / same-doc manifests are read via their own branches below, not as control sources
+        if any(k in "_" + rest for k in ("_para_", "_twinnext", "_doc_", "_mask_", "_nbr_")):      # edit / same-doc manifests are read via their own branches below, not as control sources
             continue
         if "orig" in s and "dm" in s and "by_band" in s:      # controls summary
             pfx = a.pattern.split("*")[0]; src = stem[len(pfx):] if stem.startswith(pfx) else re.sub(r"^scored_[^_]+_", "", stem)      # source name = stem minus the critic prefix (works for scored_2_, scored_big_, scored_enc_e2_manifest2_, scored_v3be2fbi_)
