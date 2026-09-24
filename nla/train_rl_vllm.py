@@ -3975,6 +3975,12 @@ def main():
                     flush=True,
                 )
         print(rl_logging.format_console_line(step, log, train_ar=args.train_critic), flush=True)
+        if _cot_new or critic_ema.enabled:   # co-training variants: compact critic gauges on stdout (all also go to wandb)
+            _ck = [("critic/dpo_margin_mean", "dpo_margin"), ("critic/dpo_active_frac", "dpo_active"), ("critic/para_n", "para_n"), ("critic/para_failed", "para_fail"),
+                   ("critic/aug_frac", "aug"), ("time/critic_para_s", "para_s"), ("critic/loss_rep0", "loss_rep0"), ("critic/scoring_snapshot_mse", "snap_mse"),
+                   ("critic/live_pre_mse", "pre_mse"), ("critic/live_post_mse", "post_mse"), ("critic/staleness", "stale")]
+            _cs = " | ".join(f"{nm} {log[k]:.4g}" for k, nm in _ck if k in log and isinstance(log[k], (int, float)))
+            if _cs: print(f"  [cotrain@{step}] {_cs}", flush=True)
         if args.reward_mode == "claims":   # compositional reward summary (the same keys go to wandb under critic/*)
             _g = lambda k: shape_terms.get(k, float("nan"))
             print(f"  [claims@{step}] n_claims {_g('critic/n_claims_mean'):.2f} (>{args.claim_max}: {_g('critic/n_claims_over_max_frac'):.2f}) | fail {_g('critic/claims_fail_frac'):.2f} | "
