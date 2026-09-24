@@ -130,43 +130,47 @@ def fig_bands(d, rep, out):
 
 
 def fig_scaling(rep, out):
-    """headline of round 2: reconstructor gain vs number of bullet train pairs, with prose / lens at the matched top size"""
+    """headline of round 2: reconstructor gain vs number of bullet train pairs; MAIN line = checkpoints picked by best absolute FVE(text)
+    on the selection rows (the gain-over-own-empty pick is shown greyed: it selects steps where the empty pathway is broken)"""
     f = os.path.join(rep, "data", "scaling.json")
     if not os.path.exists(f): return
-    S = json.load(open(f)); allb = [r for r in S["points"] if r["text"] == "bullets" and r.get("gain") is not None and r.get("policy", "6_epochs") == "6_epochs"]
-    fixed = sorted([r for r in S["points"] if r["text"] == "bullets" and r.get("policy") == "fixed_2400_steps" and r.get("selection", "gain") == "gain"], key=lambda r: r["n_pairs"])
-    pts = sorted([r for r in allb if r.get("selection", "gain") == "gain"], key=lambda r: r["n_pairs"]); absp = sorted([r for r in allb if r.get("selection") == "abs_fve"], key=lambda r: r["n_pairs"])
-    if not pts: return
-    x = [r["n_pairs"] for r in pts]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5.2))
+    S = json.load(open(f)); P = S["points"]
+    sel = lambda text, selection, policy="6_epochs": sorted([r for r in P if r["text"] == text and r.get("selection", "gain") == selection and r.get("policy", "6_epochs") == policy and r.get("gain") is not None], key=lambda r: r["n_pairs"])
+    absb, gainb, fixb = sel("bullets", "abs_fve"), sel("bullets", "gain"), sel("bullets", "abs_fve", "fixed_2400_steps")
+    if not absb and not gainb: return
+    main = absb if absb else gainb; x = [r["n_pairs"] for r in main]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5.4))
     ax = axes[0]
-    ax.plot(x, [r["gain"] for r in pts], marker="o", lw=2.5, color=CLAY, label="bullets: gain over empty text (own list)")
-    ax.plot(x, [r["pair_specific_gain"] for r in pts], marker="s", lw=2, color=CLAY, ls="--", label="bullets: pair-specific gain (own − depth-matched wrong list)")
-    if absp: ax.plot([r["n_pairs"] for r in absp], [r["gain"] for r in absp], marker="o", lw=1.5, color=CLAY, alpha=0.45, label="bullets: gain at the best-absolute-FVE checkpoint")
-    if fixed: ax.plot([r["n_pairs"] for r in fixed], [r["gain"] for r in fixed], marker="v", lw=2, color=SKY, label="bullets: fixed 2,400 steps at every size (optimisation vs data)")
-    if any(r.get("gain_ci") for r in pts):
-        lo = [r["gain_ci"][0] if r.get("gain_ci") else np.nan for r in pts]; hi = [r["gain_ci"][1] if r.get("gain_ci") else np.nan for r in pts]
-        ax.fill_between(x, lo, hi, color=CLAY, alpha=0.15, label="95% bootstrap CI of the FVE gain (over val pairs)")
-    for r in S["points"]:
-        if r["text"] in ("prose", "lens") and r.get("gain") is not None and r.get("selection", "gain") == "gain":
-            c = INK if r["text"] == "prose" else GREY; ax.scatter([r["n_pairs"]], [r["gain"]], marker="D", s=80, color=c, zorder=5, label=f"{'Sonnet prose' if r['text'] == 'prose' else 'lens-diff text'}, same {r['n_pairs'] // 1000}k pairs: {r['gain']:+.3f}")
+    ax.plot(x, [r["gain"] for r in main], marker="o", lw=2.5, color=CLAY, label="bullets: gain over the same net with empty text")
+    if any(r.get("gain_ci") for r in main):
+        lo = [r["gain_ci"][0] if r.get("gain_ci") else np.nan for r in main]; hi = [r["gain_ci"][1] if r.get("gain_ci") else np.nan for r in main]
+        ax.fill_between(x, lo, hi, color=CLAY, alpha=0.15, label="95% bootstrap CI of that gain (over val pairs)")
+    ax.plot(x, [r["pair_specific_gain"] for r in main], marker="s", lw=2, color=CLAY, ls="--", label="bullets: pair-specific gain (own − depth-matched wrong list)")
+    if fixb: ax.plot([r["n_pairs"] for r in fixb], [r["gain"] for r in fixb], marker="v", lw=2, color=SKY, label="bullets, fixed 2,400 steps at every size")
+    if absb and gainb: ax.plot([r["n_pairs"] for r in gainb], [r["gain"] for r in gainb], marker="o", lw=1.2, color=GREY, alpha=0.6, label="checkpoint picked on gain over own empty text (artefact: empty pathway broken there)")
+    for text, c, nm in (("prose", INK, "Sonnet prose"), ("lens", GREY, "lens-diff text")):
+        for r in (sel(text, "abs_fve") or sel(text, "gain")):
+            ax.scatter([r["n_pairs"]], [r["gain"]], marker="D", s=90, color=c, zorder=5, label=f"{nm}, same {r['n_pairs'] // 1000}k pairs, same recipe: {r['gain']:+.3f}")
     ax.axhline(0, color=INK, lw=0.8); ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off()
     ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("FVE of Δ gained over the same net with no text")
-    # absolute-FVE inset-free context: annotate what a text-free h_i-only MLP reaches with the same loss (fixed references)
+    ax.set_title("Does the bullet-list gain rise with data?\n(held-out val rows 0:1024, gap ≥ 2, energy-weighted loss)"); ax.legend(frameon=False, fontsize=8.5, loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
     fb = S.get("fixed_baselines_energy_loss") or {}
     if fb:
         txt = "; ".join(f"{'no depth' if 'nodepth' in k else 'TOLD depth'} @ {fb[k]['n_train'] // 1000}k: {fb[k]['fve']:.3f}" for k in ("mlp_nodepth_matched", "mlp_nodepth_extra", "mlp_depth_extra") if k in fb)
-        ax.text(0.02, 0.02, "h_i-only MLP, same loss, absolute FVE(Δ): " + txt, transform=ax.transAxes, fontsize=8.5, color=INK, va="bottom")
-    ax.set_title(S.get("title_left", "Does the bullet-list gain rise with data?\n(held-out val rows 0:1024, energy-weighted loss, gap ≥ 2)")); ax.legend(frameon=False, fontsize=9, loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
+        ax.text(0.02, 0.02, "h_i-only MLP, same loss, absolute FVE(Δ): " + txt, transform=ax.transAxes, fontsize=8, color=INK, va="bottom")
     ax = axes[1]
-    ax.plot(x, [r["bits_median"] for r in pts], marker="o", lw=2.5, color=CLAY, label="median bits per list (d_eff)")
-    ax.plot(x, [r["bits_median"] / max(1e-6, r["bullets_per_row"]) for r in pts], marker="^", lw=2, color=CLAY, ls=":", label="per bullet")
-    ax2 = ax.twinx(); ax2.plot(x, [r["p_own_beats_dm"] for r in pts], marker="x", lw=1.5, color=SKY, label="P(own list beats depth-matched wrong list)")
-    if any(r.get("flip_p") for r in pts): ax2.plot(x, [r.get("flip_p") or np.nan for r in pts], marker="x", lw=1.5, color=SAGE, label="P(original beats claim-flipped list)")
-    ax2.axhline(0.5, color=INK, ls="--", lw=0.8); ax2.set_ylim(0.4, 1.0); ax2.set_ylabel("probability over held-out pairs")
-    ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off(); ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("Gaussian-equivalent bits (d_eff)")
-    ax.set_title("Bits per list and the pair-specific / claim-flip\nprobabilities along the same data-scaling curve")
-    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels(); ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=9, loc="upper left"); ax.spines[["top"]].set_visible(False)
+    ax.plot(x, [r["fve_own"] for r in main], marker="o", lw=2.5, color=CLAY, label="bullets: FVE(Δ) with own list")
+    ax.plot(x, [r["fve_empty"] for r in main], marker="o", lw=2, color=CLAY, ls=":", label="bullets: FVE(Δ) with empty text (same net)")
+    for text, c, nm in (("prose", INK, "prose"), ("lens", GREY, "lens-diff")):
+        for r in (sel(text, "abs_fve") or sel(text, "gain")):
+            ax.scatter([r["n_pairs"]], [r["fve_own"]], marker="D", s=90, color=c, zorder=5, label=f"{nm} with text, same pairs"); ax.scatter([r["n_pairs"]], [r["fve_empty"]], marker="D", s=50, facecolors="none", edgecolors=c, zorder=5)
+    if "mlp_nodepth_extra" in fb: ax.axhline(fb["mlp_nodepth_extra"]["fve"], color=INK, ls="--", lw=1.2, label=f"h_i-only MLP, no depth, 100k pairs: {fb['mlp_nodepth_extra']['fve']:.3f}")
+    ax2 = ax.twinx(); ax2.plot(x, [r["p_own_beats_dm"] for r in main], marker="x", lw=1.5, color=SKY, label="P(own list beats depth-matched wrong list)")
+    if any(r.get("flip_p") for r in main): ax2.plot(x, [r.get("flip_p") or np.nan for r in main], marker="x", lw=1.5, color=SAGE, label="P(original beats claim-flipped list)")
+    ax2.axhline(0.5, color=INK, ls="--", lw=0.6); ax2.set_ylim(0.4, 1.0); ax2.set_ylabel("probability over held-out pairs")
+    ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off(); ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("absolute FVE of Δ on held-out pairs")
+    ax.set_title("Absolute levels: text vs no text vs an h_i-only MLP,\nand the pair-specific / claim-flip probabilities")
+    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels(); ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=8, loc="upper left"); ax.spines[["top"]].set_visible(False)
     save(fig, rep, "fig_scaling")
     out["fig_scaling"] = S
 
