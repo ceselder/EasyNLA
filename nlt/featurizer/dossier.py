@@ -212,7 +212,7 @@ def build_dossiers(a):
             lines.append("MECHANISM: " + "; ".join(mech) + ".")
             dtexts = []
             for name, tag in ((f"delta:{pid}", "change direction"), (f"attn:{pid}", "largest attention write"), (f"mlp:{pid}", "largest MLP write")):
-                if name in maemm_by:
+                if a.maemm_pairs and name in maemm_by:
                     dtexts.append(f"  - {tag}: " + " | ".join(t[:160].replace("\n", " ") for t in maemm_by[name][:2]))
             if dtexts:
                 lines.append("DIRECTION TEXTS (generated to trigger the direction):")
@@ -325,6 +325,7 @@ def main():
     ap.add_argument("--out", default=os.path.expanduser("~/nlt-feat-data/dossier-sonnet-v1"))
     ap.add_argument("--start", type=int, default=0); ap.add_argument("--end", type=int, default=0)
     ap.add_argument("--topn", type=int, default=6); ap.add_argument("--topn-tc", type=int, default=5)
+    ap.add_argument("--maemm-pairs", type=int, default=0, help="include MAEMM texts of Delta / largest writes (verified NOT direction-specific; off by default)")
     ap.add_argument("--chunk", type=int, default=4096); ap.add_argument("--max-wait-min", type=int, default=50)
     a = ap.parse_args()
     if a.end == 0 and a.cmd == "build":
