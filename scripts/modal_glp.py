@@ -251,8 +251,9 @@ def train_cond_g4(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "s
     env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
     os.makedirs(out, exist_ok=True); logf = open(os.path.join(out, "train.log"), "ab")            # durable log on the volume (detached runs lose their stdout)
     proc = subprocess.Popen(cmd, cwd=REPO_REMOTE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    stop = _commit_loop(600)                                                     # train.log / checkpoints visible mid-run
     for line in proc.stdout: sys.stdout.buffer.write(line); sys.stdout.flush(); logf.write(line); logf.flush()
-    rc = proc.wait(); logf.close(); vol_glp.commit(); return rc
+    rc = proc.wait(); logf.close(); stop.set(); vol_glp.commit(); return rc
 
 
 image_claims = image_base.pip_install("spacy==3.8.*", "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl").add_local_dir(
