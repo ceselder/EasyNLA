@@ -221,7 +221,7 @@ def lens_top_tokens(dirs, norm_w, lm_head, tok, k=8, bs=2048):
     out = []
     for s in range(0, len(dirs), bs):
         x = torch.nn.functional.normalize(dirs[s:s + bs].float(), dim=-1) * norm_w.float()
-        z = (x.to(lm_head.dtype) @ lm_head.T).float()
+        z = (x.to(lm_head.dtype) @ lm_head.T).float()  # lm_head bf16 on GPU, fp32 on CPU
         top = torch.topk(z, k, dim=-1).indices.tolist()
         out += [[tok.decode([t]) for t in row] for row in top]
     return out
@@ -232,7 +232,7 @@ def lens_top_tokens(dirs, norm_w, lm_head, tok, k=8, bs=2048):
 # ----------------------------------------------------------------------------------------------------------------------
 @app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=64 * 1024, max_containers=6)
 def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: str = DATA_DIR, writes_dir: str = WRITES_DIR,
-                trainer: int = 0, topn: int = 12, out_dir: str = f"{OUT}/sae_dossier", perm_seed: int = -1) -> str:
+                trainer: int = 0, topn: int = 12, out_dir: str = f"{OUT}/sae_dossier", perm_seed: int = -1, norm_match: int = 1) -> str:
     import time
     import numpy as np
     import pandas as pd
@@ -241,6 +241,9 @@ def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: s
     import torch
     from transformers import AutoTokenizer
     torch.backends.cuda.matmul.allow_tf32 = True
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if dev == "cpu":
+        torch.set_num_threads(max(1, os.cpu_count() or 8))
     t0 = time.time()
     vol.reload()
     pairs = pq.read_table(os.path.join(data_dir, f"pairs_{split}.parquet")).to_pandas()
@@ -254,14 +257,19 @@ def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: s
     A, M, have_w = gather_writes(pairs, wrow) if wrow else (None, None, np.zeros(len(pairs), bool))
     print(f"[sae] {split} {start}:{end} n={len(pairs)} gathered in {time.time() - t0:.0f}s; writes for {int(have_w.sum())} rows", flush=True)
 
-    saes = {L: SAE(L, trainer) for L in SAE_LAYERS}
+    saes = {L: SAE(L, trainer, device=dev) for L in SAE_LAYERS}
     tok = AutoTokenizer.from_pretrained(base_path())
     bt = base_tensors(["model.norm.weight", "lm_head.weight"])
-    norm_w = bt["model.norm.weight"].cuda(); lm_head = bt["lm_head.weight"].cuda().to(torch.bfloat16)
+    norm_w = bt["model.norm.weight"].to(dev); lm_head = bt["lm_head.weight"].to(dev).to(torch.bfloat16 if dev == "cuda" else torch.float32)
 
-    Hg = torch.from_numpy(H).cuda()                     # fp16 [n, 26, d]
-    Ag = torch.from_numpy(A).cuda() if A is not None else None
-    Mg = torch.from_numpy(M).cuda() if M is not None else None
+    Hg = torch.from_numpy(H).to(dev)                     # fp16 [n, 26, d]
+    # norm matching: the SAEs are trained on their own layer's scale; the residual norm grows ~x3-5 from k=9 to 34, so a
+    # layer-27 SAE applied raw to h_34 fires ~4x more features (smoke: L0 333 vs k=80). Scale h_k to the SAE layer's median RMS.
+    rms_k = Hg.float().pow(2).mean(-1).sqrt().median(0).values                      # [26]
+    print("[sae] per-layer median RMS:", [round(float(x), 1) for x in rms_k], flush=True)
+    scale = {L: (rms_k[L - K_LO] / rms_k) if norm_match else torch.ones_like(rms_k) for L in SAE_LAYERS}   # [26] multiplier per layer
+    Ag = torch.from_numpy(A).to(dev) if A is not None else None
+    Mg = torch.from_numpy(M).to(dev) if M is not None else None
     rows = []
     feat_hits = {L: {} for L in SAE_LAYERS}             # feature -> count (rising or falling top list)
     ii = pairs.i.astype(int).to_numpy(); jj = pairs.j.astype(int).to_numpy()
@@ -269,9 +277,10 @@ def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: s
         for idx in range(len(pairs)):
             i, j = int(ii[idx]), int(jj[idx])
             L = nearest_sae_layer(j); sae = saes[L]
-            hk = Hg[idx, i - K_LO: j - K_LO + 1].float()            # [g+1, d]  k = i..j
+            hk = Hg[idx, i - K_LO: j - K_LO + 1].float()            # [g+1, d]  k = i..j  (raw)
             hi, hj = hk[0], hk[-1]; delta = hj - hi; dn2 = float((delta @ delta).item()) + 1e-6
-            c = sae.encode(hk)                                       # [g+1, F]
+            hk_s = hk * scale[L][i - K_LO: j - K_LO + 1, None]        # norm-matched to the SAE layer
+            c = sae.encode(hk_s)                                     # [g+1, F]
             ci, cj = c[0], c[-1]; dc = cj - ci
             # rising / falling
             r_val, r_idx = torch.topk(dc, topn); f_val, f_idx = torch.topk(-dc, topn)
@@ -294,9 +303,11 @@ def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: s
             cs = c[:, sel]                                            # [g+1, m]
             fchg = (cs[1:] - cs[:-1]).abs().sum(-1); fchg = (fchg / (fchg.sum() + 1e-6)).tolist()
             # FVE of Delta
-            rec = sae.decode(cj) - sae.decode(ci)                     # = W_dec dc
-            fve_sae = 1.0 - float(((delta - rec) ** 2).sum() / dn2)
-            fve_hj = 1.0 - float(((hj - sae.decode(cj)) ** 2).sum() / (hj @ hj + 1e-6))
+            delta_s = hk_s[-1] - hk_s[0]; dn2_s = float((delta_s @ delta_s).item()) + 1e-6      # scaled-space delta
+            rec = sae.decode(cj) - sae.decode(ci)                     # = W_dec dc  (scaled space)
+            fve_sae = 1.0 - float(((delta_s - rec) ** 2).sum() / dn2_s)
+            fve_hj = 1.0 - float(((hk_s[-1] - sae.decode(cj)) ** 2).sum() / (hk_s[-1] @ hk_s[-1] + 1e-6))
+            fve_hi = 1.0 - float(((hk_s[0] - sae.decode(ci)) ** 2).sum() / (hk_s[0] @ hk_s[0] + 1e-6))
             fves = {}
             order = torch.argsort(dc.abs(), descending=True)
             for K in (5, 10, 20, 40):
@@ -311,7 +322,8 @@ def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: s
                 a_norm = a.norm(dim=-1).tolist(); m_norm = m.norm(dim=-1).tolist()
                 if len(r_idx):
                     W = sae.W_enc[r_idx]                                  # [r, d]
-                    r_attn = (W @ a.sum(0)).tolist(); r_mlp = (W @ m.sum(0)).tolist()
+                    sc = scale[L][i - K_LO + 1: j - K_LO + 1, None]
+                    r_attn = (W @ (a * sc).sum(0)).tolist(); r_mlp = (W @ (m * sc).sum(0)).tolist()
             for f in r_idx.tolist() + f_idx.tolist():
                 feat_hits[L][f] = feat_hits[L].get(f, 0) + 1
             # largest write directions (by share of Delta)
@@ -326,7 +338,7 @@ def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: s
                 layer_share=json.dumps([round(v, 4) for v in share]), layer_norm=json.dumps([round(v, 2) for v in dnorm]),
                 layer_fchg=json.dumps([round(v, 4) for v in fchg]), k_top=k_top,
                 attn_share=json.dumps(a_share), mlp_share=json.dumps(m_share), attn_norm=json.dumps(a_norm), mlp_norm=json.dumps(m_norm),
-                fve_sae_delta=fve_sae, fve_hj=fve_hj, fve_top5=fves[5], fve_top10=fves[10], fve_top20=fves[20], fve_top40=fves[40],
+                fve_sae_delta=fve_sae, fve_hj=fve_hj, fve_hi=fve_hi, fve_top5=fves[5], fve_top10=fves[10], fve_top20=fves[20], fve_top40=fves[40],
             ))
             if idx % 500 == 0:
                 print(f"[sae] {idx}/{len(pairs)} {time.time() - t0:.0f}s", flush=True)
@@ -349,8 +361,15 @@ def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: s
     vol.commit()
     print(f"[sae] wrote {out} ({len(df)} rows) in {time.time() - t0:.0f}s", flush=True)
     print(df.drop(columns=[c for c in df.columns if c.startswith(("layer_", "attn_", "mlp_"))]).head(5).to_string()[:3000], flush=True)
-    print("means:", df[["fve_sae_delta", "fve_hj", "fve_top5", "fve_top10", "fve_top20", "fve_top40", "l0_i", "l0_j", "n_shared"]].mean().to_dict(), flush=True)
+    print("means:", df[["fve_sae_delta", "fve_hj", "fve_hi", "fve_top5", "fve_top10", "fve_top20", "fve_top40", "l0_i", "l0_j", "n_shared"]].mean().to_dict(), flush=True)
     return out
+
+
+
+@app.function(volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=24 * 1024, max_containers=6)
+def sae_dossier_cpu(split: str = "val", start: int = 0, end: int = 4096, perm_seed: int = -1) -> str:
+    """CPU fallback of sae_dossier (the encodes are small; used when no GPU is schedulable)."""
+    return sae_dossier.local(split=split, start=start, end=end, perm_seed=perm_seed)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -805,6 +824,8 @@ def main(task: str = "sae", split: str = "val", start: int = 0, end: int = 4096,
          max_shards: int = 0, perm_seed: int = -1, prompt_variant: str = "user", with_records: int = 1):
     if task == "sae":
         print(sae_dossier.remote(split=split, start=start, end=end, perm_seed=perm_seed))
+    elif task == "sae_cpu":
+        print(sae_dossier_cpu.remote(split=split, start=start, end=end, perm_seed=perm_seed))
     elif task == "maxact":
         print(sae_maxact.remote(max_shards=max_shards))
     elif task == "tc":
