@@ -74,7 +74,8 @@ def main():
     e_all = errors([join_bullets(b) for b in bullets]); e_emp = errors([""] * N)
     part, exact = depth_matched_partner(df, rng)
     e_dm = errors([join_bullets(bullets[k]) for k in part])
-    multi = np.array([len(b) >= 2 for b in bullets])
+    gaps_all = (df["j"] - df["i"]).values
+    multi = np.array([len(b) >= 2 for b in bullets]) & (gaps_all >= a.min_gap)          # crux / shuffle noise on the training distribution (gap >= min_gap) only
     shuf_texts = [join_bullets([b[k] for k in rng.permutation(len(b))]) if len(b) >= 2 else join_bullets(b) for b in bullets]
     e_shuf = errors(shuf_texts)
     R_emp = residuals_empty(); d_eff = participation_ratio(R_emp); del R_emp
@@ -174,7 +175,6 @@ def main():
                 "shuffle_abs_delta_relmse_mean": float(np.abs(r_shuf - r_all)[mm & multi].mean()) if (mm & multi).any() else None,
                 "mean_relmse_all": float(r_all[mm].mean()), "mean_relmse_empty": float(r_emp[mm].mean())}
 
-    gaps_all = (df["j"] - df["i"]).values
     out = {"ckpt": a.ckpt, "text": a.text, "flip": a.flip, "n": N, "d_eff": d_eff, "min_gap": a.min_gap,
            "train_gaps": block(gaps_all >= a.min_gap), "dropped_gaps": block(gaps_all < a.min_gap) if (gaps_all < a.min_gap).any() else None,
            "gain_ci_train_gaps": boot_ci((r_emp - r_all)[gaps_all >= a.min_gap]), "d": int(X.shape[1]), "bullets_per_row": float(n_bul.mean()), "tokens_per_row": float(np.nanmean(n_tok)) if np.isfinite(n_tok).any() else None,

@@ -27,7 +27,7 @@ def main():
     p.add_argument("--init-from", default=None, help="warm start from a reconstructor checkpoint (architecture args are taken from it)")
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--batch", type=int, default=64); p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--lr-lora", type=float, default=1e-4); p.add_argument("--lr-head", type=float, default=5e-4); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--warmup", type=int, default=50)
-    p.add_argument("--p-drop", type=float, default=0.3); p.add_argument("--p-empty", type=float, default=0.1); p.add_argument("--cos-w", type=float, default=0.5)
+    p.add_argument("--p-drop", type=float, default=0.3); p.add_argument("--p-empty", type=float, default=0.2); p.add_argument("--cos-w", type=float, default=0.5)
     p.add_argument("--loss", default="energy", choices=["energy", "relmse"]); p.add_argument("--min-gap", type=int, default=2, help="drop train pairs with j - i < min-gap (round 2: gap-1 dropped)")
     p.add_argument("--p-shuffle", type=float, default=1.0, help="probability of shuffling the bullet order per training example"); p.add_argument("--n-pairs", type=int, default=None, help="use the FIRST n train pairs (teacher train order) for the data-scaling curve")
     p.add_argument("--select-on", default="gain", choices=["gain", "relmse"], help="ckpt_best criterion on the selection rows: FVE gain over empty text (round 2) or relMSE")
@@ -111,7 +111,7 @@ def main():
         if sel is not None: out.update(blk(sel, "sel")); out.update(blk(~sel, "rep"))
         return out
 
-    curve = []; t0 = time.time(); N = len(tr); best = float("inf"); best_step = 0
+    curve = []; t0 = time.time(); N = len(tr); best = float("inf"); best_step = 0; best_abs = -float("inf"); best_abs_step = 0
     for step in range(a.steps):
         f = min(1.0, (step + 1) / max(1, a.warmup)) * (0.5 * (1 + math.cos(math.pi * step / a.steps)) * 0.95 + 0.05)
         for g, b in zip(opt.param_groups, base_lrs): g["lr"] = b * f
@@ -129,9 +129,10 @@ def main():
             pre = "sel" if sel is not None else "val"
             crit = ev[f"{pre}/relmse_all"] if a.select_on == "relmse" else -(ev[f"{pre}/fve_all"] - ev[f"{pre}/fve_empty"])
             if crit < best: best, best_step = crit, step + 1; M.save(model, os.path.join(a.out, "ckpt_best.pt"), vars(a) | {"best_step": best_step}); print(f"[train] ckpt_best <- step {best_step} ({a.select_on} {crit:.4f})", flush=True)
+            if ev[f"{pre}/fve_all"] > best_abs: best_abs, best_abs_step = ev[f"{pre}/fve_all"], step + 1; M.save(model, os.path.join(a.out, "ckpt_bestabs.pt"), vars(a) | {"best_step": best_abs_step}); print(f"[train] ckpt_bestabs <- step {best_abs_step} (fve_all {best_abs:.4f})", flush=True)
         if run is not None: run.log(log, step=step)
     M.save(model, os.path.join(a.out, "ckpt_final.pt"), vars(a))
-    json.dump({"args": vars(a), "final": curve[-1] if curve else {}, "best_step": best_step, "best_crit": best, "n_train": N, "n_val": len(va), "seconds": time.time() - t0}, open(os.path.join(a.out, "train_summary.json"), "w"), indent=1)
+    json.dump({"args": vars(a), "final": curve[-1] if curve else {}, "best_step": best_step, "best_crit": best, "best_abs_step": best_abs_step, "best_abs_fve": best_abs, "n_train": N, "n_val": len(va), "seconds": time.time() - t0}, open(os.path.join(a.out, "train_summary.json"), "w"), indent=1)
     if run is not None: run.finish()
     print(f"[train] DONE -> {a.out}", flush=True)
 

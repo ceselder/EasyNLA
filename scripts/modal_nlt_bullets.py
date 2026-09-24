@@ -57,7 +57,10 @@ def chain(tag: str, extra: str = "", data: str = DATA):
     rc = _run([sys.executable, "-m", "nlt.bullets.train", "--data-dir", data, "--out", f"/vol/bullets/{tag}", "--tag", tag] + tr_args.split())
     if rc != 0: return rc
     ck = f"/vol/bullets/{tag}/ckpt_best.pt" if os.path.exists(f"/vol/bullets/{tag}/ckpt_best.pt") else f"/vol/bullets/{tag}/ckpt_final.pt"
-    return _run([sys.executable, "-m", "nlt.bullets.evaluate", "--data-dir", data, "--out", f"/vol/bullets/eval/{tag}", "--ckpt", ck] + ev_args.split())
+    rc = _run([sys.executable, "-m", "nlt.bullets.evaluate", "--data-dir", data, "--out", f"/vol/bullets/eval/{tag}", "--ckpt", ck] + ev_args.split())
+    if os.path.exists(f"/vol/bullets/{tag}/ckpt_bestabs.pt"):        # second checkpoint: best ABSOLUTE FVE(text) on the selection rows (no crux, fast)
+        _run([sys.executable, "-m", "nlt.bullets.evaluate", "--data-dir", data, "--out", f"/vol/bullets/eval/{tag}_abs", "--ckpt", f"/vol/bullets/{tag}/ckpt_bestabs.pt", "--no-crux"] + [x for x in ev_args.split() if x != "--no-crux"])
+    return rc
 
 
 @app.function(timeout=1800, volumes={"/vol": vol}, cpu=2, memory=8 * 1024)
