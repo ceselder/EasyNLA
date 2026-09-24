@@ -66,7 +66,7 @@ def clean(out: str) -> str:
 
 @app.function(gpu="H100", volumes={"/vol": vol}, secrets=SECRETS, timeout=4 * 60 * 60, max_containers=8)
 def para_files(files: list[str], source: str, verbosities: list[int], out_root: str = "/vol/z/para-v1", max_texts_per_file: int = 0,
-               temperature: float = 0.7, max_tokens: int = 160, batch: int = 4096) -> list[str]:
+               split: str = "train", temperature: float = 0.7, max_tokens: int = 160, batch: int = 4096) -> list[str]:
     import pandas as pd
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -120,8 +120,9 @@ def para_files(files: list[str], source: str, verbosities: list[int], out_root: 
                                  para_kind=kind, verbosity=verbs[k], heldout=(pids[k] in held)))
         out = pd.DataFrame(rows)
         stem = os.path.basename(f).replace(".parquet", "")
+        stem = stem[5:] if stem.startswith("part_") else stem
         for ho, g in (out.groupby("heldout") if len(out) else []):
-            d = f"{out_root}/heldout/{source}" if ho else f"{out_root}/{source}/train"
+            d = f"{out_root}/heldout/{source}" if ho else f"{out_root}/{source}/{split}"
             os.makedirs(d, exist_ok=True)
             p = f"{d}/part_{stem}.parquet"
             pq.write_table(pa.Table.from_pandas(g.drop(columns=["heldout"]).reset_index(drop=True), preserve_index=False), p)
@@ -137,13 +138,13 @@ def para_files(files: list[str], source: str, verbosities: list[int], out_root: 
 
 
 @app.local_entrypoint()
-def run_para(inputs: str, source: str, verbosities: str = "1,2", containers: int = 4, max_texts_per_file: int = 0, out_root: str = "/vol/z/para-v1"):
-    """inputs: glob on the VOLUME (resolved in a container); files are dealt round-robin to `containers` workers."""
+def run_para(inputs: str, source: str, verbosities: str = "1,2", containers: int = 4, max_texts_per_file: int = 0, out_root: str = "/vol/z/para-v1", split: str = "train"):
+    """inputs: glob on the VOLUME (resolved in a container); files are dealt round-robin to `containers` workers. verbosities '' = no filter."""
     verbs = [int(v) for v in verbosities.split(",") if v.strip()]
     files = list_files.remote(inputs)
     print(f"{len(files)} input files for source {source}: {files[:4]} ...")
     groups = [files[i::containers] for i in range(containers) if files[i::containers]]
-    for w in para_files.starmap([(g, source, verbs, out_root, max_texts_per_file) for g in groups]):
+    for w in para_files.starmap([(g, source, verbs, out_root, max_texts_per_file, split) for g in groups]):
         for p in w:
             print("wrote", p)
 
