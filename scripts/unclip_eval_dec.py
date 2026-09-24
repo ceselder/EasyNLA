@@ -44,6 +44,7 @@ def main():
     p.add_argument("--snap", required=True); p.add_argument("--out", default=None); p.add_argument("--n", type=int, default=256); p.add_argument("--n-kl", type=int, default=128); p.add_argument("--n-var", type=int, default=32); p.add_argument("--k-var", type=int, default=4)
     p.add_argument("--tests", default="fm,exact,recon,kl,var"); p.add_argument("--cfgs", default="1,2,4"); p.add_argument("--sample-steps", type=int, default=50); p.add_argument("--exact-steps", type=int, default=32); p.add_argument("--fm-draws", type=int, default=4)
     p.add_argument("--var-cfg", type=float, default=2.0); p.add_argument("--seed", type=int, default=0); p.add_argument("--lm-device", default="cuda:1"); p.add_argument("--encoder-json", default=None); p.add_argument("--max-new", type=int, default=200)
+    p.add_argument("--ref-prior", default="/vol_glp/glp27b_main/ckpts/snap_001966M", help="exact test: also log p(h) under this FIXED unconditional prior (the warm start), so the PMI does not depend on the co-trained model's own unconditional branch drifting; '' = off")
     a = p.parse_args(); tests = set(a.tests.split(",")); cfgs = [float(x) for x in a.cfgs.split(",")]; t0 = time.time(); d0 = "cuda:0"
     from nla.unclip.decoder import Decoder
     dec = Decoder(a.snap, d0, encoder_json=a.encoder_json); d = dec.d; msf = math.sqrt(d)
@@ -81,6 +82,19 @@ def main():
         res["exact"] = {"ode_steps": a.exact_steps, "pmi_bits": stats(pmi), "frac_positive": float((pmi > 0).float().mean()), "shuf_bits": stats(pms), "frac_shuf_positive": float((pms > 0).float().mean()),
                         "bits_per_dim_uncond": float(-lp["uncond"].mean() / (d * math.log(2))), "bits_per_dim_cond": float(-lp["cond"].mean() / (d * math.log(2))),
                         "cond_code_bits": float(-lp["cond"].mean() / math.log(2)), "uncond_code_bits": float(-lp["uncond"].mean() / math.log(2)), "per_row_pmi_bits": pmi.tolist()}
+        if a.ref_prior:   # fixed reference: the original unconditional prior (before co-training) on the same rows, same probes -> PMI_ref = log p_dec(h|e) - log p_prior0(h)
+            from nla.flow.model import Denoiser
+            from nla.flow.eval_cond import exact_logp
+            m0 = torch.load(os.path.join(a.ref_prior, "model.pt"), map_location="cpu", mmap=True); c0 = m0["args"]
+            with torch.device("meta"): ref = Denoiser(c0["d_input"], c0["d_model"], c0["d_mlp"], c0["n_layers"])
+            ref = ref.to_empty(device=d0).to(torch.bfloat16); ref.load_state_dict(m0["model"], strict=True); ref.requires_grad_(False); ref.eval(); del m0
+            x0r = dec.norm.normalize(Hg); lpr = []
+            for i in range(0, a.n, 64):
+                g = torch.Generator(device=d0).manual_seed(11 + i); lpr.append(exact_logp(ref, x0r[i:i + 64], None, None, n_steps=a.exact_steps, probes=1, gen=g).cpu())
+            lpr = torch.cat(lpr); pmi_ref = (lp["cond"] - lpr) / math.log(2); drift = (lp["uncond"] - lpr) / math.log(2)
+            res["exact"].update({"ref_prior": a.ref_prior, "ref_bits_per_dim": float(-lpr.mean() / (d * math.log(2))), "pmi_vs_ref_prior_bits": stats(pmi_ref), "uncond_drift_vs_ref_bits": stats(drift), "per_row_pmi_vs_ref_bits": pmi_ref.tolist()})
+            del ref; torch.cuda.empty_cache()
+            print(f"[dec-eval] exact vs FIXED prior {os.path.basename(a.ref_prior)}: PMI_ref {res['exact']['pmi_vs_ref_prior_bits']['mean']:.0f} +- {res['exact']['pmi_vs_ref_prior_bits']['sem']:.0f} bits (ref bpd {res['exact']['ref_bits_per_dim']:.3f}); the decoder's own unconditional branch vs the fixed prior: {res['exact']['uncond_drift_vs_ref_bits']['mean']:+.0f} bits", flush=True)
         print(f"[dec-eval] exact: PMI {res['exact']['pmi_bits']['mean']:.0f} +- {res['exact']['pmi_bits']['sem']:.0f} bits (median {res['exact']['pmi_bits']['median']:.0f}, {100 * res['exact']['frac_positive']:.0f}% positive) | shuffled e {res['exact']['shuf_bits']['mean']:.0f} | bpd uncond {res['exact']['bits_per_dim_uncond']:.3f} cond {res['exact']['bits_per_dim_cond']:.3f} ({time.time() - t0:.0f}s)", flush=True); dump()
 
     S = {}   # sampled vectors for the downstream tests
