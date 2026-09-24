@@ -375,7 +375,7 @@ def sae_dossier_cpu(split: str = "val", start: int = 0, end: int = 4096, perm_se
 # ----------------------------------------------------------------------------------------------------------------------
 # 2. SAE max-activating examples over the store
 # ----------------------------------------------------------------------------------------------------------------------
-@app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024)
+@app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=48 * 1024)
 def sae_maxact(data_dir: str = DATA_DIR, splits: str = "val,train", trainer: int = 0, n_top: int = 12, max_shards: int = 0,
                out_dir: str = f"{OUT}/sae_maxact", ctx_left: int = 24, ctx_right: int = 4) -> str:
     import time
@@ -487,7 +487,7 @@ def tc_records(layer: int, feats: list[int]):
     return out
 
 
-@app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024, max_containers=6)
+@app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=40 * 1024, max_containers=6)
 def tc_dossier(split: str = "val", start: int = 0, end: int = 4096, layers: str = "10-34", data_dir: str = DATA_DIR, writes_dir: str = WRITES_DIR,
                topn: int = 8, n_dirs: int = 400, out_dir: str = f"{OUT}/tc_dossier", perm_seed: int = -1, with_records: int = 1) -> str:
     import time
@@ -609,7 +609,7 @@ MAEMM_INSTR = "Please produce a string of text that triggers the following direc
 MARKER = " ?"
 
 
-@app.function(gpu=GPU_BIG, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024, max_containers=4)
+@app.function(gpu=GPU_BIG, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=40 * 1024, max_containers=4)
 def maemm_invert(spec: str, out_path: str, max_new_tokens: int = 40, batch_size: int = 64, coeff: float = 1.0, prompt_variant: str = "user",
                  verify: int = 1, n_samples: int = 1) -> str:
     """spec: JSON path on the volume with a list of {name, kind, layer, feature, vec_path, row} or {name, kind, vec: [..]}.
