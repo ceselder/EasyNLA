@@ -101,12 +101,16 @@ def dump(tag: str, extra: str = "", data: str = DATA):
 
 @app.function(timeout=3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=32 * 1024)
 def prep(extra: str = ""):
-    """CPU: build SFT row files on the volume (e.g. nlt.verbalizer.build_v0b_rows)"""
+    """CPU: build SFT row files on the volume. Default module nlt.verbalizer.build_v0b_rows; a leading 'module=<dotted.name>' token in
+    extra selects another (e.g. 'module=nlt.verbalizer.build_matched_rows --target ... --pool ... --out ...')."""
     import subprocess
     os.chdir(REPO_REMOTE); os.environ["HF_HOME"] = "/vol/hf_cache"; os.environ["HF_HUB_DISABLE_XET"] = "1"
     try: vol.reload()
     except Exception: pass
-    rc = subprocess.call([sys.executable, "-m", "nlt.verbalizer.build_v0b_rows"] + extra.split(), cwd=REPO_REMOTE)
+    args = extra.split(); mod = "nlt.verbalizer.build_v0b_rows"
+    if args and args[0].startswith("module="): mod = args[0].split("=", 1)[1]; args = args[1:]
+    print(f"[modal] prep: python -m {mod} " + " ".join(args), flush=True)
+    rc = subprocess.call([sys.executable, "-m", mod] + args, cwd=REPO_REMOTE)
     try: vol.commit()
     except Exception as e: print(f"[modal] vol.commit: {e}", flush=True)
     return rc
