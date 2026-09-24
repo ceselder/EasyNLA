@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 STEP = re.compile(r"^step\s+(\d+) \| R ([-+\d.]+) \(wg std ([-+\d.]+)\) \| bits ([-+\d.]+) med ([-+\d.]+) ws ([-+\d.]+) \| tok ([\d.]+) \| viol ([\d.]+) \| kl ([\d.]+) \| ent ([\d.]+) \| d4 ([\d.]+) \| gn ([\d.]+) \| (\d+)s")
-REF = re.compile(r"^step\s+(?P<step>\d+) \| R (?P<R>[-+\d.]+) \(wg std (?P<wg>[-+\d.]+)\) \| content (?P<content>[-+\d.]+) med (?P<med>[-+\d.]+) ws (?P<ws>[-+\d.]+) \| own (?P<own>[-+\d.]+)(?: P\(own>null\) (?P<pnull>[\d.]+))? dist (?P<dist>[-+\d.]+) acc (?P<acc>[\d.]+) \| tok (?P<tok>[\d.]+) \| viol (?P<viol>[\d.]+) \| kl (?P<kl>[\d.]+) \| ent (?P<ent>[\d.]+) \| d4 (?P<d4>[\d.]+) \| lam (?P<lam>[\d.]+) \| gn (?P<gn>[\d.]+) \|(?: listener fm (?P<lfm>[\d.]+)(?: con (?P<lcon>[\d.]+) acc (?P<lacc>[\d.]+))?(?: nulldm (?P<lnulldm>[\d.]+))? null (?P<lnull>[\d.]+)(?: own<dist (?P<lod>[\d.]+))? \|)? (?P<sec>\d+)s")
+REF = re.compile(r"^step\s+(?P<step>\d+) \| R (?P<R>[-+\d.]+) \(wg std (?P<wg>[-+\d.]+)\) \| content (?P<content>[-+\d.]+) med (?P<med>[-+\d.]+) ws (?P<ws>[-+\d.]+) \| own (?P<own>[-+\d.]+)(?: P\(own>null\) (?P<pnull>[\d.]+))? dist (?P<dist>[-+\d.]+) acc (?P<acc>[\d.]+)(?: \(pre (?P<acc_pre>[-+\d.]+|nan) ws (?P<acc_ws>[-+\d.]+|nan) mo (?P<acc_mo>[-+\d.]+|nan)\))? \| tok (?P<tok>[\d.]+) \| viol (?P<viol>[\d.]+) \| kl (?P<kl>[\d.]+) \| ent (?P<ent>[\d.]+) \| d4 (?P<d4>[\d.]+)(?: list (?P<list>[\d.]+))? \| lam (?P<lam>[\d.]+) \| gn (?P<gn>[\d.]+) \|(?: listener fm (?P<lfm>[\d.]+)(?: con (?P<lcon>[\d.]+) acc (?P<lacc>[\d.]+))?(?: nulldm (?P<lnulldm>[\d.]+))? null (?P<lnull>[\d.]+)(?: own<dist (?P<lod>[\d.]+))? \|)? (?P<sec>\d+)s")
 EVAL = re.compile(r"eval: bits ([-+\d.]+) \(med ([-+\d.]+), /tok ([-+\d.]+); random-pair control ([-+\d.]+); frozen critic ([-+\d.]+) \(live-frozen ([-+\d.]+)\)\) by band pre=([-+\d.]+) workspace=([-+\d.]+) motor=([-+\d.]+) \| tok ([\d.]+) viol ([\d.]+) nonpos ([\d.]+)")
 
 
@@ -30,10 +30,10 @@ def parse(path):
     for line in open(path, errors="replace"):
         r = REF.match(line.strip())
         if r:
-            g = r.groupdict(); f = lambda k: (float(g[k]) if g.get(k) is not None else None); last = int(g["step"])
+            g = r.groupdict(); f = lambda k: (float(g[k]) if g.get(k) not in (None, "nan") else None); last = int(g["step"])
             steps.append({"step": last, "reward": f("R"), "within_group_std": f("wg"), "content": f("content"), "content_median": f("med"), "content_workspace": f("ws"), "own_pmi": f("own"), "p_own_gt_null": f("pnull"), "distractor_pmi": f("dist"),
                           "ref_acc": f("acc"), "tokens": f("tok"), "violations": f("viol"), "kl": f("kl"), "entropy": f("ent"), "distinct4": f("d4"), "lambda": f("lam"), "grad_norm": f("gn"),
-                          "listener_fm": f("lfm"), "listener_con": f("lcon"), "listener_acc": f("lacc"), "listener_nulldm": f("lnulldm"), "listener_null": f("lnull"), "listener_own_lt_dist": f("lod"), "seconds": int(g["sec"]), "referential": True}); continue
+                          "listener_fm": f("lfm"), "listener_con": f("lcon"), "listener_acc": f("lacc"), "listener_nulldm": f("lnulldm"), "listener_null": f("lnull"), "listener_own_lt_dist": f("lod"), "acc_pre": f("acc_pre"), "acc_workspace": f("acc_ws"), "acc_motor": f("acc_mo"), "list_share": f("list"), "seconds": int(g["sec"]), "referential": True}); continue
         m = STEP.match(line.strip())
         if m:
             v = m.groups(); last = int(v[0])
@@ -66,6 +66,8 @@ def main():
         if _la: ax2.plot([q[0] for q in _la], [q[1] for q in _la], marker="s", ms=4, lw=1.5, color=CAT[2], alpha=0.8, label="listener's own contrast accuracy (diagnostic)")
         _pn = [(st, v) for st, v in zip(S["step"], S["p_own_gt_null"]) if v is not None]
         if _pn: ax2.plot([q[0] for q in _pn], [q[1] for q in _pn], marker="^", ms=4, lw=1.5, color=CAT[3], alpha=0.9, label="P(own PMI > 0): sentence beats the empty text")
+        _ls = [(st, v) for st, v in zip(S["step"], S["list_share"]) if v is not None]
+        if _ls: ax2.plot([q[0] for q in _ls], [q[1] for q in _ls], lw=1.5, ls=(0, (3, 2)), color=CAT[7], alpha=0.9, label="share of rollouts in the list register")
         ax2.axhline(0.5, color=INK2, lw=0.9, ls=(0, (4, 2))); ax2.text(S["step"][-1], 0.51, "chance", ha="right", fontsize=9.5, color=INK2); ax2.set_ylim(0, 1)
         ax2.set_xlabel("RL step"); ax2.set_ylabel("referential accuracy"); ax2.legend(frameon=False, fontsize=10); ax2.set_title("(b) Does the listener pick the right pair from the sentence?", loc="left", fontsize=12.5)
         ax3.plot(S["step"], S["tokens"], marker="o", ms=4, lw=2, color=CAT[0]); ax3.set_xlabel("RL step"); ax3.set_ylabel("tokens per sentence (mean)"); ax3.set_ylim(0, max(S["tokens"]) * 1.15)
