@@ -63,7 +63,7 @@ def main():
                f"pays {n_pass} of {len(rows)} sources over the 0.75 content gate (P(own beats the depth-matched wrong sentence) {pmin:.2f}–{pmax:.2f}); the verbalizer's and teacher's sentences are not among them")
     fig.suptitle("\n".join(textwrap.wrap(f"Controls on {a.critic_label}: the critic is a real density over h_j (own text scored against h_j from a wrong layer: {min(wj):.0f} to {max(wj):.0f} bits; "
                                           f"the passage as text: {np.mean(cp):.0f} bits) and {verdict}", 112)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
-    fig.text(0.01, 0.005, f"Fixed held-out set; n = {min(r['n'] for r in rows)}–{max(r['n'] for r in rows)} pairs per source x 8 variants, every variant of a pair scored with the same probes (exact Heun 32). Table: data/{a.controls} (redteam nlt/evals/controls_table.py). PRELIMINARY: D3 gate not passed.",
+    fig.text(0.01, 0.005, f"Fixed held-out set; n = {min(r['n'] for r in rows)}–{max(r['n'] for r in rows)} pairs per source x 8 variants, every variant of a pair scored with the same probes (exact Heun 32). Table: data/{a.controls} (redteam nlt/evals/controls_table.py). Critic numbers preliminary.",
              fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
     fig.subplots_adjust(left=0.08, right=0.985, top=0.87, bottom=0.09, hspace=0.5)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")

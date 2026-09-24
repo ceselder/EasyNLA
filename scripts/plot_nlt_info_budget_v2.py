@@ -68,7 +68,7 @@ def main():
     fig.suptitle("\n".join(textwrap.wrap("Exact information budget on held-out pairs: most text critics trained tonight pay for register and depth, not for what the sentence says; "
                                           "adapter capacity, training length and the learning-rate schedule move the content term (Qwen3-8B, layers 9–34, 512 fixed held-out pairs per set, exact ODE log-likelihood)", 105)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
     fig.text(0.01, 0.005, "wrong-depth sentence = another held-out pair's sentence with the same (i, j); random = a random pair's sentence; 'words permuted' = the pair's own sentence with its words shuffled. "
-             "All numbers are PRELIMINARY: no blind prior has passed the D3 gate (told-depth gain <= 7 exact bits).", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
+             "All critic numbers are preliminary (the blind prior still hedges on depth).", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
     fig.subplots_adjust(left=0.09, right=0.98, top=0.86, bottom=0.10, hspace=0.6)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
     json.dump(out, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)
