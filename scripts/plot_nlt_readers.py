@@ -14,7 +14,7 @@ SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
 SOURCES = [("reader_teacher_v1", "teacher\n+lens +final", "#2a78d6"), ("reader_teacher_nofinal_v1", "teacher\n+lens", "#eb6834"),
            ("reader_teacher_nolens_v1", "teacher\npassage only", "#1baf7a"), ("reader_lensdiff_jlens_L1", "J-lens\nsentence", "#4a3aa7"),
            ("reader_v0_ao_tsv1", "verbalizer\nactivations only", "#e34948"), ("reader_lensdiff_jlens_L3", "J-lens lists\ntwo readouts", "#e87ba4"),
-           ("reader_prelim_v1n_20", "plain-PMI RL\nstep 20", "#eda100"), ("reader_prelim_v1n_40", "plain-PMI RL\nstep 40", "#008300"), ("reader_ref_v1_0", "list-naming\nwarm start (V0b)", "#87867F"), ("reader_dossier_sonnet_v0_v1", "feature dossier\n(no passage)", "#b07aa1")]
+           ("reader_prelim_v1n_20", "plain-PMI RL\nstep 20", "#eda100"), ("reader_prelim_v1n_40", "plain-PMI RL\nstep 40", "#008300"), ("reader_ref_v1_0", "list-naming\nwarm start (V0b)", "#87867F"), ("reader_ref_v4_20", "referential RL arm E\nstep 20 (neighbour\ndistractor)", "#4a3aa7"), ("reader_dossier_sonnet_v0_v1", "feature dossier v0\n(no passage)", "#b07aa1"), ("reader_dossier_sonnet_v1_v1", "feature dossier v1\n(+ transcoder\nfeatures)", "#e87ba4"), ("reader_teacher_dossier_v1_v1", "teacher + dossier\n(passage AND\nfeatures)", "#e34948")]
 TASKS = [("top1", "model's final top-1 among 4", 25), ("posmatch", "position among 5 cuts of the doc", 20), ("direction", "direction of change (lens j vs i)", 50), ("category", "next-token category (5 classes)", 30)]
 
 
@@ -22,7 +22,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--data", required=True); ap.add_argument("--out-dir", required=True); ap.add_argument("--stem", default="reader_usefulness")
     a = ap.parse_args(); d = json.load(open(a.data)); srcs = [(k, l, c) for k, l, c in SOURCES if k in d]
     plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2})
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10), dpi=150, gridspec_kw={"wspace": 0.18, "hspace": 0.62}); axes = axes.ravel()
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10.5), dpi=150, gridspec_kw={"wspace": 0.18, "hspace": 0.62}); axes = axes.ravel()
     x = np.arange(len(srcs))
     for ax, (task, title, chance) in zip(axes, TASKS):
         raw = [d[k].get(task) for k, _, _ in srcs]; vals = [100 * v if v is not None else 0 for v in raw]

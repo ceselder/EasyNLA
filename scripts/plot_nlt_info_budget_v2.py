@@ -19,7 +19,7 @@ CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa
 # critic key in the json -> human label (no codenames), in display order
 CRITICS = [("lensmine", "J-lens text only\n2000 steps\nrms space"), ("lens_es", "J-lens text only\nearly-stopped\nrms space"), ("lensmine_pooled", "J-lens text only\n+ null reg.\nPOOLED space"),
            ("union_es", "all sources\nplain FM\nrms space"), ("union_null", "all sources\n+ null reg.\nrms space"),
-           ("union_pooled_null", "all sources\n+ null reg.\nPOOLED (headline)"), ("union_pooled_big", "all sources\n16 slots, 4k steps\nPOOLED"), ("v3b_fbpc_s8000", "0.6B adapter, full pool\nDECAYING lr, step 8000\nPOOLED (packaged)"), ("union_c", "all sources + null\n+ contrastive (T4)\npooled"), ("critic_v3a", "critic v3a\n(all levers, prior\nunfrozen), pooled"), ("v3a_nd_final", "critic v3a\nnull-dm arm (prior\nunfrozen), pooled")]
+           ("union_pooled_null", "all sources\n+ null reg.\nPOOLED (headline)"), ("union_pooled_big", "all sources\n16 slots, 4k steps\nPOOLED"), ("v3b_fbpc_s8000", "0.6B adapter\ndecaying lr, s8000\nPOOLED (packaged)"), ("union_c", "all sources + null\n+ contrastive (T4)\npooled"), ("critic_v3a", "critic v3a\n(all levers, prior\nunfrozen), pooled"), ("v3a_nd_final", "critic v3a\nnull-dm arm (prior\nunfrozen), pooled")]
 SETS = [("teacher_v1", "Sonnet teacher, 1 sentence (41 tok)", CAT[0]), ("lens_L1", "J-lens change description, 1 sentence (40 tok)", CAT[1]),
         ("lens_L2", "J-lens change description, 3 sentences (57 tok)", CAT[2]), ("lens_L3", "J-lens change description, lists (137 tok)", CAT[6])]
 
@@ -38,7 +38,7 @@ def main():
         return k == "union_null" and "text_union_pooled_n" in (B[k].get("ckpt") or "")
     crits = [(k, l) for k, l in CRITICS if k in B and not collided(k) and any(s in B[k]["sets"] for s, _, _ in SETS)]
     style()
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 11.5), dpi=150, gridspec_kw={"hspace": 0.75})
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 11.5), dpi=150, gridspec_kw={"hspace": 0.75})
     w = 0.8 / len(SETS); x = np.arange(len(crits)); out = {"critics": {}, "sets": {s: l for s, l, _ in SETS}, "band_content": "workspace14-32"}
     for si, (st, sl, col) in enumerate(SETS):
         form, cont, cerr, pdm = [], [], [], []
@@ -63,10 +63,10 @@ def main():
     ax1.set_title("Form: a well-formed sentence in the training register is worth ~60 bits to a single-register adapter;\nthe null regulariser (score a random pair's text as the empty text) cuts it to ~7", loc="left", fontsize=12.5)
     ax1.legend(frameon=False, loc="upper center", ncol=2, bbox_to_anchor=(0.5, -0.32))
     ax2.set_ylabel("content bits = bits(z) − bits(z_dm), workspace band"); ax2.set_ylim(min(-0.5, ax2.get_ylim()[0]), ax2.get_ylim()[1] * 1.18)
-    ax2.set_title("Content: 1–3 exact bits per sentence on every critic except the wider adapter trained 4000 steps, where J-lens descriptions\nreach 4–6 bits and P(z beats its depth-matched partner) 0.75–0.85 (number above each bar; gate 0.75)", loc="left", fontsize=12.5)
+    ax2.set_title("Content: 1–3 exact bits per sentence on most critics; the wider adapter (4000 steps) reaches 4–6 bits on J-lens descriptions and the packaged\ndecayed-learning-rate adapter 8–11 bits, at P(z beats its depth-matched partner) 0.69–0.85 (number above each bar; gate 0.75)", loc="left", fontsize=13, pad=10)
     ax2.axhline(0, color=INK2, lw=0.8)
     fig.suptitle("\n".join(textwrap.wrap("Exact information budget on held-out pairs: most text critics trained tonight pay for register and depth, not for what the sentence says; "
-                                          "adapter capacity and training length move the content term (Qwen3-8B, layers 9–34, 512 fixed held-out pairs per set, exact ODE log-likelihood)", 105)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
+                                          "adapter capacity, training length and the learning-rate schedule move the content term (Qwen3-8B, layers 9–34, 512 fixed held-out pairs per set, exact ODE log-likelihood)", 105)), fontsize=13.5, x=0.01, y=0.995, ha="left", va="top")
     fig.text(0.01, 0.005, "z_dm = another held-out pair's sentence with the same (i, j); z_rp = a random pair's sentence; 'words permuted' = the pair's own sentence with its words shuffled. "
              "All numbers are PRELIMINARY: no blind prior has passed the D3 gate (told-depth gain <= 7 exact bits).", fontsize=9.5, color=INK2, ha="left", va="bottom", wrap=True)
     fig.subplots_adjust(left=0.09, right=0.98, top=0.86, bottom=0.10, hspace=0.6)
