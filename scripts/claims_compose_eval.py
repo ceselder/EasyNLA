@@ -51,7 +51,7 @@ def main():
         *_, val = load_claims_dir(a.claims_dir, 0, a.n); rng = np.random.default_rng(0)
         sets["synthetic"] = (torch.stack([v[0] for v in val]).float(), [list(rng.permutation(v[1])[: a.k]) for v in val], None)
     aa = torch.load(a.adapter, map_location="cpu")["args"]
-    fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"))
+    fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"), prior_override=(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt") if os.path.exists(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt")) else None))
     res = {"adapter": a.adapter, "tag": a.tag, "k": a.k, "ode_steps": a.steps, "set_encode": fb.set_encode, "sets": {}}
     condC = (lambda sets: fb.cond_sets(sets)) if fb.set_encode else (lambda sets: fb.cond([format_claims(s_) for s_ in sets]))
     for name, (A, C, G) in sets.items():

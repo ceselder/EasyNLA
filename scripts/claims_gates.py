@@ -34,7 +34,7 @@ def main():
     acts = torch.tensor(np.asarray(t.column("activation_vector").combine_chunks().flatten(), dtype=np.float32).reshape(N, -1))
     gold = [extract_explanation(r) or r for r in t.column("response").to_pylist()]
     aa = torch.load(a.adapter, map_location="cpu")["args"]
-    fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"))
+    fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"), prior_override=(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt") if os.path.exists(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt")) else None))
     fb.model.eval(); d = acts.shape[1]; T = len(TS); tt = torch.tensor(TS, device=dev)
     mode = "set" if fb.set_encode else ("bullets" if aa.get("claim_subsets", 0) > 0 else "paragraph")
     compose = a.compose == "on" or (a.compose == "auto" and aa.get("claim_subsets", 0) == 1)

@@ -125,7 +125,7 @@ def cmd_score(a):
     from nla.flow.scoring import FlowBundle
     from nla.flow.claims import format_claims
     dev = "cuda:0"; aa = torch.load(a.adapter, map_location="cpu")["args"]
-    fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged")); fb.model.eval()
+    fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"), prior_override=(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt") if os.path.exists(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt")) else None)); fb.model.eval()
     fmt = (lambda c: format_claims([c])) if aa.get("claim_subsets", 0) > 0 else (lambda c: c)
     out_dir = f"{WS}/scores_{a.critic_tag}"; os.makedirs(out_dir, exist_ok=True)
     for part in a.parts.split(","):

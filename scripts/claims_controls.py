@@ -84,7 +84,7 @@ def main():
     from nla.flow.claims import format_claims
     from nla.flow.train_cond import load_claims_dir
     aa = torch.load(a.adapter, map_location="cpu")["args"]
-    fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged")); fb.model.eval()
+    fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"), prior_override=(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt") if os.path.exists(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt")) else None)); fb.model.eval()
     fmt = (lambda c: format_claims([c])) if aa.get("claim_subsets", 0) > 0 else (lambda c: c)
     sc = Scorer(fb, fmt, dev, a.D); res = {"adapter": a.adapter, "tag": a.tag, "D": a.D, "t_grid": TS}
     # ---------------- (1)+(2) benchmark twins
