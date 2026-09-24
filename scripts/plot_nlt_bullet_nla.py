@@ -139,7 +139,7 @@ def fig_scaling(rep, out):
     absb, gainb, fixb = sel("bullets", "abs_fve"), sel("bullets", "gain"), sel("bullets", "abs_fve", "fixed_2400_steps")
     if not absb and not gainb: return
     main = absb if absb else gainb; x = [r["n_pairs"] for r in main]
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.8))
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 7.2))
     ax = axes[0]
     ax.plot(x, [r["gain"] for r in main], marker="o", lw=2.5, color=CLAY, label="bullets: gain over the same net with empty text")
     if any(r.get("gain_ci") for r in main):
@@ -153,7 +153,7 @@ def fig_scaling(rep, out):
             ax.scatter([r["n_pairs"]], [r["gain"]], marker="D", s=90, color=c, zorder=5, label=f"{nm}, same {r['n_pairs'] // 1000}k pairs, same recipe: {r['gain']:+.3f}")
     ax.axhline(0, color=INK, lw=0.8); ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off()
     ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("FVE of Δ gained over the same net with no text")
-    ax.set_title("Bullet-list gain over no text vs train pairs\n(held-out val rows 0:1024, gap ≥ 2, energy-weighted loss)"); ax.legend(frameon=False, fontsize=8.5, loc="best"); ax.spines[["top", "right"]].set_visible(False)
+    ax.set_title("Bullet-list gain over no text vs train pairs\n(held-out val rows 0:1024, gap ≥ 2, energy-weighted loss)"); ax.legend(frameon=False, fontsize=8.5, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=1); ax.spines[["top", "right"]].set_visible(False)
     fb = S.get("fixed_baselines_energy_loss") or {}
     ax = axes[1]
     ax.plot(x, [r["fve_own"] for r in main], marker="o", lw=2.5, color=CLAY, label="bullets: FVE(Δ) with own list")
@@ -168,7 +168,7 @@ def fig_scaling(rep, out):
     ax2.axhline(0.5, color=INK, ls="--", lw=0.6); ax2.set_ylim(0.4, 1.0); ax2.set_ylabel("probability over held-out pairs")
     ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off(); ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("absolute FVE of Δ on held-out pairs")
     ax.set_title("Absolute FVE(Δ): with text, without, and h_i-only MLPs;\npair-specific and claim-flip probabilities (right axis)")
-    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels(); ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=8, loc="center left"); ax.spines[["top"]].set_visible(False)
+    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels(); ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=1); ax.spines[["top"]].set_visible(False)
     save(fig, rep, "fig_scaling")
     out["fig_scaling"] = S
 
