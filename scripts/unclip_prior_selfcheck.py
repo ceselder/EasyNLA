@@ -173,15 +173,15 @@ def main():
 
     # ---------------------------------------------------------------- sampling
     if "sample" in tests:
-        n = 64; t0 = time.time(); E = C.encode(CA[:n]); G = C.text_embed(CZ[:n]); res = {"n_texts": n, "n_samples": 4}
+        n = 64; t0 = time.time(); E = F.normalize(C.encode(CA[:n]), dim=-1); G = F.normalize(C.text_embed(CZ[:n]), dim=-1); res = {"n_texts": n, "n_samples": 4}   # unit vectors: dots below are cosines
         for cfg in (1.0, 3.0):
-            S = C.sample(CZ[:n], n=4, seed=0, cfg_scale=cfg, n_steps=50)                            # [n, 4, d]
+            S_raw = C.sample(CZ[:n], n=4, seed=0, cfg_scale=cfg, n_steps=50); S = F.normalize(S_raw, dim=-1)   # [n, 4, d]
             cos_true = (S * E[:, None]).sum(-1); cos_cross = torch.einsum("nkd,md->nkm", S, E)   # sampled e' vs every true e
             rank = (cos_cross >= cos_true[..., None]).sum(-1) - 1                                   # how many other activations' e are at least as close (ties against)
             clip_top1 = (torch.einsum("nkd,md->nkm", S, G).argmax(-1) == torch.arange(n, device=dev)[:, None]).float().mean().item()
-            prior_s = C.sample_prior(n=n * 4, seed=1).view(n, 4, d); cos_prior = (prior_s * E[:, None]).sum(-1)
+            prior_s = F.normalize(C.sample_prior(n=n * 4, seed=1).view(n, 4, d), dim=-1); cos_prior = (prior_s * E[:, None]).sum(-1)
             res[f"cfg{cfg}"] = {"cos_to_true_mean": cos_true.mean().item(), "cos_prior_sample_to_true_mean": cos_prior.mean().item(), "cos_true_nn_other_mean": cos_cross.masked_fill(torch.eye(n, dtype=torch.bool, device=dev)[:, None, :], -1).max(-1).values.mean().item(),
-                              "retrieval_top1_among64": (rank == 0).float().mean().item(), "clip_a2t_top1_of_sampled_e": clip_top1, "sample_norm_mean": S.norm(dim=-1).mean().item(), "within_text_sample_cos": torch.einsum("nkd,nld->nkl", S, S).mean().item()}
+                              "retrieval_top1_among64": (rank == 0).float().mean().item(), "clip_a2t_top1_of_sampled_e": clip_top1, "sample_norm_mean": S_raw.norm(dim=-1).mean().item(), "within_text_sample_cos": torch.einsum("nkd,nld->nkl", S, S).mean().item()}
         res["seconds"] = time.time() - t0
         print(f"[sample] cfg1: cos(e', e_true) {res['cfg1.0']['cos_to_true_mean']:.3f} (prior sample {res['cfg1.0']['cos_prior_sample_to_true_mean']:.3f}; nearest OTHER true e {res['cfg1.0']['cos_true_nn_other_mean']:.3f}) retrieval top1/64 {100*res['cfg1.0']['retrieval_top1_among64']:.0f}% CLIP a2t {100*res['cfg1.0']['clip_a2t_top1_of_sampled_e']:.0f}% | cfg3: cos {res['cfg3.0']['cos_to_true_mean']:.3f} top1 {100*res['cfg3.0']['retrieval_top1_among64']:.0f}%", flush=True)
         jdump(f"{out_dir}/eval_sample.json", {**meta, **res})
