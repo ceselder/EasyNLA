@@ -149,8 +149,8 @@ def fig_scaling(rep, out):
     if fixb: ax.plot([r["n_pairs"] for r in fixb], [r["gain"] for r in fixb], marker="v", lw=2, color=SKY, label="bullets, fixed 2,400 steps at every size")
     if absb and gainb: ax.plot([r["n_pairs"] for r in gainb], [r["gain"] for r in gainb], marker="o", lw=1.2, color=GREY, alpha=0.6, label="checkpoint picked on gain over own empty text (artefact: empty pathway broken there)")
     for text, c, nm in (("prose", INK, "Sonnet prose"), ("lens", GREY, "lens-diff text")):
-        for r in (sel(text, "abs_fve") or sel(text, "gain")):
-            ax.scatter([r["n_pairs"]], [r["gain"]], marker="D", s=90, color=c, zorder=5, label=f"{nm}, same {r['n_pairs'] // 1000}k pairs, same recipe: {r['gain']:+.3f}")
+        rr = sel(text, "abs_fve") or sel(text, "gain")
+        if rr: ax.plot([r["n_pairs"] for r in rr], [r["gain"] for r in rr], marker="D", ms=9, lw=1.5, ls="-.", color=c, zorder=5, label=f"{nm}, same pairs, same recipe")
     ax.axhline(0, color=INK, lw=0.8); ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off()
     ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("FVE of Δ gained over the same net with no text")
     ax.set_title("Bullet-list gain over no text vs train pairs\n(held-out val rows 0:1024, gap ≥ 2, energy-weighted loss)"); ax.legend(frameon=False, fontsize=8.5, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=1); ax.spines[["top", "right"]].set_visible(False)
@@ -159,8 +159,8 @@ def fig_scaling(rep, out):
     ax.plot(x, [r["fve_own"] for r in main], marker="o", lw=2.5, color=CLAY, label="bullets: FVE(Δ) with own list")
     ax.plot(x, [r["fve_empty"] for r in main], marker="o", lw=2, color=CLAY, ls=":", label="bullets: FVE(Δ) with empty text (same net)")
     for text, c, nm in (("prose", INK, "prose"), ("lens", GREY, "lens-diff")):
-        for r in (sel(text, "abs_fve") or sel(text, "gain")):
-            ax.scatter([r["n_pairs"]], [r["fve_own"]], marker="D", s=90, color=c, zorder=5, label=f"{nm} with text, same pairs"); ax.scatter([r["n_pairs"]], [r["fve_empty"]], marker="D", s=50, facecolors="none", edgecolors=c, zorder=5)
+        rr = sel(text, "abs_fve") or sel(text, "gain")
+        if rr: ax.plot([r["n_pairs"] for r in rr], [r["fve_own"] for r in rr], marker="D", ms=9, lw=1.5, ls="-.", color=c, zorder=5, label=f"{nm} with text (same pairs); hollow = its empty text"); ax.scatter([r["n_pairs"] for r in rr], [r["fve_empty"] for r in rr], marker="D", s=50, facecolors="none", edgecolors=c, zorder=5)
     if "mlp_nodepth_extra" in fb: ax.axhline(fb["mlp_nodepth_extra"]["fve"], color=INK, ls="--", lw=1.2, label=f"h_i-only MLP (no text, no depth), 100k pairs: {fb['mlp_nodepth_extra']['fve']:.3f}")
     if "mlp_depth_extra" in fb: ax.axhline(fb["mlp_depth_extra"]["fve"], color=SAGE, ls="--", lw=1.2, label=f"h_i-only MLP TOLD depth, 100k pairs: {fb['mlp_depth_extra']['fve']:.3f}")
     ax2 = ax.twinx(); ax2.plot(x, [r["p_own_beats_dm"] for r in main], marker="x", lw=1.5, color=SKY, label="P(own list beats depth-matched wrong list)")
