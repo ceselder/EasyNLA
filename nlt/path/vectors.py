@@ -1,6 +1,7 @@
 """Path inputs per pair: [h_i, writes..., h_j].
 
   mode 'none'      -> [h_i, h_j]                                   (the two-marker baseline through the same code path)
+  mode 'count'     -> [h_i, 0, ..., 0, h_j]                        (j-i) ZERO vectors = no-op markers: the CONTROL that reveals the gap but no write content
   mode 'delta'     -> [h_i, d_{i+1}, ..., d_j, h_j]                d_k = h_k - h_{k-1} from the STORED residuals (attention + MLP combined)
   mode 'attn_mlp'  -> [h_i, a_{i+1}, m_{i+1}, ..., a_j, m_j, h_j]  from the PathStore written by nlt.path.extract (h_j = h_i + sum_k (a_k + m_k))
 
@@ -55,6 +56,7 @@ def path_inputs(store, pos_idx, i, j, mode: str, pstore: PathStore | None = None
         ii, jj = int(i[b]), int(j[b]); assert K_LO <= ii < jj <= K_HI, (ii, jj)
         h_i, h_j = A[b, ii - K_LO], A[b, jj - K_LO]
         if mode == "none": mids = A.new_zeros((0, A.shape[-1]))
+        elif mode == "count": mids = A.new_zeros((jj - ii, A.shape[-1]))               # norm_matched_add(h, 0) == h: literal markers, count only
         elif mode == "delta": mids = A[b, ii + 1 - K_LO: jj + 1 - K_LO] - A[b, ii - K_LO: jj - K_LO]      # d_k, k = i+1..j
         elif mode == "attn_mlp": mids = pstore.writes(int(pos_idx[b]), ii, jj)
         else: raise ValueError(mode)
@@ -63,4 +65,4 @@ def path_inputs(store, pos_idx, i, j, mode: str, pstore: PathStore | None = None
 
 
 def n_mid_of(i, j, mode: str) -> int:
-    return 0 if mode == "none" else (int(j) - int(i)) * (2 if mode == "attn_mlp" else 1)
+    return 0 if mode == "none" else (int(j) - int(i)) * (2 if mode == "attn_mlp" else 1)      # count / delta: j-i markers; attn_mlp: 2(j-i)

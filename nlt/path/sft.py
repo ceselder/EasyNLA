@@ -18,7 +18,7 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="path_sft")
     p.add_argument("--text", required=True); p.add_argument("--val-text", default=None)
     p.add_argument("--base", default="Qwen/Qwen3-8B"); p.add_argument("--init", default="ao"); p.add_argument("--question", default=None)
-    p.add_argument("--path-mode", default="delta", choices=["none", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b")
+    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b")
     p.add_argument("--epochs", type=float, default=1.0); p.add_argument("--lr", type=float, default=3e-5); p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--batch", type=int, default=32); p.add_argument("--micro", type=int, default=8); p.add_argument("--max-resp-tokens", type=int, default=96)
     p.add_argument("--max-rows", type=int, default=None); p.add_argument("--copy-thresh", type=float, default=0.05)

@@ -15,7 +15,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--split", default="val")
     p.add_argument("--base", default="Qwen/Qwen3-8B"); p.add_argument("--init", required=True); p.add_argument("--source", required=True); p.add_argument("--question", default=None)
-    p.add_argument("--path-mode", default="delta", choices=["none", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b")
+    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b")
     p.add_argument("--n-pairs", type=int, default=4096); p.add_argument("--n-samples", type=int, default=1); p.add_argument("--batch", type=int, default=64)
     p.add_argument("--temperature", type=float, default=0.7); p.add_argument("--max-new-tokens", type=int, default=96); p.add_argument("--seed", type=int, default=0); p.add_argument("--verbosity", type=int, default=1)
     a = p.parse_args(); torch.manual_seed(a.seed); dev = "cuda"
