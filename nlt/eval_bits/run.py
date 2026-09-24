@@ -230,7 +230,7 @@ def main():
                             lp_m[s:s + B] = (exact_logp(model, x0, h_i, enc=enc_m, enc_mask=mask_m, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank, log_s=log_s) + log_det).cpu()
             print(f"[bits] {name}: {min(n, s + a.batch)}/{n} rows, {time.time() - t0:.0f}s", flush=True)
         paired = np.array([k in set(common) for k in idx])
-        res = {"cond": cond, "target": target, "src_rms": src_rms, "step": step, "ckpt": path, "n_rows": n, "n_paired": int(paired.sum()),
+        res = {"cond": cond, "target": target, "src_rms": src_rms, "step": step, "ckpt": path, "n_rows": n, "n_paired": int(paired.sum()), "pair_ids": [pid_all[k] for k in idx],   # redteam #489: the scored rows, so selection slices can be excluded from acceptance reads
                "proxy_fm_loss_uncond": float(L_u.mean()), "proxy_fm_loss_uncond_by_t": L_u.mean(1).tolist(),
                "uncond_bits_per_dim_vs_gaussian": summarize(ruler.numpy(), gaps, js, "ruler") if not a.skip_exact else None,
                "uncond_nll_bits_per_dim": float(-lp_u.mean() / (d * math.log(2))) if not a.skip_exact else None}
