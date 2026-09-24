@@ -1,63 +1,58 @@
-"""Every critic sits on the same claim-sensitivity floor: P(true description beats a claim-flipped twin) per critic and register.
+"""The claim-sensitivity floor: P(original text beats its variant) per critic, register and variant (redteam's data/claim_sensitivity_floor.json).
 
-Reads the paraphrase / twin summaries in a scored dir (paraphrase_eval / twin_next summaries), writes the numbers to data/claim_sensitivity_floor.json
-and a 2-panel figure (teacher sentences | V0 verbalizer sentences): bars = P(orig > x) for x in para_light, para_strong, Sonnet twin, twin_near, twin_far,
-with the 0.65 gate line and the 0.5 chance line.  Usage:
-  python scripts/plot_nlt_claim_floor.py --scored-dir /tmp/nltscored --out-dir ~/shared/reports/natural-language-transcoder
+Variants: light / strong paraphrase (should be ~0.5 if the critic reads meaning), the Sonnet claim-flip twin and the single-token
+twin_near / twin_far swaps (should be >= 0.65 for a claim-sensitive critic). Writes data/claim_floor.json (replot-ready).
 """
-import argparse, glob, json, os
+import argparse, json, os, textwrap
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# critic label -> (para file stem pattern, twinnext2 file stem pattern); {src} = teacher_v1 | v0_ao_tsv1
-CRITICS = {
-    "pooled_n (frozen)":      ("scored_para_{src}",                                                     "scored_twinnext2_{src}"),
-    "union_pooled_big":       ("scored_big_para_{src}",                                                 "scored_big_twinnext2_{src}"),
-    "enc_e2 (8B L24)":        ("scored_enc_e2_para_{src}",                                              "scored_enc_e2_twinnext2_{src}"),
-    "critic_para_p3 @3500":   ("scored_critic_para_p3_ckpt_step003500_FINAL_manifest_para_{src}",       "scored_critic_para_p3_ckpt_step003500_FINAL_manifest_twinnext2_{src}"),
-    "critic_v3b_fbpc s8000":  ("scored_v3bfbpci_para_{src}",                                            "scored_v3bfbpci_twinnext2_{src}"),
-}
-SRCS = {"teacher_v1": "Teacher (Sonnet) sentences", "v0_ao_tsv1": "V0 verbalizer sentences"}
-KEYS = [("para_light", "paraphrase (light)"), ("para_strong", "paraphrase (strong)"), ("twin", "Sonnet claim-flipped twin"), ("twin_near", "twin_near (runner-up token)"), ("twin_far", "twin_far (rank >= 8 token)")]
-
-
-def load(scored_dir, stem):
-    f = os.path.join(scored_dir, stem + ".summary.json")
-    return json.load(open(f)) if os.path.exists(f) else None
+SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e4de"
+CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+VARIANTS = [("para_light", "light paraphrase (same claim)", "#9fbde6"), ("para_strong", "strong paraphrase (same claim)", CAT[0]),
+            ("twin", "Sonnet claim-flip twin", CAT[3]), ("twin_near", "single-token twin: model's runner-up", CAT[1]), ("twin_far", "single-token twin: implausible token", CAT[7])]
+CRITIC_LABEL = {"pooled_n (frozen)": "headline critic\n(pooled, null-regularised)", "union_pooled_big": "wider adapter\n(accepted on teacher / V0)",
+                "critic_para_p3 @3500": "paraphrase-augmented\ncritic @3500", "critic_v3b_fbpc s8000": "0.6B critic, decayed lr\n@8000 (best calibrated)"}
+REG_LABEL = {"teacher_v1": "(a) Sonnet teacher sentences (+lens +final token)", "v0_ao_tsv1": "(b) the VERBALIZER's own sentences (activations only)"}
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--scored-dir", default="/tmp/nltscored"); ap.add_argument("--out-dir", required=True); a = ap.parse_args()
-    data = {"metric": "P(bits(orig) > bits(variant)) per pair, exact ODE bits (Heun 32, paired probes), all scored rows", "gate": "A4/A4b PASS >= 0.65; 0.5 = chance", "critics": {}}
-    for crit, (pp, tp) in CRITICS.items():
-        for src in SRCS:
-            ps, ts = load(a.scored_dir, pp.format(src=src)), load(a.scored_dir, tp.format(src=src))
-            row = {}
-            for k, _ in KEYS:
-                s = ps if k in ("para_light", "para_strong", "twin") else ts
-                if s and isinstance(s.get(k), dict) and s[k].get("p_orig_preferred") is not None:
-                    row[k] = {"p_orig_preferred": s[k]["p_orig_preferred"], "n_used": s[k].get("n_used"), "retention_median": s[k].get("retention_median")}
-            if row: data["critics"].setdefault(crit, {})[src] = {"pmi_orig_bits": (ps or ts)["orig_bits_mean"], **row}
-    os.makedirs(os.path.join(a.out_dir, "data"), exist_ok=True)
-    json.dump(data, open(os.path.join(a.out_dir, "data", "claim_sensitivity_floor.json"), "w"), indent=1)
-
-    crits = [c for c in CRITICS if c in data["critics"]]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 6.2), sharey=True)
-    colors = ["#9ecae1", "#4292c6", "#e6550d", "#fd8d3c", "#a63603"]
-    for ax, (src, title) in zip(axes, SRCS.items()):
-        rows = [c for c in crits if src in data["critics"][c]]; x = np.arange(len(rows)); w = 0.16
-        for kx, ((k, lab), col) in enumerate(zip(KEYS, colors)):
-            vals = [data["critics"][c][src].get(k, {}).get("p_orig_preferred", np.nan) for c in rows]
-            ax.bar(x + (kx - 2) * w, vals, w, color=col, label=lab if ax is axes[0] else None)
-        ax.axhline(0.65, color="k", ls="--", lw=1); ax.text(len(rows) - 0.5, 0.655, "gate 0.65", ha="right", fontsize=11)
-        ax.axhline(0.5, color="grey", ls=":", lw=1); ax.text(len(rows) - 0.5, 0.505, "chance", ha="right", fontsize=11, color="grey")
-        ax.set_xticks(x); ax.set_xticklabels(rows, rotation=20, ha="right", fontsize=11); ax.set_title(title, fontsize=13); ax.set_ylim(0.3, 1.0); ax.tick_params(labelsize=12)
-    axes[0].set_ylabel("P(true description scores above the variant)", fontsize=12)
-    fig.suptitle("No critic separates a claim from its counter-claim: P(true > twin) is 0.47-0.66 for every critic\n(gate 0.65, chance 0.5); paraphrases score 0.5-0.7 -- exact bits, all scored pairs, fixed val set", fontsize=14)
-    fig.legend(loc="lower center", ncol=3, fontsize=11, frameon=False, bbox_to_anchor=(0.5, 0.0)); fig.tight_layout(rect=(0, 0.11, 1, 0.93))
-    for ext in ("png", "pdf"): fig.savefig(os.path.join(a.out_dir, f"claim_sensitivity_floor.{ext}"), dpi=150)
-    print(json.dumps({c: {s: {k: round(v["p_orig_preferred"], 3) for k, v in d.items() if isinstance(v, dict)} for s, d in cs.items()} for c, cs in data["critics"].items()}, indent=0))
+    ap = argparse.ArgumentParser(); ap.add_argument("--report", default=os.path.expanduser("~/shared/reports/natural-language-transcoder")); ap.add_argument("--stem", default="claim_floor")
+    a = ap.parse_args(); D = os.path.join(a.report, "data"); C = json.load(open(os.path.join(D, "claim_sensitivity_floor.json")))
+    critics = list(C["critics"].keys()); regs = [r for r in ("teacher_v1", "v0_ao_tsv1") if any(r in C["critics"][c] for c in critics)]
+    plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "text.color": INK, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2, "axes.edgecolor": GRID})
+    fig, axes = plt.subplots(len(regs), 1, figsize=(11, 4.6 * len(regs) + 1.6), dpi=150)
+    axes = np.atleast_1d(axes); out = {"metric": C.get("metric"), "gate": C.get("gate"), "registers": {}}
+    w = 0.16; x = np.arange(len(critics)); handles = None
+    for ax, reg in zip(axes, regs):
+        out["registers"][reg] = {}
+        for k, (var, vlab, col) in enumerate(VARIANTS):
+            ys, ns = [], []
+            for c in critics:
+                v = (C["critics"][c].get(reg) or {}).get(var) or {}
+                ys.append(v.get("p_orig_preferred", np.nan)); ns.append(v.get("n_used"))
+            out["registers"][reg][var] = {c: {"p_orig_preferred": y, "n_used": n} for c, y, n in zip(critics, ys, ns)}
+            bars = ax.bar(x + (k - 2) * w, ys, w, color=col, label=vlab, zorder=3)
+            for b, y in zip(bars, ys):
+                if y == y: ax.text(b.get_x() + b.get_width() / 2, y + 0.006, f"{y:.2f}", ha="center", va="bottom", fontsize=8.5, color=INK2, rotation=90)
+        l1 = ax.axhline(0.5, color=INK2, lw=1.0, ls=(0, (4, 2)), label="chance 0.50")
+        l2 = ax.axhline(0.65, color=CAT[7], lw=1.2, ls=(0, (4, 2)), label="claim gate A4: P ≥ 0.65")
+        xt = []
+        for c in critics:
+            pmi = (C["critics"][c].get(reg) or {}).get("pmi_orig_bits")
+            xt.append(CRITIC_LABEL.get(c, c) + (f"\nPMI(orig) {pmi:+.1f} bits" if pmi is not None else ""))
+        ax.set_ylim(0.40, 0.80); ax.set_xlim(-0.5, len(critics) - 0.5); ax.set_xticks(x); ax.set_xticklabels(xt, fontsize=10.5)
+        ax.set_ylabel("P(original text scores above the variant)"); ax.set_title(REG_LABEL.get(reg, reg), loc="left", fontsize=13, fontweight="bold")
+        ax.grid(axis="y", color=GRID, zorder=0); [ax.spines[s].set_visible(False) for s in ("top", "right")]
+        if handles is None: handles = ax.get_legend_handles_labels()
+    fig.legend(*handles, frameon=False, fontsize=10, loc="upper left", bbox_to_anchor=(0.01, 0.905), ncol=3, columnspacing=1.4, handlelength=1.8)
+    fig.suptitle("\n".join(textwrap.wrap("Every critic sits at the same claim-sensitivity floor: the original sentence beats its counter-claim only 47–66% of the time on both registers (gate 65%, chance 50%) — and a paraphrase that keeps the claim costs it almost as often — so no critic pays for the claim (exact ODE bits, all scored rows, four critics incl. the best-calibrated one)", 100)), x=0.01, y=0.995, ha="left", va="top", fontsize=14)
+    fig.text(0.01, 0.004, "Redteam's data/claim_sensitivity_floor.json (exact bits, Heun 32, paired probes). Paraphrase bars near 0.5 = invariance (good); twin bars should be ≥ 0.65 for a critic that reads the claim. n per bar 170–450 pairs.", fontsize=9.5, color=INK2)
+    fig.subplots_adjust(left=0.08, right=0.99, top=0.82, bottom=0.06, hspace=0.55)
+    for ext in ("png", "pdf"): fig.savefig(os.path.join(a.report, f"{a.stem}.{ext}"), facecolor=SURFACE, bbox_inches="tight")
+    json.dump(out, open(os.path.join(D, f"{a.stem}.json"), "w"), indent=1)
+    print("saved", os.path.join(a.report, f"{a.stem}.png"), "critics", critics, "registers", regs)
 
 
 if __name__ == "__main__":
