@@ -12,9 +12,19 @@ C = {"cond": "#c2410c", "shuf": "#6b7280", "base": "#1d4ed8", "alt": "#0f766e", 
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "axes.labelsize": 12, "legend.fontsize": 11})
 
 
+def _load(p):
+    """the main eval JSON, merged with a sibling <stem>_lm.json (kl / var tests run separately on B200:2) when present"""
+    d = json.load(open(p)); q = p.replace(".json", "_lm.json")
+    if os.path.exists(q):
+        for k, v in json.load(open(q)).items():
+            if k not in d: d[k] = v
+    return d
+
+
 def main(paths, stem="unclip_decoder"):
-    runs = [json.load(open(p)) for p in paths]; names = [os.path.basename(p).replace("decoder_", "").replace(".json", "") for p in paths]
-    fig, ax = plt.subplots(2, 2, figsize=(11, 9)); data = {"runs": names}
+    runs = [_load(p) for p in paths]; names = [os.path.basename(p).replace("decoder_", "").replace(".json", "") for p in paths]
+    has_var = "var" in runs[0]; nrow = 3 if has_var else 2
+    fig, ax = plt.subplots(nrow, 2, figsize=(11, 4.6 * nrow)); data = {"runs": names}
     # (1) bits density per t
     a = ax[0, 0]
     for r, nm, k in zip(runs, names, range(len(runs))):
@@ -56,6 +66,17 @@ def main(paths, stem="unclip_decoder"):
         a.set_xlabel("exact log₂ p(h|e) − log₂ p(h) per activation (bits)"); a.set_ylabel("clean1 activations"); a.legend(loc="upper left")
         a.set_title(f"How many bits of h does e carry? Exact ODE PMI\n({r['exact']['ode_steps']} Heun steps, {r['n']} held-out activations)")
         data["exact"] = {"pmi_mean": float(pmi.mean()), "pmi_sem": float(pmi.std() / np.sqrt(len(pmi))), "frac_pos": float((pmi > 0).mean()), "shuf_mean": r["exact"]["shuf_bits"]["mean"], "bpd_uncond": r["exact"]["bits_per_dim_uncond"], "bpd_cond": r["exact"]["bits_per_dim_cond"]}
+    if has_var:   # (5) do variations keep the semantics? CLIP text-encoder similarity of the verbalizations; (6) their geometry
+        v = r["var"]; a = ax[2, 0]; ts_ = v["text_sim"]
+        keys = [("verbalized_h_vs_gold", "AV(h) vs gold z"), ("variation_vs_gold", "AV(variation)\nvs gold z"), ("variation_vs_verbalized_h", "AV(variation)\nvs AV(h)"), ("uncond_sample_vs_gold", "AV(uncond.\nsample) vs gold"), ("gold_vs_other_row_gold", "gold z vs\nother row's gold")]
+        vals = [ts_[k]["mean"] for k, _ in keys]; sem = [ts_[k]["sem"] for k, _ in keys]; x = np.arange(len(keys))
+        a.bar(x, vals, yerr=sem, color=[C["base"], C["cond"], C["cond"], C["shuf"], C["shuf"]], capsize=3); a.set_xticks(x); a.set_xticklabels([l for _, l in keys], fontsize=10); a.set_ylim(0, 1)
+        a.set_ylabel("cosine of CLIP text embeddings g(z)"); a.set_title(f"Variations (same e, new noise, CFG {v['cfg']:g}) verbalized by the warm-start AV\nkeep the explanation's semantics: text similarity to the gold explanation")
+        a = ax[2, 1]; g = [("pairwise_cos_between_variations", "between\nvariations"), ("cos_to_h", "variation\nvs true h"), ("e_cos", "cos(e(variation), e)"), ("cos_between_other_rows", "h vs another\nrow's h")]
+        vals = [v[k]["mean"] for k, _ in g]; sem = [v[k]["sem"] for k, _ in g]; x = np.arange(len(g))
+        a.bar(x, vals, yerr=sem, color=[C["cond"], C["cond"], C["alt"], C["shuf"]], capsize=3); a.set_xticks(x); a.set_xticklabels([l for _, l in g], fontsize=10); a.set_ylim(0, 1.05); a.set_ylabel("cosine (activation space / e space)")
+        a.set_title(f"Variation geometry (K = {v['K']} samples per e, {v['n']} rows):\nsamples cluster around h and share its e, not one point")
+        data["var"] = {k: v[k]["mean"] for k, _ in g} | {"text_" + k: ts_[k]["mean"] for k, _ in keys}
     fig.suptitle(f"unCLIP decoder p(h | e) — {names[0]} (step {r.get('step')}, {(r.get('samples') or 0) / 1e6:.0f}M activations)", fontsize=14); fig.tight_layout()
     os.makedirs(OUT, exist_ok=True)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(REP, f"{stem}.{ext}"), dpi=150)
