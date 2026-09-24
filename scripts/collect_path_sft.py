@@ -26,7 +26,10 @@ def parse(path):
     curve, final, n_steps = [], None, None
     for line in open(path, errors="replace"):
         m = RX_STEP.match(line.strip())
-        if m: curve.append((int(m.group(1)), float(m.group(4)))); n_steps = int(m.group(2))
+        if m:
+            st = int(m.group(1))
+            if curve and st <= curve[-1][0]: curve = []                 # a preempted container restarted from scratch: keep the run that finished
+            curve.append((st, float(m.group(4)))); n_steps = int(m.group(2))
         m = RX_FINAL.search(line) or RX_EVALONLY.search(line)
         if m:
             try: final = json.loads(m.group(1))
