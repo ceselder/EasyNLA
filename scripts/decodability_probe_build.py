@@ -4,7 +4,7 @@ From the Qwen3.6-27B layer-42 extraction shards (each row: `text` = the context 
 = h at the last token) we collect every NUMBER (>= 2 digits, the wrong-detail generator's definition), proper NAME (2-4 capitalised words) and
 QUOTED span (12-120 chars) in the context, with its token distance k = (position index) − (index of the detail's last token): k = 0 means the
 detail ends AT the read-out token, k = 1 one token earlier, ... Buckets: 0 | 1 | 2-4 | 5-16 | 17-64 | 65-256. For every positive we draw a
-matched negative of the same type from ANOTHER document (not a substring of this context), and for numbers also a near-miss (10-40 % off,
+matched negative = the true value of another selected row of the same type (another document, not a substring of this context; identical marginals), and for numbers also a near-miss (10-40 % off,
 years +-1..30) and a far (x3+7) perturbation — the controlled number test's edits. Documents are hash-split 80/20 (train / held-out test).
 Output: one torch file with fp16 activations + a row table; scripts/decodability_probe_train.py fits the probes.
 usage (Modal CPU): python scripts/decodability_probe_build.py --out /vol_glp/decodability/probe_data.pt
@@ -92,11 +92,17 @@ def main():
     texts_by = {}
     for sp, rs in by_shard.items():
         idx = sorted({r["row"] for r in rs}); tt = pq.read_table(sp, columns=["text"]).take(pa.array(idx)).column(0).to_pylist(); texts_by[sp] = dict(zip(idx, tt))
+    # matched negative = the TRUE value of another selected row of the same type and split (other document, not a substring of this
+    # context): the negatives' marginal distribution then equals the positives' by construction, so a probe cannot win from the value
+    # alone (v1 drew negatives from a pool filled by the first, domain-organised shards, and the shuffled-activation control exposed a
+    # 0.70-0.78 floor on names). The shuffled-activation control still measures whatever leak remains.
+    by_ts = {}
+    for r in rows: r["split"] = split_of(r["doc"]); by_ts.setdefault((r["type"], r["split"]), []).append(r)
     for r in rows:
-        r["split"] = split_of(r["doc"]); text = texts_by[r["shard"]][r["row"]]; tl = text.lower().replace(",", "")
+        text = texts_by[r["shard"]][r["row"]]; tl = text.lower().replace(",", ""); cands = by_ts[(r["type"], r["split"])]; r["text"] = text
         for _ in range(50):
-            v, d_ = pool[r["type"]][rng.randrange(len(pool[r["type"]]))]
-            if d_ != r["doc"] and v != r["value"] and v.lower().replace(",", "") not in tl: r["neg"] = v; break
+            o = cands[rng.randrange(len(cands))]; v = o["value"]
+            if o["doc"] != r["doc"] and v != r["value"] and v.lower().replace(",", "") not in tl: r["neg"] = v; r["neg_doc"] = o["doc"]; break
         if r["type"] == "number":
             try: r["near"] = perturb(r["value"], rng, "near"); r["far"] = perturb(r["value"], rng, "far")
             except Exception: r["near"] = None; r["far"] = None

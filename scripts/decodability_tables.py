@@ -70,6 +70,45 @@ def main():
     for k in sorted(S):
         if k.startswith("ladder/"):
             _, pair, typ = k.split("/"); md.append(f"| {pair} | {typ} | {S[k]['n']} | {fmt(S[k])} |"); out[k] = S[k]
+    # ---- test 1e: the verbalizer's h-specific accuracy by the detail's token distance from the read-out position (ties test 1 to test 2)
+    try:
+        import bisect, re, pyarrow.parquet as pq
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.6-27B", token=os.environ.get("HF_TOKEN"))
+        ctx = pq.read_table(os.path.expanduser("~/nla-exp-logs/dumps/data/av_sft_val.parquet"), columns=["detokenized_text_truncated"]).column(0).to_pylist()
+        BK = [(0, 0, "0"), (1, 1, "1"), (2, 4, "2-4"), (5, 16, "5-16"), (17, 64, "17-64"), (65, 100000, "65+")]
+        def dist(row, value):
+            """token distance from the LAST occurrence of value in the context to the read-out position (None if absent)."""
+            c = ctx[row] or ""; cl = c.lower().replace(",", ""); v = value.lower().replace(",", "")
+            # map char positions of the comma-stripped text back to the original (commas removed shift indices)
+            keep = [i for i, ch in enumerate(c.lower()) if ch != ","]; j = cl.rfind(v)
+            if j < 0: return None
+            end = keep[j + len(v) - 1] + 1; enc = tok(c, add_special_tokens=False, return_offsets_mapping=True); starts = [o[0] for o in enc["offset_mapping"]]
+            last = bisect.bisect_left(starts, end) - 1; return (len(starts) - 1) - last if last >= 0 else None
+        def bucket(k):
+            for lo, hi, nm in BK:
+                if lo <= k <= hi: return nm
+        T1e = out["by_distance"] = {}
+        md.append("\n## Test 1e — verbalizer h-specific accuracy by the detail's token distance from the read-out position (k = tokens after the detail's last token)\n")
+        md.append("| set / edit | " + " | ".join(f"k={b}" for _, _, b in BK) + " | not found |"); md.append("|---|" + "---|" * (len(BK) + 1))
+        num = [r for r in av["records"] if r["set"] == "numbers"]
+        for m in ("near", "far", "hedge", "removed"):
+            cells = {}
+            for r in num:
+                k = dist(r["act"][1], r["number"]); b = bucket(k) if k is not None else "not found"; E = pairE(r, "true", m)[0]; cells.setdefault(b, []).append(E > 0)
+            T1e[f"numbers/{m}"] = {b: {"acc": float(np.mean(v)), "n": len(v), "ci": wilson(int(sum(v)), len(v))} for b, v in cells.items()}
+            md.append(f"| numbers/{m} | " + " | ".join(f"{np.mean(cells[b]):.3f} (n{len(cells[b])})" if b in cells else "—" for b in [x[2] for x in BK] + ["not found"]) + " |")
+        for kind in ("quote", "name", "number"):
+            cells = {}
+            for r in wd:
+                if r["kind"] != kind: continue
+                g = gr[r["act"][1]]; o = g["orig"]
+                if kind == "number": o = re.sub(r"[^\d.,]", "", o)
+                k = dist(r["act"][1], o.strip()) if o.strip() else None; b = bucket(k) if k is not None else "not found"; cells.setdefault(b, []).append(pairE(r, "true", "alt")[0] > 0)
+            T1e[f"wrong_detail/{kind}"] = {b: {"acc": float(np.mean(v)), "n": len(v), "ci": wilson(int(sum(v)), len(v))} for b, v in cells.items()}
+            md.append(f"| wrong_detail/{kind} | " + " | ".join(f"{np.mean(cells[b]):.3f} (n{len(cells[b])})" if b in cells else "—" for b in [x[2] for x in BK] + ["not found"]) + " |")
+    except Exception as e:
+        md.append(f"\n(distance split skipped: {e})")
     # ---- test 2: probes
     pp = os.path.join(DD, "probe_results.json")
     if os.path.exists(pp):

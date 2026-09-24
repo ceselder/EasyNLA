@@ -9,7 +9,7 @@ documents, evaluated per distance bucket on held-out documents:
   Controls: the same probes trained and tested with the activations permuted (value-frequency leakage floor); a probe trained on the
   shuffled pairing gives the number to subtract.
   Numbers: the other-document probe evaluated on true-vs-near-miss and true-vs-far pairs, and a probe TRAINED on near-miss negatives.
-  h-only decoding of the number's last digit (10-way) and first digit (9-way) by multinomial logistic regression, per bucket.
+  h-only decoding of the number's last digit (10-way) and first digit (10-way) by multinomial logistic regression, per bucket.
 Output: JSON with accuracy, n and Wilson CI per (type, probe, negative kind, bucket).
 usage: python scripts/decodability_probe_train.py --data /vol_glp/decodability/probe_data.pt --out /vol_glp/decodability/probe_results.json
 """
@@ -106,12 +106,16 @@ def eval_pairs(m, H, Vp, Vn, idx, rows_, buckets):
     return out
 
 
-def logreg_multiclass(Htr, ytr, Hte, dev, ncls, epochs=60, seed=0):
-    torch.manual_seed(seed); m = nn.Linear(Htr.shape[1], ncls).to(dev); opt = torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=1e-2); bs = 1024
+def logreg_multiclass(Htr, ytr, Hva, yva, Hte, dev, ncls, epochs=60, seed=0):
+    """multinomial logistic regression on standardised h; the epoch is selected on the val docs (5120-d x 10 classes overfits 26k rows otherwise)."""
+    torch.manual_seed(seed); m = nn.Linear(Htr.shape[1], ncls).to(dev); opt = torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=1e-2); bs = 1024; best = (-1, None)
     for ep in range(epochs):
         perm = torch.randperm(len(Htr), device=dev)
         for s in range(0, len(perm), bs):
             ix = perm[s: s + bs]; loss = F.cross_entropy(m(Htr[ix]), ytr[ix]); opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): acc = float((m(Hva).argmax(-1) == yva).float().mean())
+        if acc > best[0]: best = (acc, {k: v.detach().clone() for k, v in m.state_dict().items()})
+    m.load_state_dict(best[1])
     with torch.no_grad(): return m(Hte).argmax(-1)
 
 
@@ -160,10 +164,10 @@ def main():
                   ("" if typ != "number" else " | near " + " ".join(f"{b}:{v['acc']:.3f}" for b, v in P["near"].items()) + " | near-trained/near " + " ".join(f"{b}:{v['acc']:.3f}" for b, v in P["near_trained"]["near"].items())), flush=True)
         if typ == "number":   # h-only: last / first digit of the number, multinomial logistic regression on standardised h
             def digits(v): return re.sub(r"[^\d]", "", v.split(".")[0] if "." in v else v)
-            for nm, fn, ncls in (("last_digit", lambda v: int(digits(v)[-1]), 10), ("first_digit", lambda v: int(digits(v)[0]) - 1, 9), ("n_digits", lambda v: min(len(digits(v)), 8) - 1, 8)):
-                ok_tr = [i for i in tr + va if digits(R[i]["value"])]; ok_te = [i for i in te if digits(R[i]["value"])]
-                ytr = torch.tensor([fn(R[i]["value"]) for i in ok_tr], device=dev); yte = np.array([fn(R[i]["value"]) for i in ok_te])
-                pred = logreg_multiclass(Hs[torch.tensor(ok_tr, device=dev)], ytr, Hs[torch.tensor(ok_te, device=dev)], dev, ncls).cpu().numpy()
+            for nm, fn, ncls in (("last_digit", lambda v: int(digits(v)[-1]), 10), ("first_digit", lambda v: int(digits(v)[0]), 10), ("n_digits", lambda v: min(len(digits(v)), 8) - 1, 8)):
+                ok_tr = [i for i in tr if digits(R[i]["value"])]; ok_va = [i for i in va if digits(R[i]["value"])]; ok_te = [i for i in te if digits(R[i]["value"])]
+                ytr = torch.tensor([fn(R[i]["value"]) for i in ok_tr], device=dev); yva = torch.tensor([fn(R[i]["value"]) for i in ok_va], device=dev); yte = np.array([fn(R[i]["value"]) for i in ok_te])
+                pred = logreg_multiclass(Hs[torch.tensor(ok_tr, device=dev)], ytr, Hs[torch.tensor(ok_va, device=dev)], yva, Hs[torch.tensor(ok_te, device=dev)], dev, ncls).cpu().numpy()
                 maj = np.bincount(ytr.cpu().numpy(), minlength=ncls).argmax(); bk = np.array([R[i]["bucket"] for i in ok_te]); out = {}
                 for b in buckets + ["all"]:
                     sel = np.ones(len(ok_te), bool) if b == "all" else (bk == b)

@@ -55,36 +55,61 @@ def fig_av(av, base, out_stem):
     ax.bar(x + 1.5 * w, av_acc, w, color=C["av"], label="verbalizer, h-specific evidence", yerr=np.abs(av_ci - np.array(av_acc)), capsize=3)
     ax.axhline(0.5, color="k", lw=0.8, ls=":"); ax.set_xticks(x); ax.set_xticklabels([f"{m}\n(n={S[f'numbers/{m}']['n']})" for m in modes]); ax.set_ylim(0.4, 1.0)
     ax.set_title("Controlled number edits (512 grounded numbers)\nverbalizer likelihood vs critics"); ax.legend(loc="upper left", fontsize=9)
-    fig.suptitle("Is the edited detail decodable from the layer-42 activation? The verbalizer's own likelihood ratio, text prior removed", fontsize=14)
+    fig.suptitle("Is the edited detail readable from the layer-42 activation? Verbalizer likelihood ratio, text prior removed", fontsize=14)
     fig.tight_layout(); fig.savefig(out_stem + ".png"); fig.savefig(out_stem + ".pdf"); plt.close(fig)
 
 
 def fig_probe(pr, out_stem):
-    B = pr["buckets"]; types = [t for t in ("number", "name", "quote") if t in pr["types"]]
-    fig, axes = plt.subplots(2, 2, figsize=(11, 9)); axes = axes.ravel(); x = np.arange(len(B))
-    for i, typ in enumerate(types):
-        ax = axes[i]; P = pr["types"][typ]["probes"]
-        for kind, col, mk in (("bilinear", C["bilinear"], "o"), ("mlp", C["mlp"], "s")):
-            r = P[kind]["other_doc"]; y = [r.get(b, {}).get("acc", np.nan) for b in B]; ci = np.array([r.get(b, {}).get("ci", (np.nan, np.nan)) for b in B]).T
-            ax.errorbar(x, y, yerr=np.abs(ci - np.array(y)), color=col, marker=mk, capsize=3, label=f"{'linear (bilinear)' if kind == 'bilinear' else 'MLP'} probe, other-document value")
-            r = P[kind]["other_doc_shuffled_h"]; ax.plot(x, [r.get(b, {}).get("acc", np.nan) for b in B], color=col, ls=":", marker=mk, mfc="none", label=f"{'linear' if kind == 'bilinear' else 'MLP'}, activations shuffled (floor)")
-            if typ == "number" and "near" in P[kind]:
-                r = P[kind]["near"]; ax.plot(x, [r.get(b, {}).get("acc", np.nan) for b in B], color=col, ls="--", marker="^", label=f"{'linear' if kind == 'bilinear' else 'MLP'}, true vs near-miss (10-40 % off)")
-        ns = [pr["types"][typ]["probes"]["mlp"]["other_doc"].get(b, {}).get("n", 0) for b in B]
-        ax.set_xticks(x); ax.set_xticklabels([f"{b}\n(n={n})" for b, n in zip(B, ns)], fontsize=10); ax.set_ylim(0.4, 1.02); ax.axhline(0.5, color="k", lw=0.8, ls=":")
-        ax.set_xlabel("tokens between the detail's last token and the read-out position"); ax.set_ylabel("2-AFC accuracy, held-out documents")
-        ax.set_title({"number": "Numbers: which of two numbers is in the context?", "name": "Names: which of two proper names is in the context?", "quote": "Quotes: which of two quoted spans is in the context?"}[typ]); ax.legend(fontsize=8, loc="lower left")
-    ax = axes[3]
-    if "number" in pr["types"]:
-        P = pr["types"]["number"]["probes"]
-        for nm, col, lab in (("h_only_last_digit", C["mlp"], "last digit (10-way)"), ("h_only_first_digit", C["bilinear"], "first digit (9-way)"), ("h_only_n_digits", C["near"], "number of digits (7-way)")):
+    B = pr["buckets"]; x = np.arange(len(B)); T = pr["types"]
+    fig, axes = plt.subplots(3, 2, figsize=(12, 13.5)); axes = axes.ravel()
+    def series(ax, r, col, mk, ls, lab, ci=True, mfc=None):
+        y = [r.get(b, {}).get("acc", np.nan) for b in B]
+        if ci: c = np.array([r.get(b, {}).get("ci", (np.nan, np.nan)) for b in B]).T; ax.errorbar(x, y, yerr=np.abs(c - np.array(y)), color=col, marker=mk, ls=ls, capsize=3, label=lab, mfc=mfc)
+        else: ax.plot(x, y, color=col, marker=mk, ls=ls, label=lab, mfc=mfc)
+    def finish(ax, title, ns, ylab="2-AFC accuracy, held-out documents", lo=0.4):
+        ax.set_xticks(x); ax.set_xticklabels([f"{b}\n(n={n})" for b, n in zip(B, ns)], fontsize=10); ax.set_ylim(lo, 1.02); ax.axhline(0.5, color="k", lw=0.8, ls=":")
+        ax.set_xlabel("distance k (tokens after the detail's last token)"); ax.set_ylabel(ylab); ax.set_title(title); ax.legend(fontsize=8, loc="upper right")
+    def ns_of(r): return [r.get(b, {}).get("n", 0) for b in B]
+    # (a) numbers vs other-document value, (b) numbers vs near-miss (probe trained on near-miss) — each with its shuffled-activation floor
+    if "number" in T:
+        P = T["number"]["probes"]; ax = axes[0]
+        series(ax, P["bilinear"]["other_doc"], C["bilinear"], "o", "-", "linear (bilinear) probe"); series(ax, P["bilinear"]["other_doc_shuffled_h"], C["bilinear"], "o", ":", "linear, activations shuffled (value-only floor)", ci=False, mfc="none")
+        series(ax, P["mlp"]["other_doc"], C["mlp"], "s", "-", "MLP probe"); series(ax, P["mlp"]["other_doc_shuffled_h"], C["mlp"], "s", ":", "MLP, activations shuffled (floor)", ci=False, mfc="none")
+        finish(ax, "Numbers: which of two numbers is in the context?\n(negative = a number from another document)", ns_of(P["mlp"]["other_doc"]))
+        ax = axes[1]; N = P["bilinear"]["near_trained"]; M = P["mlp"]["near_trained"]
+        series(ax, N["near"], C["bilinear"], "o", "-", "linear probe trained on near-misses"); series(ax, N["near_shuffled_h"], C["bilinear"], "o", ":", "linear, activations shuffled (floor)", ci=False, mfc="none")
+        series(ax, M["near"], C["mlp"], "s", "-", "MLP trained on near-misses"); series(ax, M["near_shuffled_h"], C["mlp"], "s", ":", "MLP, activations shuffled (floor)", ci=False, mfc="none")
+        series(ax, P["mlp"]["near"], C["near"], "^", "--", "MLP trained on other-doc values, tested on near-misses", ci=False)
+        finish(ax, "Numbers: true value vs its near-miss (10-40 % off)\nthe value alone already separates them (dotted)", ns_of(N["near"]))
+    if "name" in T:
+        P = T["name"]["probes"]; ax = axes[2]
+        series(ax, P["bilinear"]["other_doc"], C["bilinear"], "o", "-", "linear (bilinear) probe"); series(ax, P["bilinear"]["other_doc_shuffled_h"], C["bilinear"], "o", ":", "linear, activations shuffled (floor)", ci=False, mfc="none")
+        series(ax, P["mlp"]["other_doc"], C["mlp"], "s", "-", "MLP probe"); series(ax, P["mlp"]["other_doc_shuffled_h"], C["mlp"], "s", ":", "MLP, activations shuffled (floor)", ci=False, mfc="none")
+        finish(ax, "Names: which of two proper names is in the context?", ns_of(P["mlp"]["other_doc"]))
+    if "quote" in T:
+        P = T["quote"]["probes"]; ax = axes[3]
+        series(ax, P["bilinear"]["other_doc"], C["bilinear"], "o", "-", "linear (bilinear) probe"); series(ax, P["bilinear"]["other_doc_shuffled_h"], C["bilinear"], "o", ":", "linear, activations shuffled (floor)", ci=False, mfc="none")
+        series(ax, P["mlp"]["other_doc"], C["mlp"], "s", "-", "MLP probe"); series(ax, P["mlp"]["other_doc_shuffled_h"], C["mlp"], "s", ":", "MLP, activations shuffled (floor)", ci=False, mfc="none")
+        finish(ax, "Quotes: which of two quoted spans is in the context?", ns_of(P["mlp"]["other_doc"]))
+    ax = axes[4]
+    if "number" in T:
+        P = T["number"]["probes"]
+        for nm, col, lab in (("h_only_last_digit", C["mlp"], "last digit (10-way)"), ("h_only_first_digit", C["bilinear"], "first digit (10-way)"), ("h_only_n_digits", C["near"], "number of digits (8-way)")):
             if nm in P:
-                y = [P[nm].get(b, {}).get("acc", np.nan) for b in B]; maj = [P[nm].get(b, {}).get("majority", np.nan) for b in B]
-                ax.plot(x, y, color=col, marker="o", label=f"{lab}: logistic regression on h"); ax.plot(x, maj, color=col, ls=":", marker="o", mfc="none", label=f"{lab}: majority class")
-        ax.set_xticks(x); ax.set_xticklabels(B); ax.set_ylim(0, 1.02); ax.set_xlabel("tokens between the number's last token and the read-out position"); ax.set_ylabel("accuracy, held-out documents")
-        ax.set_title("Numbers, activation only: decoding digits of the most recent number"); ax.legend(fontsize=8, loc="upper right")
+                ax.plot(x, [P[nm].get(b, {}).get("acc", np.nan) for b in B], color=col, marker="o", label=f"{lab}: logistic regression on h"); ax.plot(x, [P[nm].get(b, {}).get("majority", np.nan) for b in B], color=col, ls=":", marker="o", mfc="none", label=f"{lab}: majority class")
+        finish(ax, "Numbers, activation only: decoding the digits", ns_of(P["h_only_last_digit"]), ylab="accuracy, held-out documents", lo=0.0); ax.legend(fontsize=8, loc="upper right")
+    ax = axes[5]   # net-of-floor summary: accuracy minus the shuffled-activation floor, best probe per type
+    for typ, col, mk in (("number", C["near"], "o"), ("name", C["bilinear"], "s"), ("quote", C["mlp"], "^")):
+        if typ not in T: continue
+        P = T[typ]["probes"]; best = max(("bilinear", "mlp"), key=lambda k: P[k]["other_doc"]["all"]["acc"] - P[k]["other_doc_shuffled_h"]["all"]["acc"])
+        ax.plot(x, [P[best]["other_doc"].get(b, {}).get("acc", np.nan) - P[best]["other_doc_shuffled_h"].get(b, {}).get("acc", np.nan) for b in B], color=col, marker=mk, label=f"{typ} vs other-document value ({'linear' if best == 'bilinear' else 'MLP'})")
+    if "number" in T:
+        P = T["number"]["probes"]; best = max(("bilinear", "mlp"), key=lambda k: P[k]["near_trained"]["near"]["all"]["acc"] - P[k]["near_trained"]["near_shuffled_h"]["all"]["acc"])
+        ax.plot(x, [P[best]["near_trained"]["near"].get(b, {}).get("acc", np.nan) - P[best]["near_trained"]["near_shuffled_h"].get(b, {}).get("acc", np.nan) for b in B], color=C["near"], marker="o", ls="--", label=f"number vs its near-miss ({'linear' if best == 'bilinear' else 'MLP'})")
+    ax.axhline(0, color="k", lw=0.8, ls=":"); ax.set_xticks(x); ax.set_xticklabels(B); ax.set_ylim(-0.05, 0.5); ax.set_xlabel("distance k (tokens after the detail's last token)"); ax.set_ylabel("accuracy above the value-only floor")
+    ax.set_title("Net of the value-only floor: exact numbers fade\nwithin a few tokens; names and quotes persist to 256"); ax.legend(fontsize=8, loc="upper right")
     fig.suptitle("How far back is a detail readable from the layer-42 activation? Probes on held-out documents", fontsize=14)
-    fig.tight_layout(); fig.savefig(out_stem + ".png"); fig.savefig(out_stem + ".pdf"); plt.close(fig)
+    fig.tight_layout(w_pad=2.0, h_pad=2.0); fig.savefig(out_stem + ".png"); fig.savefig(out_stem + ".pdf"); plt.close(fig)
 
 
 def main():
