@@ -69,11 +69,45 @@ def load_acts_striped(globs, rank, world, max_rows, encode, log_every=20):
     return E
 
 
+def load_pairs_all(globs, rank, world, max_rows, seed, render_pick):
+    """rank-disjoint by document (crc32(doc_id) % world, as train_clip.load_rows), val rows dropped; returns UNIQUE activations + a pair index so
+    several renderings of one activation cost no extra activation RAM: A fp16 [n_act, 5120], texts [n_pairs], aidx [n_pairs].
+    render_pick: canonical (the `explanation` column) | random (one random QC-passing rendering per activation, shards with explanations/qc) |
+    all (EVERY QC-passing rendering becomes its own pair; identical renderings deduplicated)"""
+    import zlib, pyarrow.parquet as pq
+    from nla.contrastive.train_clip import _files, _qc_ok
+    acts, texts, aidx = [], [], []; n_act = 0; rng = np.random.default_rng(seed + 17 * rank); files = _files(globs); t0 = time.time()
+    for fi, f in enumerate(files):
+        names = pq.ParquetFile(f).schema_arrow.names; multi = render_pick in ("random", "all") and "explanations" in names and "qc" in names
+        cols = ["activation_vector", "explanation", "is_val", "doc_id"] + (["explanations", "qc"] if multi else [])
+        t = pq.read_table(f, columns=cols)
+        dids = t.column("doc_id").to_pylist(); isv = t.column("is_val").to_pylist()
+        keep = [i for i, (d, v) in enumerate(zip(dids, isv)) if not v and zlib.crc32(str(d).encode()) % world == rank]
+        if not keep: del t; continue
+        av = t.column("activation_vector").combine_chunks().take(keep)
+        acts.append(torch.from_numpy(np.asarray(av.values.to_numpy(zero_copy_only=False), dtype=np.float32).reshape(len(keep), -1)).to(torch.float16))
+        ex = t.column("explanation").take(keep).to_pylist()
+        exs = t.column("explanations").take(keep).to_pylist() if multi else None; qcs = t.column("qc").take(keep).to_pylist() if multi else None
+        for j in range(len(keep)):
+            cands = [(ex[j] or "").strip()]
+            if multi:
+                ok = [e.strip() for e, q in zip(exs[j] or [], qcs[j] or []) if e and _qc_ok(q)]
+                if ok: cands = ok if render_pick == "all" else [ok[int(rng.integers(len(ok)))]]
+            for z in dict.fromkeys(cands):
+                if z: texts.append(z); aidx.append(n_act + j)
+        n_act += len(keep); del t
+        if (fi + 1) % 25 == 0: log(f"[prior] data: {fi + 1}/{len(files)} files, {n_act} activations / {len(texts)} pairs on rank {rank}, {time.time() - t0:.0f}s")
+        if max_rows and len(texts) >= max_rows: break
+    A = torch.cat(acts) if acts else torch.zeros(0, 5120, dtype=torch.float16)
+    if max_rows: texts, aidx = texts[:max_rows], aidx[:max_rows]
+    return A, texts, torch.tensor(aidx, dtype=torch.long)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", required=True); p.add_argument("--tag", default="unclip_prior"); p.add_argument("--base", required=True, help="Qwen/Qwen3.6-27B (tokenizer)")
     p.add_argument("--encoder-json", default="/vol_glp/unclip/encoder.json"); p.add_argument("--ar-ckpt", default="/vol/ckpts/qwen36_27b/ar_sft_merged"); p.add_argument("--enc-layer", type=int, default=42)
-    p.add_argument("--train-globs", default="/vol_q36/data/acts_qwen36_L42/shard_*.parquet"); p.add_argument("--max-rows", type=int, default=0, help="per rank (0 = all)"); p.add_argument("--render-pick", default="random", choices=["random", "canonical"])
+    p.add_argument("--train-globs", default="/vol_q36/data/acts_qwen36_L42/shard_*.parquet"); p.add_argument("--max-rows", type=int, default=0, help="per rank (0 = all)"); p.add_argument("--render-pick", default="random", choices=["random", "canonical", "all"], help="g2 shards with several renderings per activation: one random QC-passing rendering, the canonical column, or ALL QC-passing renderings as separate pairs")
     p.add_argument("--val-parquet", default="/vol_q36/data/sft/av_sft_val_clean1.parquet"); p.add_argument("--eval-n", type=int, default=736); p.add_argument("--ret-n", type=int, default=256); p.add_argument("--exact-n", type=int, default=64); p.add_argument("--exact-steps", type=int, default=24)
     p.add_argument("--n-tok", type=int, default=16); p.add_argument("--d-model", type=int, default=1024); p.add_argument("--n-layers", type=int, default=16); p.add_argument("--n-heads", type=int, default=16); p.add_argument("--mlp-ratio", type=int, default=4)
     p.add_argument("--no-tokens", action="store_true", help="no cross-attention over the explanation tokens (g-only ablation)"); p.add_argument("--no-g", action="store_true", help="no CLIP text-embedding vector condition (tokens only)")
@@ -102,7 +136,7 @@ def main():
     torch.backends.cuda.enable_cudnn_sdp(False)   # cuDNN SDPA graph failure in the LoRA-trunk backward (train_clip)
     from transformers import AutoTokenizer
     from nla.flow.train_cond import ARVecEncoder
-    from nla.contrastive.train_clip import load_rows, allreduce_grads
+    from nla.contrastive.train_clip import allreduce_grads
     from nla.schema import extract_explanation
     from nla.unclip.prior import EPrior, ENormalizer, ActEncoder, load_encoder_recipe, fm_loss, fm_proxy, exact_logp, save_prior
     import pyarrow.parquet as pq
@@ -146,10 +180,10 @@ def main():
     log(f"[prior] world {world}; denoiser {model.n_params()/1e6:.0f}M params ({a.n_layers} blocks x d {a.d_model}, {a.n_tok} e-tokens, tokens={use_tokens}, g={use_g}); trunk LoRA {sum(p_.numel() for p_ in lora)/1e6:.0f}M at lr {a.lr_lora}; denoiser lr {a.lr}")
 
     # ---------------- data
-    t0 = time.time(); A, Z, D, _ = load_rows(a.train_globs, rank, world, a.max_rows, a.seed, a.render_pick, with_text=False)
-    n_loc = torch.tensor([A.shape[0]], device=dev); n_all = n_loc.clone()
-    if ddp: dist.all_reduce(n_loc, op=dist.ReduceOp.MIN); dist.all_reduce(n_all)
-    N = A.shape[0]; log(f"[prior] rows: {int(n_all)} total ({int(n_loc)} min per rank; rank 0 {N}) from {a.train_globs[:200]}{'...' if len(a.train_globs) > 200 else ''} in {time.time()-t0:.0f}s")
+    t0 = time.time(); A, Z, AIDX = load_pairs_all(a.train_globs, rank, world, a.max_rows, a.seed, a.render_pick)
+    n_loc = torch.tensor([len(Z)], device=dev); n_all = n_loc.clone(); n_act_all = torch.tensor([A.shape[0]], device=dev)
+    if ddp: dist.all_reduce(n_loc, op=dist.ReduceOp.MIN); dist.all_reduce(n_all); dist.all_reduce(n_act_all)
+    N = len(Z); NA = A.shape[0]; log(f"[prior] pairs: {int(n_all)} total ({int(n_loc)} min per rank; rank 0 {N}) over {int(n_act_all)} unique activations (render_pick={a.render_pick}) from {a.train_globs[:200]}{'...' if len(a.train_globs) > 200 else ''} in {time.time()-t0:.0f}s")
     steps = a.steps if a.steps > 0 else start_step + (a.steps_add if a.steps_add > 0 else int(a.epochs * int(n_loc) / a.batch))   # continuation: epochs / steps-add count from the checkpoint
     # validation rows (clean1: one row per doubly-held-out document)
     vt = pq.read_table(a.val_parquet, columns=["activation_vector", "response"]).slice(0, a.eval_n)
@@ -168,7 +202,7 @@ def main():
     # ---------------- unlabelled unconditional branch: e-pool = encoded labelled activations (+ extra activation-only shards)
     POOL = None; urng = torch.Generator().manual_seed(a.seed * 7 + 101 + rank)
     if a.uncond_mult > 0 or a.uncond_pretrain_steps > 0:
-        t0 = time.time(); parts = [torch.cat([act_enc(A[i:i + 8192]).to(torch.float16).cpu() for i in range(0, N, 8192)])] if N else []
+        t0 = time.time(); parts = [torch.cat([act_enc(A[i:i + 8192]).to(torch.float16).cpu() for i in range(0, NA, 8192)])] if NA else []
         n_lab = parts[0].shape[0] if parts else 0
         if a.uncond_glob: parts.append(load_acts_striped(a.uncond_glob, rank, world, a.uncond_max_rows, act_enc))
         POOL = torch.cat(parts); n_pool = torch.tensor([POOL.shape[0]], device=dev)
@@ -287,7 +321,7 @@ def main():
         for g_ in opt.param_groups: g_["lr"] = g_["base"] * f_
         if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0
         idx = perm[cursor:cursor + a.batch]; cursor += a.batch
-        x0 = enorm.normalize(act_enc(A[idx]))
+        x0 = enorm.normalize(act_enc(A[AIDX[idx]]))
         if e_noise > 0: x0 = x0 + e_noise * torch.randn_like(x0)
         e_, m_, g_ = cond([Z[i] for i in idx.tolist()], grad=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):

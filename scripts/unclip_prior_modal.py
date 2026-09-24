@@ -74,6 +74,12 @@ def _train(tag, extra, nproc):
     _run(cmd, os.path.join(out, "train.log")); return out
 
 
+@app.function(gpu="B200:8", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=64, memory=1024 * 1024, ephemeral_disk=600 * 1024)
+def train8(tag: str, extra: str = ""):
+    """8 ranks (the data-scaling runs: frozen trunk, all Gemma renderings)"""
+    return _train(tag, extra, 8)
+
+
 @app.function(gpu="B200:4", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=768 * 1024, ephemeral_disk=600 * 1024)
 def train4(tag: str, extra: str = ""):
     return _train(tag, extra, 4)
@@ -115,6 +121,7 @@ def shell(cmd: str):
 def main(task: str = "probe", tag: str = "", extra: str = "", prior_dir: str = ""):
     if task == "probe": probe.remote()
     elif task == "count": print(count_rows.remote(extra or "/vol_q36/data/acts_qwen36_L42/shard_*.parquet,/vol_glp/scale/g1/shards/shard_*.parquet,/vol_glp/scale/g2/shards/shard_*.parquet"))
+    elif task == "train8": print(train8.remote(tag, extra))
     elif task == "train4": print(train4.remote(tag, extra))
     elif task == "train3": print(train3.remote(tag, extra))
     elif task == "train2": print(train2.remote(tag, extra))
