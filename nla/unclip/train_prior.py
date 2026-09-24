@@ -47,6 +47,28 @@ class TextCond:
         return e, m, g
 
 
+def load_acts_striped(globs, rank, world, max_rows, encode, log_every=20):
+    """activation-only rows of extraction shards (any parquet with activation_vector [+ is_val]), val rows dropped, global row index striped over
+    ranks, ENCODED to e on the fly -> fp16 [n, d_e] on cpu (2 KB/row instead of 10 KB for h)"""
+    import glob as _g, pyarrow.parquet as pq
+    files = sorted(f for g in globs.split(",") for f in _g.glob(g.strip()) if g.strip()); out = []; n = 0; gi = 0; t0 = time.time()
+    for fi, f in enumerate(files):
+        pf = pq.ParquetFile(f); names = pf.schema_arrow.names; cols = ["activation_vector"] + (["is_val"] if "is_val" in names else [])
+        for rb in pf.iter_batches(batch_size=8192, columns=cols):
+            m = rb.num_rows; keep = torch.arange(gi, gi + m) % world == rank; gi += m
+            if "is_val" in cols: keep &= ~torch.tensor(rb.column("is_val").to_pylist(), dtype=torch.bool)
+            idx = keep.nonzero().squeeze(1)
+            if len(idx) == 0: continue
+            av = rb.column("activation_vector"); d_ = av.type.list_size
+            h = torch.from_numpy(np.asarray(av.flatten().to_numpy(zero_copy_only=False), dtype=np.float32).reshape(m, d_))[idx]
+            out.append(encode(h).to(torch.float16).cpu()); n += len(idx)
+            if max_rows and n >= max_rows: break
+        if (fi + 1) % log_every == 0: log(f"[prior] e-pool: {fi + 1}/{len(files)} files, {n} rows on rank {rank}, {time.time() - t0:.0f}s")
+        if max_rows and n >= max_rows: break
+    E = torch.cat(out)[: max_rows or None] if out else torch.zeros(0, 1, dtype=torch.float16)
+    return E
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", required=True); p.add_argument("--tag", default="unclip_prior"); p.add_argument("--base", required=True, help="Qwen/Qwen3.6-27B (tokenizer)")
@@ -65,6 +87,11 @@ def main():
     p.add_argument("--anneal", action="store_true", help="curriculum phase B: lr factor = cosine from 1.0 at the start step to 0.1 at the end (no warm-up); pair with --resume-from and new --train-globs")
     p.add_argument("--no-replay", action="store_true", help="continuation on NEW data: do not replay the sampler to the checkpoint step (fresh permutation)")
     p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb", default="nla-glp"); p.add_argument("--max-hours", type=float, default=22.5); p.add_argument("--log-every", type=int, default=25)
+    p.add_argument("--uncond-mult", type=float, default=0.0, help="UNLABELLED unconditional branch: per step add this many x --batch extra e's (no text, no trunk forward) drawn from the e-pool = encoded labelled activations (+ --uncond-glob), trained through the dropped-text path")
+    p.add_argument("--uncond-glob", default="", help="extra activation-only shards for the e-pool (activation_vector [+ is_val] columns; val rows excluded; rows striped over ranks; encoded to e at load time)")
+    p.add_argument("--uncond-max-rows", type=int, default=0, help="cap on extra pool rows per rank (0 = all)"); p.add_argument("--uncond-weight", type=float, default=1.0, help="weight of the unconditional block's mean FM loss")
+    p.add_argument("--uncond-pretrain-steps", type=int, default=0, help="before the main loop (fresh runs only): unconditional-only steps on the e-pool at --uncond-pretrain-batch / --uncond-pretrain-lr (warm-up 100, then constant)")
+    p.add_argument("--uncond-pretrain-batch", type=int, default=2048); p.add_argument("--uncond-pretrain-lr", type=float, default=3e-4)
     a = p.parse_args()
     ddp = "RANK" in os.environ
     if ddp:
@@ -138,6 +165,27 @@ def main():
             dist.broadcast(enorm.mean, src=0); dist.broadcast(enorm.std, src=0)
         sd = enorm.std; log(f"[prior] e normaliser fitted on {E0.shape[0]} rows: per-dim std of e min {sd.min():.3f} median {sd.median():.3f} max {sd.max():.3f}; |mean| {enorm.mean.norm():.3f}; logdet {enorm.logdet:.1f}"); del E0
     VX = enorm.normalize(embed(VA))   # clean e's (no noise) in model space
+    # ---------------- unlabelled unconditional branch: e-pool = encoded labelled activations (+ extra activation-only shards)
+    POOL = None; urng = torch.Generator().manual_seed(a.seed * 7 + 101 + rank)
+    if a.uncond_mult > 0 or a.uncond_pretrain_steps > 0:
+        t0 = time.time(); parts = [torch.cat([act_enc(A[i:i + 8192]).to(torch.float16).cpu() for i in range(0, N, 8192)])] if N else []
+        n_lab = parts[0].shape[0] if parts else 0
+        if a.uncond_glob: parts.append(load_acts_striped(a.uncond_glob, rank, world, a.uncond_max_rows, act_enc))
+        POOL = torch.cat(parts); n_pool = torch.tensor([POOL.shape[0]], device=dev)
+        if ddp: dist.all_reduce(n_pool)
+        log(f"[prior] e-pool for p(e): {int(n_pool)} e's total (rank 0: {n_lab} labelled + {POOL.shape[0] - n_lab} extra from {a.uncond_glob[:120] or '-'}) in {time.time() - t0:.0f}s; per step +{int(round(a.uncond_mult * a.batch))} unconditional rows (x{a.uncond_mult}) at weight {a.uncond_weight}")
+    def uncond_batch(k):
+        ui = torch.randint(0, POOL.shape[0], (k,), generator=urng); xu = enorm.normalize(POOL[ui].to(dev).float())
+        return xu + e_noise * torch.randn_like(xu) if e_noise > 0 else xu
+    @torch.no_grad()
+    def fm_uncond_heldout():
+        """held-out unconditional FM loss on clean1 (mean over the t grid, fixed eps) - the p(e) branch alone, cheap"""
+        model.eval(); gen = torch.Generator(device=dev).manual_seed(0); tot = 0.0
+        for tv in (0.1, 0.3, 0.5, 0.7, 0.9):
+            eps = torch.randn(VX.shape, device=dev, generator=gen); tt = torch.full((n_ev,), tv, device=dev)
+            with torch.autocast("cuda", dtype=torch.bfloat16): v = torch.cat([model((1 - tv) * VX[i:i+256] + tv * eps[i:i+256], tt[i:i+256]).float() for i in range(0, n_ev, 256)])
+            tot += ((v - (eps - VX)) ** 2).mean().item() / 5
+        model.train(); return tot
 
     # ---------------- eval
     T_GRID = (0.1, 0.3, 0.5, 0.7, 0.9)
@@ -190,7 +238,7 @@ def main():
             else: ii = torch.tensor(idx, device=dev); lp[nm] = _exact_mem(model, VX[:nx], MEM[ii], MK[ii], G[ii] if use_g else None, a.exact_steps, gx)
         pmi = (lp["cond"] - lp["uncond"]) / math.log(2); pms = (lp["shuf"] - lp["uncond"]) / math.log(2)
         out.update({"eval/exact_pmi_bits": pmi.mean().item(), "eval/exact_pmi_median_bits": pmi.median().item(), "eval/exact_pmi_sem_bits": (pmi.std() / math.sqrt(nx)).item(), "eval/exact_frac_positive": (pmi > 0).float().mean().item(),
-                    "eval/exact_pmi_shuf_bits": pms.mean().item(), "eval/exact_nats_per_dim_uncond": (-lp["uncond"].mean() / d_e).item(), "eval/exact_n": nx, "eval/exact_steps": a.exact_steps, "eval/seconds": time.time() - te})
+                    "eval/exact_pmi_shuf_bits": pms.mean().item(), "eval/exact_nats_per_dim_uncond": (-lp["uncond"].mean() / d_e).item(), "eval/exact_code_bits_uncond": (-lp["uncond"].mean() / math.log(2)).item(), "eval/exact_n": nx, "eval/exact_steps": a.exact_steps, "eval/seconds": time.time() - te})
         log(f"  [eval@{step}] fm uncond {out['eval/fm_uncond']:.4f} cond {out['eval/fm_cond']:.4f} shuf {out['eval/fm_shuf']:.4f} | proxy gain {out['eval/proxy_gain_bits']:.1f} bits | "
             f"retrieval@{R} a2t top1 {100*out['eval/ret_a2t_top1']:.1f}% t2a {100*out['eval/ret_t2a_top1']:.1f}% mean rank {out['eval/ret_mean_rank_a2t']:.1f} | exact PMI {out['eval/exact_pmi_bits']:.1f} bits (median {out['eval/exact_pmi_median_bits']:.1f}, {100*out['eval/exact_frac_positive']:.0f}% > 0; shuffled {out['eval/exact_pmi_shuf_bits']:.1f}) | {out['eval/seconds']:.0f}s")
         model.train(); (arvec.crit if arvec.crit is not None else arvec.lm).train()
@@ -206,14 +254,31 @@ def main():
     if use_wandb:
         try: import wandb; wandb.init(project=a.wandb, name=a.tag, config=vars(a) | {"world": world, "rows": int(n_all), "denoiser_params": model.n_params(), "encoder": recipe}, resume="allow", id=None)
         except Exception as e: log("[prior] wandb off:", e); use_wandb = False
-    ev = evaluate(start_step, start_pairs)
+    pre = {}
+    if a.uncond_pretrain_steps > 0 and start_step == 0:   # unconditional-only warm start of p(e) on the e-pool (denoiser only; LoRA untouched)
+        pre["pretrain/fm_uncond_heldout_before"] = fm_uncond_heldout(); tp = time.time(); den_groups = [g_ for g_ in opt.param_groups if g_["base"] == a.lr]
+        for ps in range(1, a.uncond_pretrain_steps + 1):
+            for g_ in den_groups: g_["lr"] = a.uncond_pretrain_lr * min(1.0, ps / 100)
+            xu = uncond_batch(a.uncond_pretrain_batch)
+            with torch.autocast("cuda", dtype=torch.bfloat16): lu, _ = fm_loss(model, xu)
+            opt.zero_grad(set_to_none=True); lu.backward()
+            if ddp: allreduce_grads(list(model.parameters()))
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+            if ps % 100 == 0 or ps == 1:
+                log(f"[prior] p(e) pretrain step {ps}/{a.uncond_pretrain_steps} loss {lu.item():.4f} gn {gn.item():.3f} ({(time.time() - tp) / ps:.2f}s/step, {ps * a.uncond_pretrain_batch * world / 1e6:.1f}M e's)")
+                if use_wandb: wandb.log({"pretrain/loss": lu.item(), "pretrain/gn": gn.item(), "pretrain/e_seen": ps * a.uncond_pretrain_batch * world}, step=ps)
+        for g_ in den_groups: g_["lr"] = 0.0
+        opt.zero_grad(set_to_none=True); pre["pretrain/fm_uncond_heldout_after"] = fm_uncond_heldout(); pre["pretrain/steps"] = a.uncond_pretrain_steps; pre["pretrain/e_seen"] = a.uncond_pretrain_steps * a.uncond_pretrain_batch * world; pre["pretrain/seconds"] = time.time() - tp
+        log(f"[prior] p(e) pretraining done: held-out uncond FM {pre['pretrain/fm_uncond_heldout_before']:.4f} -> {pre['pretrain/fm_uncond_heldout_after']:.4f} on {pre['pretrain/e_seen'] / 1e6:.1f}M e's in {pre['pretrain/seconds'] / 60:.1f} min")
+        if is0: os.makedirs(os.path.join(a.out, "uncond_pretrained"), exist_ok=True); save_prior(os.path.join(a.out, "uncond_pretrained"), model, enorm, vars(a) | {"world": world, "e_noise": e_noise}, recipe, 0, 0, extra={"pretrain": pre})
+    ev = evaluate(start_step, start_pairs) | pre
     if use_wandb: wandb.log(ev, step=start_step)
     snaps = sorted((start_pairs if x.strip().startswith("+") else 0) + int(float(x.strip().lstrip("+"))) for x in a.snap_pairs.split(",") if x.strip()); done = set(q for q in snaps if q <= start_pairs)   # "+N" = N pairs after the resume point
     rng = torch.Generator().manual_seed(a.seed * 1000 + rank); perm = torch.randperm(N, generator=rng); cursor = 0
     for _ in range(0 if a.no_replay else start_step):   # replay the sampler so a resumed run continues the same data order (crash resume); --no-replay for a data switch
         if cursor + a.batch > N: perm = torch.randperm(N, generator=rng); cursor = 0
         cursor += a.batch
-    pairs = start_pairs; t_start = time.time(); t_log = time.time(); loss_acc = 0.0; n_acc = 0
+    pairs = start_pairs; t_start = time.time(); t_log = time.time(); loss_acc = 0.0; n_acc = 0; lu_acc = 0.0
     log(f"[prior] steps {start_step} -> {steps} x {a.batch} x {world} = {(steps-start_step)*a.batch*world} draws this phase ({(steps-start_step)*a.batch*world/int(n_all):.2f} passes over {int(n_all)} rows); pairs so far {start_pairs}; schedule {'ANNEAL cosine 1.0 -> 0.1' if a.anneal else ('warm-up + const' if a.lr_const else 'warm-up + cosine')}; snapshots at {snaps}")
     model.train(); (arvec.crit if arvec.crit is not None else arvec.lm).train()
     for step in range(start_step + 1, steps + 1):
@@ -227,15 +292,18 @@ def main():
         e_, m_, g_ = cond([Z[i] for i in idx.tolist()], grad=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, _ = fm_loss(model, x0, e_ if use_tokens else None, m_ if use_tokens else None, g_, p_uncond=a.p_uncond)
-        opt.zero_grad(set_to_none=True); loss.backward()
+            total = loss
+            if POOL is not None and a.uncond_mult > 0:   # unlabelled unconditional block: no text, no trunk forward, ~free on the denoiser
+                loss_u, _ = fm_loss(model, uncond_batch(int(round(a.uncond_mult * a.batch)))); total = loss + a.uncond_weight * loss_u; lu_acc += loss_u.item()
+        opt.zero_grad(set_to_none=True); total.backward()
         if ddp: allreduce_grads(trainable)
         gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); opt.step()
         pairs += a.batch * world; loss_acc += loss.item(); n_acc += 1
         if step % a.log_every == 0 or step == start_step + 1:
             dt = (time.time() - t_log) / n_acc; t_log = time.time()
-            log(f"[prior] step {step}/{steps} pairs {pairs} loss {loss_acc/n_acc:.4f} gn {gn.item():.3f} lr_f {f_:.3f} {dt:.2f}s/step | peak {torch.cuda.max_memory_allocated()/2**30:.0f} GiB")
-            if use_wandb: wandb.log({"train/loss": loss_acc / n_acc, "train/gn": gn.item(), "train/lr_f": f_, "train/pairs": pairs, "time/step_s": dt}, step=step)
-            loss_acc = 0.0; n_acc = 0
+            log(f"[prior] step {step}/{steps} pairs {pairs} loss {loss_acc/n_acc:.4f}" + (f" uncond {lu_acc/n_acc:.4f}" if POOL is not None and a.uncond_mult > 0 else "") + f" gn {gn.item():.3f} lr_f {f_:.3f} {dt:.2f}s/step | peak {torch.cuda.max_memory_allocated()/2**30:.0f} GiB")
+            if use_wandb: wandb.log({"train/loss": loss_acc / n_acc, "train/loss_uncond_block": lu_acc / n_acc, "train/gn": gn.item(), "train/lr_f": f_, "train/pairs": pairs, "time/step_s": dt}, step=step)
+            loss_acc = 0.0; n_acc = 0; lu_acc = 0.0
         hit = [q for q in snaps if pairs >= q and q not in done]
         timeout = (time.time() - t_start) / 3600 > a.max_hours; last = step == steps
         if step % a.eval_every == 0 or last or hit or timeout:
