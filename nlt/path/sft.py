@@ -18,7 +18,7 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--out", required=True); p.add_argument("--tag", default="path_sft")
     p.add_argument("--text", required=True); p.add_argument("--val-text", default=None)
     p.add_argument("--base", default="Qwen/Qwen3-8B"); p.add_argument("--init", default="ao"); p.add_argument("--question", default=None)
-    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b"); p.add_argument("--fixed-markers", type=int, default=0, help="pad the middle with zero markers to this fixed count (count carries no gap info)"); p.add_argument("--rows-direct", action="store_true", help="text parquets already carry pos_idx/i/j (nlt.path.facts): skip the pairs join and the copy filter"); p.add_argument("--ablate-mid", default="none", choices=["none", "zero", "shuffle", "noise"], help="eval-time ablation of the middle vectors (diagnostic; applies to train too, so use with --eval-only)")
+    p.add_argument("--path-mode", default="delta", choices=["none", "count", "delta", "attn_mlp"]); p.add_argument("--path-dir", default="/vol/path/qwen3_8b"); p.add_argument("--fixed-markers", type=int, default=0, help="pad the middle with zero markers to this fixed count (count carries no gap info)"); p.add_argument("--rows-direct", action="store_true", help="text parquets already carry pos_idx/i/j (nlt.path.facts): skip the pairs join and the copy filter"); p.add_argument("--ablate-mid", default="none", help="eval-time ablation of the middle vectors: none|zero|shuffle|noise, comma list allowed with --eval-only (diagnostic; applies to train too)")
     p.add_argument("--epochs", type=float, default=1.0); p.add_argument("--lr", type=float, default=3e-5); p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--batch", type=int, default=32); p.add_argument("--micro", type=int, default=8); p.add_argument("--max-resp-tokens", type=int, default=96)
     p.add_argument("--max-rows", type=int, default=None); p.add_argument("--copy-thresh", type=float, default=0.05)
@@ -125,8 +125,12 @@ def main():
         return out
 
     if a.eval_only:
-        ev = evaluate(); ev.update({"init": a.init, "path_mode": a.path_mode, "val_text": a.val_text, "ablate_mid": a.ablate_mid, "fixed_markers": a.fixed_markers}); print("[path-sft] EVAL-ONLY " + json.dumps(ev), flush=True)
-        json.dump(ev, open(os.path.join(a.out, "eval.json"), "w"), indent=1); return
+        evs = []
+        for abl in a.ablate_mid.split(","):
+            a.ablate_mid = abl; ev = evaluate(); ev.update({"init": a.init, "path_mode": a.path_mode, "val_text": a.val_text, "ablate_mid": abl, "fixed_markers": a.fixed_markers}); evs.append(ev)
+            print("[path-sft] EVAL-ONLY " + json.dumps(ev), flush=True)
+        json.dump(evs if len(evs) > 1 else evs[0], open(os.path.join(a.out, "eval.json"), "w"), indent=1); return
+    assert a.ablate_mid == "none", "--ablate-mid is an eval-only diagnostic"
     order = np.random.default_rng(a.seed).permutation(len(df)); ptr = 0; t_start = time.time(); last_eval = {}
     for step in range(n_steps):
         for g in opt.param_groups: g["lr"] = a.lr * min(1.0, (step + 1) / max(1, a.warmup)) * (0.5 * (1 + math.cos(math.pi * step / max(1, n_steps))) if step >= a.warmup else 1.0)
