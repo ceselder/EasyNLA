@@ -45,8 +45,15 @@ UN = {}                                                                  # unCLI
 for f in sorted(glob.glob(f"{U}/eval_*.json")):
     e = J(f)
     if e.get("critic", "").startswith("unclip"): UN[e["tag"]] = e
+def _pairs(t):
+    try: return int(t.rsplit("_", 1)[1])
+    except Exception: return 0
+UN = dict(sorted(UN.items(), key=lambda kv: _pairs(kv[0])))
+def _plab(t): n = _pairs(t); return f"{n // 1000}k" if n < 10 ** 6 else f"{n / 1e6:.1f}M"
+UCOL = {}
+for j, t in enumerate(UN): UCOL[f"unclip:{t}"] = ["#7c2d12", "#c2410c", "#f97316", "#fdba74"][min(3, len(UN) - 1 - j)]   # latest snapshot darkest
 for t, e in UN.items():
-    LAB[f"unclip:{t}"] = f"unCLIP, log p(e|z) [{t}]"
+    LAB[f"unclip:{t}"] = f"unCLIP log p(e|z), {_plab(t)} pairs"
     if e.get("groups"): REW[f"unclip:{t}"] = {av: np.array(v["lp"]) for av, v in e["groups"].items()}
 
 out = {"truth": {}, "truth_vs_mse_paired": {}, "wrong_detail": {}, "detector": {}, "ladder": {}, "twins": {}, "deletion": {}, "pmi": {}, "labels": LAB}
@@ -147,7 +154,7 @@ json.dump(out, open(f"{D}/unclip_compare.json", "w"), indent=1, default=float)
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 14})
 COL = {"mse": "#9ca3af", "sw_tokar": "#2563eb", "trunk_dn64": "#1e40af", "sw_scratch_tokar_pg": "#60a5fa", "sw_scratch_tokbase": "#93c5fd", "clip_plain": "#15803d",
        "verbalizer (h-specific evidence)": "#c2410c"}
-def col(n): return "#b45309" if n.startswith("unclip") else COL.get(n, "#6b7280")
+def col(n): return UCOL.get(n.split("|")[0], "#c2410c") if n.startswith("unclip") else COL.get(n, "#6b7280")
 def lab(n): return LAB.get(n, n)
 fig, ax = plt.subplots(2, 2, figsize=(14, 11.5)); ax = ax.ravel()
 # (a) truth ranking
@@ -159,24 +166,25 @@ for k, (av, a_) in enumerate((("warm", 1.0), ("trunk400", 0.45))):
 ax[0].axvline(0, color="k", lw=.8); ax[0].set_yticks(y); ax[0].set_yticklabels([lab(n) for n in names], fontsize=11); ax[0].invert_yaxis(); ax[0].grid(alpha=.3, axis="x")
 ax[0].set_xlabel("within-group Spearman with (− false claims), ± 1 s.e."); ax[0].set_title("(a) does the score rank truer explanations higher?"); ax[0].legend(fontsize=10, loc="upper left", bbox_to_anchor=(0.0, -0.2), ncol=2)
 # (b) wrong-detail by token distance of the true detail
-cols_b = [bn for bn, _ in BUCKETS]; wn = [n for n in ["verbalizer (h-specific evidence)", "sw_tokar", "trunk_dn64", "sw_scratch_tokar_pg", "clip_plain", "mse"] + [f"unclip:{t}" for t in UN] if n in out["wrong_detail"]]
+cols_b = [bn for bn, _ in BUCKETS]; LAST = [f"unclip:{t}" for t in UN][-1:]
+wn = [n for n in ["verbalizer (h-specific evidence)", "sw_tokar", "trunk_dn64", "clip_plain", "mse"] + LAST if n in out["wrong_detail"]]
 xb = np.arange(len(cols_b)); wdt = 0.8 / max(1, len(wn))
 for j, n in enumerate(wn):
     ax[1].bar(xb + (j - (len(wn) - 1) / 2) * wdt, [out["wrong_detail"][n].get(b, (np.nan, 0))[0] for b in cols_b], wdt, color=col(n), label=lab(n))
 ns = [out["wrong_detail"][wn[1]].get(b, (0, 0))[1] if len(wn) > 1 else 0 for b in cols_b] if wn else [0] * len(cols_b)
 ax[1].set_xticks(xb); ax[1].set_xticklabels([f"{b}\n(n={n_})" for b, n_ in zip(cols_b, ns)], fontsize=10); ax[1].axhline(0.5, color="k", lw=.8, ls=":"); ax[1].set_ylim(0.4, 1.0)
-ax[1].set_ylabel("P(true explanation beats its swap)"); ax[1].set_xlabel("tokens between the true detail and the read-out position"); ax[1].set_title("(b) wrong-detail detection by distance"); ax[1].legend(fontsize=9, loc="lower left"); ax[1].grid(alpha=.3, axis="y")
+ax[1].set_ylabel("P(true explanation beats its swap)"); ax[1].set_xlabel("tokens between the true detail and the read-out position"); ax[1].set_title("(b) wrong-detail detection by distance"); ax[1].legend(fontsize=9, loc="upper center", bbox_to_anchor=(0.45, -0.25), ncol=2); ax[1].grid(alpha=.3, axis="y")
 # (c) hedging: number edits + ladder
 cm = [("true number\n> near-miss", "detector", "orig>near"), ("'N or M' hedge\n> near-miss M", "detector", "hedge>near"), ("exact entity\n> omitted", "ladder", "P(exact>omit)"),
       ("omitted\n> wrong entity", "ladder", "P(omit>twin)")]
 cn = [("mse", "mse", None), ("sw_tokar", "sw_tokar", "flow 644-bit recipe, Opus 727808"), ("clip_plain", "clipQ_opus_frozen_plain__latest|raw", "clipQ_opus_frozen_plain__latest|raw")] + \
-     [(f"unclip:{t}", f"unclip:{t}|lp", f"unclip:{t}") for t in UN]
+     [(n, f"{n}|lp", n) for n in LAST]
 xc = np.arange(len(cm)); wc_ = 0.8 / max(1, len(cn))
 for j, (n, dk, lk) in enumerate(cn):
     vals = [(out["detector"].get(dk, {}) or {}).get(key, np.nan) if src == "detector" else ((out["ladder"].get(lk, {}) or {}).get(key, np.nan) if lk else np.nan) for _, src, key in cm]
     ax[2].bar(xc + (j - (len(cn) - 1) / 2) * wc_, [np.nan if v is None else v for v in vals], wc_, color=col(n), label=lab(n))
-ax[2].set_xticks(xc); ax[2].set_xticklabels([c[0] for c in cm], fontsize=10.5); ax[2].axhline(0.5, color="k", lw=.8, ls=":"); ax[2].set_ylim(0.0, 1.0); ax[2].set_ylabel("P(first scores higher than second)")
-ax[2].set_title("(c) specific-but-wrong vs hedged vs omitted"); ax[2].legend(fontsize=9.5, loc="upper left"); ax[2].grid(alpha=.3, axis="y")
+ax[2].set_xticks(xc); ax[2].set_xticklabels([c[0] for c in cm], fontsize=9.5); ax[2].axhline(0.5, color="k", lw=.8, ls=":"); ax[2].set_ylim(0.0, 1.0); ax[2].set_ylabel("P(first scores higher than second)")
+ax[2].set_title("(c) specific-but-wrong vs hedged vs omitted"); ax[2].legend(fontsize=9.5, loc="upper left", bbox_to_anchor=(0.0, -0.18), ncol=2); ax[2].grid(alpha=.3, axis="y")
 # (d) fabricated claim value + twins
 dn = [n for n in ["sw_tokar", "trunk_dn64", "clipQ_opus_frozen_plain__latest|raw"] + [f"unclip:{t}" for t in UN] if n in out["deletion"]]; yd = np.arange(len(dn))
 rat = [out["deletion"][n]["false_per_claim"] / out["deletion"][n]["true_per_claim"] if out["deletion"][n]["true_per_claim"] else np.nan for n in dn]
@@ -188,15 +196,17 @@ ax[3].set_yticks(yd); ax[3].set_yticklabels([LAB2.get(n, lab(n)) + (f"\ntwins {1
 for i_, r_ in enumerate(rat): ax[3].text(r_ + 0.005, i_, f"{r_:+.2f}", va="center", fontsize=11)
 ax[3].set_xlabel("value of one false claim / value of one true claim\n(> 0: a fabrication still earns score; 97 deletion items)"); ax[3].set_title("(d) does a fabricated claim cost score?"); ax[3].grid(alpha=.3, axis="x")
 if UN:
-    t0 = list(UN)[-1]; n0 = f"unclip:{t0}"; tu = out["truth"].get(n0, {}); tf = out["truth"].get("sw_tokar", {})
-    head = (f"A density over the contrastive embedding, log p(e|z): truth ρ on RL-policy explanations {tu.get('trunk400', (np.nan,))[0]:+.2f} vs {tf.get('trunk400', (np.nan,))[0]:+.2f} (flow), "
-            f"wrong-detail {out['wrong_detail'].get(n0, {}).get('all', (np.nan,))[0]:.2f} vs {out['wrong_detail'].get('sw_tokar', {}).get('all', (np.nan,))[0]:.2f}")
+    t0 = list(UN)[-1]; n0 = f"unclip:{t0}"; tu = out["truth"].get(n0, {}); tc = out["truth"].get("clip_plain", {}); tf = out["truth"].get("sw_tokar", {})
+    wu = out["wrong_detail"].get(n0, {}).get("all", (np.nan,))[0]; wf = out["wrong_detail"].get("sw_tokar", {}).get("all", (np.nan,))[0]
+    ru = out["deletion"].get(n0, {}); ru = ru["false_per_claim"] / ru["true_per_claim"] if ru else np.nan
+    head = (f"unCLIP at {_plab(t0)} pairs ranks RL-policy explanations by truth like the contrastive critic (ρ {tu.get('trunk400', (np.nan,))[0]:+.2f} vs {tc.get('trunk400', (np.nan,))[0]:+.2f}; flow {tf.get('trunk400', (np.nan,))[0]:+.2f}),\n"
+            f"but detects wrong details worse ({wu:.2f} vs {wf:.2f}) and still pays a fabricated claim {ru:.2f} of a true one")
 else:
     head = ("Baselines (unCLIP pending): critics beat the verbalizer on details at the read-out token (0.95–0.98 vs 0.83) but trail it further back,\n"
             "and every critic tracks truth weakly on RL-policy explanations")
 fig.suptitle(head + "\nExperiment: every critic scored on the same held-out activations, explanations and edits; the verbalizer's h-specific evidence as the reference reader",
              fontsize=13.5, y=0.995)
-fig.tight_layout(rect=(0, 0, 1, 0.94))
+fig.tight_layout(rect=(0, 0, 1, 0.93))
 for ext in ("png", "pdf"): fig.savefig(f"unclip_compare.{ext}", dpi=150 if ext == "png" else None)
 print(json.dumps({"truth_trunk400": {n: round(v.get("trunk400", (np.nan,))[0], 3) for n, v in out["truth"].items()},
                   "wrong_detail_all": {n: round(v["all"][0], 3) for n, v in out["wrong_detail"].items()}}, default=float))
