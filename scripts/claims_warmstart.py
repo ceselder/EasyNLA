@@ -138,7 +138,9 @@ def cmd_score(a):
             recs = [dict(id=f"gold:{name}:{r['row']}", doc_id=r["doc_id"], is_val=r["is_val"], source="gold_split", claims=r["bullets"], types=["gold"] * len(r["bullets"])) for r in S]
             acts = [A[r["row"]].values.to_numpy(zero_copy_only=False) for r in S]
         else:                           # syn:<text shard name>: held-out anchors, internal + text claims (final) + Gemma multi claims
-            name = part[4:]; F = pq.read_table(f"/vol_glp/claims/final/final_{name}.parquet", columns=["anchor_id", "doc_id", "is_val", "claims", "families", "types", "activation_vector"]).to_pylist()
+            name = part[4:]
+            if not os.path.exists(f"/vol_glp/claims/final/final_{name}.parquet"): print(f"[ws-score] {part}: no final shard, skipped", flush=True); continue
+            F = pq.read_table(f"/vol_glp/claims/final/final_{name}.parquet", columns=["anchor_id", "doc_id", "is_val", "claims", "families", "types", "activation_vector"]).to_pylist()
             M = {r["anchor_id"]: r for r in (pq.read_table(f"{WS}/multi/multi_{name}.parquet").to_pylist() if os.path.exists(f"{WS}/multi/multi_{name}.parquet") else [])}
             recs, acts = [], []
             for r in F:
