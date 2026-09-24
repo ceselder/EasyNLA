@@ -74,6 +74,86 @@ def parse_facts_compact(raw):
     return f if n else None
 
 
+# compact v2: the production FACT_PROMPT field definitions verbatim, only the serialisation changes (all fields mandatory, in order, so the model
+# walks the whole checklist; v1's "leave out fields that do not apply" made it skip whole entity/number/quote sections). last_words is computed.
+FACT_PROMPT_COMPACT2 = """You are annotating a text for a study of language-model internals. The text below ends exactly where a language model is about to predict the next token. Write a FACT SHEET about the text as it stands at its end, inside <facts></facts> tags: exactly eleven lines, one per field below, in this order, each as "key: value". Write "-" as the value when a field does not apply; never include anything that is not in the text.
+
+- topic: what the text is about, at most 15 words
+- genre: text type and register, at most 12 words (e.g. "tabloid celebrity news, chatty")
+- voice: who is speaking or narrating, and to whom, at most 12 words
+- doing: what the text is doing right at its end, at most 20 words
+- next: what most likely comes next (the next few tokens), at most 15 words
+- sentiment: overall tone, at most 6 words
+- format: layout or structure (prose, list, table, dialogue, code, headline, form, ...), at most 8 words
+- entities: up to 8 items separated by " ; ", each "type | value | role" with type one of person, organisation, place, work, product, event; value = the name exactly as written; role = who or what it is in the text, at most 10 words (e.g. "senior manager at the bank", "the narrator's sister")
+- numbers: up to 6 items separated by " ; ", each "value | unit | what": value exactly as written, unit or -, what it counts or measures, at most 8 words
+- dates: up to 4 items separated by " ; ", each "value | what": value exactly as written, what at most 8 words
+- quotes: up to 4 items separated by " ; ", each "value | what": value = a distinctive span of 3-12 words copied verbatim from the text, what it is (e.g. "a line of dialogue", "a heading"), at most 8 words
+Copy every value character for character from the text.
+
+Text:
+<begin_text>{text}<end_text>"""
+
+
+def parse_facts_compact2(raw):
+    """eleven 'key: value' lines, list fields ' ; '-separated with ' | ' sub-fields -> the production fact dict"""
+    if not raw: return None
+    m = re.search(r"<facts>\s*(.*?)\s*(?:</facts>|$)", raw, re.S); s = m.group(1) if m else raw
+    f = {"entities": [], "numbers": [], "dates": [], "quotes": []}; n = 0
+    for line in s.splitlines():
+        line = re.sub(r"^[\s\-\*•]+", "", line).strip().strip("*_")
+        if ":" not in line: continue
+        k, v = line.split(":", 1); k = k.strip().lower().strip("*_ \""); v = v.strip()
+        if not v or v in ("-", "—", "none", "n/a", "[]", '""'): continue
+        if k in _KEYMAP: f[_KEYMAP[k]] = v; n += 1; continue
+        items = [[y.strip().strip("“”\"") for y in x.split("|")] for x in v.split(" ; ")] if k in ("entities", "entity", "numbers", "number", "dates", "date", "quotes", "quote") else []
+        for p in items:
+            if not p or not p[0] or p[0] in ("-", "—"): continue
+            if k.startswith("entit") and len(p) >= 2: f["entities"].append({"type": p[0].lower(), "value": p[1], "role": p[2] if len(p) > 2 else ""}); n += 1
+            elif k.startswith("number"): f["numbers"].append({"value": p[0], "unit": "" if len(p) < 2 or p[1] in ("-", "—", "none", "") else p[1], "what": p[2] if len(p) > 2 else ""}); n += 1
+            elif k.startswith("date"): f["dates"].append({"value": p[0], "what": p[1] if len(p) > 1 else ""}); n += 1
+            elif k.startswith("quote"): f["quotes"].append({"value": p[0], "what": p[1] if len(p) > 1 else ""}); n += 1
+    return f if n else None
+
+
+# compact v3: the production JSON fact sheet, minified and with ARRAYS instead of keyed objects for the list fields (keeps JSON's enumeration
+# behaviour, drops the per-item key overhead, indentation and line breaks); last_words computed.
+FACT_PROMPT_COMPACT3 = """You are annotating a text for a study of language-model internals. The text below ends exactly where a language model is about to predict the next token. Write a FACT SHEET about the text as it stands at its end: one minified JSON object (no line breaks, no indentation) inside <facts></facts> tags.
+
+Keys, in this order (use "" or [] when not applicable; never include anything that is not in the text):
+- "topic": what the text is about, at most 15 words
+- "genre": text type and register, at most 12 words (e.g. "tabloid celebrity news, chatty")
+- "voice": who is speaking or narrating, and to whom, at most 12 words
+- "doing": what the text is doing right at its end, at most 20 words
+- "next": what most likely comes next (the next few tokens), at most 15 words
+- "sentiment": overall tone, at most 6 words
+- "format": layout or structure (prose, list, table, dialogue, code, headline, form, ...), at most 8 words
+- "entities": up to 8 arrays [type, value, role]: type is "person", "organisation", "place", "work", "product" or "event"; value is the name exactly as written; role is who or what it is in the text, at most 10 words (e.g. "senior manager at the bank", "the narrator's sister")
+- "numbers": up to 6 arrays [value, unit, what]: value exactly as written, unit or "", what it counts or measures, at most 8 words
+- "dates": up to 4 arrays [value, what]: value exactly as written, what at most 8 words
+- "quotes": up to 4 arrays [value, what]: value is a distinctive span of 3-12 words copied verbatim from the text, what it is (e.g. "a line of dialogue", "a heading"), at most 8 words
+Copy every value character for character from the text.
+
+Text:
+<begin_text>{text}<end_text>"""
+
+
+def parse_facts_compact3(raw):
+    """production JSON parser, then list fields given as arrays -> the production keyed objects (dict items are accepted as they are)"""
+    from nla.datagen import g2_spec as G
+    f = G.parse_facts(raw)
+    if f is None: return None
+    def conv(items, keys):
+        out = []
+        for it in items or []:
+            if isinstance(it, dict): out.append(it)
+            elif isinstance(it, (list, tuple)) and it: out.append({k: (str(it[i]) if i < len(it) and it[i] is not None else "") for i, k in enumerate(keys)})
+        return out
+    f["entities"] = conv(f.get("entities"), ("type", "value", "role")); f["numbers"] = conv(f.get("numbers"), ("value", "unit", "what"))
+    f["dates"] = conv(f.get("dates"), ("value", "what")); f["quotes"] = conv(f.get("quotes"), ("value", "what"))
+    return f
+
+
 def auto_last_words(ctx, n=5):
     """the final n words of the labeller's context (replaces the LLM-copied last_words field: exact by construction)"""
     w = re.sub(r"\s+", " ", ctx or "").strip().split()
@@ -136,11 +216,12 @@ class Plan:
         self.k = cfg.get("k", G2_K)
 
     def fact_prompt(self, i):
-        return (FACT_PROMPT_COMPACT if self.cfg.get("fact_format") == "compact" else self.G.FACT_PROMPT).format(text=self.ctxs[i])
+        fm = self.cfg.get("fact_format")
+        return (FACT_PROMPT_COMPACT if fm == "compact" else FACT_PROMPT_COMPACT2 if fm == "compact2" else FACT_PROMPT_COMPACT3 if fm == "compact3" else self.G.FACT_PROMPT).format(text=self.ctxs[i])
 
     def parse(self, i, raw):
-        G = self.G
-        f = parse_facts_compact(raw) if self.cfg.get("fact_format") == "compact" else G.parse_facts(raw)
+        G = self.G; fm = self.cfg.get("fact_format")
+        f = parse_facts_compact(raw) if fm == "compact" else parse_facts_compact2(raw) if fm == "compact2" else parse_facts_compact3(raw) if fm == "compact3" else G.parse_facts(raw)
         if f is None: return False
         if self.cfg.get("last_words_auto"): f["last_words"] = auto_last_words(self.ctxs[i])
         v, st = G.validate(f, self.ctxs[i]); self.facts[i], self.vstats[i] = v, st
@@ -275,6 +356,12 @@ SYNC_VARIANTS = {
     "compact_a600": {"fact_format": "compact", "last_words_auto": True, "a_max_tokens": 600},
     "compact_notags": {"fact_format": "compact", "last_words_auto": True, "no_render_tags": True},
     "json_posmajor": {"fact_format": "json", "order": "posmajor"},
+    "compact2": {"fact_format": "compact2", "last_words_auto": True},                  # production field definitions, compact serialisation
+    "compact2_a700": {"fact_format": "compact2", "last_words_auto": True, "a_max_tokens": 700},
+    "compact2_notags": {"fact_format": "compact2", "last_words_auto": True, "no_render_tags": True},
+    "compact3": {"fact_format": "compact3", "last_words_auto": True},                  # minified JSON with arrays for the list fields
+    "compact3_notags": {"fact_format": "compact3", "last_words_auto": True, "no_render_tags": True},
+    "json_notags": {"fact_format": "json", "no_render_tags": True},
 }
 
 
@@ -291,10 +378,12 @@ def sync_suite(names: list, n_rows: int = N_ROWS, warm: int = 300):
     mine = [tok(_chat_prompt(tok, p), add_special_tokens=False)["input_ids"] for p in probe]
     out["template_match"] = all(list(a.prompt_token_ids) == b for a, b in zip(r, mine)); out["template_probe_len"] = [len(a.prompt_token_ids) for a in r]
     out["instruction_prefix_tokens"] = {"json": len(tok(_chat_prompt(tok, G.FACT_PROMPT.format(text="")), add_special_tokens=False)["input_ids"]),
-                                        "compact": len(tok(_chat_prompt(tok, FACT_PROMPT_COMPACT.format(text="")), add_special_tokens=False)["input_ids"])}
+                                        "compact": len(tok(_chat_prompt(tok, FACT_PROMPT_COMPACT.format(text="")), add_special_tokens=False)["input_ids"]),
+                                        "compact2": len(tok(_chat_prompt(tok, FACT_PROMPT_COMPACT2.format(text="")), add_special_tokens=False)["input_ids"]),
+                                        "compact3": len(tok(_chat_prompt(tok, FACT_PROMPT_COMPACT3.format(text="")), add_special_tokens=False)["input_ids"])}
     print("[bench] template_match", out["template_match"], out["instruction_prefix_tokens"], flush=True)
     MS._g2_rows(llm, texts[:warm], keys[:warm], docs[:warm])                                                  # warm-up (compile / JIT / graph capture)
-    g2_sync(llm, texts[:warm], keys[:warm], docs[:warm], {"fact_format": "compact", "last_words_auto": True})
+    g2_sync(llm, texts[:warm], keys[:warm], docs[:warm], SYNC_VARIANTS[names[0]] or {"fact_format": "compact2", "last_words_auto": True})
     for name in names:
         cfg = SYNC_VARIANTS[name]
         try:

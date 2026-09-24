@@ -14,12 +14,15 @@ async def main(out_p, n, specs):
     import anthropic
     hdr = {"anthropic-workspace-id": os.environ["ANTHROPIC_WORKSPACE_ID"]} if os.environ.get("ANTHROPIC_WORKSPACE_ID") else {}
     cl = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], default_headers=hdr, max_retries=8)
-    V = {}
+    V, texts = {}, None
     for spec in specs:
-        name, path = spec.split("=", 1); V[name] = pq.read_table(path, columns=["doc_id", "n_raw_tokens", "text", "renders", "styles"]).to_pylist()
-    names = list(V); n_pos = min(len(v) for v in V.values())
+        name, path = spec.split("=", 1); T = pq.read_table(path); cols = ["doc_id", "n_raw_tokens", "renders", "styles"] + (["text"] if "text" in T.schema.names else [])
+        V[name] = T.select(cols).to_pylist()
+        if "text" in cols and texts is None: texts = [r["text"] for r in V[name]]          # bench variants carry no text: rows are aligned with the first file that does
+    names = list(V); n_pos = min(len(v) for v in V.values()); assert texts is not None, "no input file carries the text column"
     for v in V.values():
         assert all(a["doc_id"] == b["doc_id"] and a["n_raw_tokens"] == b["n_raw_tokens"] for a, b in zip(v[:n_pos], V[names[0]][:n_pos])), "rows misaligned"
+        for r, t in zip(v, texts): r["text"] = t
     rnd = random.Random(0); cand = [(i, j) for i in range(n_pos) for j in range(4) if all(len(V[nm][i]["renders"]) > j and V[nm][i]["renders"][j] for nm in names)]
     picks = rnd.sample(cand, min(n, len(cand)))
     res = json.load(open(out_p)).get("rows", {}) if os.path.exists(out_p) else {}
