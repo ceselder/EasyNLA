@@ -89,7 +89,7 @@ def load_shards(glob_pat, n, skip_val=True, skip=0, with_doc=False, counts=None,
     return (acts, zs, docs) if with_doc else (acts, zs)
 
 
-def load_claims_dir(root, n, n_val, weights=None, balance=0.0, balance_clip=10.0, one_claim=False, families=None, rank=0, world=1, glob_pat=None, seed=0):
+def load_claims_dir(root, n, n_val, weights=None, balance=0.0, balance_clip=10.0, one_claim=False, families=None, rank=0, world=1, glob_pat=None, seed=0, rank_files=False):
     """synthetic claim data (scripts/claims_finalize.py): {root}/final/final_*.parquet -> train (acts fp16, claim lists, per-claim sampling weights
     or None, per-claim false twins or None) up to n non-val anchors, val [(act, claims, families, types, twins)] up to n_val val anchors that carry
     all three families (internal / text / semantic). weights = parse_weights table (family / family:type -> weight); balance > 0 multiplies each
@@ -97,12 +97,14 @@ def load_claims_dir(root, n, n_val, weights=None, balance=0.0, balance_clip=10.0
     one_claim: every TRAINING anchor keeps ONE claim: its family is nla.flow.claims.draw_family(anchor_id) (anchors whose drawn family is not in
     `families` or has no claim yet are skipped — they are consumed by a later phase), then a type drawn by the balance/claim weights among the
     available types of that family, then a uniform claim of that type; its false twin is kept. rank/world: rank-disjoint training anchors
-    (global row index % world == rank); val anchors are identical on every rank. glob_pat: which final files (default {root}/final/final_*.parquet)."""
+    (global row index % world == rank; rank_files: whole files round-robin, 1/world of the reading); val anchors are identical on every rank.
+    glob_pat: which final files (default {root}/final/final_*.parquet). Returns acts, claims, weights, twins, tys (template 'family:type' of each
+    one-claim pick, else None), val."""
     import glob as _glob, pyarrow.parquet as pq, numpy as _np
     from nla.flow.claimset import claim_weight
     import random as _rnd
     from nla.flow.claims import draw_family, pick_one
-    acts, cls, ws, tws, val = [], [], [], [], []; ntr = 0; row_g = 0; rng1 = _rnd.Random(seed * 7919 + rank); fam_ct = {}
+    acts, cls, ws, tws, tys, val = [], [], [], [], [], []; ntr = 0; row_g = 0; rng1 = _rnd.Random(seed * 7919 + rank); fam_ct = {}
     tcount = {}
     if balance > 0:   # type frequencies from the finalize stats (claims per family:type)
         st_ = json.load(open(f"{root}/final/stats.json"))["claims_per_type"]; med = float(_np.median(list(st_.values())))
@@ -112,6 +114,20 @@ def load_claims_dir(root, n, n_val, weights=None, balance=0.0, balance_clip=10.0
     for ent in (glob_pat or f"{root}/final/final_*.parquet").split(";"):
         pat, _, fs = ent.partition("@")
         for f in sorted(_glob.glob(pat.strip())): entries.append((f, [x for x in fs.split(",") if x] or families))
+    if rank_files:   # val anchors from the first files (same on every rank), training rows from this rank's files only
+        for f, _ in entries:
+            if len(val) >= n_val: break
+            pf = pq.ParquetFile(f); has_tw = "twins" in pf.schema_arrow.names
+            for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "claims", "families", "types", "is_val"] + (["twins"] if has_tw else [])):
+                isv = rb.column("is_val").to_pylist(); fa = rb.column("families").to_pylist()
+                want = [i for i, v in enumerate(isv) if v and {"internal", "text", "semantic"} <= set(fa[i])][: n_val - len(val)]
+                if not want: continue
+                av = rb.column("activation_vector"); d_ = av.type.list_size
+                A = torch.from_numpy(av.flatten().to_numpy(zero_copy_only=False).reshape(-1, d_).astype(_np.float16))
+                cl = rb.column("claims").to_pylist(); ty = rb.column("types").to_pylist(); tw = rb.column("twins").to_pylist() if has_tw else [None] * len(cl)
+                val += [(A[i], cl[i], fa[i], ty[i], tw[i]) for i in want]
+        entries = entries[rank::world]; world_rows, rank_rows = 1, 0
+    else: world_rows, rank_rows = world, rank
     for f, fams_f in entries:
         pf = pq.ParquetFile(f); has_tw = "twins" in pf.schema_arrow.names
         for rb in pf.iter_batches(batch_size=4096, columns=["activation_vector", "claims", "families", "types", "is_val", "anchor_id"] + (["twins"] if has_tw else [])):
@@ -119,7 +135,7 @@ def load_claims_dir(root, n, n_val, weights=None, balance=0.0, balance_clip=10.0
             A = torch.from_numpy(av.flatten().to_numpy(zero_copy_only=False).reshape(-1, d_).astype(_np.float16))
             isv = rb.column("is_val").to_pylist(); cl = rb.column("claims").to_pylist(); fa = rb.column("families").to_pylist(); ty = rb.column("types").to_pylist()
             tw = rb.column("twins").to_pylist() if has_tw else [None] * len(cl); aid = rb.column("anchor_id").to_pylist()
-            ti = [i for i, v in enumerate(isv) if not v and (row_g + i) % world == rank]; row_g += len(isv)
+            ti = [i for i, v in enumerate(isv) if not v and (row_g + i) % world_rows == rank_rows]; row_g += len(isv)
             if one_claim:   # one claim per training activation, drawn family first
                 keep, pick = [], []
                 for i in ti:
@@ -133,16 +149,17 @@ def load_claims_dir(root, n, n_val, weights=None, balance=0.0, balance_clip=10.0
                 ti = keep[: max(0, n - ntr)]; pick = pick[: len(ti)]
                 if ti:
                     acts.append(A[ti]); cls += [[cl[i][k]] for i, k in zip(ti, pick)]; tws += [[(tw[i] or [None] * len(cl[i]))[k]] for i, k in zip(ti, pick)]; ws += [None] * len(ti); ntr += len(ti)
+                    tys += [f"{fa[i][k]}:{(ty[i][k] or '').split('/')[0]}" for i, k in zip(ti, pick)]
                 ti = []
             ti = ti[: max(0, n - ntr)]
             if ti:
-                acts.append(A[ti]); cls += [cl[i] for i in ti]; tws += [tw[i] for i in ti]; ntr += len(ti)
+                acts.append(A[ti]); cls += [cl[i] for i in ti]; tws += [tw[i] for i in ti]; ntr += len(ti); tys += [None] * len(ti)
                 ws += [[claim_weight(weights, f_, t_) * tcount.get(f"{f_}:{(t_ or '').split('/')[0]}", 1.0) for f_, t_ in zip(fa[i], ty[i])] if weights is not None else None for i in ti]
             for i, v in enumerate(isv):
-                if v and len(val) < n_val and {"internal", "text", "semantic"} <= set(fa[i]): val.append((A[i], cl[i], fa[i], ty[i], tw[i]))
+                if not rank_files and v and len(val) < n_val and {"internal", "text", "semantic"} <= set(fa[i]): val.append((A[i], cl[i], fa[i], ty[i], tw[i]))
         if ntr >= n and len(val) >= n_val: break
     if one_claim and rank == 0: print(f"[cond] one claim per activation: drawn families of the kept training anchors (rank 0) {fam_ct}", flush=True)
-    return (torch.cat(acts) if acts else torch.zeros(0, 1, dtype=torch.float16)), cls, ws, tws, val
+    return (torch.cat(acts) if acts else torch.zeros(0, 1, dtype=torch.float16)), cls, ws, tws, tys, val
 
 
 def load_pairs(parquet, n, skip=0, with_doc=False):
@@ -345,6 +362,14 @@ def main():
     p.add_argument("--set-encode", action="store_true", help="SET-ENCODED claim conditions (tokens_ar): every claim encoded alone, memories concatenated -> exactly order-free (nla.flow.claimset)")
     p.add_argument("--single-frac", type=float, default=0.0, help="claim-set mode: P(k = 1); otherwise k ~ U{2..min(K, n)} (0 = the plain U{1..min(K, n)})")
     p.add_argument("--gold-whole-frac", type=float, default=0.0, help="claim-set mode: share of GOLD anchors drawn as the whole unsplit explanation (one element) instead of a claim subset")
+    p.add_argument("--ctr-template", action="store_true", help="CLIP-style same-template batches (needs --one-claim): each micro-batch = claims of ONE template (family:type, template "
+                   "rotation weighted by the family shares), answers deduplicated, and an InfoNCE term over FLOW scores in groups of K+1 activations x their K+1 claims: "
+                   "logit_ij = -(d/2) L_FM(x_i | c_j) / tau under the same (t, eps) per activation, symmetric cross-entropy; plus the plain FM loss on every positive")
+    p.add_argument("--ctr-k", type=int, default=32, help="negatives per activation (group size K+1)"); p.add_argument("--ctr-weight", type=float, default=1.0)
+    p.add_argument("--ctr-tau-init", type=float, default=10.0, help="InfoNCE temperature in nats of FM-proxy PMI"); p.add_argument("--ctr-fixed-tau", action="store_true")
+    p.add_argument("--ctr-enc-grad", action="store_true", help="let the InfoNCE term train the text encoder too (default: encodings detached, adapter/prior only)")
+    p.add_argument("--fm-chunk", type=int, default=0, help="FM loss over the micro-batch in sub-batches of this size (same gradient; bounds the encoder-backward memory at large --batch)")
+    p.add_argument("--rank-files", action="store_true", help="--claims-dir under DDP: whole final files round-robin to ranks (1/world of the reading) instead of row striping")
     p.add_argument("--one-claim", action="store_true", help="claims-dir: ONE claim per training activation (drawn family, then balanced type, then claim; val keeps all); gold explanations: one random claim each")
     p.add_argument("--draw-families", default="", help="--one-claim: only training anchors whose drawn family is in this comma list (e.g. internal,text); default all")
     p.add_argument("--claims-glob", default=None, help="which synthetic final files (default <claims-dir>/final/final_*.parquet)")
@@ -496,7 +521,7 @@ def main():
     if is0: print(f"[cond] {len(tr_z)} train pairs ({n_sft} SFT/Opus + {len(tr_z)-n_sft} on-policy), {len(va_z)} val pairs; d_enc {d_enc}", flush=True)
     tr_claims = None; va_single = va_gold = None; sv_acts = sv_z = None
     EXTRAS = {}   # id(eval condition list) -> ((name, per-row condition texts), ...): extra conditions scored on the same (t, eps) / probes
-    tr_w = tr_tw = None; n_gold = len(tr_z); sv_pairs = None
+    tr_w = tr_tw = None; n_gold = len(tr_z); sv_pairs = None; tr_ty = None
     if a.claim_subsets > 0:   # compositional NLA: the condition is a SET of claims, not a paragraph
         from nla.flow.claims import split_claims, format_claims, sample_subset
         from nla.flow.claimset import weighted_subset, parse_weights
@@ -510,9 +535,11 @@ def main():
         EXTRAS[id(va_z)] = (("single", va_single), ("gold", va_gold))
         tr_w = [None] * len(tr_claims); tr_tw = [None] * len(tr_claims)
         if a.claims_dir:
-            s_acts, s_cl, s_w, s_tw, s_val = load_claims_dir(a.claims_dir, a.max_synth, a.eval_n, parse_weights(a.claim_weights), balance=a.balance_types, one_claim=a.one_claim,
-                                                             families=[x for x in a.draw_families.split(",") if x] or None, rank=rank if (ddp and not a.unfreeze_prior) else 0,
-                                                             world=world if (ddp and not a.unfreeze_prior) else 1, glob_pat=a.claims_glob, seed=a.seed)
+            _dis = ddp and (not a.unfreeze_prior or a.ctr_template)          # rank-disjoint synthetic rows (FSDP arms too when every activation is used once)
+            s_acts, s_cl, s_w, s_tw, s_ty, s_val = load_claims_dir(a.claims_dir, a.max_synth, a.eval_n, parse_weights(a.claim_weights), balance=a.balance_types, one_claim=a.one_claim,
+                                                             families=[x for x in a.draw_families.split(",") if x] or None, rank=rank if _dis else 0,
+                                                             world=world if _dis else 1, glob_pat=a.claims_glob, seed=a.seed, rank_files=a.rank_files)
+            tr_ty = ["gold:claim"] * len(tr_claims) + [t_ or "synthetic:unknown" for t_ in s_ty]
             tr_acts = torch.cat([tr_acts, s_acts]) if len(tr_claims) else s_acts; tr_claims = tr_claims + s_cl; tr_z = tr_z + [format_claims(c[: a.claim_subsets]) for c in s_cl]
             tr_w = tr_w + s_w; tr_tw = tr_tw + s_tw
             _sr = _random.Random(4242); sv_acts = torch.stack([v[0] for v in s_val]) if s_val else None
@@ -561,6 +588,10 @@ def main():
     msf = math.sqrt(cfg["d_input"]); _, base_mse = compute_predict_mean_baselines(va_acts[: a.eval_n], msf)
     adapter_ids = {id(p_) for p_ in model.adapter_parameters()}
     groups = [{"params": list(model.adapter_parameters()), "lr": a.lr, "base_lr": a.lr}]
+    log_tau = None
+    if a.ctr_template:   # InfoNCE temperature (nats of FM-proxy PMI), learnable unless --ctr-fixed-tau
+        log_tau = torch.nn.Parameter(torch.tensor(math.log(a.ctr_tau_init), device=dev), requires_grad=not a.ctr_fixed_tau)
+        if not a.ctr_fixed_tau: groups.append({"params": [log_tau], "lr": 1e-3, "base_lr": 1e-3})
     if a.unfreeze_prior: groups.append({"params": [p_ for p_ in model.parameters() if id(p_) not in adapter_ids], "lr": a.prior_lr, "base_lr": a.prior_lr})
     if arvec is not None and arvec.trainable_parameters(): groups.append({"params": arvec.trainable_parameters(), "lr": a.ar_lr, "base_lr": a.ar_lr})
     if a.cond_mode == "trunk":
@@ -782,22 +813,48 @@ def main():
         cursor = (a.start_step % bpp) * a.batch
         if is0: print(f"[cond] resuming at step {a.start_step} (cursor {cursor}/{N})", flush=True)
     neg_rng = _random.Random(a.seed + 17 + int(os.environ.get('RANK', 0)))
+    if a.ctr_template:   # same-template pools; each activation is drawn exactly once
+        assert tr_ty is not None and a.one_claim, "--ctr-template needs --one-claim --claims-dir"
+        from nla.flow.claims import FAMILY_SHARES as _FS
+        pools = {}
+        for i_, t_ in enumerate(tr_ty): pools.setdefault(t_, []).append(i_)
+        trng = _random.Random(a.seed * 31 + rank)
+        for v_ in pools.values(): trng.shuffle(v_)
+        if is0: print(f"[cond] same-template batches: {len(pools)} templates on rank 0, largest " + ", ".join(f"{k}:{len(v)}" for k, v in sorted(pools.items(), key=lambda x: -len(x[1]))[:8]), flush=True)
+        def next_ctr_batch(nb):
+            out, chunks = [], []
+            while len(out) < nb:
+                live = [t_ for t_, v_ in pools.items() if v_]
+                if not live: break
+                fams = sorted({t_.split(":")[0] for t_ in live}); f_ = trng.choices(fams, weights=[_FS.get(x, 0.1) for x in fams])[0]
+                ts = [t_ for t_ in live if t_.split(":")[0] == f_]; t_ = trng.choices(ts, weights=[len(pools[x]) for x in ts])[0]
+                take = pools[t_][: nb - len(out)]; del pools[t_][: len(take)]
+                chunks.append((t_, list(range(len(out), len(out) + len(take))))); out += take
+            return out, chunks
+    ctr_stats = {}
     for step in range(a.start_step + 1, a.steps + 1):
         sched = min(1.0, step / a.warmup) * (1.0 if a.lr_const else (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1))
         for gp in opt.param_groups: gp["lr"] = gp["base_lr"] * sched
         lr = a.lr * sched
         opt.zero_grad(set_to_none=True); loss_acc = 0.0
         for _acc in range(a.grad_accum):   # gradient accumulation: --grad-accum micro-batches of --batch pairs per optimizer step
-            if cursor + a.batch > N:
-                assert not a.one_pass, "one-pass run ran out of fresh activations"
-                perm = torch.randperm(N, generator=rng); cursor = 0; print(f"[cond] re-shuffle (pass {step*a.batch*a.grad_accum*world/N:.1f})", flush=True)
-            idx = perm[cursor:cursor + a.batch]; cursor += a.batch
+            if a.ctr_template:
+                idx_l, chunks = next_ctr_batch(a.batch); assert idx_l, "same-template pools ran out of fresh activations"
+                idx = torch.tensor(idx_l, dtype=torch.long)
+            else:
+                if cursor + a.batch > N:
+                    assert not a.one_pass, "one-pass run ran out of fresh activations"
+                    perm = torch.randperm(N, generator=rng); cursor = 0; print(f"[cond] re-shuffle (pass {step*a.batch*a.grad_accum*world/N:.1f})", flush=True)
+                idx = perm[cursor:cursor + a.batch]; cursor += a.batch
             _txt = [draw(i) for i in idx.tolist()] if tr_claims is not None else [tr_z[i] for i in idx.tolist()]
-            x0 = norm.normalize(tr_acts[idx].to(dev)); e, mk, cv = enc_batch(_txt, grad=True)
+            x0 = norm.normalize(tr_acts[idx].to(dev))
             if step == a.start_step + 1 and _acc == 0 and is0: print(f"[cond] model-space scale check: |x0|^2/d = {float((x0.float() ** 2).mean()):.3f} (1.0 = matches the N(0, I) noise)", flush=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, _, used = cond_fm_loss(model, x0, e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift, err_map=err_map, cfm_lambda=a.cfm_lambda)
-            (loss / a.grad_accum).backward(); loss_acc += loss.item() / a.grad_accum
+            fc = a.fm_chunk if a.fm_chunk > 0 else len(idx)                   # FM positives in sub-batches (the encoder backward is the memory hog)
+            for c0 in range(0, len(idx), fc):
+                sl = slice(c0, c0 + fc); e, mk, cv = enc_batch(_txt[sl], grad=True); w_ = min(fc, len(idx) - c0) / len(idx)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    loss, _, used = cond_fm_loss(model, x0[sl], e, mk, p_uncond=a.p_uncond, cvec=cv, shift=enc_batch.shift, err_map=err_map, cfm_lambda=a.cfm_lambda)
+                (loss * w_ / a.grad_accum).backward(); loss_acc += loss.item() * w_ / a.grad_accum
         loss = torch.tensor(loss_acc)
         closs = None; neg_stats = {}
         if a.neg_frac > 0:   # contrastive hard negatives: same activation, same (t, eps); the negative text must score WORSE by a margin
@@ -817,6 +874,33 @@ def main():
                 closs = a.neg_lambda * F.relu(a.neg_margin - gap).mean(); closs.backward()
                 neg_stats = {"train/contrast_loss": closs.item(), "train/neg_gap": gap.mean().item(), "train/neg_win": (gap > 0).float().mean().item(), "train/neg_n": n2,
                              "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2, "train/neg_frac_quote": sum(1 for k in keep_i if negs[k][1] == "quote") / n2}
+        if a.ctr_template:   # CLIP-style InfoNCE over flow scores within same-template groups of K+1 distinct answers
+            t_c = time.time(); grps = []; n_uniq = 0
+            for t_, pos in chunks:
+                seen_, uniq = set(), []
+                for p_ in pos:
+                    k_ = _txt[p_] if isinstance(_txt[p_], str) else "\n".join(_txt[p_])
+                    if k_ not in seen_: seen_.add(k_); uniq.append(p_)
+                n_uniq += len(uniq); G = a.ctr_k + 1
+                grps += [uniq[g0: g0 + G] for g0 in range(0, len(uniq) - G + 1, G)]
+            ng = torch.tensor([len(grps)], device=dev)
+            if ddp: dist.all_reduce(ng, op=dist.ReduceOp.MIN)                 # equal forward/backward counts on every rank (FSDP collectives)
+            grps = grps[: int(ng.item())]; tau = log_tau.exp().clamp(1.0, 100.0); ce_s = ar_s = ac_s = 0.0
+            for g_i, grp in enumerate(grps):
+                G = len(grp); xs = x0[grp].detach(); eg, mkg, cvg = enc_batch([_txt[p_] for p_ in grp], grad=a.ctr_enc_grad)
+                tt = torch.rand(G, device=dev); ee = torch.randn_like(xs); x_t = (1 - tt)[:, None] * xs + tt[:, None] * ee; tgt = (ee - xs).float()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    v = model(x_t.repeat_interleave(G, 0), tt.repeat_interleave(G), eg.repeat(G, 1, 1) if eg is not None else None,
+                              mkg.repeat(G, 1) if mkg is not None else None, cvg.repeat(G, 1) if cvg is not None else None)
+                Lm = ((v.float() - tgt.repeat_interleave(G, 0)) ** 2).mean(-1).view(G, G)          # [activation i, claim j], same (t, eps) along a row
+                logits = -(0.5 * x0.shape[1]) * Lm / tau; tgt_idx = torch.arange(G, device=dev)
+                ce = 0.5 * (F.cross_entropy(logits, tgt_idx) + F.cross_entropy(logits.t(), tgt_idx))
+                (a.ctr_weight * ce / max(len(grps), 1)).backward()
+                ce_s += ce.item(); ar_s += (logits.argmax(1) == tgt_idx).float().mean().item(); ac_s += (logits.argmax(0) == tgt_idx).float().mean().item()
+            ng_ = max(len(grps), 1)
+            ctr_stats = {"train/ctr_ce": ce_s / ng_, "train/ctr_acc_row": ar_s / ng_, "train/ctr_acc_col": ac_s / ng_, "train/ctr_groups": len(grps), "train/ctr_unique": n_uniq,
+                         "train/ctr_templates": len(chunks), "train/ctr_tau": float(tau), "train/ctr_seconds": time.time() - t_c, "train/ctr_chance": 1.0 / (a.ctr_k + 1)}
+            if ddp and log_tau.grad is not None: dist.all_reduce(log_tau.grad, op=dist.ReduceOp.AVG)
         if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
             for p_ in arvec.trainable_parameters():
                 if p_.grad is None: p_.grad = torch.zeros_like(p_)
@@ -854,7 +938,10 @@ def main():
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step | peak mem {torch.cuda.max_memory_allocated()/2**30:.0f} GiB", flush=True)
             cfm_st = {f"train/cfm_{k}": float(v) for k, v in getattr(cond_fm_loss, "last", {}).items()} if a.cfm_lambda > 0 else {}
             if cfm_st and is0: print(f"  [cfm] fm {cfm_st['train/cfm_fm']:.4f} | distance to another sample's flow {cfm_st['train/cfm_cfm_neg']:.4f} (lambda {a.cfm_lambda})", flush=True)
-            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats, **cfm_st}, step=step)
+            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats, **cfm_st, **ctr_stats}, step=step)
+            if ctr_stats and is0: print(f"  [ctr] InfoNCE {ctr_stats['train/ctr_ce']:.3f} (chance {math.log(a.ctr_k + 1):.2f}) acc row {100*ctr_stats['train/ctr_acc_row']:.0f}% col {100*ctr_stats['train/ctr_acc_col']:.0f}% "
+                                        f"(chance {100/(a.ctr_k + 1):.0f}%) | {ctr_stats['train/ctr_groups']} groups of {a.ctr_k + 1}, {ctr_stats['train/ctr_unique']} distinct answers, {ctr_stats['train/ctr_templates']} template chunks | "
+                                        f"tau {ctr_stats['train/ctr_tau']:.1f} nats | {ctr_stats['train/ctr_seconds']:.2f}s", flush=True)
             if gstats and is0: print(f"  [samedoc] ce {gstats['train/samedoc_ce']:.3f} acc row {100*gstats['train/samedoc_acc_row']:.0f}% col {100*gstats['train/samedoc_acc_col']:.0f}% (chance {100/a.group_size:.0f}%)", flush=True)
             if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
         pairs_seen = a.start_pairs + (step - a.start_step) * a.batch * a.grad_accum * world      # global (activation, text) draws so far

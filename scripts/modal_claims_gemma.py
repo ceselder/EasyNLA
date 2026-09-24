@@ -10,6 +10,7 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.join(os.environ.g
 from modal_nla_exp import SECRETS, REPO_LOCAL, REPO_REMOTE, REPO_IGNORE  # noqa: E402
 
 vol_glp = modal.Volume.from_name("nla-glp")
+vol_q36 = modal.Volume.from_name("nla-qwen36-ema")
 image = (modal.Image.from_registry("vllm/vllm-openai:v0.29.0", setup_dockerfile_commands=["RUN ln -sf $(which python3) /usr/local/bin/python"]).entrypoint([])
          .run_commands("pip install --no-cache-dir pyarrow aiohttp 'huggingface_hub[hf_xet]'")
          .env({"HF_HOME": "/vol_glp/hf", "HF_XET_HIGH_PERFORMANCE": "1", "PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false", "PYTHONPATH": REPO_REMOTE,
@@ -17,7 +18,7 @@ image = (modal.Image.from_registry("vllm/vllm-openai:v0.29.0", setup_dockerfile_
          .add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE))
 app = modal.App("nla-claims-gemma", image=image)
 ROOT = "/vol_glp/claims"; OUT = f"{ROOT}/gemma"
-KW = dict(volumes={"/vol_glp": vol_glp}, secrets=SECRETS, cpu=32, memory=256 * 1024)
+KW = dict(volumes={"/vol_glp": vol_glp, "/vol_q36": vol_q36}, secrets=SECRETS, cpu=32, memory=256 * 1024)
 
 
 @app.function(gpu="B200:4", timeout=3 * 3600, **KW)
@@ -57,6 +58,22 @@ def stream1(k: int, K: int, pattern: str = "text_v*_*.jsonl.gz", exclude: str = 
     return cg.gen_stream(ROOT, OUT, k, K, pattern=pattern, layout="single", commit=vol_glp.commit, reload=vol_glp.reload, exclude=set(exclude.split(",")))
 
 
+@app.function(gpu="B200", timeout=12 * 3600, max_containers=8, **KW)
+def ws_split(files: str):
+    """verbalizer warm start: Gemma splits gold Opus explanations into atomic bullets (scripts/claims_warmstart.run_split)"""
+    sys.path.insert(0, f"{REPO_REMOTE}/scripts"); import claims_warmstart as cw
+    vol_glp.reload()
+    return cw.run_split(cw.WS, [x for x in files.split(",") if x], commit=vol_glp.commit)
+
+
+@app.function(gpu="B200", timeout=12 * 3600, max_containers=8, **KW)
+def ws_multi(names: str):
+    """verbalizer warm start: 3 aspects x 2 quote-checked claims for every held-out synthetic anchor of the given text shards"""
+    sys.path.insert(0, f"{REPO_REMOTE}/scripts"); import claims_warmstart as cw
+    vol_glp.reload()
+    return cw.run_multi(ROOT, cw.WS, [x for x in names.split(",") if x], commit=vol_glp.commit)
+
+
 @app.local_entrypoint()
 def main(task: str = "bench", layouts: str = "", n: int = 20000, names: str = "", layout: str = "a_dp4", containers: int = 2, exclude: str = ""):
     if task == "bench":
@@ -66,6 +83,14 @@ def main(task: str = "bench", layouts: str = "", n: int = 20000, names: str = ""
         groups = [",".join(ns[i::k]) for i in range(k) if ns[i::k]]
         f = gen if task == "gen" else gen1
         calls = [f.spawn(g, layout) if task == "gen" else f.spawn(g) for g in groups]
+        out = []
+        for c in calls:
+            try: out.append(c.get())
+            except Exception as e: out.append(f"ERR {type(e).__name__}: {str(e)[:200]}")
+        print(out)
+    elif task in ("ws_split", "ws_multi"):   # --names = comma list (gold shard paths for ws_split, text shard names for ws_multi), split over --containers
+        ns = [x for x in names.split(",") if x]; k = min(containers, len(ns)); f = ws_split if task == "ws_split" else ws_multi
+        calls = [f.spawn(",".join(ns[i::k])) for i in range(k)]
         out = []
         for c in calls:
             try: out.append(c.get())

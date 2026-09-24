@@ -232,6 +232,12 @@ def train_cond_ddp4(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = 
     return _ddp(tag, prior_tag, prior_ckpt, extra, 4)
 
 
+@app.function(gpu="B200:8", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=64, memory=1024 * 1024, ephemeral_disk=600 * 1024)
+def train_cond_g8(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = ""):
+    """from-scratch / co-trained prior over 8 B200 (FSDP2 via --unfreeze-prior, torchrun); same launcher as train_cond_ddp with the prior unfrozen"""
+    return _ddp(tag, prior_tag, prior_ckpt, "--unfreeze-prior " + extra, 8)
+
+
 @app.function(gpu="B200:4", timeout=23 * 3600, **COMMON)
 def train_cond_g4(tag: str, prior_tag: str = "glp27b_main", prior_ckpt: str = "snap_000655M", extra: str = ""):
     """Stage 2 with the prior CO-TRAINED (FSDP2 over 4 GPUs, torchrun); each rank holds its own encoder copy."""
@@ -340,6 +346,13 @@ def claims_compose_variants(adapter: str, tag: str, extra: str = ""):
     return _claims([f"{REPO_REMOTE}/scripts/claims_compose_variants.py", "--adapter", adapter, "--tag", tag] + extra.split())
 
 
+@app.function(gpu="B200", timeout=4 * 3600, **COMMON)
+def claims_controls(adapter: str, tag: str, extra: str = ""):
+    """twin detection with a wrong-activation control, claim-only LM baseline, same-template retrieval (N = 16/64/256)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_controls.py", "--adapter", adapter, "--tag", tag] + extra.split())
+
+
 @app.function(gpu="B200", timeout=6 * 3600, **COMMON)
 def claims_finalize(root: str, extra: str = ""):
     """synthetic claims: merge the three families per anchor, near-duplicate removal (sentence embeddings), stats -> {root}/final"""
@@ -372,6 +385,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
     elif task == "ultra_extract":   # all shards in parallel, one B200 each; --tag = explained dir name, --sets = out dir
         calls = [ultra_extract.spawn(f"/vol_glp/data/{tag or 'ultra_explained_t1'}/chunk_*.parquet", sets or "/vol_glp/data/ultra_L42", shard=i, nshards=nshards, extra=extra) for i in range(nshards)]
         print("rc", _gather(calls))
+    elif task == "train_cond_g8":   # 8-GPU FSDP (--unfreeze-prior added)
+        print("rc", train_cond_g8.remote(tag or "cond_g8", prior_tag, ckpt, extra))
     elif task == "train_cond_g4":
         print("rc", train_cond_g4.remote(tag or "cond_cotrain", prior_tag, ckpt, extra))
     elif task == "train_cond_ddp4":
@@ -410,6 +425,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", claims_gates.remote(ckpt, tag, extra))
     elif task == "claims_compose_variants":   # --ckpt = adapter path, --tag = output tag
         print("rc", claims_compose_variants.remote(ckpt, tag, extra))
+    elif task == "claims_controls":   # --ckpt = adapter path, --tag = output tag
+        print("rc", claims_controls.remote(ckpt, tag, extra))
     elif task == "claims_finalize":
         print("rc", claims_finalize.remote(root, extra))
     elif task == "gen_onpolicy":
