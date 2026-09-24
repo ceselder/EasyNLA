@@ -133,18 +133,20 @@ def fig_scaling(rep, out):
     """headline of round 2: reconstructor gain vs number of bullet train pairs, with prose / lens at the matched top size"""
     f = os.path.join(rep, "data", "scaling.json")
     if not os.path.exists(f): return
-    S = json.load(open(f)); pts = [r for r in S["points"] if r["text"] == "bullets" and r.get("gain") is not None]
+    S = json.load(open(f)); allb = [r for r in S["points"] if r["text"] == "bullets" and r.get("gain") is not None]
+    pts = sorted([r for r in allb if r.get("selection", "gain") == "gain"], key=lambda r: r["n_pairs"]); absp = sorted([r for r in allb if r.get("selection") == "abs_fve"], key=lambda r: r["n_pairs"])
     if not pts: return
-    pts = sorted(pts, key=lambda r: r["n_pairs"]); x = [r["n_pairs"] for r in pts]
+    x = [r["n_pairs"] for r in pts]
     fig, axes = plt.subplots(1, 2, figsize=(11, 5.2))
     ax = axes[0]
     ax.plot(x, [r["gain"] for r in pts], marker="o", lw=2.5, color=CLAY, label="bullets: gain over empty text (own list)")
     ax.plot(x, [r["pair_specific_gain"] for r in pts], marker="s", lw=2, color=CLAY, ls="--", label="bullets: pair-specific gain (own − depth-matched wrong list)")
+    if absp: ax.plot([r["n_pairs"] for r in absp], [r["gain"] for r in absp], marker="o", lw=1.5, color=CLAY, alpha=0.45, label="bullets: gain at the best-absolute-FVE checkpoint")
     if any(r.get("gain_ci") for r in pts):
         lo = [r["gain_ci"][0] if r.get("gain_ci") else np.nan for r in pts]; hi = [r["gain_ci"][1] if r.get("gain_ci") else np.nan for r in pts]
         ax.fill_between(x, lo, hi, color=CLAY, alpha=0.15, label="95% bootstrap CI (per-example gain)")
     for r in S["points"]:
-        if r["text"] in ("prose", "lens") and r.get("gain") is not None:
+        if r["text"] in ("prose", "lens") and r.get("gain") is not None and r.get("selection", "gain") == "gain":
             c = INK if r["text"] == "prose" else GREY; ax.scatter([r["n_pairs"]], [r["gain"]], marker="D", s=80, color=c, zorder=5, label=f"{'Sonnet prose' if r['text'] == 'prose' else 'lens-diff text'} at {r['n_pairs'] // 1000}k matched pairs: {r['gain']:+.3f}")
     ax.axhline(0, color=INK, lw=0.8); ax.set_xscale("log"); ax.set_xticks(x); ax.set_xticklabels([f"{v // 1000}k" for v in x]); ax.minorticks_off()
     ax.set_xlabel("bullet-list train pairs"); ax.set_ylabel("FVE of Δ gained over the same net with no text")

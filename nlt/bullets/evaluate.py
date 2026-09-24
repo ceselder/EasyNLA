@@ -78,6 +78,17 @@ def main():
     multi = np.array([len(b) >= 2 for b in bullets]) & (gaps_all >= a.min_gap)          # crux / shuffle noise on the training distribution (gap >= min_gap) only
     shuf_texts = [join_bullets([b[k] for k in rng.permutation(len(b))]) if len(b) >= 2 else join_bullets(b) for b in bullets]
     e_shuf = errors(shuf_texts)
+    # per-pair noise scale: the largest |relerr(shuffle) - relerr(list)| over n_shuffle extra random orders (a pair's own reordering sensitivity)
+    pair_noise = np.zeros(N)
+    if a.n_shuffle > 0:
+        ex_idx, ex_txt = [], []
+        for n, b in enumerate(bullets):
+            if len(b) < 2: continue
+            for _ in range(a.n_shuffle): ex_idx.append(n); ex_txt.append(join_bullets([b[k] for k in rng.permutation(len(b))]))
+        if ex_idx:
+            e_ex = errors(ex_txt, ex_idx); ex_idx = np.array(ex_idx); r_ex = (e_ex / EN[ex_idx]).cpu().numpy()
+            base = (e_all / EN).cpu().numpy()
+            for n, r in zip(ex_idx, r_ex): pair_noise[n] = max(pair_noise[n], abs(r - base[n]))
     R_emp = residuals_empty(); d_eff = participation_ratio(R_emp); del R_emp
     rel = lambda e: (e / EN).cpu().numpy()
     r_all, r_emp, r_dm, r_shuf = rel(e_all), rel(e_emp), rel(e_dm), rel(e_shuf)
@@ -124,11 +135,13 @@ def main():
         d_loo = r_loo - r_all[loo_idx]                     # > 0: removing the bullet hurts
         d_swap_slot = r_loo - r_sw                          # value of a RANDOM depth-matched bullet in the same slot (> 0: helps)
         noise = float(np.percentile(np.abs(r_shuf - r_all)[multi], 95))
-        cruxy = (d_loo > noise) & (d_loo > d_swap_slot)
+        pn = pair_noise[loo_idx]                                                        # per-pair noise (its own reordering sensitivity)
+        cruxy_global = (d_loo > noise) & (d_loo > d_swap_slot)
+        cruxy = (d_loo > pn) & (d_loo > d_swap_slot) & (d_loo > 0)                      # ROUND 2 definition: beyond the PAIR'S OWN shuffle noise and beyond the swap
         gain_pair = (r_emp - r_all)
         per_bullet = pd.DataFrame({"pair_id": df["pair_id"].values[loo_idx], "k": loo_k, "bullet": [bullets[n][k] for n, k in zip(loo_idx, loo_k)],
                                    "n_bullets": n_bul[loo_idx], "relmse_all": r_all[loo_idx], "relmse_loo": r_loo, "relmse_swap": r_sw,
-                                   "d_loo": d_loo, "d_swap_slot": d_swap_slot, "cruxy": cruxy, "pair_gain": gain_pair[loo_idx],
+                                   "d_loo": d_loo, "d_swap_slot": d_swap_slot, "cruxy": cruxy, "cruxy_global_noise": cruxy_global, "pair_noise": pn, "pair_gain": gain_pair[loo_idx],
                                    "j": df["j"].values[loo_idx], "gap": (df["j"] - df["i"]).values[loo_idx]})
         per_bullet["band"] = band_of(per_bullet["j"].values)
         per_bullet["d_loo_bits"] = (d_eff / 2) * np.log2(np.clip(r_loo, 1e-9, None) / np.clip(r_all[loo_idx], 1e-9, None))
@@ -141,7 +154,9 @@ def main():
                 continue
             s = np.sort(np.clip(g["d_loo"].values, 0, None))[::-1]
             shares1.append(min(1.0, s[0] / tot)); shares2.append(min(1.0, s[:2].sum() / tot)); npos.append(int((g["d_loo"] > noise).sum()))
-        crux = {"n_bullets": int(len(per_bullet)), "n_pairs": int(multi.sum()), "noise95_shuffle": noise, "frac_cruxy": float(cruxy.mean()), "frac_cruxy_ci": boot_ci(cruxy.astype(float)),
+        crux = {"n_bullets": int(len(per_bullet)), "n_pairs": int(multi.sum()), "noise95_shuffle": noise, "pair_noise_median": float(np.median(pn)), "pair_noise_mean": float(pn.mean()),
+                "frac_cruxy": float(cruxy.mean()), "frac_cruxy_ci": boot_ci(cruxy.astype(float)), "frac_cruxy_global_noise": float(cruxy_global.mean()),
+                "frac_loo_beyond_pair_noise": float((d_loo > pn).mean()), "loo_over_pair_noise_median": float(np.median(np.abs(d_loo) / np.clip(pn, 1e-6, None))),
                 "frac_loo_beyond_noise": float((d_loo > noise).mean()), "frac_loo_beats_swap": float((d_loo > d_swap_slot).mean()),
                 "frac_loo_negative_beyond_noise": float((d_loo < -noise).mean()),
                 "d_loo_mean": float(d_loo.mean()), "d_loo_median": float(np.median(d_loo)), "d_loo_pcts": {str(q): float(np.percentile(d_loo, q)) for q in (5, 25, 50, 75, 95)},
