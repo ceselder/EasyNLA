@@ -564,6 +564,70 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True, name_map=None):
     return time.time() - t0
 
 
+# ---- critic co-training variants (--cotrain-para-frac / --cotrain-shuffle-frac / --tripwire-every) ----
+PARA_PROMPT = ("Rewrite the text below so that it keeps exactly the same meaning and every fact, but uses different wording and a "
+               "different order. Do not add, remove or soften any information. Output only the rewritten text.\n\nText:\n{t}")
+
+
+def shuffle_units(text, rng):
+    """Meaning-preserving reorder: shuffle the lines (bullets) when there are >= 2 non-empty lines, else the sentences."""
+    lines = [l for l in text.split("\n") if l.strip()]
+    if len(lines) >= 2:
+        rng.shuffle(lines)
+        return "\n".join(lines)
+    sents = [s for s in re.split(r"(?<=[.;!?])\s+", text.strip()) if s]
+    if len(sents) >= 2:
+        rng.shuffle(sents)
+        return " ".join(sents)
+    return text
+
+
+@torch.no_grad()
+def paraphrase_base(actor, tokenizer, vectors_ref, texts, device, max_new_tokens=256, batch=16, temperature=0.7, seed=0):
+    """Paraphrase `texts` with the BASE model: the actor's LoRA disabled (peft disable_adapter) and the injection hook off
+    (vectors_ref[0] = None). The vLLM engine can't do this (it holds the merged policy weights). The global torch RNG and
+    the actor's train/eval mode are restored afterwards. Returns (paraphrases, n_failed); a failed or empty paraphrase falls
+    back to the original text."""
+    if not texts:
+        return [], 0
+    was_training, saved_v, saved_side = actor.training, vectors_ref[0], tokenizer.padding_side
+    cpu_rng = torch.get_rng_state(); cuda_rng = torch.cuda.get_rng_state(device) if torch.cuda.is_available() else None
+    out, n_failed = [], 0
+    try:
+        vectors_ref[0] = None; actor.eval(); tokenizer.padding_side = "left"; torch.manual_seed(int(seed))
+        pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        with actor.disable_adapter():
+            for s in range(0, len(texts), batch):
+                chunk = texts[s:s + batch]
+                prompts = []
+                for t in chunk:
+                    msgs = [{"role": "user", "content": PARA_PROMPT.format(t=t)}]
+                    try:
+                        prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False))
+                    except TypeError:
+                        prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+                enc = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+                gen = actor.generate(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], max_new_tokens=max_new_tokens,
+                                     do_sample=True, temperature=temperature, top_p=0.95, pad_token_id=pad, use_cache=True)
+                for r, t in enumerate(chunk):
+                    txt = tokenizer.decode(gen[r, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                    txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.S).strip()
+                    if len(txt) < 0.3 * len(t) or len(txt) > 3.0 * len(t) + 50:
+                        txt, n_failed = t, n_failed + 1
+                    out.append(txt)
+    except Exception as e:   # never let augmentation kill a training step: fall back to the originals
+        print(f"[paraphrase] failed ({type(e).__name__}: {str(e)[:160]}); using originals", flush=True)
+        out = out + list(texts[len(out):]); n_failed = len(texts)
+    finally:
+        vectors_ref[0] = saved_v; tokenizer.padding_side = saved_side
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state(cuda_rng, device)
+        if was_training:
+            actor.train()
+    return out, n_failed
+
+
 
 def score_with_critic(
     critic, tokenizer, explanations, activations, template, mse_scale_f, device,
@@ -1675,9 +1739,33 @@ def main():
                    help="Use rsLoRA scaling (alpha/sqrt(r) instead of alpha/r). "
                         "Default ON because we use r=128 where vanilla LoRA's "
                         "alpha/r=0.125 collapses the effective learning rate.")
-    p.add_argument("--cotrain-select", choices=["all", "best"], default="all",
+    p.add_argument("--cotrain-select", choices=["all", "best", "awr", "dpo"], default="all",
                    help="which rollouts the critic (AR or flow, --flow-cotrain rollouts/mix) co-trains on each step: every kept rollout, or only the "
-                        "highest-reward rollout of each prompt group (best-of-group bootstrapping of the ground truth)")
+                        "highest-reward rollout of each prompt group (best-of-group bootstrapping of the ground truth). MSE critic only: "
+                        "awr = advantage-weighted regression on every rollout of the group (weights softmax(adv/tau) + a uniform floor); "
+                        "dpo = pairwise ranking loss (best vs worst rollout of the group by the actor reward) + MSE on the best + the uniform floor")
+    p.add_argument("--cotrain-awr-tau", type=float, default=1.0, help="--cotrain-select awr: softmax temperature on the policy's (batch-normalised) advantages")
+    p.add_argument("--cotrain-floor", type=float, default=0.2,
+                   help="--cotrain-select awr/dpo: share of each group's weight spread uniformly over all its rollouts (keeps the critic reading ordinary explanations)")
+    p.add_argument("--cotrain-dpo-beta", type=float, default=50.0, help="--cotrain-select dpo: beta on the per-row MSE margin (normalised units)")
+    p.add_argument("--cotrain-dpo-weight", type=float, default=1.0, help="--cotrain-select dpo: weight of the ranking term relative to the MSE on the best rollout")
+    p.add_argument("--cotrain-dpo-margin", type=float, default=0.05,
+                   help="--cotrain-select dpo: clip: a pair stops pushing once err_worst - err_best exceeds this (normalised MSE units), so 'reconstruct the "
+                        "worst badly' can't run away (DiffusionITM-style bound)")
+    p.add_argument("--critic-steps-per-batch", type=int, default=1,
+                   help="MSE critic: optimizer steps per co-train batch (two-timescale: a fast critic behind a slow actor). 1 = off")
+    p.add_argument("--critic-anchor", type=float, default=0.0,
+                   help="MSE critic, with --critic-lag-steps/--critic-ema-decay: weight of an MSE anchor between the live critic's predictions and the "
+                        "scoring snapshot's (each round stays close to the previous round's AR). 0 = off")
+    p.add_argument("--cotrain-para-frac", type=float, default=0.0,
+                   help="MSE critic: fraction of the co-train explanations replaced by an online paraphrase from the BASE model (actor LoRA disabled, "
+                        "HF generate). 0 = off")
+    p.add_argument("--cotrain-shuffle-frac", type=float, default=0.0,
+                   help="MSE critic: fraction of the co-train explanations whose bullet / sentence order is shuffled (applied after paraphrasing). 0 = off")
+    p.add_argument("--tripwire-every", type=int, default=0,
+                   help="co-adaptation tripwire (MSE critic): every N steps (at an eval step) paraphrase + shuffle the 128 eval explanations, log the FVE "
+                        "drop under the LIVE co-trained critic (tripwire/*) and dump the variants to <save_dir>/tripwire/{orig,para,shuf}/ for "
+                        "offline scoring under the frozen SFT critic (nla/flow/score_dumps.py --critic). 0 = off")
     p.add_argument("--train-critic", action=argparse.BooleanOptionalAction, default=True,
                    help="Co-train the AR critic (paper-faithful, default ON; "
                         "--no-train-critic to disable). Adds a separate optimizer for "
@@ -2382,6 +2470,24 @@ def main():
     if critic is not None:
         critic.eval()  # Qwen3 has no dropout — eval mode is fine for both grad/no-grad
         print(f"[critic] value_head shape={tuple(critic.value_head.weight.shape)}")
+    # ---- critic co-training variants: MSE-critic path only; all off by default (bitwise-identical to the reference when off) ----
+    _cot_new = (args.cotrain_select in ("awr", "dpo") or args.critic_steps_per_batch > 1 or args.critic_anchor > 0
+                or args.cotrain_para_frac > 0 or args.cotrain_shuffle_frac > 0 or args.tripwire_every > 0)
+    if _cot_new:
+        if args.ar_loss == "flow" or args.async_gen:
+            raise SystemExit("--cotrain-select awr/dpo, --critic-steps-per-batch, --critic-anchor, --cotrain-para-frac/-shuffle-frac and "
+                             "--tripwire-every are implemented for the synchronous MSE-critic path only (not --ar-loss flow / --async-gen)")
+        if (args.critic_steps_per_batch > 1 or args.cotrain_select in ("awr", "dpo") or args.critic_anchor > 0) and not args.train_critic:
+            raise SystemExit("critic co-training options need --train-critic")
+        if args.critic_steps_per_batch > 1 and max(1, args.grad_accum) != 1:
+            raise SystemExit("--critic-steps-per-batch > 1 needs --grad-accum 1")
+        if args.critic_anchor > 0 and not critic_ema.enabled:
+            raise SystemExit("--critic-anchor needs a scoring snapshot: --critic-lag-steps N or --critic-ema-decay d")
+        if args.ar_loss in ("downstream_kl", "mse_plus_kl") and (args.cotrain_select in ("awr", "dpo") or args.critic_anchor > 0):
+            raise SystemExit("awr/dpo/anchor are implemented for the plain MSE critic loss only")
+        print(f"[cotrain] select={args.cotrain_select} (awr tau {args.cotrain_awr_tau}, floor {args.cotrain_floor}, dpo beta {args.cotrain_dpo_beta} "
+              f"w {args.cotrain_dpo_weight} margin {args.cotrain_dpo_margin}) steps/batch={args.critic_steps_per_batch} anchor={args.critic_anchor} "
+              f"para={args.cotrain_para_frac} shuffle={args.cotrain_shuffle_frac} tripwire_every={args.tripwire_every}", flush=True)
 
     # ---- karvonen hook on actor (for training-time forward only; rollout uses vLLM) ----
     vectors_ref = [None]
@@ -3440,6 +3546,7 @@ def main():
         cotrain_n_pairs = 0; cotrain_sel_reward = float("nan")   # logged as critic/n_pairs, critic/sel_reward_mean
         critic_bwd_ok = False  # DP: did THIS rank run a finite critic backward this step?
         critic_kl_val = float("nan")
+        _post_gauge_ctx = None   # (texts, golds) for the post-update critic gauge (two-timescale / lagged critics)
         _critic_now = (args.critic_update_every <= 1) or (step % args.critic_update_every == 0)
         if args.train_critic and critic_optim is not None and _critic_now and not _async:
             crit_inputs = []
@@ -3455,7 +3562,9 @@ def main():
             _mm_orig = {keep[j] for j in _mm if j < len(keep)}
             _crit_iter = [i for i in keep if i not in _mm_orig]
             cotrain_sel_reward = float("nan")
-            if getattr(args, "cotrain_select", "all") == "best":   # best-of-group: one (h, z) pair per prompt = the rollout the reward liked most
+            _csel = getattr(args, "cotrain_select", "all")
+            _cw = None   # awr/dpo: per-rollout co-train weight (orig index -> weight)
+            if _csel == "best":   # best-of-group: one (h, z) pair per prompt = the rollout the reward liked most
                 _best = {}
                 for i in _crit_iter:
                     r_ = rewards[i] if i < len(rewards) else None
@@ -3464,11 +3573,46 @@ def main():
                     if g_ not in _best or r_ > _best[g_][0]: _best[g_] = (r_, i)
                 _crit_iter = [i for _, i in _best.values()]
                 if _best: cotrain_sel_reward = float(sum(r_ for r_, _ in _best.values()) / len(_best))
+            elif _csel in ("awr", "dpo") and flow is None:
+                # every scored rollout of the group; awr: w = floor/n + (1-floor)*softmax(adv/tau); dpo: w = floor/n (+ the pair term below).
+                # The advantages/ranking are the POLICY's own (self-labelled): circular by construction, watch the tripwire.
+                _grp = {}
+                for i in _crit_iter:
+                    r_ = rewards[i] if i < len(rewards) else None
+                    if r_ is None or not math.isfinite(r_) or all_explanations[i] is None: continue
+                    _grp.setdefault(all_prompt_group[i], []).append(i)
+                _cw = {}
+                for g_, idx_ in _grp.items():
+                    n_ = len(idx_)
+                    if _csel == "awr":
+                        a_ = torch.tensor([float(adv[i]) for i in idx_], dtype=torch.float64) / max(args.cotrain_awr_tau, 1e-6)
+                        sm_ = torch.softmax(a_, 0)
+                        for j_, i in enumerate(idx_): _cw[i] = args.cotrain_floor / n_ + (1.0 - args.cotrain_floor) * float(sm_[j_])
+                    else:
+                        for i in idx_: _cw[i] = args.cotrain_floor / n_
+                _crit_iter = [i for idx_ in _grp.values() for i in idx_]
+            # online paraphrase / order-shuffle augmentation of the critic's training texts (the targets stay the true activations)
+            _caug = {}
+            if flow is None and (args.cotrain_para_frac > 0 or args.cotrain_shuffle_frac > 0) and _crit_iter:
+                _t_para0 = time.time(); _arng = random.Random(step * 1_000_003 + rank)
+                _cand = [i for i in _crit_iter if all_explanations[i] is not None]
+                _pidx = [i for i in _cand if _arng.random() < args.cotrain_para_frac]
+                if _pidx:
+                    _ptxt, _pfail = paraphrase_base(actor, tokenizer, vectors_ref, [all_explanations[i] for i in _pidx], device, seed=step * 131 + rank)
+                    _caug.update(dict(zip(_pidx, _ptxt)))
+                    shape_terms["critic/para_n"] = float(len(_pidx)); shape_terms["critic/para_failed"] = float(_pfail)
+                for i in _cand:
+                    if _arng.random() < args.cotrain_shuffle_frac:
+                        _caug[i] = shuffle_units(_caug.get(i, all_explanations[i]), _arng)
+                shape_terms["critic/aug_frac"] = float(len(_caug)) / max(len(_cand), 1)
+                shape_terms["time/critic_para_s"] = time.time() - _t_para0
+            crit_w = [] if _cw is not None else None; crit_orig = []
             for i in _crit_iter:
                 expl = all_explanations[i]
                 act = all_activations[i]
                 if expl is None:
                     continue
+                expl = _caug.get(i, expl)
                 text = template.format(explanation=expl)
                 ids = tokenizer.encode(text, add_special_tokens=False)
                 if len(ids) > 1024 or len(ids) == 0:
@@ -3477,6 +3621,16 @@ def main():
                 crit_golds.append(act)
                 crit_texts.append(expl)
                 crit_pg.append(all_prompt_group[i])
+                crit_orig.append(i)
+                if crit_w is not None: crit_w.append(_cw[i])
+            crit_pairs = []   # dpo: (pos_best, pos_worst) into crit_inputs, by the actor reward within the group
+            if _csel == "dpo" and crit_w is not None:
+                _bypg = {}
+                for pos_, i in enumerate(crit_orig): _bypg.setdefault(all_prompt_group[i], []).append(pos_)
+                for g_, ps_ in _bypg.items():
+                    if len(ps_) < 2: continue
+                    ps_ = sorted(ps_, key=lambda q: rewards[crit_orig[q]])
+                    if rewards[crit_orig[ps_[-1]]] > rewards[crit_orig[ps_[0]]]: crit_pairs.append((ps_[-1], ps_[0]))
             # AR downstream-KL is fwd+bwd-through-base per rollout — cap the count
             # (strided subsample so it spans prompts, not just the first few groups).
             if (args.ar_loss == "downstream_kl" and kl_gold_cache
@@ -3487,34 +3641,38 @@ def main():
                 crit_golds = [crit_golds[j] for j in _sel]
                 crit_pg = [crit_pg[j] for j in _sel]
             cotrain_n_pairs = len(crit_inputs)
-            if crit_inputs:
-                # Micro-batch the critic update — single forward on 256 sequences
-                # × 200 tokens × 5.5B-param critic with grad blows past 130GB.
-                # Accumulate gradient across micro-batches, single step at the
-                # end (loss is divided by total bs so it averages correctly).
+            # ---- two-timescale / lag gauges + the lagged-AR anchor need the SCORING snapshot's predictions on this batch ----
+            _gauges = flow is None and (critic_ema.enabled or args.critic_steps_per_batch > 1)
+            _post_gauge_ctx = (list(crit_texts), list(crit_golds)) if (_gauges and crit_inputs) else None
+            _shadow_n = None
+            if flow is None and crit_inputs and critic_ema.enabled and (args.critic_anchor > 0 or _gauges):
+                _golds_n = normalize_activation(torch.stack(crit_golds).to(device).float(), mse_scale_f)
+                _sh = []
+                with critic_ema.swapped(), torch.no_grad():
+                    for cs in range(0, len(crit_inputs), max(1, args.critic_micro_batch)):
+                        _ch = crit_inputs[cs:cs + max(1, args.critic_micro_batch)]; _ml = max(x.numel() for x in _ch)
+                        _bx = torch.full((len(_ch), _ml), tokenizer.eos_token_id, dtype=torch.long, device=device)
+                        _am = torch.zeros((len(_ch), _ml), dtype=torch.long, device=device)
+                        for r_, x_ in enumerate(_ch): _bx[r_, :x_.numel()] = x_.to(device); _am[r_, :x_.numel()] = 1
+                        _sh.append(normalize_activation(critic_predict(critic, _bx, _am, mse_scale_f).float(), mse_scale_f))
+                _shadow_n = torch.cat(_sh)
+                shape_terms["critic/scoring_snapshot_mse"] = float(((_shadow_n - _golds_n) ** 2).mean())   # error of the critic that scored this batch
+                if args.critic_anchor <= 0:
+                    _shadow_n = None   # gauge only
+
+            def _critic_mse_pass():
+                """one forward/backward over this rank's co-train batch (MSE critic path). The default path (no weights, no anchor) is the
+                original code verbatim; returns (loss for logging, finite, per-row plain MSE list when the gauges are on)."""
                 bs_total = len(crit_inputs)
                 pad_id = tokenizer.eos_token_id
-                if is_accum_start:
-                    critic_optim.zero_grad()
-                accumulated = 0.0
-                finite = True
                 cmb = max(1, args.critic_micro_batch)
                 _use_kl_ar = (args.ar_loss == "downstream_kl" and kl_gold_cache)
-                if flow is not None:
-                    # flow critic: conditional FM loss (per-sample condition dropout); grads on the adapter. Data per --flow-cotrain:
-                    # the kept rollouts (classic co-training), grounded gold pairs (never the policy's own text), or half/half.
-                    if args.flow_cotrain == "rollouts":
-                        accumulated = flow.train_backward(crit_texts, crit_golds, accum)
-                    elif args.flow_cotrain == "grounded":
-                        accumulated = flow.train_backward_grounded(max(len(crit_texts), 64), accum, seed=step * 7919 + int(os.environ.get("RANK", 0)))
-                    else:
-                        h = max(len(crit_texts) // 2, 32)
-                        a1 = flow.train_backward(crit_texts[:h], crit_golds[:h], accum * 2); a2 = flow.train_backward_grounded(h, accum * 2, seed=step * 7919 + int(os.environ.get("RANK", 0)))
-                        accumulated = (a1 + a2) / 2
-                    finite = math.isfinite(accumulated)
-                    if not finite:
-                        print(f"step {step}: flow critic loss non-finite, skipping", flush=True)
-                for cs in ([] if flow is not None else range(0, bs_total, cmb)):
+                _plain = crit_w is None and _shadow_n is None
+                _wsum = (float(sum(crit_w)) + (1.0 - args.cotrain_floor) * len(crit_pairs)) if crit_w is not None else float(bs_total)
+                accumulated = 0.0
+                finite = True
+                rows = []
+                for cs in range(0, bs_total, cmb):
                     chunk = list(range(cs, min(cs + cmb, bs_total)))
                     bs = len(chunk)
                     if _use_kl_ar:
@@ -3544,15 +3702,111 @@ def main():
                     gold = torch.stack([crit_golds[i] for i in chunk]).to(device).float()
                     pred_n = normalize_activation(pred, mse_scale_f)
                     gold_n = normalize_activation(gold, mse_scale_f)
-                    # Scale so the sum across micro-batches = MSE over full batch;
-                    # extra /accum for gradient accumulation across steps.
-                    raw_mse = F.mse_loss(pred_n, gold_n) * (bs / bs_total)
+                    if _plain:
+                        # Scale so the sum across micro-batches = MSE over full batch;
+                        # extra /accum for gradient accumulation across steps.
+                        raw_mse = F.mse_loss(pred_n, gold_n) * (bs / bs_total)
+                    else:   # awr/dpo weights (sum to 1 per group) and/or the lagged-AR anchor to the scoring snapshot's predictions
+                        per_ = ((pred_n - gold_n) ** 2).mean(-1)
+                        w_ = (torch.tensor([crit_w[i] for i in chunk], dtype=per_.dtype, device=per_.device) if crit_w is not None
+                              else torch.ones(bs, dtype=per_.dtype, device=per_.device))
+                        raw_mse = (w_ * per_).sum() / _wsum
+                        if _shadow_n is not None:
+                            raw_mse = raw_mse + args.critic_anchor * (w_ * ((pred_n - _shadow_n[cs:cs + bs].to(pred_n.dtype)) ** 2).mean(-1)).sum() / _wsum
                     if not torch.isfinite(raw_mse):
                         print(f"step {step}: critic loss non-finite (chunk {cs}), skipping", flush=True)
                         finite = False
                         break
                     (raw_mse / accum).backward()
                     accumulated += raw_mse.item()
+                    if _gauges:
+                        rows += ((pred_n.detach().float() - gold_n.float()) ** 2).mean(-1).tolist()
+                if finite and crit_pairs:
+                    # DPO-style critic ranking: prefer a lower reconstruction error for the group's best rollout than for its worst,
+                    # -log sigmoid(beta*(e_worst - e_best)); a pair stops pushing once the margin exceeds --cotrain-dpo-margin (bounded),
+                    # plus (1-floor) * MSE on the best. Normalised by the same per-group weight total as the floor term.
+                    _np = max(1, cmb // 2); _m_all, _act_all, _rk_all = [], [], []
+                    for ps in range(0, len(crit_pairs), _np):
+                        _pp = crit_pairs[ps:ps + _np]; _rows = [b for b, _ in _pp] + [w for _, w in _pp]
+                        max_len = max(crit_inputs[i].numel() for i in _rows)
+                        batch_ids = torch.full((len(_rows), max_len), pad_id, dtype=torch.long, device=device)
+                        attn = torch.zeros((len(_rows), max_len), dtype=torch.long, device=device)
+                        for row, i in enumerate(_rows):
+                            L = crit_inputs[i].numel(); batch_ids[row, :L] = crit_inputs[i].to(device); attn[row, :L] = 1
+                        pred = critic_predict(critic, batch_ids, attn, mse_scale_f)
+                        gold = torch.stack([crit_golds[i] for i in _rows]).to(device).float()
+                        per_ = ((normalize_activation(pred, mse_scale_f) - normalize_activation(gold, mse_scale_f)) ** 2).mean(-1)
+                        e_b, e_w = per_[:len(_pp)], per_[len(_pp):]
+                        margin = e_w - e_b
+                        active = (margin.detach() < args.cotrain_dpo_margin).to(per_.dtype)
+                        rk = F.softplus(-args.cotrain_dpo_beta * margin) * active
+                        loss_p = (1.0 - args.cotrain_floor) * (e_b + args.cotrain_dpo_weight * rk).sum() / _wsum
+                        if not torch.isfinite(loss_p):
+                            print(f"step {step}: critic dpo loss non-finite, skipping", flush=True); finite = False; break
+                        (loss_p / accum).backward(); accumulated += loss_p.item()
+                        _m_all += margin.detach().float().tolist(); _act_all += active.float().tolist(); _rk_all += rk.detach().float().tolist()
+                    if _m_all:
+                        shape_terms["critic/dpo_margin_mean"] = float(np.mean(_m_all)); shape_terms["critic/dpo_active_frac"] = float(np.mean(_act_all))
+                        shape_terms["critic/dpo_rank_loss"] = float(np.mean(_rk_all)); shape_terms["critic/dpo_pairs"] = float(len(_m_all))
+                return accumulated, finite, rows
+
+            # ---- extra critic steps on the same batch (--critic-steps-per-batch k: the fast critic of a two-timescale setup). Runs on EVERY
+            # rank (collectives stay matched even when a rank built no batch); the LAST pass goes through the normal step path below. ----
+            _reps = max(1, args.critic_steps_per_batch) if flow is None else 1
+            _pre_rows = None
+            for _rep in range(_reps - 1):
+                critic_optim.zero_grad(set_to_none=True)
+                _ok_r = False
+                if crit_inputs:
+                    _acc_r, _ok_r, _rows_r = _critic_mse_pass()
+                    if _rep == 0:
+                        _pre_rows = _rows_r; shape_terms["critic/loss_rep0"] = _acc_r
+                if is_dist:
+                    if not _ok_r:
+                        for p in critic_trainable:
+                            if p.grad is not None: p.grad.zero_()
+                    _allreduce_grads_(critic_trainable, world_size)
+                _gn_r = torch.nn.utils.clip_grad_norm_(critic_trainable, args.max_grad_norm)
+                _gn_r = _gn_r.item() if hasattr(_gn_r, "item") else float(_gn_r)
+                if math.isfinite(_gn_r) and (_ok_r or is_dist):
+                    critic_ema.assert_live("(extra critic step)")
+                    critic_optim.step()
+                    critic_ema.update()
+                critic_optim.zero_grad(set_to_none=True)
+            if crit_inputs:
+                # Micro-batch the critic update — single forward on 256 sequences
+                # × 200 tokens × 5.5B-param critic with grad blows past 130GB.
+                # Accumulate gradient across micro-batches, single step at the
+                # end (loss is divided by total bs so it averages correctly).
+                bs_total = len(crit_inputs)
+                pad_id = tokenizer.eos_token_id
+                if is_accum_start:
+                    critic_optim.zero_grad()
+                accumulated = 0.0
+                finite = True
+                cmb = max(1, args.critic_micro_batch)
+                _use_kl_ar = (args.ar_loss == "downstream_kl" and kl_gold_cache)
+                if flow is not None:
+                    # flow critic: conditional FM loss (per-sample condition dropout); grads on the adapter. Data per --flow-cotrain:
+                    # the kept rollouts (classic co-training), grounded gold pairs (never the policy's own text), or half/half.
+                    if args.flow_cotrain == "rollouts":
+                        accumulated = flow.train_backward(crit_texts, crit_golds, accum)
+                    elif args.flow_cotrain == "grounded":
+                        accumulated = flow.train_backward_grounded(max(len(crit_texts), 64), accum, seed=step * 7919 + int(os.environ.get("RANK", 0)))
+                    else:
+                        h = max(len(crit_texts) // 2, 32)
+                        a1 = flow.train_backward(crit_texts[:h], crit_golds[:h], accum * 2); a2 = flow.train_backward_grounded(h, accum * 2, seed=step * 7919 + int(os.environ.get("RANK", 0)))
+                        accumulated = (a1 + a2) / 2
+                    finite = math.isfinite(accumulated)
+                    if not finite:
+                        print(f"step {step}: flow critic loss non-finite, skipping", flush=True)
+                if flow is None:
+                    _acc_m, finite, _rows_m = _critic_mse_pass()
+                    accumulated += _acc_m
+                    if _pre_rows is None:
+                        _pre_rows = _rows_m
+                    if _gauges and _pre_rows:
+                        shape_terms["critic/live_pre_mse"] = float(np.mean(_pre_rows))   # live critic on fresh rollouts BEFORE this step's update(s)
                 critic_bwd_ok = finite
                 # Supplemental downstream-KL on a strided subsample (MSE grads above
                 # stay on ALL rollouts): grad += w * mean_KL / accum.
@@ -3611,6 +3865,15 @@ def main():
                 critic_optim.zero_grad(set_to_none=True)
             critic_grad_norm_val = _cgn
 
+        if _post_gauge_ctx is not None:   # staleness gauge: live critic error on this step's fresh rollouts AFTER its update(s)
+            _rp, _ = score_with_critic(critic, tokenizer, _post_gauge_ctx[0], _post_gauge_ctx[1], template, mse_scale_f, device)
+            _post = [-r for r in _rp if r is not None]
+            if _post:
+                shape_terms["critic/live_post_mse"] = float(np.mean(_post))
+                if "critic/live_pre_mse" in shape_terms:
+                    shape_terms["critic/update_gain"] = shape_terms["critic/live_pre_mse"] - shape_terms["critic/live_post_mse"]
+                if "critic/scoring_snapshot_mse" in shape_terms:
+                    shape_terms["critic/staleness"] = shape_terms["critic/scoring_snapshot_mse"] - shape_terms["critic/live_post_mse"]
         t_critic_end = time.time()  # [timing] end of AR critic co-training
 
         # ---- logging ----
@@ -3814,6 +4077,41 @@ def main():
                            str(_dump_dir / f"step_{step:06d}_r{int(os.environ.get('RANK', 0))}.pt"))
             except Exception as _e:
                 print(f"[eval] rollout dump failed: {_e}", flush=True)
+            # ---- co-adaptation tripwire (--tripwire-every): meaning-preserving variants of the eval explanations scored by the LIVE
+            # co-trained critic; a widening orig-vs-variant FVE gap means the critic reads surface form. Variants are dumped in the
+            # eval_rollouts format so nla/flow/score_dumps.py --critic <frozen SFT critic> gives the frozen-critic side offline. ----
+            if args.tripwire_every > 0 and step % args.tripwire_every == 0 and flow is None:
+                _t_tw = time.time()
+                _tw_idx = [ei for ei in range(len(eval_rows)) if _eval_expls[ei]]
+                _tw_orig = [_eval_expls[ei] for ei in _tw_idx]
+                _tw_acts = [_eval_prompts_with_acts[ei][1] for ei in _tw_idx]
+                _tw_para, _tw_pf = paraphrase_base(actor, tokenizer, vectors_ref, _tw_orig, device, seed=9_999 + step)
+                _tw_rng = random.Random(step)
+                _tw_shuf = [shuffle_units(t_, _tw_rng) for t_ in _tw_orig]
+                _tw_fve = {}
+                for _nm, _txts in (("orig", _tw_orig), ("para", _tw_para), ("shuf", _tw_shuf)):
+                    _rr, _ = score_with_critic(critic, tokenizer, _txts, _tw_acts, template, mse_scale_f, device)
+                    _vv = [-r for r in _rr if r is not None]
+                    _tw_fve[_nm] = (1.0 - float(np.mean(_vv)) / eval_fve_baseline) * 100.0 if _vv else float("nan")
+                    try:
+                        _twd = save_dir / "tripwire" / _nm; _twd.mkdir(parents=True, exist_ok=True)
+                        torch.save({"step": step, "explanations": _txts, "vector_rewards": _rr, "flow_rewards": [], "eval_idx": _tw_idx,
+                                    "activations": torch.stack([torch.as_tensor(a_).to(torch.float16).cpu() for a_ in _tw_acts])},
+                                   str(_twd / f"step_{step:06d}_r0.pt"))
+                    except Exception as _e:
+                        print(f"[tripwire] dump failed: {_e}", flush=True)
+                for _nm in ("orig", "para", "shuf"):
+                    log[f"tripwire/fve_{_nm}"] = _tw_fve[_nm]
+                log["tripwire/gap_para"] = _tw_fve["orig"] - _tw_fve["para"]
+                log["tripwire/gap_shuf"] = _tw_fve["orig"] - _tw_fve["shuf"]
+                log["tripwire/n"] = float(len(_tw_idx)); log["tripwire/para_failed"] = float(_tw_pf)
+                log["tripwire/para_identical_frac"] = float(np.mean([p_ == o_ for p_, o_ in zip(_tw_para, _tw_orig)])) if _tw_orig else float("nan")
+                log["time/tripwire_s"] = time.time() - _t_tw
+                print(f"  [tripwire@{step}] live-critic FVE orig {_tw_fve['orig']:.1f} para {_tw_fve['para']:.1f} shuf {_tw_fve['shuf']:.1f} "
+                      f"(gap para {log['tripwire/gap_para']:.2f}, shuf {log['tripwire/gap_shuf']:.2f}; para failed {_tw_pf}/{len(_tw_idx)}; "
+                      f"{log['time/tripwire_s']:.0f}s)", flush=True)
+                if _tw_orig:
+                    print(f"    [tripwire@{step} ex] ORIG {_tw_orig[0][:200]!r}\n    PARA {_tw_para[0][:200]!r}\n    SHUF {_tw_shuf[0][:200]!r}", flush=True)
             eval_rewards_ema = None
             if critic_ema.enabled:
                 with critic_ema.swapped():
