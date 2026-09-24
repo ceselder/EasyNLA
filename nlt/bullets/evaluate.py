@@ -37,11 +37,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--ckpt", required=True); p.add_argument("--text", required=True); p.add_argument("--out", required=True)
     p.add_argument("--flip", default=None); p.add_argument("--verbosity", default=None); p.add_argument("--n-val", type=int, default=1536); p.add_argument("--split", default="val")
-    p.add_argument("--no-crux", action="store_true"); p.add_argument("--n-swap", type=int, default=1); p.add_argument("--batch", type=int, default=96); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", default=None, help="a:b slice of the fixed val rows to report on (e.g. 0:1024 when 1024:1536 picked the checkpoint)"); p.add_argument("--no-crux", action="store_true"); p.add_argument("--n-swap", type=int, default=1); p.add_argument("--batch", type=int, default=96); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda"; rng = np.random.default_rng(a.seed); os.makedirs(a.out, exist_ok=True); torch.manual_seed(a.seed)
     norm = GlobalNorm.load(os.path.join(a.data_dir, "stats.pt"), "affine").to(dev)
     verb = [int(v) for v in a.verbosity.split(",")] if a.verbosity else None
     pv = load_pairs(a.data_dir, a.split).iloc[: a.n_val]
+    if a.rows: lo, hi = [int(x) for x in a.rows.split(":")]; pv = pv.iloc[lo:hi]
     df = join_text(a.text, pv, verbosity=verb)
     print(f"[eval] {len(df)} rows on the first {a.n_val} fixed {a.split} pairs; bullets/row {df['n_bullets'].mean():.2f}", flush=True)
     H = gather_acts(a.data_dir, a.split, df["pos_idx"].values, df["i"].values, df["j"].values)

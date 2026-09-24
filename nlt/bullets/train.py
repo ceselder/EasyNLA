@@ -21,7 +21,9 @@ def main():
     p.add_argument("--text", required=True); p.add_argument("--val-text", required=True)
     p.add_argument("--verbosity", default=None, help="comma list of verbosity levels to keep"); p.add_argument("--val-verbosity", default=None)
     p.add_argument("--pair-ids", default=None, help="json list of train pair_ids to restrict to (matched runs)"); p.add_argument("--n-val", type=int, default=1536)
-    p.add_argument("--max-train", type=int, default=None)
+    p.add_argument("--max-train", type=int, default=None); p.add_argument("--epochs", type=float, default=0, help="if > 0, steps = epochs * n_train / batch")
+    p.add_argument("--freeze-lora", action="store_true", help="frozen text encoder (no LoRA): small-data regime"); p.add_argument("--bottleneck", type=int, default=0); p.add_argument("--text-dropout", type=float, default=0.0)
+    p.add_argument("--select-rows", default=None, help="a:b val rows used ONLY to pick ckpt_best.pt (report on the other rows)")
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--batch", type=int, default=64); p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--lr-lora", type=float, default=1e-4); p.add_argument("--lr-head", type=float, default=5e-4); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--warmup", type=int, default=50)
     p.add_argument("--p-drop", type=float, default=0.3); p.add_argument("--p-empty", type=float, default=0.1); p.add_argument("--cos-w", type=float, default=0.5)
@@ -51,6 +53,12 @@ def main():
     Dva = norm.normalize(Hva["h_j"].to(dev)) - norm.normalize(Hva["h_i"].to(dev)); Xva = norm.normalize(Hva["h_i"].to(dev))
     del Htr, Hva
 
+    if a.epochs > 0: a.steps = max(50, int(round(a.epochs * len(tr) / a.batch)))
+    sel = None
+    if a.select_rows:
+        lo, hi = [int(x) for x in a.select_rows.split(":")]; sel_ids = set(pv["pair_id"].iloc[lo:hi]); sel = torch.as_tensor(va["pair_id"].isin(sel_ids).values, device=dev)
+        print(f"[train] selection rows {lo}:{hi} -> {int(sel.sum())} val rows for ckpt_best; {int((~sel).sum())} rows left for the report", flush=True)
+    print(f"[train] steps {a.steps} (batch {a.batch}, {a.steps * a.batch / max(1, len(tr)):.1f} epochs)", flush=True)
     model = M.build(a, dev); model.train()
     opt = torch.optim.AdamW(M.trainable_groups(model, a.lr_lora, a.lr_head, a.wd), betas=(0.9, 0.95))
     base_lrs = [g["lr"] for g in opt.param_groups]
@@ -80,11 +88,15 @@ def main():
                 p_all = model(x, [join_bullets(b) for b in bullets_va[s:s + B]]).float(); p_emp = model(x, [""] * len(x)).float()
             se_all.append(((p_all - d) ** 2).sum(-1)); se_emp.append(((p_emp - d) ** 2).sum(-1)); en.append((d ** 2).sum(-1))
         se_all, se_emp, en = map(torch.cat, (se_all, se_emp, en)); model.train()
-        return {"val/fve_all": float(1 - se_all.sum() / en.sum()), "val/fve_empty": float(1 - se_emp.sum() / en.sum()),
-                "val/relmse_all": float((se_all / en).mean()), "val/relmse_empty": float((se_emp / en).mean()),
-                "val/gain_per_ex": float(((se_emp - se_all) / en).mean()), "val/p_text_beats_empty": float((se_all < se_emp).float().mean())}
+        def blk(m, pre):
+            return {f"{pre}/fve_all": float(1 - se_all[m].sum() / en[m].sum()), f"{pre}/fve_empty": float(1 - se_emp[m].sum() / en[m].sum()),
+                    f"{pre}/relmse_all": float((se_all[m] / en[m]).mean()), f"{pre}/relmse_empty": float((se_emp[m] / en[m]).mean()),
+                    f"{pre}/gain_per_ex": float(((se_emp[m] - se_all[m]) / en[m]).mean()), f"{pre}/p_text_beats_empty": float((se_all[m] < se_emp[m]).float().mean())}
+        out = blk(torch.ones_like(en, dtype=torch.bool), "val")
+        if sel is not None: out.update(blk(sel, "sel")); out.update(blk(~sel, "rep"))
+        return out
 
-    curve = []; t0 = time.time(); N = len(tr)
+    curve = []; t0 = time.time(); N = len(tr); best = float("inf"); best_step = 0
     for step in range(a.steps):
         f = min(1.0, (step + 1) / max(1, a.warmup)) * (0.5 * (1 + math.cos(math.pi * step / a.steps)) * 0.95 + 0.05)
         for g, b in zip(opt.param_groups, base_lrs): g["lr"] = b * f
@@ -93,15 +105,17 @@ def main():
             pred = model(x, texts).float()
         loss, rm, cos = M.recon_loss(pred, d, a.cos_w)
         opt.zero_grad(set_to_none=True); loss.backward(); gn = float(torch.nn.utils.clip_grad_norm_([q for g in opt.param_groups for q in g["params"]], 1.0)); opt.step()
-        log = {"train/loss": float(loss.detach()), "train/relmse": float(rm.detach().mean()), "train/cos": float(cos.detach().mean()), "train/grad_norm": gn, "train/lr_head": opt.param_groups[1]["lr"]}
+        log = {"train/loss": float(loss.detach()), "train/relmse": float(rm.detach().mean()), "train/cos": float(cos.detach().mean()), "train/grad_norm": gn, "train/lr_head": opt.param_groups[-1]["lr"]}
         if step % 50 == 0:
             print(f"[train] {step}/{a.steps} loss {log['train/loss']:.4f} relmse {log['train/relmse']:.4f} cos {log['train/cos']:.3f} gn {gn:.2f} {(time.time() - t0) / (step + 1):.2f}s/step", flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             ev = evaluate(); log.update(ev); curve.append({"step": step + 1, **log}); print(f"[eval@{step + 1}] {json.dumps({k: round(v, 4) for k, v in ev.items()})}", flush=True)
             json.dump(curve, open(os.path.join(a.out, "curve.json"), "w"), indent=1)
+            crit = ev.get("sel/relmse_all", ev["val/relmse_all"])
+            if crit < best: best, best_step = crit, step + 1; M.save(model, os.path.join(a.out, "ckpt_best.pt"), vars(a) | {"best_step": best_step}); print(f"[train] ckpt_best <- step {best_step} ({crit:.4f})", flush=True)
         if run is not None: run.log(log, step=step)
     M.save(model, os.path.join(a.out, "ckpt_final.pt"), vars(a))
-    json.dump({"args": vars(a), "final": curve[-1] if curve else {}, "n_train": N, "n_val": len(va), "seconds": time.time() - t0}, open(os.path.join(a.out, "train_summary.json"), "w"), indent=1)
+    json.dump({"args": vars(a), "final": curve[-1] if curve else {}, "best_step": best_step, "best_crit": best, "n_train": N, "n_val": len(va), "seconds": time.time() - t0}, open(os.path.join(a.out, "train_summary.json"), "w"), indent=1)
     if run is not None: run.finish()
     print(f"[train] DONE -> {a.out}", flush=True)
 

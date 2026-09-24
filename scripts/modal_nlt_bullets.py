@@ -56,7 +56,8 @@ def chain(tag: str, extra: str = "", data: str = DATA):
     tr_args, ev_args = [s.strip() for s in extra.split(";;")]
     rc = _run([sys.executable, "-m", "nlt.bullets.train", "--data-dir", data, "--out", f"/vol/bullets/{tag}", "--tag", tag] + tr_args.split())
     if rc != 0: return rc
-    return _run([sys.executable, "-m", "nlt.bullets.evaluate", "--data-dir", data, "--out", f"/vol/bullets/eval/{tag}", "--ckpt", f"/vol/bullets/{tag}/ckpt_final.pt"] + ev_args.split())
+    ck = f"/vol/bullets/{tag}/ckpt_best.pt" if os.path.exists(f"/vol/bullets/{tag}/ckpt_best.pt") else f"/vol/bullets/{tag}/ckpt_final.pt"
+    return _run([sys.executable, "-m", "nlt.bullets.evaluate", "--data-dir", data, "--out", f"/vol/bullets/eval/{tag}", "--ckpt", ck] + ev_args.split())
 
 
 @app.function(timeout=1800, volumes={"/vol": vol}, cpu=2, memory=8 * 1024)

@@ -46,7 +46,7 @@ class TextTower(nn.Module):
 
 
 class Reconstructor(nn.Module):
-    def __init__(self, d_act=4096, d_enc=1024, d_model=1024, n_q=4, n_heads=8, hidden=4096, n_hidden=2, text_tower: TextTower | None = None):
+    def __init__(self, d_act=4096, d_enc=1024, d_model=1024, n_q=4, n_heads=8, hidden=4096, n_hidden=2, text_tower: TextTower | None = None, bottleneck=0, text_dropout=0.0):
         super().__init__()
         self.text = text_tower
         self.src = nn.Sequential(nn.Linear(d_act, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
@@ -56,7 +56,10 @@ class Reconstructor(nn.Module):
         self.q_from_src = nn.Linear(d_model, n_q * d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.ln_q = nn.LayerNorm(d_model); self.ln_kv = nn.LayerNorm(d_model)
-        din = d_model + n_q * d_model
+        self.bottleneck = bottleneck
+        if bottleneck:                            # squeeze the text read-out through a small channel (+ dropout): less capacity to memorise 4096-d deltas
+            self.squeeze = nn.Sequential(nn.Linear(n_q * d_model, bottleneck), nn.SiLU(), nn.Dropout(text_dropout))
+        din = d_model + (bottleneck if bottleneck else n_q * d_model)
         layers = [nn.Linear(din, hidden), nn.SiLU()]
         for _ in range(n_hidden - 1): layers += [nn.Linear(hidden, hidden), nn.SiLU()]
         layers += [nn.Linear(hidden, d_act)]
@@ -76,8 +79,9 @@ class Reconstructor(nn.Module):
         pad = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=dev), ~mask], 1)   # True = ignore
         q = self.ln_q(self.queries.expand(B, -1, -1) + self.q_from_src(s).view(B, self.n_q, self.d_model))
         r, _ = self.attn(q, kv, kv, key_padding_mask=pad, need_weights=False)          # [B, n_q, d_model]
-        z = torch.cat([s, r.reshape(B, -1)], -1)
-        return self.head(z)
+        rt = r.reshape(B, -1)
+        if self.bottleneck: rt = self.squeeze(rt)
+        return self.head(torch.cat([s, rt], -1))
 
 
 def rel_mse(pred, target, eps=1e-6):
@@ -93,15 +97,17 @@ def recon_loss(pred, target, cos_w=0.5):
 
 def build(args_or_dict, device="cuda"):
     a = args_or_dict if isinstance(args_or_dict, dict) else vars(args_or_dict)
-    tower = TextTower(a.get("enc_model", "Qwen/Qwen3-0.6B"), a.get("enc_layer", 20), a.get("lora_r", 64), a.get("lora_alpha", 16), a.get("max_len", 320), trainable=True)
-    model = Reconstructor(d_act=4096, d_enc=tower.d_enc, d_model=a.get("d_model", 1024), n_q=a.get("n_q", 4), n_heads=a.get("n_heads", 8), hidden=a.get("hidden", 4096), n_hidden=a.get("n_hidden", 2), text_tower=tower)
+    tower = TextTower(a.get("enc_model", "Qwen/Qwen3-0.6B"), a.get("enc_layer", 20), a.get("lora_r", 64), a.get("lora_alpha", 16), a.get("max_len", 320), trainable=not a.get("freeze_lora", False))
+    model = Reconstructor(d_act=4096, d_enc=tower.d_enc, d_model=a.get("d_model", 1024), n_q=a.get("n_q", 4), n_heads=a.get("n_heads", 8), hidden=a.get("hidden", 4096), n_hidden=a.get("n_hidden", 2), text_tower=tower,
+                          bottleneck=a.get("bottleneck", 0), text_dropout=a.get("text_dropout", 0.0))
     return model.to(device)
 
 
 def trainable_groups(model, lr_lora, lr_head, wd=0.01):
     lora = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
     head = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" not in n]
-    return [{"params": lora, "lr": lr_lora, "weight_decay": 0.0}, {"params": head, "lr": lr_head, "weight_decay": wd}]
+    groups = [{"params": lora, "lr": lr_lora, "weight_decay": 0.0}, {"params": head, "lr": lr_head, "weight_decay": wd}]
+    return [g for g in groups if g["params"]]
 
 
 def save(model, path, args):
