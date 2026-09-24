@@ -129,6 +129,9 @@ def run(task: str = "plan", only: str = "", dry_run: int = 1):
             from huggingface_hub import HfApi
             api = HfApi(token=os.environ["HF_TOKEN"])
             api.create_repo(repo_id, repo_type=repo["type"], private=True, exist_ok=True)
+            info0 = api.repo_info(repo_id, repo_type=repo["type"])
+            if not info0.private:                                  # HARD RULE (board #557): never upload into a public repo; never flip visibility from here
+                print(f"   REFUSING {repo_id}: it exists and is PUBLIC -- make it private first", flush=True); continue
             open(os.path.join(work, "README.md"), "w").write(card)
             api.upload_file(path_or_fileobj=os.path.join(work, "README.md"), path_in_repo="README.md", repo_id=repo_id, repo_type=repo["type"])
             for (p, d), s in zip(items, sizes):

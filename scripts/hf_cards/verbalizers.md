@@ -6,6 +6,8 @@ tags: [interpretability, verbalizer, lora, qwen3-8b, natural-language-transcoder
 ---
 # NLT verbalizers V0 / V0b (Qwen3-8B LoRA) -- PRIVATE research artifact
 
+(Repo created by the rl agent at 00:30 UTC and made private at 00:51; this card and the meta.json files were added by the packager.)
+
 Two-marker **verbalizers**: Qwen3-8B + LoRA (r64, alpha 16, rsLoRA) that read TWO injected residual activations of Qwen3-8B --
 the source h_i and the target h_j of the same token position, injected by norm-matched addition at the output of block 1 at two
 marker positions of a constant prompt -- and write one sentence z describing what changed between them. No layer index is ever

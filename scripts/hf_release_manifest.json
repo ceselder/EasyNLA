@@ -28,7 +28,7 @@
    }
   },
   {
-   "name": "nlt-qwen3-8b-verbalizers",
+   "name": "nlt-qwen3-8b-verbalizer",
    "type": "model",
    "card": "verbalizers.md",
    "folders": [
@@ -51,7 +51,8 @@
      "dst": "v0b_mix"
     }
    ],
-   "card_vars": {}
+   "card_vars": {},
+   "note": "reuses rl's existing repo (created 00:30, flipped to private by the orchestrator at 00:51); the upload only adds/updates files"
   },
   {
    "name": "nlt-qwen3-8b-critics",
