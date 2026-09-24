@@ -28,6 +28,16 @@ def _run(cmd):
     os.environ.setdefault("WANDB_DIR", "/root/wandb"); os.makedirs("/root/wandb", exist_ok=True)
     vol.reload()
     print("[modal] " + " ".join(cmd), flush=True)
+    # numbered checkpoints must be visible to OTHER containers mid-run (selection loops, rl hot-swap): commit in the background
+    every = int(os.environ.get("NLT_COMMIT_EVERY", "600"))
+    if every > 0:
+        import threading, time as _t
+        def _bg():
+            while True:
+                _t.sleep(every)
+                try: vol.commit(); print(f"[modal] bg volume commit ok", flush=True)
+                except Exception as e: print(f"[modal] bg volume commit failed: {e}", flush=True)
+        threading.Thread(target=_bg, daemon=True).start()
     rc = subprocess.call(cmd, cwd=REPO_REMOTE)
     vol.commit(); return rc
 
