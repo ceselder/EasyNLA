@@ -85,6 +85,11 @@ def train2(tag: str, extra: str = ""):
     return _torchrun(tag, extra, 2, commit_every=120)
 
 
+@app.function(gpu="B200:2", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=512 * 1024, ephemeral_disk=600 * 1024)
+def train2l(tag: str, extra: str = ""):
+    return _torchrun(tag, extra, 2)
+
+
 @app.function(gpu="B200", timeout=6 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=256 * 1024, ephemeral_disk=600 * 1024)
 def train1(tag: str, extra: str = ""):
     return _torchrun(tag, extra, 1, commit_every=120)
