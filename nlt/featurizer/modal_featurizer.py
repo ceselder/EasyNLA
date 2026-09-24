@@ -55,8 +55,8 @@ vol = modal.Volume.from_name("nlt", create_if_missing=True)
 vol_ro = modal.Volume.from_name("nla-exp")      # read-only fallback for the base snapshot
 SECRETS = [modal.Secret.from_name("nla-exp-secrets")]
 VOLS = {"/vol": vol, "/vol_nla_exp": vol_ro}
-GPU_ANY = ["H100", "A100-80GB", "A100-40GB", "L40S"]     # fallback list: the dossier jobs are light
-GPU_BIG = ["H100", "A100-80GB", "L40S"]
+GPU_ANY = ["H100", "A100-80GB", "A100-40GB", "L40S", "L4", "A10G"]     # fallback list: the dossier jobs are light
+GPU_BIG = ["H100", "A100-80GB", "A100-40GB", "L40S", "L4", "A10G"]     # Qwen3-8B bf16 + LoRA fits in 24 GB at batch 32
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -610,7 +610,7 @@ MARKER = " ?"
 
 
 @app.function(gpu=GPU_BIG, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=40 * 1024, max_containers=4)
-def maemm_invert(spec: str, out_path: str, max_new_tokens: int = 40, batch_size: int = 64, coeff: float = 1.0, prompt_variant: str = "user",
+def maemm_invert(spec: str, out_path: str, max_new_tokens: int = 40, batch_size: int = 32, coeff: float = 1.0, prompt_variant: str = "user",
                  verify: int = 1, n_samples: int = 1) -> str:
     """spec: JSON path on the volume with a list of {name, kind, layer, feature, vec_path, row} or {name, kind, vec: [..]}.
     Writes parquet [name, kind, layer, feature, text, sample_idx, verify_act, verify_ref] to out_path."""
