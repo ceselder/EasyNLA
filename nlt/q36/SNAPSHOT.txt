@@ -1,0 +1,6 @@
+Vendored from ~/grad-olens (github.com/ceselder/grad-olens), commit 4893b3c6cbe3e755ba0a223b027ff80ca24e3c70 (2026-09-19), READ-ONLY source.
+  common.py        <- src/common.py (load_base, backbone, InjectL1, MARKER_ID, LORA_TARGET_RE, ar_read/Layer42Hook/StopForward, norm_match) + multi-layer capture + J-lens reader + olens_prompt (from src/train_grad_olens.py)
+  rollout_vllm.py  <- src/rollout_vllm.py (+ --prompt bullets, --specs h_L12;h_L42-h_L24;..., greedy+sampled per row, --out-dir)
+  modal image pins <- modal_app.py (torch 2.8.0 / transformers 5.5.4 / peft 0.19.1) and modal_vllm.py (vllm 0.21.0 + ceselder/vllm-metamodels@6a0a0e5)
+Olens checkpoints used (grad-olens volume, read-only): ckpt/ar_ivrl/final (RL 300 steps, regular activation olens, input h42), ckpt/ar_ivsft/final, ckpt/h2hpfx_ar_r512/final (span -> h42 reconstructor, r512 cos loss, read last).
+Also uses (olens-1layer volume, read-only): data/harvest_v5 (TEST FILE shard00_part0000.parquet never trained on), jlens/qwen36_27b_jlens.pt, frozen/qwen36_27b_embed_head.pt.
