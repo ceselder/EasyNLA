@@ -32,10 +32,10 @@ vol_glp = modal.Volume.from_name("nla-glp", create_if_missing=True)
 vol_q36 = modal.Volume.from_name("nla-qwen36-ema")
 VOLS = {"/vol_glp": vol_glp, "/vol_q36": vol_q36}
 image_q = image_base.add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE)
-image_g = (modal.Image.from_registry("vllm/vllm-openai:v0.29.0", setup_dockerfile_commands=["RUN ln -sf $(which python3) /usr/local/bin/python"]).entrypoint([])
+image_g = (modal.Image.from_registry("vllm/vllm-openai:v0.30.0", setup_dockerfile_commands=["RUN ln -sf $(which python3) /usr/local/bin/python"]).entrypoint([])   # 0.30: FlashInfer attention for Gemma-4 (engine optimiser, +65%)
            .run_commands("pip install --no-cache-dir pyarrow wandb 'huggingface_hub[hf_xet]'")
            .env({"HF_HOME": "/vol_glp/hf", "HF_XET_HIGH_PERFORMANCE": "1", "PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false",
-                 "PYTHONPATH": REPO_REMOTE, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"})
+                 "PYTHONPATH": REPO_REMOTE, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1", "VLLM_CACHE_ROOT": "/vol_glp/scale/vllm_cache/v30"})
            .add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE))
 app = modal.App("nla-scale")
 
@@ -44,7 +44,7 @@ app = modal.App("nla-scale")
 # production labeller config, from the 6-way bench (20k real prompts, 1 B200 each): bigger batches +8 %, one variant per document +3 % prompts/s at
 # 10 % longer outputs; fp8 weights+KV -4 % and 8x parse failures (decode-bound on the MoE/attention kernels, not weight bandwidth); n>1 gives no
 # extra explanations per second (127 at n=2 vs 126) -> bf16, 1024 seqs, 32k batched tokens, n=1
-LABEL_CFG = dict(fp8=False, fp8_kv=False, max_num_seqs=1024, max_num_batched_tokens=32768, n=1)
+LABEL_CFG = dict(fp8=False, fp8_kv=False, max_num_seqs=1024, max_num_batched_tokens=32768, n=1, attention_backend="TRITON_FLASHINFER")   # backend: [gemma-engine] 03:40 win, quality-guarded
 
 
 def _llm(cfg=None):
@@ -53,6 +53,7 @@ def _llm(cfg=None):
     kw = dict(model=LABELLER, dtype="bfloat16", max_model_len=8192, gpu_memory_utilization=0.90, limit_mm_per_prompt={"image": 0},
               max_num_seqs=c["max_num_seqs"], enable_prefix_caching=True, seed=0)
     if c.get("max_num_batched_tokens"): kw["max_num_batched_tokens"] = c["max_num_batched_tokens"]
+    if c.get("attention_backend"): kw["attention_backend"] = c["attention_backend"]
     if c.get("fp8"): kw["quantization"] = "fp8"
     if c.get("fp8_kv"): kw["kv_cache_dtype"] = "fp8"
     return LLM(**kw)
@@ -232,9 +233,35 @@ def g2_label(sid: int, src: str, out_root: str):
     global _LLM
     if "_LLM" not in globals(): _LLM = _llm()
     recs, st = _g2_rows(_LLM, d["text"], [f"{a}|{b}" for a, b in zip(d["doc_id"], d["n_raw_tokens"])], d["doc_id"])
-    rows = [{"doc_id": a, "n_raw_tokens": b, **r} for a, b, r in zip(d["doc_id"], d["n_raw_tokens"], recs)]
+    import vllm as _v; eng = f"vllm-{_v.__version__}-{LABEL_CFG.get('attention_backend') or 'auto'}"
+    rows = [{"doc_id": a, "n_raw_tokens": b, **r, "engine": eng} for a, b, r in zip(d["doc_id"], d["n_raw_tokens"], recs)]
+    st["engine"] = eng
     os.makedirs(f"{out_root}/lab", exist_ok=True); pq.write_table(pa.Table.from_pylist(rows), out, compression="zstd"); vol_glp.commit()
     st["sid"] = sid; print("[g2label]", json.dumps(st), flush=True); return st
+
+
+@app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=64 * 1024)
+def g2_qc_stats(root: str = f"{ROOT}/g2"):
+    """per-engine QC of the g2 label shards: rendering parse rate, fact-sheet parse rate, deterministic pass rates, positions passing, mean words"""
+    import glob, json as _j, pyarrow.parquet as pq, collections
+    vol_glp.reload(); agg = collections.defaultdict(lambda: collections.Counter()); shards = collections.defaultdict(list)
+    for f in sorted(glob.glob(f"{root}/lab/lab_*.parquet")):
+        cols = pq.ParquetFile(f).schema_arrow.names
+        t = pq.read_table(f, columns=[c for c in ("renders", "qc", "facts", "n_pass", "engine") if c in cols]).to_pydict()
+        eng = (t.get("engine") or ["vllm-0.29.0-auto"])[0]; shards[eng].append(os.path.basename(f)); a = agg[eng]
+        for rs, qs, fa, npass in zip(t["renders"], t["qc"], t["facts"], t["n_pass"]):
+            a["positions"] += 1; a["facts_ok"] += fa is not None; a["positions_passing"] += (npass or 0) > 0; a["passing_renders"] += npass or 0
+            for r, q in zip(rs or [], qs or []):
+                a["renders"] += 1; a["parsed"] += r is not None
+                if r is None: continue
+                q = _j.loads(q); a["exact_missing"] += q.get("exact_missing", 0) > 0; a["leaked"] += q.get("leaked", 0) > 0; a["unsupported_numbers"] += q.get("unsupported_numbers", 0) > 0; a["words"] += q.get("words", 0)
+    out = {}
+    for eng, a in agg.items():
+        P, Rn, Pa = max(1, a["positions"]), max(1, a["renders"]), max(1, a["parsed"])
+        out[eng] = {"shards": len(shards[eng]), "positions": a["positions"], "fact_sheet_parse": a["facts_ok"] / P, "render_parse": a["parsed"] / Rn,
+                    "exact_missing": a["exact_missing"] / Pa, "leaked": a["leaked"] / Pa, "unsupported_numbers": a["unsupported_numbers"] / Pa,
+                    "positions_with_passing_render": a["positions_passing"] / P, "passing_renders_per_position": a["passing_renders"] / P, "mean_words": a["words"] / Pa}
+    return out
 
 
 @app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=4, memory=48 * 1024, max_containers=16)
