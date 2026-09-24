@@ -32,7 +32,8 @@ def _decoder(model):
 
 
 class TwoMarkerInjector:
-    """positions: the two marker positions in the (constant, right-padded) prompt, e.g. (spec.pos_i, spec.pos_j). With positions given,
+    """Also works for N markers (pathverb, DECISIONS v1.26): pass positions=(p_1..p_N) and a slot of shape [B, N, d]; vector k is norm-matched-added at marker k.
+    positions: the two marker positions in the (constant, right-padded) prompt, e.g. (spec.pos_i, spec.pos_j). With positions given,
     the hook injects EXACTLY there after checking the token is the marker; without them it scans the whole row for exactly two markers,
     which breaks as soon as a response contains ' ?' (seen with lens-diff texts) -- always pass positions in training code."""
     def __init__(self, model, marker_id: int, layer: int = 1, strict: bool = True, positions=None):
@@ -63,19 +64,21 @@ class TwoMarkerInjector:
         B = ids.shape[0]
         assert vec.shape[0] == B, f"injection slot has {vec.shape[0]} rows for a batch of {B}"
         bidx, pidx, vrows = [], [], []
+        n_mk = len(self.positions) if self.positions is not None else (vec.shape[1] if vec.dim() == 3 else 2)   # N markers (pathverb: 2 + writes)
         for b in range(B):
             if self.positions is not None:
                 pos = list(self.positions)
-                if ids.shape[1] <= pos[1] or any(int(ids[b, p]) != self.marker_id for p in pos):
+                if ids.shape[1] <= max(pos) or any(int(ids[b, p]) != self.marker_id for p in pos):
                     if self.strict: raise RuntimeError(f"row {b}: marker token not at the fixed prompt positions {pos}")
                     continue
             else:
                 pos = (ids[b] == self.marker_id).nonzero(as_tuple=False).flatten().tolist()
-                if len(pos) != 2:
-                    if self.strict: raise RuntimeError(f"row {b}: expected 2 marker tokens, found {len(pos)}")
+                if len(pos) != n_mk:
+                    if self.strict: raise RuntimeError(f"row {b}: expected {n_mk} marker tokens, found {len(pos)}")
                     continue
             vb = vec[b]
-            if vb.dim() == 1: vb = vb.unsqueeze(0).expand(2, -1)
+            if vb.dim() == 1: vb = vb.unsqueeze(0).expand(len(pos), -1)
+            assert vb.shape[0] >= len(pos), f"row {b}: {vb.shape[0]} vectors for {len(pos)} markers"
             for k, p in enumerate(pos): bidx.append(b); pidx.append(p); vrows.append(vb[k])
         if not bidx: return output
         # read the PRE-injection rows from `resid` (never modified), write the new rows into a clone: no saved-for-backward tensor
