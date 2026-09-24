@@ -12,7 +12,7 @@ of the conditional-mean estimate (x0-hat from pure noise) with u_j, with and wit
 """
 from __future__ import annotations
 import argparse, copy, json, math, os, time
-os.environ["HF_HUB_OFFLINE"] = "0"; os.environ.setdefault("HF_HOME", "/vol/hf_cache")
+os.environ["HF_HUB_OFFLINE"] = "0"; os.environ["HF_HOME"] = "/vol/hf_cache"          # the nlt volume (rw): Qwen3-0.6B text encoder downloads once; the 27B is not needed here
 import numpy as np, torch
 from critic_data import Store, Directions, TextPools, load_val_sets, dm_partner
 

@@ -52,7 +52,10 @@ print(f"[craft] shard {args.shard_index}: {n} pairs, {n_samp} readouts per vecto
 # ---- J-lens rising / falling per pair ----
 tb = pq.read_table(args.acts); rows = pairs["row"].to_numpy()
 jl = JLens(args.jlens, args.frozen, dev)
-def fsl(col, idx): return torch.tensor(tb.column(col).combine_chunks().flatten().to_numpy(zero_copy_only=False).reshape(tb.num_rows, D_MODEL).astype(np.float32)[idx], device=dev)
+HC = {}
+def fsl(col, idx):
+    if col not in HC: HC[col] = torch.tensor(tb.column(col).combine_chunks().flatten().to_numpy(zero_copy_only=False).reshape(tb.num_rows, D_MODEL).astype(np.float32), device=dev)
+    return HC[col][torch.as_tensor(idx, device=dev)]
 LEAN = [None] * n
 for L_i in sorted(set(pairs["i"])):
     for L_j in sorted(set(pairs[pairs["i"] == L_i]["j"])):
@@ -69,7 +72,7 @@ for L_i in sorted(set(pairs["i"])):
                         if len(out) >= args.jl_k: break
                     return out
                 LEAN[r_] = (words(up[a_]), words(dn[a_]))
-del jl; torch.cuda.empty_cache()
+del jl, HC; torch.cuda.empty_cache()
 
 # ---- embeddings for new / faded ----
 from transformers import AutoModel, AutoTokenizer

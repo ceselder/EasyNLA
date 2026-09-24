@@ -16,7 +16,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--data-dir", required=True); p.add_argument("--text", required=True, help="comma list of globs (train pools)"); p.add_argument("--val-text", default=None); p.add_argument("--out", required=True)
 p.add_argument("--steps", type=int, default=400); p.add_argument("--batch", type=int, default=8, help="per-GPU micro-batch"); p.add_argument("--grad-accum", type=int, default=4); p.add_argument("--lr", type=float, default=3e-5)
 p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16); p.add_argument("--max-len", type=int, default=160); p.add_argument("--init-adapter", default=None)
-p.add_argument("--samples", default=None, help="comma list of readout sample ids to keep (default all)"); p.add_argument("--val-rows", type=int, default=512); p.add_argument("--eval-every", type=int, default=100); p.add_argument("--save-every", type=int, default=200); p.add_argument("--warmup", type=int, default=20)
+p.add_argument("--band", default=None, help="comma list of layers to load from the store (RAM)"); p.add_argument("--samples", default=None, help="comma list of readout sample ids to keep (default all)"); p.add_argument("--val-rows", type=int, default=512); p.add_argument("--eval-every", type=int, default=100); p.add_argument("--save-every", type=int, default=200); p.add_argument("--warmup", type=int, default=20)
 p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb-project", default="nlt-qwen36-27b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--wandb-name", default=None); p.add_argument("--no-wandb", action="store_true")
 args = p.parse_args()
 import torch.distributed as dist
@@ -43,11 +43,12 @@ def load_rows(paths, split, store):
     df = load_text_pairs(files, os.path.join(args.data_dir, f"pairs_{split}.parquet")); df = df[df["pos_idx"].isin(store.row_of)].reset_index(drop=True)
     if args.samples and "sample" in df: df = df[df["sample"].isin([int(x) for x in args.samples.split(",")])].reset_index(drop=True)
     return df
-store = Store(args.data_dir, "train", device="cpu", verbose=is_main); df = load_rows(args.text, "train", store); df = df.iloc[RANK::WORLD].reset_index(drop=True)
+BAND = [int(x) for x in args.band.split(",")] if args.band else None
+store = Store(args.data_dir, "train", device="cpu", layers=BAND, verbose=is_main); df = load_rows(args.text, "train", store); df = df.iloc[RANK::WORLD].reset_index(drop=True)
 P(f"[sft] {len(df)} train text rows per rank (sources {df['source'].value_counts().to_dict()}); eff batch {args.batch * args.grad_accum * WORLD}")
 store_val = dfv = None
 if args.val_text and is_main:
-    store_val = Store(args.data_dir, "val", device="cpu", verbose=False); dfv = load_rows(args.val_text, "val", store_val).drop_duplicates("pair_id").iloc[: args.val_rows].reset_index(drop=True)
+    store_val = Store(args.data_dir, "val", device="cpu", layers=BAND, verbose=False); dfv = load_rows(args.val_text, "val", store_val).drop_duplicates("pair_id").iloc[: args.val_rows].reset_index(drop=True)
     P(f"[sft] {len(dfv)} val rows")
 
 def make_batch(sub, st):

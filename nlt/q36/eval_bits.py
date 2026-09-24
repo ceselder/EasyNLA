@@ -14,7 +14,7 @@ Twins (--twins label:glob): rows [pair_id, variant, text] with variant 'true' an
 """
 from __future__ import annotations
 import argparse, json, math, os, time
-os.environ["HF_HUB_OFFLINE"] = "0"; os.environ.setdefault("HF_HOME", "/vol/hf_cache")
+os.environ["HF_HUB_OFFLINE"] = "0"; os.environ["HF_HOME"] = "/vol/hf_cache"          # the nlt volume (rw): Qwen3-0.6B text encoder downloads once; the 27B is not needed here
 import numpy as np, torch
 import pyarrow.parquet as pq
 from critic_data import Store, Directions, load_text_pairs, dm_partner

@@ -112,7 +112,7 @@ def load_text_pairs(paths, pairs_parquet, pools_verbose=True):
         for p in (sorted(glob.glob(pat)) or [pat]):
             df = pq.read_table(p).to_pandas()
             if "source" not in df: df["source"] = os.path.basename(p).replace(".parquet", "")
-            dfs.append(df[["pair_id", "text", "source"]])
+            dfs.append(df[[c for c in ("pair_id", "text", "source", "sample") if c in df]])
     tx = pd.concat(dfs, ignore_index=True); tx = tx[tx["text"].astype(str).str.strip().str.len() > 0]
     return tx.merge(pairs, on="pair_id", how="inner")
 

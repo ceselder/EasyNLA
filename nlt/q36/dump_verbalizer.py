@@ -14,12 +14,12 @@ from critic_data import Store, Directions, load_text_pairs
 ap = argparse.ArgumentParser()
 ap.add_argument("--data-dir", required=True); ap.add_argument("--adapter", required=True); ap.add_argument("--out", required=True); ap.add_argument("--split", default="val")
 ap.add_argument("--pairs-text", default=None); ap.add_argument("--n", type=int, default=1024); ap.add_argument("--batch", type=int, default=16); ap.add_argument("--max-new", type=int, default=112)
-ap.add_argument("--sample", action="store_true"); ap.add_argument("--temperature", type=float, default=1.0); ap.add_argument("--source", default="verbalizer"); ap.add_argument("--base-only", action="store_true", help="no adapter: the base model with the injected markers (control)")
+ap.add_argument("--band", default=None); ap.add_argument("--sample", action="store_true"); ap.add_argument("--temperature", type=float, default=1.0); ap.add_argument("--source", default="verbalizer"); ap.add_argument("--base-only", action="store_true", help="no adapter: the base model with the injected markers (control)")
 args = ap.parse_args(); dev = "cuda"; t0 = time.time(); tok = load_tokenizer(); pad_id = tok.eos_token_id
 PROMPT = change_prompt(tok); PLEN = len(PROMPT); PROMPT_T = torch.tensor(PROMPT, dtype=torch.long, device=dev)
 model = load_base(dev)
 if not args.base_only: model = PeftModel.from_pretrained(model, args.adapter); model.eval()
-inj = InjectMarkers(model); dirs = Directions(os.path.join(args.data_dir, "layer_stats.pt"), device=dev); store = Store(args.data_dir, args.split, device="cpu")
+inj = InjectMarkers(model); dirs = Directions(os.path.join(args.data_dir, "layer_stats.pt"), device=dev); store = Store(args.data_dir, args.split, device="cpu", layers=[int(x) for x in args.band.split(",")] if args.band else None)
 vp = pq.read_table(os.path.join(args.data_dir, f"pairs_{args.split}.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)]
 if args.pairs_text:
     have = set(load_text_pairs(sorted(sum((glob.glob(g) for g in args.pairs_text.split(",")), [])), os.path.join(args.data_dir, f"pairs_{args.split}.parquet"))["pair_id"]); vp = vp[vp["pair_id"].isin(have)]
