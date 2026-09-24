@@ -22,8 +22,8 @@ def stats(recs):
     return {"n": n, "claims_per_expl": len(C) / max(1, n), "claim_precision": sum(c["verdict"] == "supported" for c in C) / max(1, len(C)),
             "contradicted_per_expl": sum(c["verdict"] == "contradicted" for c in C) / max(1, n),
             "names_per_expl": (typ["name"] + typ["place"] + typ["title"]) / max(1, n), "numbers_per_expl": (typ["number"] + typ["date"]) / max(1, n),
-            "quotes_per_expl": typ["quote"] / max(1, n), "halluc_1_10": sum((r or {}).get("hallucination_1_10", 0) for r in recs) / max(1, n),
-            "inform_1_10": sum((r or {}).get("informativeness_1_10", 0) for r in recs) / max(1, n)}
+            "quotes_per_expl": typ["quote"] / max(1, n), "halluc_1_10": sum((r or {}).get("h") or 0 for r in recs) / max(1, n),
+            "inform_1_10": sum((r or {}).get("inf") or 0 for r in recs) / max(1, n)}
 
 
 async def judge(name):

@@ -41,14 +41,20 @@ app = modal.App("gemma-bench-engine")
 
 
 # ------------------------------------------------------------------------------------------------------------ helpers (in-container)
-def _prep_hf(models):
+def _complete(src):
+    """a snapshot dir counts as present only if its weights are there (a lone encoding/*.py from hf_hub_download must not shadow the download)"""
+    import glob
+    return os.path.isdir(f"{src}/snapshots") and bool(glob.glob(f"{src}/snapshots/*/*.safetensors") or glob.glob(f"{src}/snapshots/*/*.safetensors.index.json"))
+
+
+def _prep_hf(models, force=False):
     """HF cache = local dir of symlinks: base Gemma from production's cache, everything else downloaded once into BENCH_HF"""
     from huggingface_hub import snapshot_download
     os.makedirs("/root/hf/hub", exist_ok=True); os.makedirs(BENCH_HF, exist_ok=True)
     for m in models:
         d = "models--" + m.replace("/", "--")
         for src in (f"{PROD_HF}/{d}", f"{BENCH_HF}/{d}"):
-            if os.path.isdir(src) and os.path.isdir(f"{src}/snapshots"): break
+            if not force and _complete(src): break
         else:
             t0 = time.time(); print(f"[hf] downloading {m} -> {BENCH_HF}", flush=True)
             snapshot_download(m, cache_dir=BENCH_HF, token=os.environ.get("HF_TOKEN"), allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.py", "*.model", "*.tiktoken"])
@@ -134,9 +140,9 @@ RUNNERS = {"v29": run_v29, "v30": run_v30, "sgl": run_sgl, "v30x8": run_v30_x8, 
 
 
 @app.function(**{**FN, "cpu": 8, "memory": 32 * 1024, "timeout": 4 * 3600})
-def prefetch(model: str):
+def prefetch(model: str, force: bool = False):
     """download one checkpoint into BENCH_HF once (shared by every later run)"""
-    vol_glp.reload(); t0 = time.time(); _prep_hf([model]); return {"model": model, "seconds": time.time() - t0}
+    vol_glp.reload(); t0 = time.time(); _prep_hf([model], force=force); return {"model": model, "seconds": time.time() - t0}
 
 
 # ------------------------------------------------------------------------------------------------------------ probe: what does this engine support?
