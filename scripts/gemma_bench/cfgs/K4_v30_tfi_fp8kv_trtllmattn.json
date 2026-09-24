@@ -1,0 +1,25 @@
+{
+ "mode": "offline",
+ "warmup": 300,
+ "engine_kwargs": {
+  "model": "google/gemma-4-26B-A4B-it",
+  "dtype": "bfloat16",
+  "max_model_len": 8192,
+  "gpu_memory_utilization": 0.9,
+  "limit_mm_per_prompt": {
+   "image": 0
+  },
+  "max_num_seqs": 1024,
+  "max_num_batched_tokens": 32768,
+  "enable_prefix_caching": true,
+  "seed": 0,
+  "kv_cache_dtype": "fp8",
+  "attention_config": {
+   "backend": "TRITON_FLASHINFER",
+   "use_trtllm_attention": true
+  }
+ },
+ "env": {
+  "VLLM_CACHE_ROOT": "/vol_glp/scale/bench/vllm_cache/v30"
+ }
+}
