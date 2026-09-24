@@ -28,6 +28,9 @@ def main():
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--batch", type=int, default=64); p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--lr-lora", type=float, default=1e-4); p.add_argument("--lr-head", type=float, default=5e-4); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--warmup", type=int, default=50)
     p.add_argument("--p-drop", type=float, default=0.3); p.add_argument("--p-empty", type=float, default=0.1); p.add_argument("--cos-w", type=float, default=0.5)
+    p.add_argument("--loss", default="energy", choices=["energy", "relmse"]); p.add_argument("--min-gap", type=int, default=2, help="drop train pairs with j - i < min-gap (round 2: gap-1 dropped)")
+    p.add_argument("--p-shuffle", type=float, default=1.0, help="probability of shuffling the bullet order per training example"); p.add_argument("--n-pairs", type=int, default=None, help="use the FIRST n train pairs (teacher train order) for the data-scaling curve")
+    p.add_argument("--select-on", default="gain", choices=["gain", "relmse"], help="ckpt_best criterion on the selection rows: FVE gain over empty text (round 2) or relMSE")
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--max-len", type=int, default=320); p.add_argument("--d-model", type=int, default=1024); p.add_argument("--n-q", type=int, default=4); p.add_argument("--n-heads", type=int, default=8)
     p.add_argument("--hidden", type=int, default=4096); p.add_argument("--n-hidden", type=int, default=2)
@@ -42,6 +45,9 @@ def main():
         ids = set(json.load(open(a.pair_ids))); tr = tr[tr["pair_id"].isin(ids)].reset_index(drop=True)
     if a.max_train:
         tr = tr.iloc[: a.max_train].reset_index(drop=True)
+    if a.n_pairs:
+        tr = tr.iloc[: a.n_pairs].reset_index(drop=True)      # parts are read in file order = teacher train order
+    n_before = len(tr); tr = tr[(tr["j"] - tr["i"]) >= a.min_gap].reset_index(drop=True); print(f"[train] min-gap {a.min_gap}: {n_before} -> {len(tr)} train rows", flush=True)
     pv = load_pairs(a.data_dir, "val").iloc[: a.n_val]
     va = join_text(a.val_text, pv, verbosity=vverb)
     print(f"[train] {len(tr)} train rows ({tr['n_bullets'].mean():.1f} bullets, {tr['n_tokens'].mean() if 'n_tokens' in tr else -1:.0f} tokens avg); {len(va)} val rows of the first {a.n_val} fixed val pairs", flush=True)
@@ -84,6 +90,8 @@ def main():
         keep = [b for b in bl if rng.random() >= a.p_drop]
         if not keep:
             keep = [bl[rng.integers(len(bl))]]
+        if len(keep) >= 2 and rng.random() < a.p_shuffle:
+            keep = [keep[k] for k in rng.permutation(len(keep))]
         return join_bullets(keep)
 
     @torch.no_grad()
@@ -110,7 +118,7 @@ def main():
         idx = rng.integers(0, N, a.batch); x = Xtr[idx]; d = Dtr[idx]; texts = [augment(bullets_tr[k]) for k in idx]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred = model(x, texts).float()
-        loss, rm, cos = M.recon_loss(pred, d, a.cos_w)
+        loss, rm, cos = M.recon_loss(pred, d, a.cos_w, a.loss)
         opt.zero_grad(set_to_none=True); loss.backward(); gn = float(torch.nn.utils.clip_grad_norm_([q for g in opt.param_groups for q in g["params"]], 1.0)); opt.step()
         log = {"train/loss": float(loss.detach()), "train/relmse": float(rm.detach().mean()), "train/cos": float(cos.detach().mean()), "train/grad_norm": gn, "train/lr_head": opt.param_groups[-1]["lr"]}
         if step % 50 == 0:
@@ -118,8 +126,9 @@ def main():
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
             ev = evaluate(); log.update(ev); curve.append({"step": step + 1, **log}); print(f"[eval@{step + 1}] {json.dumps({k: round(v, 4) for k, v in ev.items()})}", flush=True)
             json.dump(curve, open(os.path.join(a.out, "curve.json"), "w"), indent=1)
-            crit = ev.get("sel/relmse_all", ev["val/relmse_all"])
-            if crit < best: best, best_step = crit, step + 1; M.save(model, os.path.join(a.out, "ckpt_best.pt"), vars(a) | {"best_step": best_step}); print(f"[train] ckpt_best <- step {best_step} ({crit:.4f})", flush=True)
+            pre = "sel" if sel is not None else "val"
+            crit = ev[f"{pre}/relmse_all"] if a.select_on == "relmse" else -(ev[f"{pre}/fve_all"] - ev[f"{pre}/fve_empty"])
+            if crit < best: best, best_step = crit, step + 1; M.save(model, os.path.join(a.out, "ckpt_best.pt"), vars(a) | {"best_step": best_step}); print(f"[train] ckpt_best <- step {best_step} ({a.select_on} {crit:.4f})", flush=True)
         if run is not None: run.log(log, step=step)
     M.save(model, os.path.join(a.out, "ckpt_final.pt"), vars(a))
     json.dump({"args": vars(a), "final": curve[-1] if curve else {}, "best_step": best_step, "best_crit": best, "n_train": N, "n_val": len(va), "seconds": time.time() - t0}, open(os.path.join(a.out, "train_summary.json"), "w"), indent=1)

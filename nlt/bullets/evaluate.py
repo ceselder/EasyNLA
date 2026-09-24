@@ -37,7 +37,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True); p.add_argument("--ckpt", required=True); p.add_argument("--text", required=True); p.add_argument("--out", required=True)
     p.add_argument("--flip", default=None); p.add_argument("--verbosity", default=None); p.add_argument("--n-val", type=int, default=1536); p.add_argument("--split", default="val")
-    p.add_argument("--rows", default=None, help="a:b slice of the fixed val rows to report on (e.g. 0:1024 when 1024:1536 picked the checkpoint)"); p.add_argument("--no-crux", action="store_true"); p.add_argument("--n-swap", type=int, default=1); p.add_argument("--batch", type=int, default=96); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rows", default=None, help="a:b slice of the fixed val rows to report on (e.g. 0:1024 when 1024:1536 picked the checkpoint)"); p.add_argument("--no-crux", action="store_true")
+    p.add_argument("--min-gap", type=int, default=2, help="the 'train_gaps' block reports rows with gap >= min-gap; the dropped gaps get their own block"); p.add_argument("--n-swap", type=int, default=1); p.add_argument("--batch", type=int, default=96); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda"; rng = np.random.default_rng(a.seed); os.makedirs(a.out, exist_ok=True); torch.manual_seed(a.seed)
     norm = GlobalNorm.load(os.path.join(a.data_dir, "stats.pt"), "affine").to(dev)
     verb = [int(v) for v in a.verbosity.split(",")] if a.verbosity else None
@@ -173,7 +174,10 @@ def main():
                 "shuffle_abs_delta_relmse_mean": float(np.abs(r_shuf - r_all)[mm & multi].mean()) if (mm & multi).any() else None,
                 "mean_relmse_all": float(r_all[mm].mean()), "mean_relmse_empty": float(r_emp[mm].mean())}
 
-    out = {"ckpt": a.ckpt, "text": a.text, "flip": a.flip, "n": N, "d_eff": d_eff, "d": int(X.shape[1]), "bullets_per_row": float(n_bul.mean()), "tokens_per_row": float(np.nanmean(n_tok)) if np.isfinite(n_tok).any() else None,
+    gaps_all = (df["j"] - df["i"]).values
+    out = {"ckpt": a.ckpt, "text": a.text, "flip": a.flip, "n": N, "d_eff": d_eff, "min_gap": a.min_gap,
+           "train_gaps": block(gaps_all >= a.min_gap), "dropped_gaps": block(gaps_all < a.min_gap) if (gaps_all < a.min_gap).any() else None,
+           "gain_ci_train_gaps": boot_ci((r_emp - r_all)[gaps_all >= a.min_gap]), "d": int(X.shape[1]), "bullets_per_row": float(n_bul.mean()), "tokens_per_row": float(np.nanmean(n_tok)) if np.isfinite(n_tok).any() else None,
            "dm_exact_frac": float(exact.mean()), "overall": block(), "gain_ci": boot_ci(r_emp - r_all), "pair_specific_gain_per_ex_ci": boot_ci(r_dm - r_all), "bits_mean_ci": boot_ci(b_all),
            "by_band": {b: block(per_pair["band"].values == b) for b in ["pre", "workspace", "motor"] if (per_pair["band"].values == b).any()},
            "by_gap": {g: block(per_pair["gap_bucket"].values == g) for g in per_pair["gap_bucket"].unique() if g},
