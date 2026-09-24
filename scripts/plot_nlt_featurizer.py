@@ -200,7 +200,7 @@ def main():
         save(fig, a.report_dir, "featurizer_transcoder_mlp")
 
     # ------------------------------------------------------------------ Fig 5: MAEMM verification
-    mm = load_parts(f"{a.data_dir}/maemm/{a.split}/gen_*.parquet")
+    mm = load_parts(f"{a.data_dir}/maemm/{a.split}/gen_0*.parquet")
     if len(mm) and "verify_act" in mm.columns:
         # ratio to the feature's recorded max activation (transcoder repo records) where available
         rec = {}
