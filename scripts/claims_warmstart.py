@@ -108,7 +108,7 @@ def _score_block(fb, fmt, X, owner, claims, D, dev, seeds, rows_per_fwd=12000):
             x0 = X[i:i + 1]; xt = ((1 - tt)[None, :, None] * x0[None] + tt[None, :, None] * E[:, None, :]).reshape(R, d); tg = (E[:, None, :] - x0[None]).expand(D, T, d).reshape(R, d)
             with torch.autocast("cuda", dtype=torch.bfloat16): v0 = fb.model(xt, tt.repeat(D)).float()
             XT[i], TG[i], LU[i] = xt, tg, ((v0 - tg) ** 2).mean(-1).mean()
-        out = [None] * len(claims); per = max(1, rows_per_fwd // R)
+        out = [None] * len(claims); per = max(1, min(256, rows_per_fwd // R))   # <= 256 texts per encoder call (batch x heads must fit the Triton grid)
         for k0 in range(0, len(claims), per):
             kk = list(range(k0, min(len(claims), k0 + per))); enc, mk, cv = fb.cond([fmt(claims[k]) for k in kk])
             xs = torch.cat([XT[owner[k]] for k in kk]); ts = tt.repeat(D * len(kk)); tg = torch.cat([TG[owner[k]] for k in kk])

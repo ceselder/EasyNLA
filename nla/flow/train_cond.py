@@ -367,6 +367,11 @@ def main():
                    "logit_ij = -(d/2) L_FM(x_i | c_j) / tau under the same (t, eps) per activation, symmetric cross-entropy; plus the plain FM loss on every positive")
     p.add_argument("--ctr-k", type=int, default=32, help="negatives per activation (group size K+1)"); p.add_argument("--ctr-weight", type=float, default=1.0)
     p.add_argument("--ctr-tau-init", type=float, default=20.0, help="InfoNCE temperature in nats of FM-proxy PMI"); p.add_argument("--ctr-fixed-tau", action="store_true")
+    p.add_argument("--ctr-tau-lr", type=float, default=1e-3, help="learning rate of log tau"); p.add_argument("--ctr-tau-max", type=float, default=100.0, help="tau clamp (nats)")
+    p.add_argument("--ctr-global", type=int, default=0, help="N > 0: ONE same-template group of N distinct-answer activations spread over all ranks (N/world rows each), full N x N "
+                   "InfoNCE matrix (every claim is a negative for every other activation); rows sharded, logits all-gathered, gradient by chunked recompute (GradCache)")
+    p.add_argument("--ctr-groups", type=int, default=1, help="with --ctr-global: global groups per step (same template, different activations)")
+    p.add_argument("--ctr-chunk", type=int, default=512, help="with --ctr-global: denoiser rows per forward+backward chunk (no-grad pass uses 4x)")
     p.add_argument("--ctr-enc-grad", action="store_true", help="let the InfoNCE term train the text encoder too (default: encodings detached, adapter/prior only)")
     p.add_argument("--fm-chunk", type=int, default=0, help="FM loss over the micro-batch in sub-batches of this size (same gradient; bounds the encoder-backward memory at large --batch)")
     p.add_argument("--rank-files", action="store_true", help="--claims-dir under DDP: whole final files round-robin to ranks (1/world of the reading) instead of row striping")
@@ -591,7 +596,7 @@ def main():
     log_tau = None
     if a.ctr_template:   # InfoNCE temperature (nats of FM-proxy PMI), learnable unless --ctr-fixed-tau
         log_tau = torch.nn.Parameter(torch.tensor(math.log(a.ctr_tau_init), device=dev), requires_grad=not a.ctr_fixed_tau)
-        if not a.ctr_fixed_tau: groups.append({"params": [log_tau], "lr": 1e-3, "base_lr": 1e-3})
+        if not a.ctr_fixed_tau: groups.append({"params": [log_tau], "lr": a.ctr_tau_lr, "base_lr": a.ctr_tau_lr})
     if a.unfreeze_prior: groups.append({"params": [p_ for p_ in model.parameters() if id(p_) not in adapter_ids], "lr": a.prior_lr, "base_lr": a.prior_lr})
     if arvec is not None and arvec.trainable_parameters(): groups.append({"params": arvec.trainable_parameters(), "lr": a.ar_lr, "base_lr": a.ar_lr})
     if a.cond_mode == "trunk":
@@ -821,13 +826,20 @@ def main():
         trng = _random.Random(a.seed * 31 + rank)
         for v_ in pools.values(): trng.shuffle(v_)
         if is0: print(f"[cond] same-template batches: {len(pools)} templates on rank 0, largest " + ", ".join(f"{k}:{len(v)}" for k, v in sorted(pools.items(), key=lambda x: -len(x[1]))[:8]), flush=True)
+        def _pick_tpl(live):
+            fams = sorted({t_.split(":")[0] for t_ in live}); f_ = trng.choices(fams, weights=[_FS.get(x, 0.1) for x in fams])[0]
+            ts = [t_ for t_ in live if t_.split(":")[0] == f_]; return trng.choices(ts, weights=[len(pools[x]) for x in ts])[0]
+        ctr_shared = [None]   # --ctr-global: the template all ranks share this step (rank 0 picks it)
         def next_ctr_batch(nb):
             out, chunks = [], []
+            if a.ctr_global:
+                live = [t_ for t_, v_ in pools.items() if v_]; pick = [_pick_tpl(live) if (is0 and live) else None]
+                if ddp: dist.broadcast_object_list(pick, src=0)
+                ctr_shared[0] = pick[0]
             while len(out) < nb:
                 live = [t_ for t_, v_ in pools.items() if v_]
                 if not live: break
-                fams = sorted({t_.split(":")[0] for t_ in live}); f_ = trng.choices(fams, weights=[_FS.get(x, 0.1) for x in fams])[0]
-                ts = [t_ for t_ in live if t_.split(":")[0] == f_]; t_ = trng.choices(ts, weights=[len(pools[x]) for x in ts])[0]
+                t_ = ctr_shared[0] if (not chunks and pools.get(ctr_shared[0])) else _pick_tpl(live)
                 take = pools[t_][: nb - len(out)]; del pools[t_][: len(take)]
                 chunks.append((t_, list(range(len(out), len(out) + len(take))))); out += take
             return out, chunks
@@ -874,7 +886,74 @@ def main():
                 closs = a.neg_lambda * F.relu(a.neg_margin - gap).mean(); closs.backward()
                 neg_stats = {"train/contrast_loss": closs.item(), "train/neg_gap": gap.mean().item(), "train/neg_win": (gap > 0).float().mean().item(), "train/neg_n": n2,
                              "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2, "train/neg_frac_quote": sum(1 for k in keep_i if negs[k][1] == "quote") / n2}
-        if a.ctr_template:   # CLIP-style InfoNCE over flow scores within same-template groups of K+1 distinct answers
+        if a.ctr_template and a.ctr_global:   # ONE same-template group of N activations across all ranks, full N x N InfoNCE (rows sharded over ranks)
+            t_c = time.time(); Ng = a.ctr_global; M = Ng // world; assert M * world == Ng, "--ctr-global must be divisible by the world size"
+            assert not a.ctr_enc_grad, "--ctr-global keeps the claim encodings detached"
+            ky = lambda z: z if isinstance(z, str) else "\n".join(z)
+            t0_, pos0 = chunks[0] if chunks else (None, [])
+            seen_, mine = set(), []
+            if t0_ is not None and t0_ == ctr_shared[0]: mine = list(pos0)   # every activation of the shared template (repeated answers = shared positives)
+            d_x = x0.shape[1]; ce_s = ar_s = ac_s = 0.0; nv_s = dup_s = 0; cr_s = cc_s = 0.0; tau = log_tau.detach().exp().clamp(1.0, a.ctr_tau_max); n_grp = max(1, a.ctr_groups)
+            for g_i in range(n_grp):
+                loc = mine[g_i * M: (g_i + 1) * M]; nloc = len(loc)
+                pad = loc + [loc[0] if loc else 0] * (M - nloc)                    # padding rows/claims: computed (uniform FSDP calls), masked out of the loss
+                allt = [None] * world
+                if ddp: dist.all_gather_object(allt, [_txt[p_] if k_ < nloc else None for k_, p_ in enumerate(pad)])
+                else: allt = [[_txt[p_] if k_ < nloc else None for k_, p_ in enumerate(pad)]]
+                C = [c for r_ in allt for c in r_]; valid = torch.tensor([c is not None for c in C], device=dev)
+                if int(valid.sum()) < 4:
+                    if ddp and a.unfreeze_prior: pass                              # still run the calls below with zero weight (FSDP needs matching collectives)
+                    elif g_i == 0: break
+                    else: continue
+                fill = next((c for c in C if c is not None), _txt[0])
+                keys = [ky(c) if c is not None else None for c in C]
+                eg, mkg, cvg = enc_batch([c if c is not None else fill for c in C], grad=False)
+                xs = x0[pad].detach(); gen = torch.Generator().manual_seed(a.seed * 1000003 + step * 97 + g_i)
+                tt = torch.full((M,), float(torch.rand(1, generator=gen)), device=dev)   # one t for the whole global group (logits comparable across ranks)
+                ee = torch.randn_like(xs); x_t = (1 - tt)[:, None] * xs + tt[:, None] * ee; tgt = (ee - xs).float()
+                R = M * Ng; ch0, ch1 = 4 * a.ctr_chunk, a.ctr_chunk
+                def _rows(r0, r1):
+                    r = torch.arange(r0, r1, device=dev); ii, jj = r // Ng, r % Ng
+                    v = model(x_t[ii], tt[ii], eg[jj] if eg is not None else None, mkg[jj] if mkg is not None else None, cvg[jj] if cvg is not None else None)
+                    return ((v.float() - tgt[ii]) ** 2).mean(-1)
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):   # pass 1: all logits, no graph
+                    L0l = ((model(x_t, tt).float() - tgt) ** 2).mean(-1)
+                    Lml = torch.cat([_rows(r0, min(R, r0 + ch0)) for r0 in range(0, R, ch0)]).view(M, Ng)
+                if ddp:
+                    gl = [torch.empty_like(Lml) for _ in range(world)]; dist.all_gather(gl, Lml.contiguous()); Lm = torch.cat(gl)
+                    g0 = [torch.empty_like(L0l) for _ in range(world)]; dist.all_gather(g0, L0l.contiguous()); L0 = torch.cat(g0)
+                else: Lm, L0 = Lml, L0l
+                kid, canon = {}, []
+                for j_, k_ in enumerate(keys): canon.append(-1 if k_ is None else kid.setdefault(k_, j_))
+                canon_t = torch.tensor(canon, device=dev); ar_ = torch.arange(Ng, device=dev)
+                is_can = valid & (canon_t == ar_); cols = is_can.nonzero().squeeze(1); vr = valid.nonzero().squeeze(1); n_ans = len(cols)
+                Lleaf = Lm.detach().requires_grad_(True); tau = log_tau.exp().clamp(1.0, a.ctr_tau_max)
+                base = (0.5 * d_x) * (L0[:, None] - Lleaf) / tau                          # FM-proxy PMI / tau, [activation i, claim of activation j]
+                if n_ans >= 2 and len(vr) >= 4:
+                    ninf = float("-inf")
+                    rowl = base[vr][:, cols]; tgt_r = torch.searchsorted(cols, canon_t[vr])   # activation -> its answer among the DISTINCT answers
+                    ce_r = F.cross_entropy(rowl, tgt_r)
+                    coll = base[:, cols].t().masked_fill(~valid[None, :], ninf)            # answer -> activations; all activations with that answer are positives
+                    pos = (canon_t[None, :] == cols[:, None]) & valid[None, :]
+                    ce_c = (torch.logsumexp(coll, 1) - torch.logsumexp(coll.masked_fill(~pos, ninf), 1)).mean()
+                    ce = 0.5 * (ce_r + ce_c)
+                    (a.ctr_weight * ce / n_grp).backward()                                  # -> d loss / d L_ij (identical on every rank) and log_tau.grad
+                    gW = Lleaf.grad[rank * M: (rank + 1) * M].reshape(-1) * world       # this rank's rows; x world undoes the cross-rank gradient average
+                    ce_s += ce.item(); cr_s += ce_r.item(); cc_s += ce_c.item(); nv_s += len(vr); dup_s += n_ans
+                    ar_s += (rowl.detach().argmax(1) == tgt_r).float().mean().item(); ac_s += pos.gather(1, coll.detach().argmax(1, keepdim=True)).float().mean().item()
+                else: gW = torch.zeros(R, device=dev)
+                for r0 in range(0, R, ch1):                                          # pass 2: recompute chunk by chunk with the graph, weight by dL/dL_ij
+                    if not (ddp and a.unfreeze_prior) and not bool(gW[r0: r0 + ch1].any()): continue   # zero-weight chunk (padding / repeated answers); FSDP must still run it
+                    with torch.autocast("cuda", dtype=torch.bfloat16): Lc = _rows(r0, min(R, r0 + ch1))
+                    (Lc * gW[r0: r0 + ch1]).sum().backward()
+            ng_ = max(1, n_grp)
+            ctr_stats = {"train/ctr_ce": ce_s / ng_, "train/ctr_ce_row": cr_s / ng_, "train/ctr_ce_col": cc_s / ng_, "train/ctr_acc_row": ar_s / ng_, "train/ctr_acc_col": ac_s / ng_,
+                         "train/ctr_groups": n_grp, "train/ctr_unique": nv_s / ng_, "train/ctr_answers": dup_s / ng_, "train/ctr_templates": len(chunks), "train/ctr_tau": float(tau),
+                         "train/ctr_seconds": time.time() - t_c, "train/ctr_chance": 1.0 / max(dup_s / ng_, 1), "train/ctr_group_size": Ng, "train/ctr_local_rows": len(mine)}
+            if ddp and log_tau.requires_grad:                                     # every rank issues it (a rank with no group this step has no grad yet)
+                if log_tau.grad is None: log_tau.grad = torch.zeros_like(log_tau)
+                dist.all_reduce(log_tau.grad, op=dist.ReduceOp.AVG)
+        elif a.ctr_template:   # CLIP-style InfoNCE over flow scores within same-template groups of K+1 distinct answers
             t_c = time.time(); grps = []; n_uniq = 0
             for t_, pos in chunks:
                 seen_, uniq = set(), []
@@ -888,9 +967,9 @@ def main():
                 ng = torch.tensor([n_real], device=dev); dist.all_reduce(ng, op=dist.ReduceOp.MAX)
                 dummy = grps[0] if grps else list(range(min(a.ctr_k + 1, len(_txt))))
                 while len(grps) < int(ng.item()): grps.append(dummy); w_g.append(0.0)
-            ce_s = ar_s = ac_s = 0.0; tau = log_tau.detach().exp().clamp(1.0, 100.0)
+            ce_s = ar_s = ac_s = 0.0; tau = log_tau.detach().exp().clamp(1.0, a.ctr_tau_max)
             for g_i, grp in enumerate(grps):
-                tau = log_tau.exp().clamp(1.0, 100.0)                           # rebuilt per group: each group has its own backward
+                tau = log_tau.exp().clamp(1.0, a.ctr_tau_max)                           # rebuilt per group: each group has its own backward
                 G = len(grp); xs = x0[grp].detach(); eg, mkg, cvg = enc_batch([_txt[p_] for p_ in grp], grad=a.ctr_enc_grad)
                 tt = torch.rand(1, device=dev).expand(G).contiguous(); ee = torch.randn_like(xs)   # one t per group: FM losses of different activations comparable
                 x_t = (1 - tt)[:, None] * xs + tt[:, None] * ee; tgt = (ee - xs).float()
@@ -907,7 +986,9 @@ def main():
             ng_ = max(n_real, 1)
             ctr_stats = {"train/ctr_ce": ce_s / ng_, "train/ctr_acc_row": ar_s / ng_, "train/ctr_acc_col": ac_s / ng_, "train/ctr_groups": n_real, "train/ctr_unique": n_uniq,
                          "train/ctr_templates": len(chunks), "train/ctr_tau": float(tau), "train/ctr_seconds": time.time() - t_c, "train/ctr_chance": 1.0 / (a.ctr_k + 1)}
-            if ddp and log_tau.grad is not None: dist.all_reduce(log_tau.grad, op=dist.ReduceOp.AVG)
+            if ddp and log_tau.requires_grad:                                     # every rank issues it (a rank with no group this step has no grad yet)
+                if log_tau.grad is None: log_tau.grad = torch.zeros_like(log_tau)
+                dist.all_reduce(log_tau.grad, op=dist.ReduceOp.AVG)
         if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
             for p_ in arvec.trainable_parameters():
                 if p_.grad is None: p_.grad = torch.zeros_like(p_)
@@ -946,7 +1027,11 @@ def main():
             cfm_st = {f"train/cfm_{k}": float(v) for k, v in getattr(cond_fm_loss, "last", {}).items()} if a.cfm_lambda > 0 else {}
             if cfm_st and is0: print(f"  [cfm] fm {cfm_st['train/cfm_fm']:.4f} | distance to another sample's flow {cfm_st['train/cfm_cfm_neg']:.4f} (lambda {a.cfm_lambda})", flush=True)
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats, **cfm_st, **ctr_stats}, step=step)
-            if ctr_stats and is0: print(f"  [ctr] InfoNCE {ctr_stats['train/ctr_ce']:.3f} (chance {math.log(a.ctr_k + 1):.2f}) acc row {100*ctr_stats['train/ctr_acc_row']:.0f}% col {100*ctr_stats['train/ctr_acc_col']:.0f}% "
+            if ctr_stats and is0 and a.ctr_global: print(f"  [ctr] InfoNCE row {ctr_stats['train/ctr_ce_row']:.3f} col {ctr_stats['train/ctr_ce_col']:.3f} (row chance {math.log(max(ctr_stats['train/ctr_answers'], 1)):.2f}) "
+                                        f"acc row {100*ctr_stats['train/ctr_acc_row']:.1f}% col {100*ctr_stats['train/ctr_acc_col']:.1f}% (row chance {100*ctr_stats['train/ctr_chance']:.1f}%) | "
+                                        f"{ctr_stats['train/ctr_groups']} global group(s) of {a.ctr_global}: {ctr_stats['train/ctr_unique']:.0f} activations, {ctr_stats['train/ctr_answers']:.0f} distinct answers | "
+                                        f"tau {ctr_stats['train/ctr_tau']:.1f} nats | {ctr_stats['train/ctr_seconds']:.2f}s", flush=True)
+            elif ctr_stats and is0: print(f"  [ctr] InfoNCE {ctr_stats['train/ctr_ce']:.3f} (chance {math.log(a.ctr_k + 1):.2f}) acc row {100*ctr_stats['train/ctr_acc_row']:.0f}% col {100*ctr_stats['train/ctr_acc_col']:.0f}% "
                                         f"(chance {100/(a.ctr_k + 1):.0f}%) | {ctr_stats['train/ctr_groups']} groups of <= {a.ctr_k + 1}, {ctr_stats['train/ctr_unique']} distinct answers, {ctr_stats['train/ctr_templates']} template chunks | "
                                         f"tau {ctr_stats['train/ctr_tau']:.1f} nats | {ctr_stats['train/ctr_seconds']:.2f}s", flush=True)
             if gstats and is0: print(f"  [samedoc] ce {gstats['train/samedoc_ce']:.3f} acc row {100*gstats['train/samedoc_acc_row']:.0f}% col {100*gstats['train/samedoc_acc_col']:.0f}% (chance {100/a.group_size:.0f}%)", flush=True)
