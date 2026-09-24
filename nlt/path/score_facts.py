@@ -23,7 +23,7 @@ RX_PCT = re.compile(r"(\d{1,3})% (?:of the shift came from )?attention")
 def parse(text: str) -> dict:
     out = {}
     for fact, pats in RX.items():
-        hits = [lab for rx, lab in pats if re.search(rx, text or "")]
+        hits = [lab for rx, lab in pats if re.search(rx, text or "", re.I)]
         out[fact] = hits[0] if len(hits) == 1 else (hits[0] if hits else None)     # first match; ambiguous texts still count their first claim
         out[fact + "_n"] = len(hits)
     m = RX_PCT.search(text or ""); out["pct"] = int(m.group(1)) if m else None
