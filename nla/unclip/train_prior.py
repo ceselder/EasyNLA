@@ -20,26 +20,46 @@ def log(*a, **k):
     if int(os.environ.get("RANK", 0)) == 0: print(*a, **k, flush=True)
 
 
+class _Passthrough(torch.nn.Module):
+    """stand-in for a frozen lower trunk layer during the LoRA-on pass: layer 0's stand-in returns the captured output of layer lo-1 (computed once,
+    LoRA off, no grad); the others return their input unchanged, so the real layers lo..42 see the same hidden state as in the full pass"""
+    def __init__(self, cap=None): super().__init__(); self.cap = cap
+    def forward(self, hidden_states, *args, **kwargs): return self.cap[0] if self.cap is not None else hidden_states
+
+
 class TextCond:
     """texts -> (token states [B, T, d_enc], key mask [B, T], g [B, d_g] or None). LoRA-tuned trunk for the tokens; g from the FROZEN trunk
-    (LoRA disabled) through the frozen CLIP pooling head when the CLIP text trunk was frozen (else through the same LoRA trunk)."""
-    def __init__(self, arvec, act_enc, use_g, max_len):
-        self.arvec, self.act_enc, self.use_g, self.max_len = arvec, act_enc, use_g, max_len
+    (LoRA disabled) through the frozen CLIP pooling head when the CLIP text trunk was frozen (else through the same LoRA trunk).
+    lo > 0 (partial LoRA on layers lo..enc_layer): the frozen layers 0..lo-1 run ONCE (inside the LoRA-off g pass) and their output is re-injected
+    for the LoRA-on pass, so the trainable pass costs only the top layers' forward + backward."""
+    def __init__(self, arvec, act_enc, use_g, max_len, lo=0):
+        self.arvec, self.act_enc, self.use_g, self.max_len, self.lo = arvec, act_enc, use_g, max_len, int(lo)
         mod = arvec.crit if arvec.crit is not None else arvec.lm
         self.lora_layers = [m for m in mod.modules() if hasattr(m, "enable_adapters") and hasattr(m, "lora_A")]
         self.g_frozen = act_enc.frozen_text() if use_g else False
+        self.layers = arvec._layers(); self._cap = [None]
+        if self.lo > 0: self.layers[self.lo - 1].register_forward_hook(lambda m_, i_, o_: self._cap.__setitem__(0, (o_[0] if isinstance(o_, tuple) else o_).detach()))
 
     def lora(self, on):
         for m in self.lora_layers: m.enable_adapters(bool(on))
 
     def __call__(self, texts, grad=False):
-        texts = [z if z else "(empty)" for z in texts]; g = None
+        texts = [z if z else "(empty)" for z in texts]; g = None; shared = False
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if self.use_g and (self.g_frozen and self.lora_layers):
-                self.lora(False)
+                self.lora(False); self._cap[0] = None
                 with torch.no_grad(): e0, m0 = self.arvec.tokens(texts, max_len=self.max_len); g = self.act_enc.pool_text(e0, m0)
-                self.lora(True); del e0, m0
-            if grad and self.arvec.trainable: e, m = self.arvec.tokens(texts, max_len=self.max_len)
+                self.lora(True); del e0, m0; shared = self.lo > 0 and self._cap[0] is not None and grad and self.arvec.trainable
+            if grad and self.arvec.trainable:
+                if shared:   # LoRA-on pass over layers lo..L only: swap the frozen lower layers for stand-ins that replay the captured hidden state
+                    saved = [self.layers[i] for i in range(self.lo)]
+                    try:
+                        for i in range(self.lo): self.layers[i] = _Passthrough(self._cap if i == 0 else None)
+                        e, m = self.arvec.tokens(texts, max_len=self.max_len)
+                    finally:
+                        for i in range(self.lo): self.layers[i] = saved[i]
+                    self._cap[0] = None
+                else: e, m = self.arvec.tokens(texts, max_len=self.max_len)
             else:
                 with torch.no_grad(): e, m = self.arvec.tokens(texts, max_len=self.max_len)
             if self.use_g and g is None:
@@ -119,6 +139,7 @@ def main():
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--e-noise", type=float, default=0.05, help="isotropic noise added to the standardised e during training when e is unit-normalised (proper density off the shell); 0 with unnormalised e")
     p.add_argument("--max-len", type=int, default=224); p.add_argument("--enorm-n", type=int, default=65536)
     p.add_argument("--batch", type=int, default=64, help="per rank"); p.add_argument("--steps", type=int, default=0); p.add_argument("--epochs", type=float, default=1.0, help="steps = epochs x min rows per rank / batch when --steps is 0")
+    p.add_argument("--lora-top-k", type=int, default=0, help="partial LoRA: adapters trainable only on the top K trunk layers below/at the read layer (K=12 -> layers 31..42); lower layers run without grad (backprop stops at layer 43-K); 0 = LoRA on all layers")
     p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--lr-lora", type=float, default=3e-5); p.add_argument("--wd", type=float, default=0.01); p.add_argument("--warmup", type=int, default=300); p.add_argument("--lr-const", action="store_true", help="constant lr after warm-up (phases that continue each other); default cosine to 10 %")
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--snap-pairs", default="64e3,128e3,256e3,512e3,1e6,2e6,4e6,8e6", help="global pair counts for snapshots; '+N' entries are relative to the resume point"); p.add_argument("--snap-final", action="store_true")
     p.add_argument("--resume-from", default=None, help="dir with prior.pt (+ text_lora.pt, opt.pt)"); p.add_argument("--resume-opt", action="store_true"); p.add_argument("--start-pairs", type=int, default=-1, help="-1 = from the checkpoint")
@@ -158,8 +179,26 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.base); tok.padding_side = "right"
     if tok.pad_token_id is None: tok.pad_token = tok.eos_token
     use_tokens, use_g = not a.no_tokens, not a.no_g
-    arvec = ARVecEncoder(a.ar_ckpt, tok, dev, lora_r=64, lora_alpha=16, grad_ckpt=True, trainable=a.lr_lora > 0, enc_layer=a.enc_layer)
-    cond = TextCond(arvec, act_enc, use_g, a.max_len)
+    partial = a.lr_lora > 0 and a.lora_top_k > 0
+    arvec = ARVecEncoder(a.ar_ckpt, tok, dev, lora_r=64, lora_alpha=16, grad_ckpt=not partial, trainable=a.lr_lora > 0, enc_layer=a.enc_layer)
+    lo = 0
+    if partial:   # freeze the LoRA tensors of the lower layers; non-reentrant checkpointing gives param grads without input grads -> no backward below lo
+        import re as _re
+        nL = len(arvec._layers()); lo = max(0, nL - a.lora_top_k); mod_ = arvec.crit if arvec.crit is not None else arvec.lm; nfz = 0
+        for n_, p_ in mod_.named_parameters():
+            m_ = _re.search(r"layers\.(\d+)\.", n_)
+            if "lora_" in n_ and m_ and int(m_.group(1)) < lo: p_.requires_grad_(False); nfz += 1
+        bb = arvec.crit.backbone if arvec.crit is not None else arvec.owner
+        try: bb.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except Exception as e: log("[prior] grad ckpt off:", e)
+        log(f"[prior] partial LoRA: trainable in trunk layers {lo}..{nL - 1} only ({nfz} LoRA tensors frozen below); lower layers computed once per batch (shared between the g pass and the LoRA pass)")
+    cond = TextCond(arvec, act_enc, use_g, a.max_len, lo=lo)
+    if partial and is0:   # one-time check of the shared-lower-layers trick: at init (LoRA B = 0) the swapped pass must reproduce the full pass exactly
+        zt = ["The passage discusses the 1994 election results in Norway.", "A recipe for sourdough bread with a long cold proof."]
+        e_sh, m_sh, _ = cond(zt, grad=True)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16): e_full, _ = arvec.tokens(zt, max_len=a.max_len)
+        log(f"[prior] shared-lower check: max |tokens(shared) - tokens(full)| = {(e_sh.detach().float() - e_full.float()).abs().max().item():.3e} (expect ~0 at init); grad graph starts at layer {lo}")
+        del e_sh, m_sh, e_full
     d_enc = 5120 if arvec.crit is not None else arvec.owner.config.hidden_size
 
     # ---------------- denoiser
