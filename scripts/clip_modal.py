@@ -103,6 +103,19 @@ def evaluate(ckpt: str, extra: str = ""):
     return ckpt
 
 
+@app.function(gpu="B200", timeout=6 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=256 * 1024, ephemeral_disk=600 * 1024)
+def script(name: str, extra: str = ""):
+    """run scripts/<name> on one B200 with --base = the local Qwen3.6-27B snapshot (pooling diagnostic etc.)"""
+    import subprocess
+    from playground_app import resolve_base
+    base = resolve_base("Qwen/Qwen3.6-27B", local_snapshot=True)
+    proc = subprocess.Popen([sys.executable, f"{REPO_REMOTE}/scripts/{name}", "--base", base] + extra.split(), cwd=REPO_REMOTE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT); tail = []
+    for line in proc.stdout: sys.stdout.buffer.write(line); sys.stdout.flush(); tail = (tail + [line.decode(errors="replace").rstrip()])[-60:]
+    rc = proc.wait(); vol_glp.commit()
+    if rc != 0: raise SystemExit(f"{name} exited {rc}; tail:\n" + "\n".join(tail))
+    return name
+
+
 @app.local_entrypoint()
 def main(task: str = "probe", tag: str = "", extra: str = ""):
     if task == "probe": probe.remote()

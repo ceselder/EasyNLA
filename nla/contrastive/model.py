@@ -60,6 +60,54 @@ class ClipHeads(nn.Module):
     def scale(self): return self.logit_scale.clamp(max=math.log(100.0)).exp()
 
 
+class TokEmb:
+    """token-level text embeddings for late interaction: t [n, L, d] (L2-normalised per token), m [n, L] bool; indexable like a tensor"""
+    def __init__(self, t, m): self.t, self.m = t, m
+    def __len__(self): return self.t.shape[0]
+    def __getitem__(self, i):
+        if isinstance(i, int): i = [i]
+        return TokEmb(self.t[i], self.m[i])
+    @staticmethod
+    def cat(xs):
+        L = max(x.t.shape[1] for x in xs); d = xs[0].t.shape[2]
+        t = torch.cat([F.pad(x.t, (0, 0, 0, L - x.t.shape[1])) for x in xs]); m = torch.cat([F.pad(x.m, (0, L - x.m.shape[1])) for x in xs]); return TokEmb(t, m)
+    def to(self, dev): return TokEmb(self.t.to(dev), self.m.to(dev))
+
+
+def maxsim(A, T, chunk=None, ckpt=False, budget=2e8):
+    """late interaction: A [nA, K, d] activation tokens, T TokEmb text tokens -> [nA, nT], sim = mean over real text tokens of max over K
+    of the cosine (ColBERT MaxSim with the explanation as the query). Chunked over texts (and checkpointed when training)."""
+    def blk(A_, t_, m_):
+        s_ = torch.einsum("akd,tld->atlk", A_, t_).amax(-1)                            # [nA, nT_c, L]
+        m_ = m_.to(s_.dtype); return (s_ * m_[None]).sum(-1) / m_.sum(-1).clamp_min(1)[None]
+    outs = []; chunk = chunk or max(1, int(budget / max(1, A.shape[0] * T.t.shape[1] * A.shape[1])))
+    for c in range(0, len(T), chunk):
+        t_, m_ = T.t[c:c + chunk], T.m[c:c + chunk]
+        outs.append(torch.utils.checkpoint.checkpoint(blk, A, t_, m_, use_reentrant=False) if ckpt else blk(A, t_, m_))
+    return torch.cat(outs, 1)
+
+
+def maxsim_diag(A, T):
+    """MaxSim of A[i] with T[i] only -> [n]"""
+    s_ = torch.einsum("akd,ald->alk", A, T.t).amax(-1); m_ = T.m.to(s_.dtype)
+    return (s_ * m_).sum(-1) / m_.sum(-1).clamp_min(1)
+
+
+class LateHeads(nn.Module):
+    """non-pooled verifier: activation -> K learned tokens (MLP on the standardised h); explanation -> per-token projection of the trunk's
+    token states (no pooling); score = scale * MaxSim."""
+    def __init__(self, d_enc=5120, K=16, d=128, init_temp=0.07):
+        super().__init__()
+        self.K, self.d = K, d
+        self.act_net = nn.Sequential(nn.LayerNorm(5120), nn.Linear(5120, 4096), nn.GELU(), nn.LayerNorm(4096), nn.Linear(4096, K * d))
+        self.act_pos = nn.Parameter(torch.randn(K, d) * 0.02)
+        self.txt_net = nn.Sequential(nn.LayerNorm(d_enc), nn.Linear(d_enc, 1024), nn.GELU(), nn.Linear(1024, d))
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / init_temp)))
+    def scale(self): return self.logit_scale.clamp(max=math.log(100.0)).exp()
+    def act(self, x): return F.normalize(self.act_net(x).float().view(-1, self.K, self.d) + self.act_pos[None], dim=-1)
+    def text(self, e, m): return TokEmb(F.normalize(self.txt_net(e.float()).float(), dim=-1), m)
+
+
 class ClipCritic:
     """inference / eval wrapper: loads heads + text-trunk LoRA from a checkpoint dir written by train_clip.save_ckpt"""
     def __init__(self, ckpt_dir, base, device="cuda", ar_ckpt=None, stats=None):
@@ -77,7 +125,9 @@ class ClipCritic:
                                  enc_layer=self.args["enc_layer"], enc_model=enc_model, keep_norm=bool(enc_model))
         if not frozen: self.text.load_saved(torch.load(os.path.join(ckpt_dir, "text_lora.pt"), map_location="cpu"))
         d_enc = self.text.owner.config.hidden_size if self.text.crit is None else 5120
-        self.heads = ClipHeads(self.args["act_arch"], d_enc, self.args["d_out"]).to(device); self.heads.load_state_dict(st["heads"]); self.heads.eval()
+        self.late = self.args.get("arch", "pooled") == "late"
+        self.heads = (LateHeads(d_enc, self.args.get("late_k", 16), self.args.get("late_d", 128)) if self.late else ClipHeads(self.args["act_arch"], d_enc, self.args["d_out"])).to(device)
+        self.heads.load_state_dict(st["heads"]); self.heads.eval()
         (self.text.crit if self.text.crit is not None else self.text.lm).eval()
 
     def text_emb(self, texts, bs=64, grad=False):
@@ -85,13 +135,22 @@ class ClipCritic:
         for i in range(0, len(texts), bs):
             with torch.set_grad_enabled(grad), torch.autocast("cuda", dtype=torch.bfloat16):
                 e, m = self.text.tokens([z if z else "(empty)" for z in texts[i:i + bs]], max_len=self.args.get("max_len", 256))
-                outs.append(F.normalize(self.heads.pool(e, m).float(), dim=-1))
-        return torch.cat(outs)
+                outs.append(self.heads.text(e, m) if self.late else F.normalize(self.heads.pool(e, m).float(), dim=-1))
+        return TokEmb.cat(outs) if self.late else torch.cat(outs)
 
     def act_emb(self, h_raw, grad=False):
         with torch.set_grad_enabled(grad):
             x = self.norm.normalize(h_raw.to(self.device).float()).float()
-            return F.normalize(self.heads.act(x).float(), dim=-1)
+            return self.heads.act(x).float() if self.late else F.normalize(self.heads.act(x).float(), dim=-1)
+
+    def sim(self, A, T):
+        """unscaled similarity matrix [nA, nT] (cosine for pooled, MaxSim for late)"""
+        return maxsim(A, T) if self.late else A @ T.T
+
+    def diag(self, A, T):
+        """similarity of row i of A with row i of T -> [n]"""
+        if not self.late: return (A * T).sum(-1)
+        return maxsim_diag(A, T)
 
     @torch.no_grad()
     def rl_scores(self, explanations, activations, bank=None, bs=64):
@@ -101,12 +160,12 @@ class ClipCritic:
         if not idx: return out
         T = self.text_emb([explanations[i] for i in idx], bs=bs)
         A = torch.cat([self.act_emb(torch.stack([activations[i].float() for i in idx[c:c + 512]])) for c in range(0, len(idx), 512)])
-        s = self.heads.scale(); r = s * (A * T).sum(-1)
-        if bank is not None: r = r - (torch.logsumexp(s * bank @ T.T, 0) - math.log(bank.shape[0]))
+        s = self.heads.scale(); r = s * self.diag(A, T)
+        if bank is not None: r = r - (torch.logsumexp(s * self.sim(bank, T), 0) - math.log(bank.shape[0]))
         for j, i in enumerate(idx):
             v = float(r[j]); out[i] = v if math.isfinite(v) else None
         return out
 
     def score(self, A, T):
         """[nA, D] x [nT, D] -> scaled cosine logits [nA, nT]"""
-        return self.heads.scale().detach() * A @ T.T
+        return self.heads.scale().detach() * self.sim(A, T)

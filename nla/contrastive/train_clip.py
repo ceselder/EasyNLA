@@ -121,6 +121,10 @@ def main():
     p.add_argument("--enc-layer", type=int, default=42); p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--lora-top", type=int, default=0, help="LoRA trainable only in the top K trunk layers (0 = all); the lower layers run without a backward pass")
     p.add_argument("--frozen-text", action="store_true", help="no LoRA at all: frozen trunk token states, only the pooling head + activation encoder train")
+    p.add_argument("--arch", default="pooled", choices=["pooled", "late"], help="late: non-pooled verifier, K activation tokens x per-token text projection, MaxSim")
+    p.add_argument("--late-k", type=int, default=16); p.add_argument("--late-d", type=int, default=128)
+    p.add_argument("--gradcache", action="store_true", help="trainable trunk LoRA with a large batch: embed without grad, loss grads w.r.t. the embeddings, then re-embed per chunk with grad")
+    p.add_argument("--gc-chunk", type=int, default=64)
     p.add_argument("--act-arch", default="mlp", choices=["mlp", "chunks"]); p.add_argument("--d-out", type=int, default=1024); p.add_argument("--max-len", type=int, default=224)
     p.add_argument("--batch", type=int, default=512, help="per-rank rows (global = world x batch)"); p.add_argument("--max-cuts", type=int, default=4)
     p.add_argument("--neg-source", default="make_negative", choices=["make_negative", "twins"], help="twins: g2 wrong-exact twins swapped into the rendering (nla.contrastive.ladders)")
@@ -142,7 +146,7 @@ def main():
     from nla.flow.negatives import make_negative
     from nla.flow.halluc_classify import perturb, grounded_numbers
     from nla.schema import extract_explanation
-    from nla.contrastive.model import ClipHeads
+    from nla.contrastive.model import ClipHeads, LateHeads, TokEmb, maxsim, maxsim_diag
     norm = Normalizer.load(a.stats).to(dev)
     tok = AutoTokenizer.from_pretrained(a.base); tok.padding_side = "right"
     if tok.pad_token_id is None: tok.pad_token = tok.eos_token
@@ -160,7 +164,10 @@ def main():
         except Exception as e: log("[clip] grad ckpt off:", e)
         log(f"[clip] LoRA trainable in layers {lo}..{nL - 1} only ({nfz} LoRA tensors frozen below)")
     d_enc = text.owner.config.hidden_size if text.crit is None else 5120
-    heads = ClipHeads(a.act_arch, d_enc, a.d_out).to(dev)
+    late = a.arch == "late"
+    heads = (LateHeads(d_enc, a.late_k, a.late_d) if late else ClipHeads(a.act_arch, d_enc, a.d_out)).to(dev)
+    SIM = (lambda A_, T_, ck=False: maxsim(A_, T_, ckpt=ck)) if late else (lambda A_, T_, ck=False: A_ @ T_.T)
+    DIAG = (lambda A_, T_: maxsim_diag(A_, T_)) if late else (lambda A_, T_: (A_ * T_).sum(-1))
     lora = text.trainable_parameters(); hp = list(heads.parameters())
     if ddp:
         with torch.no_grad():
@@ -206,12 +213,23 @@ def main():
         for i in range(0, len(texts), bs):
             with torch.set_grad_enabled(grad), torch.autocast("cuda", dtype=torch.bfloat16):
                 e, m = text.tokens([z if z else "(empty)" for z in texts[i:i + bs]], max_len=a.max_len)
-                outs.append(F.normalize(heads.pool(e, m).float(), dim=-1))
+                outs.append(heads.text(e, m) if late else F.normalize(heads.pool(e, m).float(), dim=-1))
+        if late: return TokEmb.cat(outs)
         return torch.cat(outs) if outs else torch.zeros(0, a.d_out, device=dev)
 
     def embed_acts(X, grad=False):
         with torch.set_grad_enabled(grad):
-            return F.normalize(heads.act(norm.normalize(X.to(dev).float())).float(), dim=-1)
+            x = norm.normalize(X.to(dev).float())
+            return heads.act(x).float() if late else F.normalize(heads.act(x).float(), dim=-1)
+
+    def gather_T(T_loc):
+        """gather local text embeddings from every rank (autograd); TokEmb padded to the global max length"""
+        if not ddp: return T_loc
+        if not late: return gather_grad(T_loc)
+        L = torch.tensor([T_loc.t.shape[1]], device=dev); dist.all_reduce(L, op=dist.ReduceOp.MAX); L = int(L)
+        t = F.pad(T_loc.t, (0, 0, 0, L - T_loc.t.shape[1])); m = F.pad(T_loc.m, (0, L - T_loc.m.shape[1]))
+        ms = [torch.zeros_like(m) for _ in range(world)]; dist.all_gather(ms, m); return TokEmb(gather_grad(t), torch.cat(ms))
+    def slice_T(E, lo, hi): return E[lo:hi] if not late else TokEmb(E.t[lo:hi], E.m[lo:hi])
 
     def all_gather_rows(x, n_total):
         """gather row-sharded (i::world) eval embeddings back into order"""
@@ -225,17 +243,19 @@ def main():
     @torch.no_grad()
     def evaluate(step):
         (text.crit if text.crit is not None else text.lm).eval(); heads.eval(); N = len(VZ)
-        idx = list(range(rank, N, world)); ta = embed_texts([VZ[i] for i in idx]); aa = embed_acts(VA[idx])
-        T_ = all_gather_rows(ta, N); A_ = all_gather_rows(aa, N)
-        # extra texts: wrong-detail negatives + number variants (sharded the same way)
         extra = [(i, zn) for i, (zn, _) in enumerate(VNEG) if zn] ; ex_texts = [zn for _, zn in extra]
-        var_texts = [it[1][k] for it in VNUM for k in ("orig", "near", "far", "hedge", "removed")]
-        allx = ex_texts + var_texts; xi = list(range(rank, len(allx), world)); X_ = all_gather_rows(embed_texts([allx[i] for i in xi]), len(allx))
+        var_texts = [it[1][k] for it in VNUM for k in ("orig", "near", "far", "hedge", "removed")]; allx = ex_texts + var_texts
+        if late:   # token-level embeddings: rank 0 embeds everything (other ranks wait at the barrier below)
+            if is0: T_ = embed_texts(VZ); A_ = torch.cat([embed_acts(VA[i:i + 4096]) for i in range(0, N, 4096)]); X_ = embed_texts(allx)
+        else:
+            idx = list(range(rank, N, world)); ta = embed_texts([VZ[i] for i in idx]); aa = embed_acts(VA[idx])
+            T_ = all_gather_rows(ta, N); A_ = all_gather_rows(aa, N)
+            xi = list(range(rank, len(allx), world)); X_ = all_gather_rows(embed_texts([allx[i] for i in xi]), len(allx))
         out = {}
         if is0:
             s = heads.scale().item()
             for n_ in (1000, 10000):
-                n_ = min(n_, N); L = A_[:n_] @ T_[:n_].T; ar = torch.arange(n_, device=dev)
+                n_ = min(n_, N); L = SIM(A_[:n_], slice_T(T_, 0, n_)); ar = torch.arange(n_, device=dev)
                 for nm, M in (("a2t", L), ("t2a", L.T)):
                     top = M.topk(5, dim=1).indices; out[f"eval/ret_{nm}_top1_n{n_}"] = (top[:, 0] == ar).float().mean().item(); out[f"eval/ret_{nm}_top5_n{n_}"] = (top == ar[:, None]).any(1).float().mean().item()
             by = {}
@@ -243,17 +263,20 @@ def main():
             ok_r = ok_c = tot = 0
             for g in by.values():
                 if len(g) < 5: continue
-                g = sorted(g)[:5]; M = A_[g] @ T_[g].T; ar = torch.arange(5, device=dev)
+                g = sorted(g)[:5]; M = SIM(A_[g], T_[g]); ar = torch.arange(5, device=dev)
                 ok_r += (M.argmax(1) == ar).sum().item(); ok_c += (M.argmax(0) == ar).sum().item(); tot += 5
             out["eval/samedoc5_a2t"] = ok_r / max(tot, 1); out["eval/samedoc5_t2a"] = ok_c / max(tot, 1)
-            kinds = {}
+            kinds = {}; ii = [i for i, _ in extra]
+            dT = DIAG(A_[ii], T_[ii]); dX = DIAG(A_[ii], slice_T(X_, 0, len(ii)))
             for j, (i, _) in enumerate(extra):
-                w_ = (A_[i] @ T_[i] > A_[i] @ X_[j]).item(); k_ = VNEG[i][1]; kinds.setdefault(k_, []).append(w_)
+                w_ = bool(dT[j] > dX[j]); k_ = VNEG[i][1]; kinds.setdefault(k_, []).append(w_)
             allw = [w for v in kinds.values() for w in v]; out["eval/neg_detect_acc"] = float(np.mean(allw)) if allw else float("nan")
             for k_, v in kinds.items(): out[f"eval/neg_detect_acc_{k_}"] = float(np.mean(v))
             base = len(ex_texts); V5 = ("orig", "near", "far", "hedge", "removed"); sc = {k: [] for k in V5}
-            for j, (i, _) in enumerate(VNUM):
-                for q, k in enumerate(V5): sc[k].append((A_[i] @ X_[base + 5 * j + q]).item())
+            if VNUM:
+                rows5 = [i for i, _ in VNUM for _q in V5]; dV = DIAG(A_[rows5], slice_T(X_, base, base + len(rows5))).tolist()
+                for j in range(len(VNUM)):
+                    for q, k in enumerate(V5): sc[k].append(dV[5 * j + q])
             if VNUM:
                 o = np.array(sc["orig"])
                 for k in ("near", "far", "hedge", "removed"): out[f"eval/num_orig_gt_{k}"] = float(np.mean(o > np.array(sc[k])))
@@ -262,6 +285,7 @@ def main():
             log(f"  [eval@{step}] ret a2t top1 n1k {out['eval/ret_a2t_top1_n1000']:.3f} n10k {out.get('eval/ret_a2t_top1_n10000', float('nan')):.3f} | t2a top1 n1k {out['eval/ret_t2a_top1_n1000']:.3f} | "
                 f"samedoc5 {out['eval/samedoc5_a2t']:.3f}/{out['eval/samedoc5_t2a']:.3f} | wrong-detail {out['eval/neg_detect_acc']:.3f} " + " ".join(f"{k.split('_')[-1]} {v:.3f}" for k, v in out.items() if k.startswith("eval/neg_detect_acc_"))
                 + f" | num orig>near {out.get('eval/num_orig_gt_near', float('nan')):.3f} >far {out.get('eval/num_orig_gt_far', float('nan')):.3f} >hedge {out.get('eval/num_orig_gt_hedge', float('nan')):.3f} hedge>near {out.get('eval/num_hedge_gt_near', float('nan')):.3f} | scale {s:.1f}")
+        if ddp and late: dist.barrier()
         (text.crit if text.crit is not None else text.lm).train(); heads.train()
         return out
 
@@ -308,37 +332,53 @@ def main():
             if pos < 0 or not nv or nv == raw: nears.append(None); hedges.append(None); continue
             nears.append(z[:pos] + nv + z[pos + len(raw):]); hedges.append(z[:pos] + f"{raw} or {nv}" + z[pos + len(raw):])
         rk = [(j, r) for (j, r), n_ in zip(rk, nears) if n_]; nears = [x for x in nears if x]; hedges = [x for x in hedges if x]
-        # ---- forward: local embeddings with grad, gathered with autograd
-        Ta = embed_texts(zs + negs, grad=True, bs=len(zs) + len(negs)); T_loc, N_loc = Ta[: len(zs)], Ta[len(zs):]
+        # ---- forward: every local text (explanations, negatives, ranking variants) embedded once; gathered with autograd
+        if a.rank_source == "ladders": extra_t = [t_ for _, rr in lad_items for _, t_ in rr]
+        else: extra_t = nears + hedges
+        texts_all = zs + negs + extra_t; b = len(zs)
+        if a.gradcache:   # embeddings without grad; loss grads w.r.t. them; per-chunk re-embedding with grad after the loss backward
+            with torch.no_grad(): E0 = embed_texts(texts_all, grad=False, bs=a.gc_chunk)
+            if late: E_all = TokEmb(E0.t.detach().requires_grad_(True), E0.m); E_leaf = E_all.t
+            else: E_all = E0.detach().requires_grad_(True); E_leaf = E_all
+        else:
+            E_all = embed_texts(texts_all, grad=True, bs=len(texts_all)); E_leaf = None
+        T_loc, N_loc, X_loc = slice_T(E_all, 0, b), slice_T(E_all, b, b + n_neg), slice_T(E_all, b + n_neg, len(texts_all))
         A_loc = embed_acts(A[idx], grad=True)
-        if ddp:
-            T_all, A_all, N_all = gather_grad(T_loc), gather_grad(A_loc), gather_grad(N_loc)
-            nv_t = torch.tensor([neg_valid], device=dev); nvl = [torch.zeros_like(nv_t) for _ in range(world)]; dist.all_gather(nvl, nv_t)
-        else: T_all, A_all, N_all, nvl = T_loc, A_loc, N_loc, [torch.tensor([neg_valid])]
+        T_all, N_all = gather_T(T_loc), gather_T(N_loc)
+        A_all = gather_grad(A_loc) if ddp else A_loc
+        if ddp: nv_t = torch.tensor([neg_valid], device=dev); nvl = [torch.zeros_like(nv_t) for _ in range(world)]; dist.all_gather(nvl, nv_t)
+        else: nvl = [torch.tensor([neg_valid])]
         neg_mask = torch.cat([torch.arange(n_neg, device=dev) < int(v) for v in nvl])
-        s = heads.scale(); b = len(zs); lab = torch.arange(b, device=dev) + rank * b
-        cols = torch.cat([T_all, N_all], 0); L_at = s * A_loc @ cols.T
-        L_at[:, T_all.shape[0]:] = L_at[:, T_all.shape[0]:].masked_fill(~neg_mask[None], -1e4)
-        L_ta = s * T_loc @ A_all.T
+        s = heads.scale(); lab = torch.arange(b, device=dev) + rank * b; nT = len(T_all)
+        cols = TokEmb.cat([T_all, N_all]) if late else torch.cat([T_all, N_all], 0)
+        L_at = s * SIM(A_loc, cols, True)
+        L_at = torch.cat([L_at[:, :nT], L_at[:, nT:].masked_fill(~neg_mask[None], -1e4)], 1)
+        L_ta = s * (SIM(A_all, T_loc, True).T if late else T_loc @ A_all.T)
         loss_nce = 0.5 * (F.cross_entropy(L_at, lab) + F.cross_entropy(L_ta, lab))
         loss_rank = torch.zeros((), device=dev)
         if rk:
-            E = embed_texts(nears + hedges, grad=True, bs=len(nears) + len(hedges)); En, Eh = E[: len(nears)], E[len(nears):]
-            jj = torch.tensor([j for j, _ in rk], device=dev); a_ = A_loc[jj]
-            s_o = s * (a_ * T_loc[jj]).sum(-1); s_n = s * (a_ * En).sum(-1); s_h = s * (a_ * Eh).sum(-1)
+            nn_ = len(nears); En, Eh = slice_T(X_loc, 0, nn_), slice_T(X_loc, nn_, 2 * nn_)
+            jj = [j for j, _ in rk]; a_ = A_loc[jj]
+            s_o = s * DIAG(a_, T_loc[jj] if not late else TokEmb(T_loc.t[jj], T_loc.m[jj])); s_n = s * DIAG(a_, En); s_h = s * DIAG(a_, Eh)
             loss_rank = (F.softplus(s_n - s_h) + F.softplus(s_h - s_o)).mean()
         if lad_items:   # consecutive rungs of each fact's ladder: softplus(s_lower - s_higher), same activation
-            flat = [t_ for _, rr in lad_items for _, t_ in rr]; E = embed_texts(flat, grad=True, bs=len(flat)); pos = 0; terms = []
+            rows_ = [j for j, rr in lad_items for _ in rr]; sv_all = s * DIAG(A_loc[rows_], X_loc); pos = 0; terms = []
             for j, rr in lad_items:
-                sv = s * (E[pos:pos + len(rr)] @ A_loc[j]); pos += len(rr); terms.append(F.softplus(sv[1:] - sv[:-1]))
+                sv = sv_all[pos:pos + len(rr)]; pos += len(rr); terms.append(F.softplus(sv[1:] - sv[:-1]))
             loss_rank = torch.cat(terms).mean(); rk = lad_items
         loss = loss_nce + a.rank_lambda * loss_rank * (len(rk) > 0)
         opt.zero_grad(set_to_none=True); loss.backward()
+        if a.gradcache:   # second pass: re-embed each chunk WITH grad and push the cached embedding gradient through trunk LoRA + text head
+            G_ = E_leaf.grad
+            for c in range(0, len(texts_all), a.gc_chunk):
+                e_c = embed_texts(texts_all[c:c + a.gc_chunk], grad=True, bs=a.gc_chunk)
+                if late: (e_c.t * G_[c:c + a.gc_chunk, : e_c.t.shape[1]]).sum().backward()
+                else: (e_c * G_[c:c + a.gc_chunk]).sum().backward()
         if ddp: allreduce_grads(lora + hp)
         gn = torch.nn.utils.clip_grad_norm_(lora + hp, 1.0)
         opt.step(); pairs += world * b
         if step % 5 == 0 or step == 1:
-            with torch.no_grad(): acc = (L_at[:, : T_all.shape[0]].argmax(1) == lab).float().mean().item()
+            with torch.no_grad(): acc = (L_at[:, :nT].argmax(1) == lab).float().mean().item()
             dt = (time.time() - t_step) / (5 if step > 1 else 1); t_step = time.time()
             log(f"[clip] step {step}/{steps} pairs {pairs} loss {loss_nce.item():.4f} rank {loss_rank.item():.4f} (n {len(rk)}) acc {acc:.3f} scale {s.item():.1f} gn {gn.item():.2f} lr_f {lr_f:.3f} {dt:.1f}s/step epoch {batcher.epoch}")
             if use_wandb: wandb.log({"train/loss_nce": loss_nce.item(), "train/loss_rank": loss_rank.item(), "train/acc_in_batch": acc, "train/scale": s.item(), "train/gn": gn.item(), "train/lr_f": lr_f, "time/step_s": dt, "pairs": pairs}, step=step)

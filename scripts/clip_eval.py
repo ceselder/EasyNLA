@@ -37,16 +37,16 @@ def main():
         bank_idx = [i for i in range(len(VD)) if VD[i] not in cdocs][: a.bank_n]; Bk = VAe[bank_idx]; s_ = C.heads.scale().item(); res["scale"] = s_
     print(f"[clip-eval] {a.ckpt}: scale {s_:.1f}, val {len(VZ)} rows, bank {len(bank_idx)} activations ({time.time() - t0:.0f}s)", flush=True)
     def lse_bank(T):   # [nT, D] -> log mean_j exp s(h_j, z) over the bank, per text
-        return (torch.logsumexp(s_ * (Bk @ T.T), 0) - math.log(Bk.shape[0]))
+        return (torch.logsumexp(s_ * C.sim(Bk, T), 0) - math.log(Bk.shape[0]))
     @torch.no_grad()
     def score(Ae, texts):   # Ae [nA, D] embeddings; -> raw [nA, nT], normaliser [nT]
-        T = C.text_emb(texts); return (s_ * Ae @ T.T), lse_bank(T), T
+        T = C.text_emb(texts); return (s_ * C.sim(Ae, T)), lse_bank(T), T
 
     if "val" in tests:
         with torch.no_grad(): VT = C.text_emb(VZ)
         out = {}
         for n_ in (1000, 10000):
-            n_ = min(n_, len(VZ)); L = VAe[:n_] @ VT[:n_].T; ar = torch.arange(n_, device=dev)
+            n_ = min(n_, len(VZ)); L = C.sim(VAe[:n_], VT[:n_]); ar = torch.arange(n_, device=dev)
             for nm, M in (("a2t", L), ("t2a", L.T)):
                 top = M.topk(5, dim=1).indices; out[f"ret_{nm}_top1_n{n_}"] = (top[:, 0] == ar).float().mean().item(); out[f"ret_{nm}_top5_n{n_}"] = (top == ar[:, None]).any(1).float().mean().item()
         by = {}
@@ -54,16 +54,17 @@ def main():
         ok_r = ok_c = tot = 0
         for g in by.values():
             if len(g) < 5: continue
-            g = sorted(g)[:5]; M = VAe[g] @ VT[g].T; ar = torch.arange(5, device=dev); ok_r += (M.argmax(1) == ar).sum().item(); ok_c += (M.argmax(0) == ar).sum().item(); tot += 5
+            g = sorted(g)[:5]; M = C.sim(VAe[g], VT[g]); ar = torch.arange(5, device=dev); ok_r += (M.argmax(1) == ar).sum().item(); ok_c += (M.argmax(0) == ar).sum().item(); tot += 5
         out["samedoc5_a2t"] = ok_r / tot; out["samedoc5_t2a"] = ok_c / tot; out["samedoc5_n"] = tot
         rng = np.random.default_rng(3); ok = 0; M_ = 1024
         for i in range(M_):
-            cand = [i] + list(rng.choice([j for j in range(M_) if j != i], 7, replace=False)); ok += int((VAe[i] @ VT[cand].T).argmax().item() == 0)
+            cand = [i] + list(rng.choice([j for j in range(M_) if j != i], 7, replace=False)); ok += int(C.sim(VAe[i:i + 1], VT[[int(c) for c in cand]])[0].argmax().item() == 0)
         out["source_match_1of8"] = ok / M_
         nrng = random.Random(2); negs = [make_negative(z, nrng, VZ[:1024]) for z in VZ[:1024]]; rows_ = [i for i, (zn, _) in enumerate(negs) if zn]
         with torch.no_grad(): TN = C.text_emb([negs[i][0] for i in rows_])
         kinds = {}
-        for j, i in enumerate(rows_): kinds.setdefault(negs[i][1], []).append(bool((VAe[i] @ VT[i]) > (VAe[i] @ TN[j])))
+        dT = C.diag(VAe[rows_], VT[rows_]); dN = C.diag(VAe[rows_], TN)
+        for j, i in enumerate(rows_): kinds.setdefault(negs[i][1], []).append(bool(dT[j] > dN[j]))
         out["neg_detect_acc"] = float(np.mean([w for v in kinds.values() for w in v])); out.update({f"neg_detect_acc_{k}": float(np.mean(v)) for k, v in kinds.items()}); out.update({f"neg_n_{k}": len(v) for k, v in kinds.items()})
         res["val"] = out; print("[clip-eval] val", json.dumps({k: round(v, 4) for k, v in out.items()}), flush=True)
 
@@ -89,7 +90,7 @@ def main():
                 if row in TA:
                     e = TA[row]; acts = [e["h_stored"], e["h_recap"]] + list(e["twins"]) + ([e["placebo"]] if e["placebo"] is not None else [])
                     Aa = C.act_emb(torch.stack(acts).float()); tw.setdefault(str(row), {"n_twins": len(e["twins"]), "has_placebo": e["placebo"] is not None, "S": {}})
-                    tw[str(row)]["S"][av] = (s_ * T @ Aa.T).tolist()                 # [nZ, nA]
+                    tw[str(row)]["S"][av] = (s_ * C.sim(Aa, T)).T.tolist()           # [nZ, nA]
             for it in [d for d in dele if d["row"] == row]:
                 raw, lz, _ = score(Ah, [it["z"], it["remove_false"] or "(empty)", it["remove_true"] or "(empty)"])
                 dl.append({"av": it["av"], "g": it["g"], "i": it["i"], "row": row, "n_removed": it["n_removed"], "n_false": it["n_false"], "raw": raw[0].tolist(), "pmi": (raw[0] - lz).tolist()})
@@ -114,7 +115,7 @@ def main():
         n = 256; perm = torch.randperm(n, generator=torch.Generator().manual_seed(1)).tolist(); zs = CZ[:n]; zsh = [zs[i] for i in perm]
         with torch.no_grad():
             Ae = C.act_emb(CA[:n]); T = C.text_emb(zs); Ts = C.text_emb(zsh)
-            pmi = (s_ * (Ae * T).sum(-1) - lse_bank(T)); pms = (s_ * (Ae * Ts).sum(-1) - lse_bank(Ts))
+            pmi = (s_ * C.diag(Ae, T) - lse_bank(T)); pms = (s_ * C.diag(Ae, Ts) - lse_bank(Ts))
         res["pmi"] = {"n": n, "pmi_nats_mean": pmi.mean().item(), "pmi_bits_mean": pmi.mean().item() / math.log(2), "shuf_bits_mean": pms.mean().item() / math.log(2),
                       "cap_bits": math.log(len(bank_idx)) / math.log(2), "frac_positive": (pmi > 0).float().mean().item()}
         print("[clip-eval] pmi", json.dumps(res["pmi"]), flush=True)
