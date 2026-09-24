@@ -37,6 +37,8 @@ def score(facts: pd.DataFrame, dump: pd.DataFrame, name: str) -> dict:
     for fact in RX:
         true = d[fact].values; pred = P[fact].values; m = multi if fact.startswith("peak") else np.ones(len(d), bool)
         res[f"acc_{fact}"] = float(np.mean((pred == true)[m])); res[f"parsed_{fact}"] = float(np.mean([p is not None for p in pred[m]])); res[f"n_{fact}"] = int(m.sum())
+    for cls in np.unique(d["kind"].values):                      # accuracy of the attention-vs-MLP fact by TRUE class (the rare attention class is the tell)
+        mk = d["kind"].values == cls; res[f"acc_kind_true_{cls}"] = float(np.mean((P["kind"].values == cls)[mk])); res[f"n_kind_true_{cls}"] = int(mk.sum())
     if "attn_share" in d:
         tp = np.clip(d["attn_share"].values, 0, 1) * 100; pp = P["pct"].values.astype(float)
         ok = ~np.isnan(pp); res["pct_mae"] = float(np.mean(np.abs(pp[ok] - tp[ok]))) if ok.any() else None; res["pct_parsed"] = float(ok.mean())
