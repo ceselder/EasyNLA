@@ -17,10 +17,12 @@ def main():
     a = ap.parse_args(); res = {"critic": a.critic, "sources": {}, "edits": {}}
     for f in sorted(glob.glob(os.path.join(a.scored_dir, a.pattern + ".summary.json"))):
         stem = os.path.basename(f)[: -len(".summary.json")]; s = json.load(open(f))
-        if any(k in stem for k in ("_para_", "_twinnext", "_doc_", "_mask_")):      # edit / same-doc manifests are read via their own branches below, not as control sources
+        pfx0 = a.pattern.split("*")[0]; rest = stem[len(pfx0):] if stem.startswith(pfx0) else stem      # test the manifest part only (a critic called critic_para_* must not be skipped as a paraphrase file)
+        if any(k in "_" + rest for k in ("_para_", "_twinnext", "_doc_", "_mask_")):      # edit / same-doc manifests are read via their own branches below, not as control sources
             continue
         if "orig" in s and "dm" in s and "by_band" in s:      # controls summary
             pfx = a.pattern.split("*")[0]; src = stem[len(pfx):] if stem.startswith(pfx) else re.sub(r"^scored_[^_]+_", "", stem)      # source name = stem minus the critic prefix (works for scored_2_, scored_big_, scored_enc_e2_manifest2_, scored_v3be2fbi_)
+            src = re.sub(r"^(FINAL_)?manifest2_", "", src)                                    # lens's layout: scored_<critic>_FINAL_manifest2_<src> / _FINAL_manifest_para_<src> / _manifest_twinnext2_<src>
             ws = s["by_band"]["orig"].get("workspace"); wd = s["by_band"]["dm"].get("workspace"); wr = s["by_band"]["rp"].get("workspace") if "rp" in s["by_band"] else None
             n = s["orig"]["n"]; noise = (s["orig"]["ci95"][1] - s["orig"]["ci95"][0]) / 2 / 1.96 * math.sqrt(max(1, n)) / math.sqrt(max(1, n))   # per-pair sem as the stand-in
             content_ws = (ws["bits_mean"] - wd["bits_mean"]) if ws and wd else float("nan"); p_dm = s["dm"]["p_orig_higher"]
@@ -43,7 +45,10 @@ def main():
             # A4 (proposed, board #285): P(z > twin) >= 0.65 from this critic's paraphrase/twin summary of the same source, if scored
             prefix = a.pattern.split("*")[0]                      # e.g. 'scored_big_' -> this critic's twin file is scored_big_para_<src>; pooled_n's were written without a critic tag
             cands = [os.path.join(a.scored_dir, f"{prefix}para_{src}.summary.json")] + ([os.path.join(a.scored_dir, f"scored_para_{src}.summary.json")] if a.critic == "union_pooled_null" else [])
-            t2 = os.path.join(a.scored_dir, f"{prefix}twinnext2_{src}.summary.json")      # generator-independent twins (nlt.evals.twin_next): twin_near / twin_far
+            prefix2 = re.sub(r"(FINAL_)?manifest2_$", "", prefix)                                  # other layouts: <prefix>[FINAL_]manifest_para_<src>, <prefix>[FINAL_]manifest_twinnext2_<src> (full-row FINAL files first)
+            cands += sorted(glob.glob(os.path.join(a.scored_dir, f"{prefix2}*para_{src}.summary.json")), key=lambda p: ("FINAL" not in p, p))
+            t2s = [os.path.join(a.scored_dir, f"{prefix}twinnext2_{src}.summary.json")] + sorted(glob.glob(os.path.join(a.scored_dir, f"{prefix2}*twinnext2_{src}.summary.json")), key=lambda p: ("FINAL" not in p, p))
+            t2 = next((p for p in t2s if os.path.exists(p)), t2s[0])      # generator-independent twins (nlt.evals.twin_next): twin_near / twin_far
             if os.path.exists(t2):
                 ts2 = json.load(open(t2)); tn, tfar = ts2.get("twin_near", {}), ts2.get("twin_far", {})
                 if tn.get("p_orig_preferred") is not None or tfar.get("p_orig_preferred") is not None:
