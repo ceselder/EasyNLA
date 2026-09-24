@@ -44,7 +44,7 @@ app = modal.App("nla-scale")
 # production labeller config, from the 6-way bench (20k real prompts, 1 B200 each): bigger batches +8 %, one variant per document +3 % prompts/s at
 # 10 % longer outputs; fp8 weights+KV -4 % and 8x parse failures (decode-bound on the MoE/attention kernels, not weight bandwidth); n>1 gives no
 # extra explanations per second (127 at n=2 vs 126) -> bf16, 1024 seqs, 32k batched tokens, n=1
-LABEL_CFG = dict(fp8=False, fp8_kv=False, max_num_seqs=1024, max_num_batched_tokens=32768, n=1, attention_backend="TRITON_FLASHINFER")   # backend: [gemma-engine] 03:40 win, quality-guarded
+LABEL_CFG = dict(fp8=False, fp8_kv=True, max_num_seqs=1024, max_num_batched_tokens=32768, n=1, attention_backend="TRITON_FLASHINFER")   # backend + fp8 KV cache: [gemma-engine] wins, quality-guarded
 
 
 def _engine_kwargs(cfg=None):
@@ -288,7 +288,7 @@ def g2_label(sid: int, src: str, out_root: str):
     global _AGEN
     if "_AGEN" not in globals(): _AGEN = _AsyncGen()
     recs, st = _g2_rows(_AGEN, d["text"], [f"{a}|{b}" for a, b in zip(d["doc_id"], d["n_raw_tokens"])], d["doc_id"])
-    import vllm as _v; eng = f"vllm-{_v.__version__}-{LABEL_CFG.get('attention_backend') or 'auto'}-asyncpretok"
+    import vllm as _v; eng = f"vllm-{_v.__version__}-{LABEL_CFG.get('attention_backend') or 'auto'}-asyncpretok{'-fp8kv' if LABEL_CFG.get('fp8_kv') else ''}"
     rows = [{"doc_id": a, "n_raw_tokens": b, **r, "engine": eng} for a, b, r in zip(d["doc_id"], d["n_raw_tokens"], recs)]
     st["engine"] = eng
     os.makedirs(f"{out_root}/lab", exist_ok=True); pq.write_table(pa.Table.from_pylist(rows), out, compression="zstd"); vol_glp.commit()
