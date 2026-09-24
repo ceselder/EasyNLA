@@ -170,18 +170,21 @@ def gen_stream(root, out, k, K, pattern="text_v*_*.jsonl.gz", layout="a_dp4", co
     lp = f"/tmp/server_stream_{k}.log"                 # local disk: an open file on the volume blocks volume.reload()
     logf = open(lp, "w"); proc, t_start = start_server(flags, mns, 8000, logf)
     if t_start is None: raise SystemExit("gemma server did not start: " + open(lp).read()[-2000:])
-    print(f"[gemma-stream {k}/{K}] server up in {t_start:.0f}s ({layout})", flush=True); idle_since = time.time(); n_done = 0
+    print(f"[gemma-stream {k}/{K}] server up in {t_start:.0f}s ({layout})", flush=True); idle_since = time.time(); n_done = 0; fails = {}
     try:
         while not os.path.exists(f"{out}/STOP"):
             if reload: reload()
             names = sorted(os.path.basename(f)[5:-9] for f in glob.glob(f"{root}/text/{pattern}"))
             todo = [n for n in names if zlib.crc32(n.encode()) % K == k and n not in exclude and not os.path.exists(f"{out}/semantic_{n}.parquet")
-                    and not os.path.exists(f"{out}/stats_{n}.json")]
+                    and not os.path.exists(f"{out}/stats_{n}.json") and fails.get(n, 0) < 3]
             if not todo:
                 if (time.time() - idle_since) / 60 > idle_exit_min: break
                 time.sleep(300); continue
             for n in todo:
-                gen_one(root, out, n, mns, flags, layout)
+                if fails.get(n, 0) >= 3: continue
+                try: gen_one(root, out, n, mns, flags, layout)
+                except Exception as e:                  # e.g. a shard still being written: retry on a later scan, give up after 3 tries
+                    fails[n] = fails.get(n, 0) + 1; print(f"[gemma-stream {k}/{K}] {n} failed ({type(e).__name__}: {str(e)[:120]}), try {fails[n]}", flush=True); continue
                 n_done += 1; idle_since = time.time()
                 if commit: commit()
     finally:

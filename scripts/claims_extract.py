@@ -294,8 +294,10 @@ def _write(a, W, rec, greedy, tok, piece, docs, t0, t_fwd, t_gen, agree):
         "activation_vector", pa.FixedSizeListArray.from_arrays(pa.array(vec.reshape(-1)), dim))
     name = f"{a.tag}_{a.shard:03d}"; tmp = f"{a.root}/anchors/anchors_{name}.parquet.tmp"
     pq.write_table(tbl, tmp, compression="zstd"); os.replace(tmp, f"{a.root}/anchors/anchors_{name}.parquet")
-    with gzip.open(f"{a.root}/text/text_{name}.jsonl.gz", "wt") as f:
+    tmpt = f"{a.root}/text/text_{name}.jsonl.gz.tmp"                 # atomic: readers (Gemma streams) must never see a half-written shard
+    with gzip.open(tmpt, "wt") as f:
         for r in txt: f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmpt, f"{a.root}/text/text_{name}.jsonl.gz")
     write_internal(txt, f"{a.root}/claims/internal_{name}.parquet", tok.decode, seed=a.seed * 7 + a.shard)
     json.dump({"shard": name, "docs": len(docs), "windows": len(W), "anchors": len(out), "tokens_fwd": sum(len(w["ids"]) for w in W), "t_fwd_s": t_fwd, "t_gen_s": t_gen,
                "top1_agree": agree, "anchor_types": {t: sum(1 for r in txt if r["anchor_type"] == t) for t in ANCHOR_TYPES}},

@@ -211,7 +211,8 @@ def _work(args):
     res = text_claims(rows, nlp, seed=seed, max_per=max_per)
     keep = [i for i, c in enumerate(res) if c]
     tbl = pa.table({"anchor_id": [rows[i]["anchor_id"] for i in keep], "claims": [[x for _, x in res[i]] for i in keep], "types": [[t for t, _ in res[i]] for i in keep]})
-    os.makedirs(f"{root}/claims", exist_ok=True); pq.write_table(tbl, f"{root}/claims/text_{name}.parquet", compression="zstd")
+    os.makedirs(f"{root}/claims", exist_ok=True); tmp = f"{root}/claims/text_{name}.parquet.tmp"
+    pq.write_table(tbl, tmp, compression="zstd"); os.replace(tmp, f"{root}/claims/text_{name}.parquet")
     return name, len(rows), sum(len(c) for c in res)
 
 
