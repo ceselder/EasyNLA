@@ -58,7 +58,7 @@ def main():
     from nla.unclip.decoder import Decoder
     dec = Decoder(a.snap, d0, encoder_json=a.encoder_json); d = dec.d; msf = math.sqrt(d)
     H, Z, TXT, DOC = load_rows(a.n); Hg = H.to(d0); E = dec.encode(Hg); perm = torch.randperm(a.n, generator=torch.Generator().manual_seed(1)).tolist(); E_shuf = E[perm]
-    res = {"snap": a.snap, "step": dec.step, "samples": dec.samples, "adapter_args": {k: v for k, v in dec.aa.items() if isinstance(v, (int, float, str, bool, type(None)))}, "n": a.n, "seed": a.seed, "tests": sorted(tests), "e_scale": dec.enc.e_scale}
+    res = {"snap": a.snap, "step": dec.step, "samples": dec.samples, "adapter_args": {k: v for k, v in dec.aa.items() if isinstance(v, (int, float, str, bool, type(None)))}, "n": a.n, "seed": a.seed, "tests": sorted(tests), "e_scale": dec.enc.e_scale, "space": dec.aa.get("space", "std")}
     print(f"[dec-eval] {a.snap}: step {dec.step}, {a.n} clean1 rows, tests {sorted(tests)}", flush=True)
     out_path = a.out or os.path.join(a.snap, "eval_dec.json")
     def dump(): json.dump(res, open(out_path, "w"), indent=1)
@@ -91,7 +91,8 @@ def main():
         res["exact"] = {"ode_steps": a.exact_steps, "pmi_bits": stats(pmi), "frac_positive": float((pmi > 0).float().mean()), "shuf_bits": stats(pms), "frac_shuf_positive": float((pms > 0).float().mean()),
                         "bits_per_dim_uncond": float(-lp["uncond"].mean() / (d * math.log(2))), "bits_per_dim_cond": float(-lp["cond"].mean() / (d * math.log(2))),
                         "cond_code_bits": float(-lp["cond"].mean() / math.log(2)), "uncond_code_bits": float(-lp["uncond"].mean() / math.log(2)), "per_row_pmi_bits": pmi.tolist()}
-        if a.ref_prior:   # fixed reference: the original unconditional prior (before co-training) on the same rows, same probes -> PMI_ref = log p_dec(h|e) - log p_prior0(h)
+        if a.ref_prior and dec.aa.get("space", "std") == "dir": print("[dec-eval] dir-space decoder: the fixed-prior PMI control lives in another coordinate system -> skipped", flush=True)
+        if a.ref_prior and dec.aa.get("space", "std") != "dir":   # fixed reference: the original unconditional prior (before co-training) on the same rows, same probes -> PMI_ref = log p_dec(h|e) - log p_prior0(h)
             from nla.flow.model import Denoiser
             from nla.flow.eval_cond import exact_logp
             m0 = torch.load(os.path.join(a.ref_prior, "model.pt"), map_location="cpu", mmap=True); c0 = m0["args"]

@@ -29,9 +29,13 @@ class Decoder:
         missing = [k for k in res.missing_keys if not k.startswith("prior.") and ".base." not in k]; assert not missing, missing[:5]
         for mod in self.model.adapter_modules(): mod.float()
         self.fp32 = fp32; self.model.eval(); self.model.requires_grad_(False)
-        self.norm = Normalizer.load(aa["stats"]).to(self.dev)
+        self.space = aa.get("space", "std")
+        if self.space == "dir":   # direction-space decoder: samples are DIRECTIONS (norm ~sqrt(d)); consumers rescale to ||h|| (scripts/unclip_eval_dec.py match_norm)
+            from nla.unclip.dirspace import DirNormalizer
+            self.norm = DirNormalizer(aa["dir_whiten"]).to(self.dev)
+        else: self.norm = Normalizer.load(aa["stats"]).to(self.dev)
         self.enc = load_encoder(encoder_json or aa["encoder_json"], self.dev); self.d_e = self.enc.d_e
-        print(f"[decoder] {snap_dir}: step {self.step}, {(self.samples or 0)/1e6:.0f}M samples, prior {cfg['n_layers']} blocks ({'co-trained' if os.path.exists(pco) else 'frozen snapshot'}), adapter {self.model.n_adapter_params()/1e6:.0f}M, d_e {self.d_e}", flush=True)
+        print(f"[decoder] {snap_dir}: step {self.step}, {(self.samples or 0)/1e6:.0f}M samples, prior {cfg['n_layers']} blocks ({'co-trained' if os.path.exists(pco) else 'frozen snapshot'}), adapter {self.model.n_adapter_params()/1e6:.0f}M, d_e {self.d_e}, space {self.space}", flush=True)
 
     # ---- pieces
     @torch.no_grad()

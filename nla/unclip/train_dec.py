@@ -21,6 +21,7 @@ from nla.flow.model import Denoiser, Normalizer
 from nla.flow.cond_model import CondDenoiser, cond_fm_loss
 from nla.flow.train import ShardFeeder, lr_at
 from nla.flow.shards import n_ready
+from nla.unclip.dirspace import DirNormalizer, RawFeederNorm
 
 COND_MODE = "clip_vec"   # adapter args tag: pooled VECTOR condition e (d_cvec = d_e), no token cross-reads, no text anywhere
 
@@ -44,6 +45,9 @@ def get_args():
     p.add_argument("--shard-coarse", action="store_true", help="FSDP with one unit per CondMLPBlock (FAILS: prior.layers[i] is also blocks[i].base, the root meets DTensors -> 'value was None'); default = the train_cond pattern (every called sub-module of the prior block sharded separately)")
     p.add_argument("--no-fsdp", action="store_true", help="single process / CPU test: plain tensors"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cpu-test", action="store_true", help="tiny random prior + random encoder weights on CPU (tests/CI)")
+    p.add_argument("--dir-space", default=None, help="DIRECTION-space decoder: flow-match h_dir = sqrt(d) h/||h|| in RAW coordinates with PriorGrad-A covariance-shaped noise: model space x' = W (h_dir - mu) from this whitening file (scripts/unclip_fit_dir_whitening.py), plain velocity MSE mapped back by W_inv (err_map), radial smoothing noise --radial-sigma")
+    p.add_argument("--radial-sigma", type=float, default=0.02, help="dir-space: training targets h_dir * (1 + sigma * eps) (the sphere gets a thickness; exact log p is over the smoothed distribution)")
+    p.add_argument("--init-from", default=None, help="warm start from a DECODER snapshot dir (prior_cotrained_latest.pt + adapter_latest.pt), e.g. /vol_glp/unclip/decoder/dec_main/snap_000262M")
     p.add_argument("--export-latest", action="store_true", help="no training: load <out>/latest (DCP; same world size as the run), evaluate, write a loadable snapshot <out>/snap_<samples>M, exit")
     return p.parse_args()
 
@@ -115,7 +119,7 @@ def adapter_args(a, cfg, d_e, step, samples):
     return {"cond_mode": COND_MODE, "n_slots": a.n_slots, "n_heads": a.n_heads, "d_head": a.d_head, "gate_rank": a.gate_rank, "d_c": a.d_c, "d_cvec": d_e, "d_e": d_e,
             "prior": a.prior, "prior_weights": a.prior_weights, "stats": a.stats, "encoder_json": a.encoder_json, "p_uncond": a.p_uncond, "tag": a.tag,
             "lr": a.lr, "prior_lr": a.prior_lr, "freeze_prior": a.freeze_prior, "batch": a.batch, "grad_accum": a.grad_accum, "step": step, "samples": samples,
-            "unfreeze_prior": not a.freeze_prior, "enc_layer": 42, "whiten": None}
+            "unfreeze_prior": not a.freeze_prior, "enc_layer": 42, "whiten": None, "space": "dir" if a.dir_space else "std", "dir_whiten": a.dir_space, "radial_sigma": a.radial_sigma if a.dir_space else 0.0, "init_from": a.init_from}
 
 
 # ------------------------------------------------------------------------------------------------------------------ eval
@@ -169,9 +173,11 @@ def recon_stats(h_raw, h_hat, norm, prefix):
 @torch.no_grad()
 def evaluate(model, enc, norm, held_raw, clean_raw, a, dev):
     model.eval(); out = {}
+    dn = getattr(a, "_dnorm", None)
+    if dn is not None: norm = dn                                    # dir-space: model space = whitened directions; denormalize -> h_dir
     for prefix, raw in (("eval", held_raw), ("clean1", clean_raw)):
         if raw is None: continue
-        x0 = norm.normalize(raw.to(dev)); e = enc.from_standardised(x0)
+        x0 = norm.normalize(raw.to(dev)); e = enc(raw.to(dev)) if dn is not None else enc.from_standardised(x0)
         out.update(fm_branches(model, x0, e, dev, prefix))
         # x0-hat at t = 0.9 under the condition (the 'conditional FVE' the conditioners report) and a conditional Euler sample (CFG 1) on sample_n rows
         n_s = min(a.sample_n, x0.shape[0]); xs, es = x0[:n_s], e[:n_s]; g = torch.Generator(device=dev).manual_seed(7)
@@ -183,6 +189,8 @@ def evaluate(model, enc, norm, held_raw, clean_raw, a, dev):
         out.update({f"{prefix}/{k}": val for k, val in recon_stats(raw[:n_s].to(dev).float(), samp_c, norm, f"sample{a.sample_steps}_cfg1").items()})
         out[f"{prefix}/uncond_sample_norm_ratio"] = (samp_u.norm(dim=-1) / raw[:n_s].to(dev).norm(dim=-1)).mean().item()
         out[f"{prefix}/sample_e_cos"] = (enc(samp_c) * es).sum(-1).mean().item() / enc.d_e     # does the sample land at the right e? (CLIP-space consistency)
+        hr = raw[:n_s].to(dev).float(); samp_nm = samp_c * (hr.norm(dim=-1, keepdim=True) / samp_c.norm(dim=-1, keepdim=True).clamp_min(1e-6))
+        out[f"{prefix}/sample_e_cos_normmatched"] = (enc(samp_nm) * es).sum(-1).mean().item() / enc.d_e   # the sample's DIRECTION at ||h|| (what gets spliced)
         del x0, e
     model.train()
     if hasattr(model, "reshard"): model.reshard()
@@ -197,11 +205,11 @@ def save_latest(path, model, opt, step, samples, a, fsdp, rank):
         if rank == 0 and os.path.exists(tmp): __import__("shutil").rmtree(tmp, ignore_errors=True)
         dist.barrier()
         dcp.save({"model": get_model_state_dict(model), "opt": get_optimizer_state_dict(model, opt)}, checkpoint_id=tmp)
-        if rank == 0: json.dump({"step": step, "samples": samples, "args": vars(a)}, open(os.path.join(tmp, "meta.json"), "w"))
+        if rank == 0: json.dump({"step": step, "samples": samples, "args": {k: v for k, v in vars(a).items() if not k.startswith("_")}}, open(os.path.join(tmp, "meta.json"), "w"))
         dist.barrier()
     else:
-        os.makedirs(tmp, exist_ok=True); torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "samples": samples, "args": vars(a)}, os.path.join(tmp, "state.pt"))
-        json.dump({"step": step, "samples": samples, "args": vars(a)}, open(os.path.join(tmp, "meta.json"), "w"))
+        os.makedirs(tmp, exist_ok=True); torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "samples": samples, "args": {k: v for k, v in vars(a).items() if not k.startswith("_")}}, os.path.join(tmp, "state.pt"))
+        json.dump({"step": step, "samples": samples, "args": {k: v for k, v in vars(a).items() if not k.startswith("_")}}, open(os.path.join(tmp, "meta.json"), "w"))
     if rank == 0:
         if os.path.exists(path): os.rename(path, path + ".old")
         os.rename(tmp, path)
@@ -240,7 +248,8 @@ def main():
     else: rank, world = 0, 1; dev = torch.device("cuda" if torch.cuda.is_available() and not a.cpu_test else "cpu")
     is0 = rank == 0; torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     if dev.type == "cuda": torch.backends.cuda.matmul.allow_tf32 = True
-    norm = Normalizer.load(a.stats).to(dev)
+    norm = Normalizer.load(a.stats).to(dev)            # the flow prior's standardised space (also the encoder's input space)
+    dnorm = DirNormalizer(a.dir_space).to(dev) if a.dir_space else None; err_map = dnorm.W_inv if dnorm is not None else None   # PriorGrad-A: loss = squared error mapped back to h_dir coordinates
     from nla.unclip.encoder import load_encoder, ActEncoder
     if a.cpu_test:   # tiny random prior + random encoder, real recipe json (weights ignored)
         cfg = {"d_input": 5120, "d_model": 256, "d_mlp": 512, "n_layers": 2}; sd = None
@@ -255,6 +264,11 @@ def main():
     if not hasattr(enc, "from_standardised"):
         raise RuntimeError("nla.unclip.encoder.ActEncoder needs from_standardised()")
     model = build(a, cfg, sd, d_e, dev); del sd
+    if a.init_from:   # warm start from a decoder snapshot (prior + adapter), before sharding
+        pc_ = torch.load(os.path.join(a.init_from, "prior_cotrained_latest.pt"), map_location="cpu", mmap=True); model.prior.load_state_dict({k: v.float() for k, v in pc_["model"].items()}); del pc_
+        ad_ = torch.load(os.path.join(a.init_from, "adapter_latest.pt"), map_location="cpu"); res_ = model.load_state_dict(ad_["adapter"], strict=False); assert not res_.unexpected_keys, res_.unexpected_keys[:5]
+        if is0: print(f"[dec] warm start from decoder snapshot {a.init_from} (step {ad_.get('step')}, {(ad_.get('samples') or 0)/1e6:.0f}M samples): prior + {len(ad_['adapter'])} adapter tensors", flush=True)
+        del ad_
     n_prior = sum(p.numel() for p in model.prior.parameters()); n_ad = model.n_adapter_params()
     fsdp = ddp
     if fsdp: model = shard(model, a)
@@ -272,6 +286,7 @@ def main():
         step, samples = load_latest(latest, model, opt, fsdp)
         if is0: print(f"[dec] resumed from step {step} ({samples/1e6:.0f}M samples)", flush=True)
     if is0:
+        if dnorm is not None: print(f"[dec] DIRECTION space: h_dir = sqrt(d) h/||h|| (raw units) -> x' = W (h_dir - mu) from {a.dir_space} (logdet_W {dnorm.logdet_w:.0f} nats); loss = velocity MSE mapped back by W_inv (PriorGrad-A); radial smoothing sigma {a.radial_sigma}", flush=True)
         print(f"[dec] prior {n_prior/1e9:.2f}B ({'frozen' if a.freeze_prior else f'lr {a.prior_lr}'}) from {a.prior} ({a.prior_weights}); adapter {n_ad/1e6:.0f}M (lr {a.lr}), d_e {d_e}, e_scale {enc.e_scale}; world {world}, fsdp {fsdp}, global batch {global_batch}, total steps {total_steps}, p_uncond {a.p_uncond}", flush=True)
         if not a.no_wandb:
             try:
@@ -288,11 +303,12 @@ def main():
         if is0: print(f"[dec] exported {latest} -> snap_{int(samples/1e6):06d}M (step {step}, {samples/1e6:.0f}M samples)", flush=True); print("[dec] done", flush=True)
         if ddp: dist.destroy_process_group()
         return
-    if a.shard_dir: feeder = ShardFeeder(a.shard_dir, norm, a.batch, dev, a.stop_file, a.stream_timeout)
-    elif a.parquet_glob: feeder = StaticFeeder(a.parquet_glob, norm, a.batch, dev, rank, world, a.max_rows, a.seed)
+    fnorm = RawFeederNorm() if dnorm is not None else norm
+    if a.shard_dir: feeder = ShardFeeder(a.shard_dir, fnorm, a.batch, dev, a.stop_file, a.stream_timeout)
+    elif a.parquet_glob: feeder = StaticFeeder(a.parquet_glob, fnorm, a.batch, dev, rank, world, a.max_rows, a.seed)
     else: raise SystemExit("--shard-dir or --parquet-glob")
     t_start = time.time(); t_log = time.time(); loss_acc, n_acc = 0.0, 0; next_snapshot = (samples // a.snapshot_every_samples + 1) * a.snapshot_every_samples
-    stop_flag = torch.zeros(1, device=dev); ev = {}
+    stop_flag = torch.zeros(1, device=dev); ev = {}; a._dnorm = dnorm
     if step == 0:
         ev = evaluate(model, enc, norm, held, clean, a, dev)
         if is0:
@@ -312,9 +328,12 @@ def main():
         for g in opt.param_groups: g["lr"] = g["base_lr"] * lr
         opt.zero_grad(set_to_none=True); loss_sum = 0.0
         for x0 in xs:
-            with torch.no_grad(): e = enc.from_standardised(x0)
+            if dnorm is not None:   # dir-space: the feeder gave RAW h; e from the raw h (the standard encoder), target = whitened smoothed direction
+                with torch.no_grad(): e = enc(x0); x0 = dnorm.normalize_train(x0, a.radial_sigma)
+            else:
+                with torch.no_grad(): e = enc.from_standardised(x0)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
-                loss, _, _ = cond_fm_loss(model, x0, None, None, p_uncond=a.p_uncond, cvec=e)
+                loss, _, _ = cond_fm_loss(model, x0, None, None, p_uncond=a.p_uncond, cvec=e, err_map=err_map)
             (loss / len(xs)).backward(); loss_sum += loss.item()
         gn = torch.nn.utils.clip_grad_norm_(trainable, a.clip); gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn
         opt.step(); step += 1; samples += global_batch; loss_acc += loss_sum / len(xs); n_acc += 1
