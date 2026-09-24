@@ -151,26 +151,25 @@ def run(task: str = "plan", only: str = "", dry_run: int = 1):
             if not info0.private:                                  # HARD RULE (board #557): never upload into a public repo; never flip visibility from here
                 print(f"   REFUSING {repo_id}: it exists and is PUBLIC -- make it private first", flush=True); continue
             open(os.path.join(work, "README.md"), "w").write(card)
-            api.upload_file(path_or_fileobj=os.path.join(work, "README.md"), path_in_repo="README.md", repo_id=repo_id, repo_type=repo["type"])
-            # stage everything into ONE tree and upload it as ONE commit (per-file upload_file = one commit per file hit the Hub's hourly commit
-            # quota after ~370 files on the 905-file fixed-eval dataset); big checkpoints go one file per commit (priority order, failure-tolerant)
-            stage = os.path.join(work, "_stage"); os.makedirs(stage, exist_ok=True); n_ok = 0; big = []
+            # stage everything into ONE tree and upload it as ONE commit per repo: the Hub allows 256 repository commits per hour PER USER; the
+            # per-file upload_file path (one commit per file) hit that quota on the 905-file dataset and then blocked every other repo for an hour.
+            import time as _time
+            stage = os.path.join(work, "_stage"); os.makedirs(stage, exist_ok=True); n_ok = 0
             for (p, d), s in zip(items, sizes):
                 if s < 0: print("   skip missing", p, flush=True); continue
-                if s > 2e9: big.append((p, d, s)); continue
                 dst = os.path.join(stage, d); os.makedirs(os.path.dirname(dst), exist_ok=True)
-                if os.path.abspath(p) != os.path.abspath(dst): shutil.copy(p, dst)
+                if os.path.abspath(p) != os.path.abspath(dst): shutil.move(p, dst) if p.startswith(work) else shutil.copy(p, dst)
                 n_ok += 1
-            if n_ok:
+            shutil.copy(os.path.join(work, "README.md"), os.path.join(stage, "README.md"))
+            for attempt in range(3):
                 try:
-                    api.upload_folder(folder_path=stage, repo_id=repo_id, repo_type=repo["type"], commit_message="nlt release (packager)"); print(f"   uploaded {n_ok} files in one commit", flush=True)
+                    api.upload_folder(folder_path=stage, repo_id=repo_id, repo_type=repo["type"], commit_message="nlt release (packager, one commit)")
+                    print(f"   uploaded {n_ok} files + README in ONE commit", flush=True); break
                 except Exception as e:
-                    print(f"   FOLDER UPLOAD FAILED ({n_ok} files): {str(e)[:1500]}", flush=True)
-            for p, d, s in big:
-                try:
-                    api.upload_file(path_or_fileobj=p, path_in_repo=d, repo_id=repo_id, repo_type=repo["type"]); n_ok += 1; print(f"   uploaded {d} ({s/1e6:.0f} MB)", flush=True)
-                except Exception as e:                                  # quota / transient: report and continue with the next file (priority order in the manifest)
-                    print(f"   FAILED {d}: {str(e)[:1500]}", flush=True)
+                    msg = str(e); print(f"   FOLDER UPLOAD FAILED (attempt {attempt + 1}): {msg[:600]}", flush=True)
+                    m_ = re.search(r"Retry after (\d+) seconds", msg); wait = int(m_.group(1)) + 15 if m_ else 600
+                    if "rate limit for repository commits" in msg and attempt == 0: wait = 3660        # the hourly commit quota: wait it out once
+                    if attempt < 2: print(f"   sleeping {wait}s before retry", flush=True); _time.sleep(wait)
             print(f"   {n_ok} files uploaded", flush=True)
             info = api.repo_info(repo_id, repo_type=repo["type"]); assert info.private, f"{repo_id} is not private!"
             print(f"   DONE {repo_id} private={info.private}", flush=True)
