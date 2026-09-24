@@ -50,7 +50,7 @@ def digit_extras(v):
     if digits:
         for i, ch in enumerate(digits[:6]): x[i * 10 + int(ch)] = 1
         for i, ch in enumerate(digits[::-1][:6]): x[60 + i * 10 + int(ch)] = 1
-        x[120 + min(len(digits), 8) - 1] = 1; x[128] = np.log10(max(int(digits), 1)) / 10
+        x[120 + min(len(digits), 8) - 1] = 1; x[128] = min(len(digits) - 1, 30) / 10   # ~log10 magnitude (digit strings can exceed float range)
     x[129] = float("," in v); x[130] = float("." in v)
     return x
 
@@ -65,7 +65,7 @@ def main():
     p.add_argument("--out-dir", required=True); p.add_argument("--base", default="Qwen/Qwen3.6-27B")
     p.add_argument("--globs", default="/vol_glp/scale/g1/shards/shard_*.parquet,/vol_glp/scale/g2/shards/shard_*.parquet,/vol_q36/data/acts_qwen36_L42/shard_*.parquet")
     p.add_argument("--max-shards", type=int, default=0); p.add_argument("--per-cell", type=int, default=500000); p.add_argument("--max-per-row", type=int, default=2)
-    p.add_argument("--chunk-rows", type=int, default=300000); p.add_argument("--seed", type=int, default=0); p.add_argument("--tok-batch", type=int, default=2048)
+    p.add_argument("--chunk-rows", type=int, default=300000); p.add_argument("--resume-pass1", action="store_true", help="load pass1_state.pkl from --out-dir instead of re-scanning the shards"); p.add_argument("--seed", type=int, default=0); p.add_argument("--tok-batch", type=int, default=2048)
     a = p.parse_args(); rng = random.Random(a.seed); t0 = time.time(); os.makedirs(a.out_dir, exist_ok=True)
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     from transformers import AutoTokenizer
@@ -82,7 +82,11 @@ def main():
         return i
     res = {(t, b): [] for t in range(3) for b in range(6)}; seen = {k: 0 for k in res}   # (shard_idx, row, k, value_id, doc_hash, n_ctx)
     seen_pos = set(); n_rows = 0; n_dup = 0; ctx_len = []
-    for si, sp in enumerate(shards):
+    import pickle; state_path = os.path.join(a.out_dir, "pass1_state.pkl")
+    if a.resume_pass1:
+        st = pickle.load(open(state_path, "rb")); res, seen, vstr, n_rows, n_dup, ctx_len, shards = st["res"], st["seen"], st["vstr"], st["n_rows"], st["n_dup"], st["ctx_len"], st["shards"]
+        vals = [{v: i for i, v in enumerate(vs)} for vs in vstr]; print(f"[scale-build] resumed pass-1 state: {n_rows} positions", flush=True)
+    for si, sp in enumerate(shards if not a.resume_pass1 else []):
         t1 = time.time(); t = pq.read_table(sp, columns=["text", "doc_id"]); texts = t.column("text").to_pylist(); docs = t.column("doc_id").to_pylist()
         for s in range(0, len(texts), a.tok_batch):
             enc = tok(texts[s: s + a.tok_batch], add_special_tokens=False, return_offsets_mapping=True)
@@ -109,6 +113,7 @@ def main():
         fill = " ".join(f"{TYPES[t][0]}{BNAME[b]}:{len(res[(t, b)]) // 1000}k" for t in range(3) for b in range(6))
         print(f"[scale-build] pass1 {si + 1}/{len(shards)} {os.path.basename(sp)}: {len(texts)} rows ({time.time() - t1:.0f}s) | total {n_rows} (dup {n_dup}) | {fill} | {(time.time() - t0) / 60:.0f} min", flush=True)
     counts_seen = {f"{TYPES[t]}/{BNAME[b]}": seen[(t, b)] for t in range(3) for b in range(6)}
+    if not a.resume_pass1: pickle.dump({"res": res, "seen": seen, "vstr": vstr, "n_rows": n_rows, "n_dup": n_dup, "ctx_len": ctx_len, "shards": shards}, open(state_path, "wb")); print(f"[scale-build] pass-1 state saved to {state_path}", flush=True)
     print(f"[scale-build] pass1 done: {n_rows} positions; candidates seen {json.dumps(counts_seen)}; context tokens pcts {np.percentile(ctx_len, [5, 25, 50, 75, 95]).tolist()}", flush=True)
 
     # ---------------- pass 2: activations + negatives, per shard
@@ -149,23 +154,27 @@ def main():
     for t in range(3): flush(t)
     # ---------------- metadata + value tables
     counts = {}
-    for t in range(3):
-        R = rows[t]; keep = [r for r in R if r["neg"] >= 0]
+    for t in range(3):   # metadata first (so a value-table failure cannot lose the row tables)
+        R = rows[t]
         cols = {"bucket": pa.array([BNAME[r["b"]] for r in R]), "k": pa.array([r["k"] for r in R], pa.int32()), "split": pa.array([r["split"] for r in R], pa.int8()),
                 "value_id": pa.array([r["v"] for r in R], pa.int32()), "neg_id": pa.array([r["neg"] for r in R], pa.int32()), "doc_hash": pa.array([r["dh"] for r in R], pa.int64()),
                 "n_ctx": pa.array([r["n"] for r in R], pa.int32()), "shard": pa.array([r["si"] for r in R], pa.int16()), "row": pa.array([r["row"] for r in R], pa.int32())}
         if t == 0: cols.update({"near_id": pa.array([r.get("near", -1) for r in R], pa.int32()), "far_id": pa.array([r.get("far", -1) for r in R], pa.int32()), "near_in_ctx": pa.array([r.get("near_in_ctx", 0) for r in R], pa.int8())})
-        pq.write_table(pa.table(cols), os.path.join(a.out_dir, f"meta_{TYPES[t]}.parquet"))
+        pq.write_table(pa.table(cols), os.path.join(a.out_dir, f"meta_{TYPES[t]}.parquet")); json.dump(vstr[t], open(os.path.join(a.out_dir, f"values_{TYPES[t]}_strings.json"), "w"))
+        print(f"[scale-build] meta_{TYPES[t]}.parquet written ({len(R)} rows)", flush=True)
+    for t in range(3):
+        R = rows[t]; keep = [r for r in R if r["neg"] >= 0]
         for r in R: counts[f"{TYPES[t]}/{BNAME[r['b']]}/{['test', 'val', 'train'][r['split']]}"] = counts.get(f"{TYPES[t]}/{BNAME[r['b']]}/{['test', 'val', 'train'][r['split']]}", 0) + 1
         V = vstr[t]; print(f"[scale-build] {TYPES[t]}: {len(R)} rows ({len(keep)} with a negative), {len(V)} unique values; tokenising values …", flush=True)
-        toks = np.full((len(V), NTOK), -1, dtype=np.int32)
-        for s in range(0, len(V), 8192):
-            enc = tok([" " + v for v in V[s: s + 8192]], add_special_tokens=False)["input_ids"]
-            for j, ids in enumerate(enc): ids = (ids or [0])[:NTOK]; toks[s + j, : len(ids)] = ids
-        np.save(os.path.join(a.out_dir, f"values_{TYPES[t]}_tokens.npy"), toks)
-        np.save(os.path.join(a.out_dir, f"values_{TYPES[t]}_hash.npy"), np.array([hash_ids(v) for v in V], dtype=np.int16))
-        np.save(os.path.join(a.out_dir, f"values_{TYPES[t]}_digits.npy"), np.stack([digit_extras(v) for v in V]) if t == 0 else np.zeros((len(V), 131), dtype=np.float16))
-        json.dump(V, open(os.path.join(a.out_dir, f"values_{TYPES[t]}_strings.json"), "w"))
+        try:
+            toks = np.full((len(V), NTOK), -1, dtype=np.int32)
+            for s in range(0, len(V), 8192):
+                enc = tok([" " + v for v in V[s: s + 8192]], add_special_tokens=False)["input_ids"]
+                for j, ids in enumerate(enc): ids = (ids or [0])[:NTOK]; toks[s + j, : len(ids)] = ids
+            np.save(os.path.join(a.out_dir, f"values_{TYPES[t]}_tokens.npy"), toks)
+            np.save(os.path.join(a.out_dir, f"values_{TYPES[t]}_hash.npy"), np.array([hash_ids(v) for v in V], dtype=np.int16))
+            np.save(os.path.join(a.out_dir, f"values_{TYPES[t]}_digits.npy"), np.stack([digit_extras(v) for v in V]) if t == 0 else np.zeros((len(V), 131), dtype=np.float16))
+        except Exception as e: print(f"[scale-build] value tables for {TYPES[t]} FAILED: {e!r} (strings + meta are saved; rerun the tables offline)", flush=True)
     json.dump({"counts": counts, "candidates_seen": counts_seen, "n_positions": n_rows, "n_dup_positions": n_dup, "n_no_negative": n_noneg, "chunk_sizes": {TYPES[t]: chunk_sizes[t] for t in range(3)},
                "shards": shards, "per_cell": a.per_cell, "ctx_len_pcts": np.percentile(ctx_len, [5, 25, 50, 75, 95]).tolist(), "elapsed_min": (time.time() - t0) / 60},
               open(os.path.join(a.out_dir, "counts.json"), "w"), indent=1)
