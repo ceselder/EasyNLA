@@ -882,10 +882,13 @@ def main():
                     k_ = _txt[p_] if isinstance(_txt[p_], str) else "\n".join(_txt[p_])
                     if k_ not in seen_: seen_.add(k_); uniq.append(p_)
                 n_uniq += len(uniq); G = a.ctr_k + 1
-                grps += [uniq[g0: g0 + G] for g0 in range(0, len(uniq) - G + 1, G)]
-            ng = torch.tensor([len(grps)], device=dev)
-            if ddp: dist.all_reduce(ng, op=dist.ReduceOp.MIN)                 # equal forward/backward counts on every rank (FSDP collectives)
-            grps = grps[: int(ng.item())]; ce_s = ar_s = ac_s = 0.0; tau = log_tau.detach().exp().clamp(1.0, 100.0)
+                grps += [uniq[g0: g0 + G] for g0 in range(0, len(uniq), G) if len(uniq[g0: g0 + G]) >= 4]   # low-cardinality templates: smaller groups (>= 4)
+            n_real = len(grps); w_g = [1.0] * n_real
+            if ddp and a.unfreeze_prior:   # FSDP: every rank must run the same number of forward/backward calls -> pad with zero-weight dummy groups
+                ng = torch.tensor([n_real], device=dev); dist.all_reduce(ng, op=dist.ReduceOp.MAX)
+                dummy = grps[0] if grps else list(range(min(a.ctr_k + 1, len(_txt))))
+                while len(grps) < int(ng.item()): grps.append(dummy); w_g.append(0.0)
+            ce_s = ar_s = ac_s = 0.0; tau = log_tau.detach().exp().clamp(1.0, 100.0)
             for g_i, grp in enumerate(grps):
                 tau = log_tau.exp().clamp(1.0, 100.0)                           # rebuilt per group: each group has its own backward
                 G = len(grp); xs = x0[grp].detach(); eg, mkg, cvg = enc_batch([_txt[p_] for p_ in grp], grad=a.ctr_enc_grad)
@@ -899,10 +902,10 @@ def main():
                 L0 = ((v0.float() - tgt) ** 2).mean(-1)
                 logits = (0.5 * x0.shape[1]) * (L0[:, None] - Lm) / tau; tgt_idx = torch.arange(G, device=dev)   # FM-proxy PMI / tau: columns compare across activations
                 ce = 0.5 * (F.cross_entropy(logits, tgt_idx) + F.cross_entropy(logits.t(), tgt_idx))
-                (a.ctr_weight * ce / max(len(grps), 1)).backward()
-                ce_s += ce.item(); ar_s += (logits.argmax(1) == tgt_idx).float().mean().item(); ac_s += (logits.argmax(0) == tgt_idx).float().mean().item()
-            ng_ = max(len(grps), 1)
-            ctr_stats = {"train/ctr_ce": ce_s / ng_, "train/ctr_acc_row": ar_s / ng_, "train/ctr_acc_col": ac_s / ng_, "train/ctr_groups": len(grps), "train/ctr_unique": n_uniq,
+                (a.ctr_weight * w_g[g_i] * ce / max(n_real, 1)).backward()
+                if w_g[g_i] > 0: ce_s += ce.item(); ar_s += (logits.argmax(1) == tgt_idx).float().mean().item(); ac_s += (logits.argmax(0) == tgt_idx).float().mean().item()
+            ng_ = max(n_real, 1)
+            ctr_stats = {"train/ctr_ce": ce_s / ng_, "train/ctr_acc_row": ar_s / ng_, "train/ctr_acc_col": ac_s / ng_, "train/ctr_groups": n_real, "train/ctr_unique": n_uniq,
                          "train/ctr_templates": len(chunks), "train/ctr_tau": float(tau), "train/ctr_seconds": time.time() - t_c, "train/ctr_chance": 1.0 / (a.ctr_k + 1)}
             if ddp and log_tau.grad is not None: dist.all_reduce(log_tau.grad, op=dist.ReduceOp.AVG)
         if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
@@ -944,7 +947,7 @@ def main():
             if cfm_st and is0: print(f"  [cfm] fm {cfm_st['train/cfm_fm']:.4f} | distance to another sample's flow {cfm_st['train/cfm_cfm_neg']:.4f} (lambda {a.cfm_lambda})", flush=True)
             if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats, **cfm_st, **ctr_stats}, step=step)
             if ctr_stats and is0: print(f"  [ctr] InfoNCE {ctr_stats['train/ctr_ce']:.3f} (chance {math.log(a.ctr_k + 1):.2f}) acc row {100*ctr_stats['train/ctr_acc_row']:.0f}% col {100*ctr_stats['train/ctr_acc_col']:.0f}% "
-                                        f"(chance {100/(a.ctr_k + 1):.0f}%) | {ctr_stats['train/ctr_groups']} groups of {a.ctr_k + 1}, {ctr_stats['train/ctr_unique']} distinct answers, {ctr_stats['train/ctr_templates']} template chunks | "
+                                        f"(chance {100/(a.ctr_k + 1):.0f}%) | {ctr_stats['train/ctr_groups']} groups of <= {a.ctr_k + 1}, {ctr_stats['train/ctr_unique']} distinct answers, {ctr_stats['train/ctr_templates']} template chunks | "
                                         f"tau {ctr_stats['train/ctr_tau']:.1f} nats | {ctr_stats['train/ctr_seconds']:.2f}s", flush=True)
             if gstats and is0: print(f"  [samedoc] ce {gstats['train/samedoc_ce']:.3f} acc row {100*gstats['train/samedoc_acc_row']:.0f}% col {100*gstats['train/samedoc_acc_col']:.0f}% (chance {100/a.group_size:.0f}%)", flush=True)
             if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
