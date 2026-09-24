@@ -194,9 +194,9 @@ def main():
             res[f"seconds_per_1k_{nm}"] = C.timing(CA[:n], CZ[:n], seed=0, **kw)
         r1 = C.score(CA[:32], CZ[:32], mode="exact", n_steps=16, seed=0); r2 = C.score(CA[:32], CZ[:32], mode="exact", n_steps=16, seed=0)
         res["deterministic_exact"] = bool(torch.equal(r1["pmi"], r2["pmi"])); res["max_abs_diff_exact_repeat"] = (r1["pmi"] - r2["pmi"]).abs().max().item()
-        f1 = C.score(CA[:32], CZ[:32], mode="fast", seed=0); f2 = C.score(CA[:32], CZ[:32], mode="fast", seed=0); res["deterministic_fast"] = bool(torch.equal(f1["pmi"], f2["pmi"]))
+        f1 = C.score(CA[:32], CZ[:32], mode="fast", seed=0); f2 = C.score(CA[:32], CZ[:32], mode="fast", seed=0); res["deterministic_fast"] = bool(torch.equal(f1["pmi"], f2["pmi"])); res["max_abs_diff_fast_repeat"] = (f1["pmi"] - f2["pmi"]).abs().max().item()
         res["fast_vs_exact_corr"] = float(np.corrcoef(f1["pmi"].numpy(), r1["pmi"].numpy())[0, 1])
-        print(f"[api] s/1k pairs: " + " ".join(f"{k.split('seconds_per_1k_')[1]} {v:.1f}" for k, v in res.items() if k.startswith("seconds")) + f" | deterministic exact {res['deterministic_exact']} (max diff {res['max_abs_diff_exact_repeat']:.2e}) fast {res['deterministic_fast']} | corr(fast, exact) {res['fast_vs_exact_corr']:.3f}", flush=True)
+        print(f"[api] s/1k pairs: " + " ".join(f"{k.split('seconds_per_1k_')[1]} {v:.1f}" for k, v in res.items() if k.startswith("seconds")) + f" | deterministic exact {res['deterministic_exact']} (max diff {res['max_abs_diff_exact_repeat']:.2e}) fast {res['deterministic_fast']} (max diff {res['max_abs_diff_fast_repeat']:.2e} nats) | corr(fast, exact) {res['fast_vs_exact_corr']:.3f}", flush=True)
         jdump(f"{out_dir}/eval_api.json", {**meta, **res})
     print(f"[selfcheck] done in {(time.time()-T0)/60:.1f} min", flush=True)
 

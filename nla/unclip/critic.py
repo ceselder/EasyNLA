@@ -23,6 +23,7 @@ class _MemModel(torch.nn.Module):
     def __init__(self, model, mem, mask, g): super().__init__(); self.m, self.mem, self.mask, self.g = model, mem, mask, g
     def forward(self, x, t, enc=None, enc_mask=None, gg=None):
         if self.mem is None and self.g is None: return self.m(x, t)
+        if enc is None and gg is None: return self.m(x, t)              # an UNCONDITIONAL call (classifier-free guidance's v_u) -> ignore the stored memory
         return self.m(x, t, None, self.mask, self.g, mem=self.mem)
 
 
