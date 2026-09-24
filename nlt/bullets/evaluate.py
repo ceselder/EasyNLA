@@ -38,7 +38,7 @@ def main():
     p.add_argument("--data-dir", required=True); p.add_argument("--ckpt", required=True); p.add_argument("--text", required=True); p.add_argument("--out", required=True)
     p.add_argument("--flip", default=None); p.add_argument("--verbosity", default=None); p.add_argument("--n-val", type=int, default=1536); p.add_argument("--split", default="val")
     p.add_argument("--rows", default=None, help="a:b slice of the fixed val rows to report on (e.g. 0:1024 when 1024:1536 picked the checkpoint)"); p.add_argument("--no-crux", action="store_true")
-    p.add_argument("--min-gap", type=int, default=2, help="the 'train_gaps' block reports rows with gap >= min-gap; the dropped gaps get their own block"); p.add_argument("--n-swap", type=int, default=1); p.add_argument("--batch", type=int, default=96); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--min-gap", type=int, default=2, help="the 'train_gaps' block reports rows with gap >= min-gap; the dropped gaps get their own block"); p.add_argument("--n-swap", type=int, default=1); p.add_argument("--n-shuffle", type=int, default=4, help="extra order shuffles per pair for a PER-PAIR noise scale"); p.add_argument("--batch", type=int, default=96); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda"; rng = np.random.default_rng(a.seed); os.makedirs(a.out, exist_ok=True); torch.manual_seed(a.seed)
     norm = GlobalNorm.load(os.path.join(a.data_dir, "stats.pt"), "affine").to(dev)
     verb = [int(v) for v in a.verbosity.split(",")] if a.verbosity else None
