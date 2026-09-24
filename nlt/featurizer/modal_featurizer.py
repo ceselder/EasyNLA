@@ -55,6 +55,8 @@ vol = modal.Volume.from_name("nlt", create_if_missing=True)
 vol_ro = modal.Volume.from_name("nla-exp")      # read-only fallback for the base snapshot
 SECRETS = [modal.Secret.from_name("nla-exp-secrets")]
 VOLS = {"/vol": vol, "/vol_nla_exp": vol_ro}
+GPU_ANY = ["H100", "A100-80GB", "A100-40GB", "L40S"]     # fallback list: the dossier jobs are light
+GPU_BIG = ["H100", "A100-80GB", "L40S"]
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -228,7 +230,7 @@ def lens_top_tokens(dirs, norm_w, lm_head, tok, k=8, bs=2048):
 # ----------------------------------------------------------------------------------------------------------------------
 # 1. SAE dossier
 # ----------------------------------------------------------------------------------------------------------------------
-@app.function(gpu="H100", volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=64 * 1024, max_containers=6)
+@app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=64 * 1024, max_containers=6)
 def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: str = DATA_DIR, writes_dir: str = WRITES_DIR,
                 trainer: int = 0, topn: int = 12, out_dir: str = f"{OUT}/sae_dossier", perm_seed: int = -1) -> str:
     import time
@@ -354,7 +356,7 @@ def sae_dossier(split: str = "val", start: int = 0, end: int = 4096, data_dir: s
 # ----------------------------------------------------------------------------------------------------------------------
 # 2. SAE max-activating examples over the store
 # ----------------------------------------------------------------------------------------------------------------------
-@app.function(gpu="H100", volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024)
+@app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024)
 def sae_maxact(data_dir: str = DATA_DIR, splits: str = "val,train", trainer: int = 0, n_top: int = 12, max_shards: int = 0,
                out_dir: str = f"{OUT}/sae_maxact", ctx_left: int = 24, ctx_right: int = 4) -> str:
     import time
@@ -466,7 +468,7 @@ def tc_records(layer: int, feats: list[int]):
     return out
 
 
-@app.function(gpu="H100", volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024, max_containers=6)
+@app.function(gpu=GPU_ANY, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024, max_containers=6)
 def tc_dossier(split: str = "val", start: int = 0, end: int = 4096, layers: str = "10-34", data_dir: str = DATA_DIR, writes_dir: str = WRITES_DIR,
                topn: int = 8, n_dirs: int = 400, out_dir: str = f"{OUT}/tc_dossier", perm_seed: int = -1, with_records: int = 1) -> str:
     import time
@@ -588,7 +590,7 @@ MAEMM_INSTR = "Please produce a string of text that triggers the following direc
 MARKER = " ?"
 
 
-@app.function(gpu="H100", volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024, max_containers=4)
+@app.function(gpu=GPU_BIG, volumes=VOLS, secrets=SECRETS, timeout=4 * 3600, cpu=8, memory=96 * 1024, max_containers=4)
 def maemm_invert(spec: str, out_path: str, max_new_tokens: int = 40, batch_size: int = 64, coeff: float = 1.0, prompt_variant: str = "user",
                  verify: int = 1, n_samples: int = 1) -> str:
     """spec: JSON path on the volume with a list of {name, kind, layer, feature, vec_path, row} or {name, kind, vec: [..]}.
@@ -735,6 +737,69 @@ def maemm_invert(spec: str, out_path: str, max_new_tokens: int = 40, batch_size:
     return out_path
 
 
+
+@app.function(volumes=VOLS, secrets=SECRETS, timeout=2 * 3600, cpu=8, memory=64 * 1024)
+def build_maemm_spec(split: str = "val", start: int = 0, end: int = 4096, n_sae: int = 1500, n_tc: int = 300, data_dir: str = DATA_DIR,
+                     writes_dir: str = WRITES_DIR, out_dir: str = f"{OUT}/maemm") -> str:
+    """Directions for the MAEMM inverter: Delta, largest attention write, largest MLP write per pair (from the stores) + the most frequent
+    SAE (per SAE layer) and transcoder (per MLP layer) features' decoder directions from the dossier feature tables. Writes
+    {out_dir}/{split}/spec_{start}_{end}_<part>.json (3 parts: pairs / sae / tc) + pair_dirs npy."""
+    import numpy as np
+    import pandas as pd
+    import pyarrow.parquet as pq
+    vol.reload()
+    os.makedirs(os.path.join(out_dir, split), exist_ok=True)
+    sae_parts = sorted(glob.glob(f"{OUT}/sae_dossier/{split}/part_*.parquet"))
+    df = pd.concat([pq.read_table(f, columns=["pair_id", "i", "j", "k_top", "attn_share", "mlp_share"]).to_pandas() for f in sae_parts], ignore_index=True)
+    pairs = pq.read_table(os.path.join(data_dir, f"pairs_{split}.parquet")).to_pandas()
+    pairs = pairs[pairs.pair_id.isin(set(df.pair_id))].drop_duplicates("pair_id").set_index("pair_id").loc[df.pair_id].reset_index()
+    row_of, _ = load_split_index(data_dir, split)
+    H = gather_all_layers(pairs, row_of)
+    wrow = writes_index(writes_dir, split)
+    A, M, have = gather_writes(pairs, wrow) if wrow else (None, None, np.zeros(len(pairs), bool))
+    ii = pairs.i.astype(int).to_numpy(); jj = pairs.j.astype(int).to_numpy()
+    dirs, items = [], []
+    for n in range(len(pairs)):
+        i, j = int(ii[n]), int(jj[n]); pid = str(pairs.pair_id.iloc[n])
+        d = H[n, j - K_LO].astype(np.float32) - H[n, i - K_LO].astype(np.float32)
+        items.append(dict(name=f"delta:{pid}", kind="delta", layer=j, feature=-1, vec_path=f"{out_dir}/{split}/pair_dirs_{start:07d}_{end:07d}.npy", row=len(dirs))); dirs.append(d)
+        if A is not None and have[n]:
+            a_sh = json.loads(df.attn_share.iloc[n]); m_sh = json.loads(df.mlp_share.iloc[n])
+            ka = i + 1 + int(np.argmax(np.abs(a_sh))); km = i + 1 + int(np.argmax(np.abs(m_sh)))
+            items.append(dict(name=f"attn:{pid}", kind="attn", layer=ka, feature=-1, vec_path=items[-1]["vec_path"], row=len(dirs))); dirs.append(A[n, ka - K_LO].astype(np.float32))
+            items.append(dict(name=f"mlp:{pid}", kind="mlp", layer=km, feature=-1, vec_path=items[-1]["vec_path"], row=len(dirs))); dirs.append(M[n, km - K_LO].astype(np.float32))
+    np.save(f"{out_dir}/{split}/pair_dirs_{start:07d}_{end:07d}.npy", np.stack(dirs).astype(np.float16))
+    json.dump(items, open(f"{out_dir}/{split}/spec_{start:07d}_{end:07d}_pairs.json", "w"))
+    n_pairs = len(items)
+    # SAE features: most frequent per layer
+    items = []
+    for L in SAE_LAYERS:
+        fs = sorted(glob.glob(f"{OUT}/sae_dossier/{split}/features_L{L}_*.parquet"))
+        if not fs:
+            continue
+        ft = pd.concat([pq.read_table(f).to_pandas().assign(src=f) for f in fs], ignore_index=True)
+        ft = ft.sort_values("n_hits", ascending=False).drop_duplicates("feature")
+        for r in ft.head(n_sae).itertuples():
+            src_rows = pq.read_table(r.src, columns=["feature"]).column("feature").to_pylist()
+            items.append(dict(name=f"sae:{L}:{int(r.feature)}", kind="sae", layer=L, feature=int(r.feature), vec_path=r.src.replace(".parquet", "_dirs.npy"), row=src_rows.index(int(r.feature))))
+    json.dump(items, open(f"{out_dir}/{split}/spec_{start:07d}_{end:07d}_sae.json", "w"))
+    n_sae_items = len(items)
+    # transcoder features: most frequent per layer (dirs npy rows are in n_hits order, first n_dirs)
+    items = []
+    for f in sorted(glob.glob(f"{OUT}/tc_dossier/{split}/features_L*_*.parquet")):
+        k = int(os.path.basename(f).split("_")[1][1:])
+        ft = pq.read_table(f, columns=["feature", "n_hits"]).to_pandas()
+        dirs_path = f.replace(".parquet", "_dirs.npy"); enc_path = f.replace(".parquet", "_enc.npy")
+        n_avail = np.load(dirs_path, mmap_mode="r").shape[0]
+        for row, r in enumerate(ft.head(min(n_tc, n_avail)).itertuples()):
+            items.append(dict(name=f"tc:{k}:{int(r.feature)}", kind="tc", layer=k, feature=int(r.feature), vec_path=dirs_path, row=row, enc_path=enc_path, enc_row=row))
+    json.dump(items, open(f"{out_dir}/{split}/spec_{start:07d}_{end:07d}_tc.json", "w"))
+    vol.commit()
+    msg = f"[spec] pairs {n_pairs} dirs, sae {n_sae_items}, tc {len(items)} -> {out_dir}/{split}/spec_{start:07d}_{end:07d}_*.json"
+    print(msg, flush=True)
+    return msg
+
+
 @app.local_entrypoint()
 def main(task: str = "sae", split: str = "val", start: int = 0, end: int = 4096, layers: str = "10-34", spec: str = "", out: str = "",
          max_shards: int = 0, perm_seed: int = -1, prompt_variant: str = "user", with_records: int = 1):
@@ -746,5 +811,7 @@ def main(task: str = "sae", split: str = "val", start: int = 0, end: int = 4096,
         print(tc_dossier.remote(split=split, start=start, end=end, layers=layers, perm_seed=perm_seed, with_records=with_records))
     elif task == "maemm":
         print(maemm_invert.remote(spec=spec, out_path=out, prompt_variant=prompt_variant))
+    elif task == "spec":
+        print(build_maemm_spec.remote(split=split, start=start, end=end))
     else:
         raise SystemExit(f"unknown task {task}")
