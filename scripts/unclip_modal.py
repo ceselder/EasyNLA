@@ -54,6 +54,14 @@ def train_stream(tag: str, extra: str = "", n_prod: int = 4, n_cons: int = 4, pr
     return _stream(cmd, f"{out}/train.log", _env())
 
 
+@app.function(gpu="B200:4", timeout=23 * 3600, volumes=VOLS, secrets=SECRETS, cpu=32, memory=768 * 1024, ephemeral_disk=600 * 1024)
+def train_stream4(tag: str, extra: str = "", n_prod: int = 2, n_cons: int = 2, prior: str = "/vol_glp/glp27b_main/ckpts/snap_001966M", launch_extra: str = ""):
+    """B200:4 fallback when 8-GPU containers stay pending: 2 producers + 2 FSDP consumers (use --batch 8192 --grad-accum 2 for the same global batch)"""
+    out = f"{DEC}/{tag}"
+    cmd = [sys.executable, f"{REPO_REMOTE}/scripts/unclip_launch.py", "--out-dir", out, "--n-producers", str(n_prod), "--n-consumers", str(n_cons), "--prior", prior, "--tag", tag, "--wandb-name", tag, "--trainer-extra", extra] + launch_extra.split()
+    return _stream(cmd, f"{out}/train.log", _env())
+
+
 def _static(tag, extra, nproc, prior):
     out = f"{DEC}/{tag}"
     cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={nproc}", "-m", "nla.unclip.train_dec", "--prior", prior, "--stats", "/vol_glp/glp27b_main/rep_statistics.pt",
@@ -96,6 +104,7 @@ def shell1(cmd: str):
 @app.local_entrypoint()
 def main(task: str = "train_stream", tag: str = "", extra: str = "", prior: str = "/vol_glp/glp27b_main/ckpts/snap_001966M", n_prod: int = 4, n_cons: int = 4, launch_extra: str = "", cmd: str = ""):
     if task == "train_stream": print("rc", train_stream.remote(tag, extra, n_prod, n_cons, prior, launch_extra))
+    elif task == "train_stream4": print("rc", train_stream4.remote(tag, extra, n_prod, n_cons, prior, launch_extra))
     elif task == "train_static4": print("rc", train_static4.remote(tag, extra, prior))
     elif task == "train_static8": print("rc", train_static8.remote(tag, extra, prior))
     elif task == "eval": print("rc", eval_dec.remote(tag, extra))
