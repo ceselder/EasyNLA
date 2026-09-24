@@ -76,7 +76,7 @@ def main():
     p.add_argument("--width", type=int, default=1024); p.add_argument("--depth", type=int, default=12); p.add_argument("--heads", type=int, default=16); p.add_argument("--k-chunks", type=int, default=8); p.add_argument("--mlp-ratio", type=int, default=4)
     p.add_argument("--param", default="x0", choices=["x0", "v", "x0res"], help="x0: predict the unnoised target (paper); v: velocity (plain FM); x0res: x0 loss with the velocity parametrisation")
     p.add_argument("--t-min", type=float, default=0.02); p.add_argument("--bidir-tail", type=int, default=0); p.add_argument("--x0-scale", type=float, default=0.0, help="constant target rescale inside the net (0 = set from the data rms)")
-    p.add_argument("--steps", type=int, default=4000); p.add_argument("--batch", type=int, default=1024); p.add_argument("--lr", type=float, default=1.2e-4); p.add_argument("--warmup", type=int, default=300); p.add_argument("--wd", type=float, default=0.01)
+    p.add_argument("--steps", type=int, default=4000); p.add_argument("--batch", type=int, default=1024); p.add_argument("--micro-batch", type=int, default=256, help="rows per backward pass (gradient accumulation up to --batch)"); p.add_argument("--lr", type=float, default=1.2e-4); p.add_argument("--warmup", type=int, default=300); p.add_argument("--wd", type=float, default=0.01)
     p.add_argument("--beta2", type=float, default=0.999); p.add_argument("--ema", type=float, default=0.999); p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-floor", type=float, default=0.05)
     p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=512); p.add_argument("--eval-offset", type=int, default=4096); p.add_argument("--spot-exact-n", type=int, default=128); p.add_argument("--spot-ode-steps", type=int, default=16)
@@ -132,20 +132,25 @@ def main():
     for step in range(step0, a.steps):
         if pools is not None: rows, i, j, texts, names = pools.sample(a.batch, gen, a.batch_mode)
         else: rows, i, j = store.sample_pairs(a.batch, gen); texts = depth_tag_texts(i, j)
-        h_i, x0, _, _ = make_x0(norm, store.gather(rows, i, dev), store.gather(rows, j, dev), "delta", False, 0.0)
-        with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts)
-        keep = torch.rand(a.batch, device=dev, generator=None) >= a.p_uncond; mask = mask & keep[:, None]           # text dropout -> unconditional rows
-        t = torch.rand(a.batch, device=dev); eps = torch.randn_like(x0)
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
-        with torch.autocast("cuda", dtype=torch.bfloat16): l, v_mse = model.loss(x0, h_i, t, eps, enc, mask)
-        loss = l.mean()
-        opt.zero_grad(set_to_none=True); loss.backward(); gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip); opt.step()
+        opt.zero_grad(set_to_none=True); keep = torch.rand(a.batch, device=dev) >= a.p_uncond                       # text dropout -> unconditional rows
+        l_all = torch.zeros(a.batch, device=dev); v_all = torch.zeros(a.batch, device=dev); mask_T = 0
+        for s0 in range(0, a.batch, a.micro_batch):                                                                  # gradient accumulation: same batch, bounded activation memory
+            sl = slice(s0, min(a.batch, s0 + a.micro_batch)); nb = sl.stop - sl.start
+            h_i, x0, _, _ = make_x0(norm, store.gather(rows[sl], i[sl], dev), store.gather(rows[sl], j[sl], dev), "delta", False, 0.0)
+            with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts[sl])
+            mask = mask & keep[sl][:, None]; mask_T = max(mask_T, int(mask.shape[1]))
+            t = torch.rand(nb, device=dev); eps = torch.randn_like(x0)
+            with torch.autocast("cuda", dtype=torch.bfloat16): l, v_mse = model.loss(x0, h_i, t, eps, enc, mask)
+            (l.mean() * nb / a.batch).backward(); l_all[sl] = l.detach(); v_all[sl] = v_mse
+        l, v_mse = l_all, v_all; loss = l.mean()
+        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip); opt.step()
         with torch.no_grad():
             dec = min(a.ema, (1 + step) / (10 + step)); torch._foreach_lerp_(ema_p, raw_p, 1 - dec)
         rows_seen += a.batch; ema_loss = loss.item() if ema_loss is None else 0.98 * ema_loss + 0.02 * loss.item()
         if step % 25 == 0:
             el = time.time() - t0; log = {"train/loss": loss.item(), "train/loss_ema": ema_loss, "train/v_mse": float(v_mse.mean()), "train/loss_cond": float(l[keep].mean()) if keep.any() else float("nan"), "train/loss_uncond": float(l[~keep].mean()) if (~keep).any() else float("nan"),
-                                          "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/rows_per_s": (step - step0 + 1) * a.batch / max(1e-6, el), "train/rows_seen": rows_seen, "train/step_s": el / max(1, step - step0 + 1), "train/seq_len": int(mask.shape[1]) + 3 * a.k_chunks + 2, "train/pool": (names[0] if pools is not None else "synth")}
+                                          "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/rows_per_s": (step - step0 + 1) * a.batch / max(1e-6, el), "train/rows_seen": rows_seen, "train/step_s": el / max(1, step - step0 + 1), "train/seq_len": mask_T + 3 * a.k_chunks + 2, "train/pool": (names[0] if pools is not None else "synth")}
             wandb.log(log, step=step)
             if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} v_mse {float(v_mse.mean()):.4f} cond {log['train/loss_cond']:.4f} uncond {log['train/loss_uncond']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']}", flush=True)
         if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
