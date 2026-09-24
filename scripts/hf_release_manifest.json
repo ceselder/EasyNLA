@@ -456,7 +456,7 @@
     }
    ],
    "card_vars": {
-    "critic_list": "Priority order and gate status (redteam #713; every 'accepted' cites data/acceptance_<critic>.json and names the register): none_v1_pooled -- blind conditional flow prior, 1.89B, exact NLL 0.742 bits/dim (+1.41 vs N(0,I)); depth_v1_pooled -- told-depth diagnostic (FORBIDDEN as a critic), +29.7 exact bits vs blind; text_union_pooled_big -- accepted on teacher / V0 text (content 5-9 bits, PMI(z) > 0), paraphrase-invariant (0.96 / 0.92), twin gate FAIL (0.53 / 0.50); enc_e2 (Qwen3-8B-L24 encoder adapter) -- accepted on J-lens-register descriptions ONLY (lens_L1: A1/A1b/A2/A3 pass); on free verbalizer text PMI(z) < 0 (a pure mismatcher); not claim-sensitive (twin gate FAIL on every register); critic_para_p3 step 4000 (paraphrase-augmented adapter; DECISIONS v1.24) -- paraphrase-invariant (P(orig > paraphrase) 0.52-0.56, retention 0.89-0.93); NOT claim-sensitive (held-out twins 0.48-0.64); REJECT on V0 controls (content 8.4, P(z>dm) 0.69 vs the 0.70 line, A3 one-sided fail); data/acceptance_critic_para_p3_ckpt_step004000_heldout.json; critic_v3b_fbpc step 8000 (v3 recipe, pooled prior, full pool, decaying-lr continuation) -- HELD-OUT ACCEPT on the J-lens registers (L1: content 16.5 @ P(z>dm) 0.75, PMI +12.4, A1/A1b/A2/A3 pass; L3 22.7 @ 0.86), REJECT on teacher (P 0.68) and verbalizer (P 0.63) text; twins 0.51-0.62 (claim-insensitive, like every critic tonight); the least wording-invariant of the four (P(orig > paraphrase) 0.63-0.71); later steps (9000-12000) raise PMI mainly through a text-presence bonus (dm > 0) and were not shipped; then none_v1_squash (documents the squash finding), text_union_pooled_n (first-budget headline), critic_v3b_e2sentpc step 6000 and critic_v3b_e2p step 3000 (8B-L24 encoder arms, RECORD ONLY: training frozen by DECISIONS v1.32 before an exact pick existed; e2sentpc s6000 fails the exact hard flag, V0 PMI -7.9 / jlens20 -200), none_v2 step 30000 (4.4B squash-space blind prior on 1.37M positions, stopped at 33.6k steps; exact NLL 0.2247 bits/dim, +1.92 vs N(0,I), the best blind density of the night; NOT an adapter base -- DECISIONS v1.25: the squash space broke the text adapters; record), critic_v3a_nd (record). Steps in each folder's best.json / eval_latest.json / BEST.txt."
+    "critic_list": "Priority order (fbpc s8000, critic_big_dossier, union_pooled_n, union_pooled_big, critic_para_p3, then the rest) and gate status (redteam #713; every 'accepted' cites data/acceptance_<critic>.json and names the register): none_v1_pooled -- blind conditional flow prior, 1.89B, exact NLL 0.742 bits/dim (+1.41 vs N(0,I)); depth_v1_pooled -- told-depth diagnostic (FORBIDDEN as a critic), +29.7 exact bits vs blind; text_union_pooled_big -- accepted on teacher / V0 text (content 5-9 bits, PMI(z) > 0), paraphrase-invariant (0.96 / 0.92), twin gate FAIL (0.53 / 0.50); enc_e2 (Qwen3-8B-L24 encoder adapter) -- accepted on J-lens-register descriptions ONLY (lens_L1: A1/A1b/A2/A3 pass); on free verbalizer text PMI(z) < 0 (a pure mismatcher); not claim-sensitive (twin gate FAIL on every register); critic_para_p3 step 4000 (paraphrase-augmented adapter; DECISIONS v1.24) -- paraphrase-invariant (P(orig > paraphrase) 0.52-0.56, retention 0.89-0.93); NOT claim-sensitive (held-out twins 0.48-0.64); REJECT on V0 controls (content 8.4, P(z>dm) 0.69 vs the 0.70 line, A3 one-sided fail); data/acceptance_critic_para_p3_ckpt_step004000_heldout.json; critic_v3b_fbpc step 8000 (v3 recipe, pooled prior, full pool, decaying-lr continuation) -- HELD-OUT ACCEPT on the J-lens registers (L1: content 16.5 @ P(z>dm) 0.75, PMI +12.4, A1/A1b/A2/A3 pass; L3 22.7 @ 0.86), REJECT on teacher (P 0.68) and verbalizer (P 0.63) text; twins 0.51-0.62 (claim-insensitive, like every critic tonight); the least wording-invariant of the four (P(orig > paraphrase) 0.63-0.71); later steps (9000-12000) raise PMI mainly through a text-presence bonus (dm > 0) and were not shipped; then none_v1_squash (documents the squash finding), text_union_pooled_n (first-budget headline), critic_v3b_e2sentpc step 6000 and critic_v3b_e2p step 3000 (8B-L24 encoder arms, RECORD ONLY: training frozen by DECISIONS v1.32 before an exact pick existed; e2sentpc s6000 fails the exact hard flag, V0 PMI -7.9 / jlens20 -200), none_v2 step 30000 (4.4B squash-space blind prior on 1.37M positions, stopped at 33.6k steps; exact NLL 0.2247 bits/dim, +1.92 vs N(0,I), the best blind density of the night; NOT an adapter base -- DECISIONS v1.25: the squash space broke the text adapters; record), critic_v3a_nd (record). Steps in each folder's best.json / eval_latest.json / BEST.txt. critic_big_dossier (ckpt_final): union_pooled_big adapted to the feature-dossier register (dossier-sonnet-v1 rows added to the pool; PMI on dossier text -16 -> +8.5, content unchanged, A3 FAIL) -- the critic used for the dossier-source columns."
    },
    "builders": [
     {
@@ -468,14 +468,15 @@
       "BEST.txt"
      ],
      "src": [
+      "BEST:/vol/critic/critic_v3b_fbpc/BEST.txt|/vol/critic/critic_v3b_fbpc/ckpt_step008000.pt",
+      "/vol/critic/critic_big_dossier/ckpt_final.pt",
+      "/vol/critic/text_union_pooled_n/ckpt_best.pt",
+      "/vol/critic/text_union_pooled_big/ckpt_best.pt",
+      "BEST:/vol/critic/critic_para_p3/BEST.txt|/vol/critic/critic_para_p3/ckpt_step004000.pt",
+      "/vol/critic/enc_e2/ckpt_best.pt",
       "/vol/critic/none_v1_pooled/ckpt_final.pt",
       "/vol/critic/depth_v1_pooled/ckpt_final.pt",
-      "/vol/critic/text_union_pooled_big/ckpt_best.pt",
-      "/vol/critic/enc_e2/ckpt_best.pt",
-      "BEST:/vol/critic/critic_para_p3/BEST.txt|/vol/critic/critic_para_p3/ckpt_step004000.pt",
-      "BEST:/vol/critic/critic_v3b_fbpc/BEST.txt|/vol/critic/critic_v3b_fbpc/ckpt_step008000.pt",
       "/vol/critic/none_v1_squash/ckpt_final.pt",
-      "/vol/critic/text_union_pooled_n/ckpt_best.pt",
       "/vol/critic/critic_v3b_e2sentpc/ckpt_step006000.pt",
       "/vol/critic/critic_v3b_e2p/ckpt_step003000.pt",
       "/vol/critic/none_v2/ckpt_latest.pt",
@@ -483,7 +484,7 @@
      ]
     }
    ],
-   "note": "#708/#711: priority order; BEST:<dir>/BEST.txt = the numbered EXACT-selected checkpoint named inside (never ckpt_best.pt of a v3b arm: proxy-selected); records (none_v2, v3a_nd) last"
+   "note": "orchestrator 04:15: priority head = fbpc s8000, critic_big_dossier, pooled_n, pooled_big, critic_para best; then the rest; every checkpoint is self-contained (the adapter ckpts include the prior weights) and expects stats.pt"
   }
  ]
 }

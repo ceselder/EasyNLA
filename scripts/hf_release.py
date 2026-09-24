@@ -128,7 +128,7 @@ def _plan_repo(repo: dict, work: str, plan_only: bool = False):
     return items
 
 
-@app.function(timeout=6 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=160 * 1024, ephemeral_disk=512 * 1024)
+@app.function(timeout=2 * 3600, volumes={"/vol": vol}, secrets=SECRETS, cpu=8, memory=160 * 1024, ephemeral_disk=512 * 1024)   # <= 2 h: exits on its own (orchestrator constraint)
 def run(task: str = "plan", only: str = "", dry_run: int = 1):
     import shutil, tempfile
     vol.reload(); man = _load_manifest(); total = 0
