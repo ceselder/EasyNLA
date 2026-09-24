@@ -353,6 +353,20 @@ def claims_controls(adapter: str, tag: str, extra: str = ""):
     return _claims([f"{REPO_REMOTE}/scripts/claims_controls.py", "--adapter", adapter, "--tag", tag] + extra.split())
 
 
+@app.function(gpu="B200", timeout=8 * 3600, max_containers=4, **COMMON)
+def ws_score(adapter: str, critic_tag: str, parts: str):
+    """verbalizer warm start: single-claim PMI of candidate bullets under a critic (scripts/claims_warmstart.py score)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_warmstart.py", "score", "--adapter", adapter, "--critic-tag", critic_tag, "--parts", parts])
+
+
+@app.function(timeout=4 * 3600, volumes=VOLS, secrets=SECRETS, cpu=16, memory=256 * 1024)
+def ws_build(critic_tag: str, extra: str = ""):
+    """verbalizer warm start: critic-filtered bullet-list SFT sets (scripts/claims_warmstart.py build)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_warmstart.py", "build", "--critic-tag", critic_tag] + extra.split())
+
+
 @app.function(gpu="B200", timeout=6 * 3600, **COMMON)
 def claims_finalize(root: str, extra: str = ""):
     """synthetic claims: merge the three families per anchor, near-duplicate removal (sentence embeddings), stats -> {root}/final"""
@@ -427,6 +441,11 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", claims_compose_variants.remote(ckpt, tag, extra))
     elif task == "claims_controls":   # --ckpt = adapter path, --tag = output tag
         print("rc", claims_controls.remote(ckpt, tag, extra))
+    elif task == "ws_score":   # --ckpt adapter, --tag critic tag, --sets comma list of parts (gold:<shard> / syn:<text shard>), split over --nshards containers
+        ps = [x for x in sets.split(",") if x]; k = min(nshards, len(ps))
+        print("rc", _gather([ws_score.spawn(ckpt, tag, ",".join(ps[i::k])) for i in range(k)]))
+    elif task == "ws_build":
+        print("rc", ws_build.remote(tag, extra))
     elif task == "claims_finalize":
         print("rc", claims_finalize.remote(root, extra))
     elif task == "gen_onpolicy":
