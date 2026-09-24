@@ -36,14 +36,18 @@ def match_norm(v, ref):
     return v * (ref.norm(dim=-1, keepdim=True) / v.norm(dim=-1, keepdim=True).clamp_min(1e-6))
 
 
-def recon(h, hh, msf):
-    """PRIMARY: cosine to the true activation. Secondary: FVE (NLA unit-L2 convention, scale-free by construction), FVE after matching ||h|| (raw-unit
+def recon(h, hh, msf, mu=None, mu_eval=None):
+    """PRIMARY: CENTERED cosine cos(h' - mu, h - mu), mu = the dataset mean activation (rep_statistics; the shared mean direction carries ~54 % of
+    ||h||^2, so raw cosine is inflated: the mean activation alone scores raw cos ~0.73); also raw cosine and the cosine centered on the eval-set mean. Secondary: FVE (NLA unit-L2 convention, scale-free by construction), FVE after matching ||h|| (raw-unit
     MSE relative to the predict-mean baseline), norm ratio, relative error."""
     from nla.schema import normalize_activation, compute_predict_mean_baselines
     _, base = compute_predict_mean_baselines(h, msf)
     mse = ((normalize_activation(hh, msf) - normalize_activation(h, msf)) ** 2).mean(-1)
     hm = match_norm(hh, h); base_raw = ((h - h.mean(0, keepdim=True)) ** 2).mean().item(); mse_raw = ((hm - h) ** 2).mean().item()
-    return {"cos": stats(F.cosine_similarity(hh, h, dim=-1).cpu()), "fve": float(100 * (1 - mse.mean().item() / base)), "fve_normmatched_raw": float(100 * (1 - mse_raw / base_raw)),
+    out = {"cos": stats(F.cosine_similarity(hh, h, dim=-1).cpu()), "fve": float(100 * (1 - mse.mean().item() / base)), "fve_normmatched_raw": float(100 * (1 - mse_raw / base_raw))}
+    if mu is not None: out["cos_centered"] = stats(F.cosine_similarity(hh - mu, h - mu, dim=-1).cpu())
+    if mu_eval is not None: out["cos_centered_evalmean"] = stats(F.cosine_similarity(hh - mu_eval, h - mu_eval, dim=-1).cpu())
+    return out | {
             "norm_ratio": stats((hh.norm(dim=-1) / h.norm(dim=-1)).cpu()), "rel_err": stats(((hh - h).norm(dim=-1) / h.norm(dim=-1)).cpu()), "rel_err_normmatched": stats(((hm - h).norm(dim=-1) / h.norm(dim=-1)).cpu())}
 
 
@@ -57,7 +61,9 @@ def main():
     a = p.parse_args(); tests = set(a.tests.split(",")); cfgs = [float(x) for x in a.cfgs.split(",")]; t0 = time.time(); d0 = "cuda:0"
     from nla.unclip.decoder import Decoder
     dec = Decoder(a.snap, d0, encoder_json=a.encoder_json); d = dec.d; msf = math.sqrt(d)
-    H, Z, TXT, DOC = load_rows(a.n); Hg = H.to(d0); E = dec.encode(Hg); perm = torch.randperm(a.n, generator=torch.Generator().manual_seed(1)).tolist(); E_shuf = E[perm]
+    from nla.flow.model import Normalizer
+    MU = Normalizer.load(dec.aa["stats"]).mean.to(d0)                       # dataset mean activation (2M FineWeb activations; raw units)
+    H, Z, TXT, DOC = load_rows(a.n); Hg = H.to(d0); MU_EVAL = Hg.mean(0); E = dec.encode(Hg); perm = torch.randperm(a.n, generator=torch.Generator().manual_seed(1)).tolist(); E_shuf = E[perm]
     res = {"snap": a.snap, "step": dec.step, "samples": dec.samples, "adapter_args": {k: v for k, v in dec.aa.items() if isinstance(v, (int, float, str, bool, type(None)))}, "n": a.n, "seed": a.seed, "tests": sorted(tests), "e_scale": dec.enc.e_scale, "space": dec.aa.get("space", "std")}
     print(f"[dec-eval] {a.snap}: step {dec.step}, {a.n} clean1 rows, tests {sorted(tests)}", flush=True)
     out_path = a.out or os.path.join(a.snap, "eval_dec.json")
@@ -115,10 +121,11 @@ def main():
         S["mean_act"] = Hg.mean(0, keepdim=True).expand_as(Hg).contiguous(); S["other_row"] = Hg[[(i + 1) % a.n for i in range(a.n)]]
         rc = {}
         for k, v in S.items():
-            rc[k] = recon(Hg, v, msf); rc[k]["e_cos"] = stats(((dec.encode(v) * E).sum(-1) / dec.d_e).cpu()); rc[k]["e_cos_normmatched"] = stats(((dec.encode(match_norm(v, Hg)) * E).sum(-1) / dec.d_e).cpu())
+            rc[k] = recon(Hg, v, msf, MU, MU_EVAL); rc[k]["e_cos"] = stats(((dec.encode(v) * E).sum(-1) / dec.d_e).cpu()); rc[k]["e_cos_normmatched"] = stats(((dec.encode(match_norm(v, Hg)) * E).sum(-1) / dec.d_e).cpu())
         rc["h_stored"] = {"e_cos": stats(((dec.encode(Hg.to(torch.bfloat16).float()) * E).sum(-1) / dec.d_e).cpu())}
-        res["recon"] = {"sample_steps": a.sample_steps, "cfgs": cfgs, "primary_metric": "cos", **rc}
-        print("[dec-eval] recon (PRIMARY cos; FVE raw / after matching ||h||; norm ratio): " + " | ".join(f"{k}: cos {rc[k]['cos']['mean']:.3f} FVE {rc[k]['fve']:.1f}/{rc[k]['fve_normmatched_raw']:.1f} norm {rc[k]['norm_ratio']['mean']:.2f} e-cos {rc[k]['e_cos_normmatched']['mean']:.3f}" for k in S), flush=True); dump()
+        rc["h_stored"]["cos_centered_mu_vs_h"] = stats(F.cosine_similarity(MU[None].expand_as(Hg), Hg, dim=-1).cpu())   # how much raw cos the shared mean alone buys
+        res["recon"] = {"sample_steps": a.sample_steps, "cfgs": cfgs, "primary_metric": "cos_centered", "mu_norm": float(MU.norm()), "mu_eval_norm": float(MU_EVAL.norm()), "cos_mu_mu_eval": float(F.cosine_similarity(MU, MU_EVAL, dim=0)), **rc}
+        print("[dec-eval] recon (PRIMARY centered cos(h'-mu, h-mu) | raw cos | FVE raw / after matching ||h|| | norm ratio | e-cos): " + " | ".join(f"{k}: c-cos {rc[k]['cos_centered']['mean']:.3f} (eval-mean {rc[k]['cos_centered_evalmean']['mean']:.3f}) raw {rc[k]['cos']['mean']:.3f} FVE {rc[k]['fve']:.1f}/{rc[k]['fve_normmatched_raw']:.1f} norm {rc[k]['norm_ratio']['mean']:.2f} e-cos {rc[k]['e_cos_normmatched']['mean']:.3f}" for k in S), flush=True); dump()
 
     lm = tok = None; st = {"cap": None, "vec": None, "pos": None}
     def load_lm():
@@ -205,7 +212,11 @@ def main():
         pair = [];
         for i in range(n_v):
             C = F.cosine_similarity(Vs[i][:, None], Vs[i][None], dim=-1); pair.append(C[~torch.eye(K, dtype=bool, device=C.device)].mean().item())
-        var = {"n": n_v, "K": K, "cfg": a.var_cfg, "splice_norm": a.splice_norm, "pairwise_cos_between_variations": stats(pair), "cos_to_h": stats(F.cosine_similarity(Vs, Hg[:n_v, None], dim=-1).flatten().cpu()),
+        pair_c = []
+        for i in range(n_v):
+            Cc = F.cosine_similarity((Vs[i] - MU)[:, None], (Vs[i] - MU)[None], dim=-1); pair_c.append(Cc[~torch.eye(K, dtype=bool, device=Cc.device)].mean().item())
+        var = {"n": n_v, "K": K, "cfg": a.var_cfg, "splice_norm": a.splice_norm, "pairwise_cos_between_variations": stats(pair), "pairwise_cos_centered_between_variations": stats(pair_c),
+               "cos_centered_to_h": stats(F.cosine_similarity(Vs - MU, Hg[:n_v, None] - MU, dim=-1).flatten().cpu()), "cos_centered_between_other_rows": stats(F.cosine_similarity(Hg[:n_v] - MU, Hg[[(i + 1) % a.n for i in range(n_v)]] - MU, dim=-1).cpu()), "cos_to_h": stats(F.cosine_similarity(Vs, Hg[:n_v, None], dim=-1).flatten().cpu()),
                "e_cos": stats(((dec.encode(Vs.reshape(-1, d)) * E[:n_v].repeat_interleave(K, 0)).sum(-1) / dec.d_e).cpu()),
                "cos_between_other_rows": stats(F.cosine_similarity(Hg[:n_v], Hg[[(i + 1) % a.n for i in range(n_v)]], dim=-1).cpu())}
         z_h = verbalize(Hg[:n_v]); z_var = [verbalize(Vs[:, k]) for k in range(K)]; z_unc = verbalize(U_read)
@@ -218,7 +229,7 @@ def main():
         var["clip_score_vs_h"] = {"gold": stats((sc * (eu * g_gold).sum(-1)).cpu()), "verbalized_h": stats((sc * (eu * g_h).sum(-1)).cpu()), "variation": stats(torch.cat([sc * (eu * g).sum(-1) for g in g_var]).cpu()), "uncond_sample": stats((sc * (eu * g_unc).sum(-1)).cpu())}
         var["examples"] = [{"row": i, "doc": DOC[i], "prefix_tail": (TXT[i] or "")[-300:], "gold": Z[i], "verbalized_h": z_h[i], "variations": [z_var[k][i] for k in range(K)], "uncond_sample": z_unc[i]} for i in range(min(n_v, 12))]
         res["var"] = var
-        print(f"[dec-eval] var: pairwise cos between variations {var['pairwise_cos_between_variations']['mean']:.3f}, cos to h {var['cos_to_h']['mean']:.3f}, e-cos {var['e_cos']['mean']:.3f} | text g-sim: verbalized h vs gold {var['text_sim']['verbalized_h_vs_gold']['mean']:.3f}, variations vs gold {var['text_sim']['variation_vs_gold']['mean']:.3f}, uncond sample vs gold {var['text_sim']['uncond_sample_vs_gold']['mean']:.3f}, other-row gold {var['text_sim']['gold_vs_other_row_gold']['mean']:.3f} ({time.time() - t0:.0f}s)", flush=True); dump()
+        print(f"[dec-eval] var: CENTERED cos to h {var['cos_centered_to_h']['mean']:.3f} (raw {var['cos_to_h']['mean']:.3f}; other rows centered {var['cos_centered_between_other_rows']['mean']:.3f}), centered pairwise between variations {var['pairwise_cos_centered_between_variations']['mean']:.3f} (raw {var['pairwise_cos_between_variations']['mean']:.3f}), e-cos {var['e_cos']['mean']:.3f} | text g-sim: verbalized h vs gold {var['text_sim']['verbalized_h_vs_gold']['mean']:.3f}, variations vs gold {var['text_sim']['variation_vs_gold']['mean']:.3f}, uncond sample vs gold {var['text_sim']['uncond_sample_vs_gold']['mean']:.3f}, other-row gold {var['text_sim']['gold_vs_other_row_gold']['mean']:.3f} ({time.time() - t0:.0f}s)", flush=True); dump()
     res["seconds"] = time.time() - t0; dump(); print(f"[dec-eval] done -> {out_path} ({res['seconds']:.0f}s)", flush=True)
 
 
