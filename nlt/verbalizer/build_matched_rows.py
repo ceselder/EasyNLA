@@ -29,18 +29,18 @@ def main():
     assert tf and pf, f"no files: target {len(tf)} pool {len(pf)}"
     tgt = pd.concat([pq.read_table(f, columns=["pair_id", "verbosity"]).to_pandas() for f in tf], ignore_index=True)
     if a.target_verbosity: tgt = tgt[tgt["verbosity"].isin([int(v) for v in a.target_verbosity.split(",")])]
-    tgt["pair_id"] = tgt["pair_id"].astype(np.int64); tgt["verbosity"] = tgt["verbosity"].astype(int)
+    tgt["pair_id"] = tgt["pair_id"].astype(str); tgt["verbosity"] = tgt["verbosity"].astype(int)          # pair_id is a string key (e.g. "val:16:10:13")
     want = tgt.groupby(["pair_id", "verbosity"]).size().rename("n").reset_index()
     ids = set(tgt["pair_id"].tolist())
     print(f"[matched] target: {len(tgt)} rows, {len(ids)} pairs, verbosity mix {tgt['verbosity'].value_counts().sort_index().to_dict()} from {len(tf)} files", flush=True)
     # pool: only rows whose pair_id is wanted (filter per file to keep memory small)
     parts = []
     for f in pf:
-        t = pq.read_table(f).to_pandas(); t = t[t["pair_id"].astype(np.int64).isin(ids)]
+        t = pq.read_table(f).to_pandas(); t = t[t["pair_id"].astype(str).isin(ids)]
         if len(t): parts.append(t)
     pool = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
     assert len(pool), "no pool rows share a pair_id with the target"
-    pool["pair_id"] = pool["pair_id"].astype(np.int64); pool["verbosity"] = pool["verbosity"].astype(int)
+    pool["pair_id"] = pool["pair_id"].astype(str); pool["verbosity"] = pool["verbosity"].astype(int)
     pool = pool.sample(frac=1.0, random_state=a.seed).reset_index(drop=True)          # random tie-break among candidates
     by_pair = {pid: g for pid, g in pool.groupby("pair_id")}
     print(f"[matched] pool: {len(pool)} candidate rows over {len(by_pair)} of the {len(ids)} target pairs", flush=True)
