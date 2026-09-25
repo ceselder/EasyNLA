@@ -4,9 +4,9 @@
 set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt; MAXG=${MAXG:-8}; BAND=12,16,20,24,28,30,32,36,40,42,44,48,52,54,56,60; TX=/vol/q36/text/v1
 log(){ echo "[v1b] $(date -u +%H:%M) $*"; }
 nfiles(){ timeout 120 modal volume ls nlt "$1" 2>/dev/null | grep -cE "$2" || true; }
-gpus_in_use(){ timeout 90 modal app list 2>/dev/null | grep "nlt-q36" | grep -vE "stopped" | awk -F'│' '{gsub(/ /,"",$5); s+=$5} END {print s+0}'; }
+source /home/celeste/nlt-q36-logs/gpu_lib.sh
 wait_gpu(){ need=${1:-1}; for i in $(seq 1 600); do g=$(gpus_in_use); [ $((g + need)) -le $MAXG ] && return 0; sleep 120; done; return 1; }
-run(){ NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script "$1" --args "$2" 2>&1 | grep -E "SPAWNED|modal.com/apps|rror" | sed "s/^/[$3] /" | tee -a /home/celeste/nlt-q36-logs/apps.txt; }
+run(){ out=$(NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script "$1" --args "$2" 2>&1 | grep -E "SPAWNED|modal.com/apps|rror"); echo "$out" | sed "s/^/[$3] /" | tee -a /home/celeste/nlt-q36-logs/apps.txt; ledger_add "$out" 1 "$3"; }
 for i in $(seq 1 600); do n=$(nfiles q36/results "bits_v1_(main|components|verbalizer|describers)\.json"); [ "$n" -ge 4 ] && break; sleep 180; done; log "v1 bits landed; launching the v1b ablation"
 POOLS="craft_full=0.30:$TX/train/craft_full__*.parquet,describer=0.20:$TX/train/describer_sonnet5_A__*.parquet,craft_nojl=0.08:$TX/train/craft_nojl__*.parquet,craft_delta=0.12:$TX/train/craft_delta__*.parquet,craft_newfaded=0.08:$TX/train/craft_newfaded__*.parquet,jlens=0.12:$TX/train/jlens__*.parquet,olens_j=0.10:$TX/train/olens_j__*.parquet,raw_all=0.10:$TX/train/raw_all__*.parquet"
 VALS="craft_full:$TX/val/craft_full__*.parquet,describer:$TX/val/describer_sonnet5_A__*.parquet,raw_all:$TX/val/raw_all__*.parquet"
