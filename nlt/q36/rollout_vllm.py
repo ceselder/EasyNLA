@@ -118,8 +118,17 @@ def main():
         from vllm.config.attention import AttentionConfig; extra["attention_config"] = AttentionConfig(backend="FLASH_ATTN")
     except Exception:
         pass
-    llm = LLM(model=args.model, tokenizer=args.model, dtype="bfloat16", gpu_memory_utilization=args.gpu_mem, max_model_len=len(PROMPT) + args.max_tokens + 8,
-              max_num_seqs=args.max_num_seqs, enforce_eager=False, enable_prefix_caching=False, disable_log_stats=True, seed=args.seed, **extra)
+    mns = args.max_num_seqs; llm = None
+    while llm is None:                                              # smaller GPUs (H100 80 GB) leave fewer Mamba cache blocks than max_num_seqs -> halve and retry
+        try:
+            llm = LLM(model=args.model, tokenizer=args.model, dtype="bfloat16", gpu_memory_utilization=args.gpu_mem, max_model_len=len(PROMPT) + args.max_tokens + 8,
+                      max_num_seqs=mns, enforce_eager=False, enable_prefix_caching=False, disable_log_stats=True, seed=args.seed, **extra)
+        except Exception as e:
+            msg = str(e)
+            if ("Mamba cache blocks" in msg or "max_num_seqs" in msg) and mns > 32:
+                mns //= 2; print(f"[rollout] engine init failed ({msg[:120]}...) -> retry with max_num_seqs {mns}", flush=True); import gc; gc.collect(); torch.cuda.empty_cache()
+            else: raise
+    print(f"[rollout] engine up with max_num_seqs {mns}", flush=True)
     if args.adapter:
         from vllm_lens.metamodel import merge_lora
         info = merge_lora(llm, args.adapter, keep_base="none")
