@@ -76,6 +76,7 @@ def main():
     p.add_argument("--param", default="v", choices=["x0", "v", "x0res"]); p.add_argument("--t-min", type=float, default=0.02); p.add_argument("--x0-scale", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=1024); p.add_argument("--micro-batch", type=int, default=128); p.add_argument("--lr", type=float, default=1.2e-4); p.add_argument("--warmup", type=int, default=300); p.add_argument("--wd", type=float, default=0.01)
     p.add_argument("--uncond-steps", type=int, default=0, help="PRETRAIN p(u_j | u_i) with NO text on random band pairs from the whole store for this many steps (unlabelled pairs are free), then switch to the text pools (tip from the NLA flow-critic session: freeze-then-condition worked best there)"); p.add_argument("--beta2", type=float, default=0.999); p.add_argument("--ema", type=float, default=0.999); p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--uncond-frac", type=float, default=0.15); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-floor", type=float, default=0.05)
+    p.add_argument("--null-dm", type=float, default=0.0, help="8B v1.16 regulariser: at the same (x_t, t, eps) pull the velocity under a depth-matched WRONG text (another micro-batch row, same (i,j) else same j else rolled) toward the no-text velocity (detached), so a wrong text earns no bits and the text path stays calibrated to the null path")
     p.add_argument("--sigma-r", type=float, default=0.1); p.add_argument("--radial", default="lognormal", choices=["lognormal", "fixed"], help="fixed: s = 1 + isotropic dequantisation noise --sigma-iso (radial density shared by the text and null paths)"); p.add_argument("--sigma-iso", type=float, default=0.05); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=256); p.add_argument("--eval-offset", type=int, default=2048, help="val pairs before this index are the FIXED test set (eval_bits.py); monitoring uses pairs after it"); p.add_argument("--spot-exact-n", type=int, default=64); p.add_argument("--spot-ode-steps", type=int, default=16)
     p.add_argument("--save-every", type=int, default=1000); p.add_argument("--keep-every", type=int, default=0); p.add_argument("--max-hours", type=float, default=20.0); p.add_argument("--max-train-pos", type=int, default=None); p.add_argument("--data-device", default="cuda"); p.add_argument("--seed", type=int, default=0)
@@ -138,7 +139,14 @@ def main():
                 mask = mask & keep[sl][:, None]; mask_T = max(mask_T, int(mask.shape[1]))
             t = torch.rand(nb, device=dev); eps = torch.randn_like(x0)
             with torch.autocast("cuda", dtype=torch.bfloat16): l, v_mse = model.loss(x0, src, t, eps, enc, mask)
-            (l.mean() * nb / a.batch).backward(); l_all[sl] = l.detach(); v_all[sl] = v_mse
+            step_loss = l.mean()
+            if a.null_dm > 0 and enc is not None:
+                perm = torch.tensor(dm_partner(i[sl], j[sl]), device=dev); x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.no_grad(): v_null = model(x_t, t, src)
+                    v_dm = model(x_t, t, src, enc=enc[perm], enc_mask=mask[perm])
+                step_loss = step_loss + a.null_dm * ((v_dm.float() - v_null.float().detach()) ** 2).mean(-1).mean() / (model.x0_scale ** 2)
+            (step_loss * nb / a.batch).backward(); l_all[sl] = l.detach(); v_all[sl] = v_mse
         loss = l_all.mean(); gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip); opt.step()
         with torch.no_grad():
             dec = min(a.ema, (1 + step) / (10 + step)); torch._foreach_lerp_(ema_p, raw_p, 1 - dec)
