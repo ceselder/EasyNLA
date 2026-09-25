@@ -44,7 +44,9 @@ app = modal.App("nla-scale")
 # production labeller config, from the 6-way bench (20k real prompts, 1 B200 each): bigger batches +8 %, one variant per document +3 % prompts/s at
 # 10 % longer outputs; fp8 weights+KV -4 % and 8x parse failures (decode-bound on the MoE/attention kernels, not weight bandwidth); n>1 gives no
 # extra explanations per second (127 at n=2 vs 126) -> bf16, 1024 seqs, 32k batched tokens, n=1
-LABEL_CFG = dict(fp8=False, fp8_kv=True, max_num_seqs=1024, max_num_batched_tokens=32768, n=1, attention_backend="TRITON_FLASHINFER")   # backend + fp8 KV cache: [gemma-engine] wins, quality-guarded
+# fp8 KV cache REVERTED (2026-09-25 00:40): on some containers (uncalibrated KV scales set by the first batch) stage A degenerates to the 900-token
+# cap on ~every position (fact sheets 10 / 48k parsed); the guard passed on the first 6 shards only
+LABEL_CFG = dict(fp8=False, fp8_kv=False, max_num_seqs=1024, max_num_batched_tokens=32768, n=1, attention_backend="TRITON_FLASHINFER")
 
 
 def _engine_kwargs(cfg=None):
@@ -363,6 +365,33 @@ def run_para(n_shards: int = 30):
         try: out[f"join{s}"] = para_join.remote(s)
         except Exception as e: out[f"join{s}"] = f"ERR {str(e)[:200]}"
     json.dump(out, open(f"{PARA_ROOT}/run_para_status.json", "w"), indent=1); vol_glp.commit(); return out
+
+
+@app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=64 * 1024)
+def g2_drop_bad(root: str = f"{ROOT}/g2", max_bad: float = 0.2, dry: bool = False):
+    """delete g2 label shards (and their joined shards) whose fact-sheet parse failure rate exceeds max_bad, so the orchestrator relabels them"""
+    import glob, pyarrow.parquet as pq
+    vol_glp.reload(); bad = []
+    for f in sorted(glob.glob(f"{root}/lab/lab_*.parquet")):
+        sid = int(os.path.basename(f)[4:8]); fa = pq.read_table(f, columns=["facts"]).column(0).to_pylist(); fr = sum(x is None for x in fa) / max(1, len(fa))
+        if fr > max_bad:
+            bad.append((sid, round(fr, 3)))
+            if not dry:
+                for p in (f, f"{root}/shards/shard_{sid:04d}.parquet"):
+                    if os.path.exists(p): os.remove(p)
+    if not dry: vol_glp.commit()
+    return bad
+
+
+@app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=4, memory=32 * 1024)
+def para_bad(max_fail: float = 0.05):
+    """paraphrase shards whose para_ok failure rate exceeds max_fail (degenerate containers) -> list of (sid, fail rate)"""
+    import glob, pyarrow.parquet as pq
+    vol_glp.reload(); out = []
+    for f in sorted(glob.glob(f"{PARA_ROOT}/opus/para_*.parquet")):
+        ok = pq.read_table(f, columns=["para_ok"]).column(0).to_pylist(); fr = 1 - sum(sum(x) for x in ok) / max(1, 2 * len(ok))
+        out.append((int(os.path.basename(f)[5:9]), round(fr, 4)))
+    return [x for x in out if x[1] > max_fail], len(out)
 
 
 @app.function(image=image_q, timeout=3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=64 * 1024)
