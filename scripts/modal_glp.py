@@ -355,6 +355,13 @@ def fit_whiten_unitnorm(extra: str = ""):
 
 
 @app.function(gpu="B200", timeout=4 * 3600, **COMMON)
+def rl_pmi_judge(adapter: str, extra: str = ""):
+    """per-claim critic PMI vs claim-judge verdict on RL eval dumps (scripts/claims_rl_pmi_vs_judge.py)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_rl_pmi_vs_judge.py", "--adapter", adapter] + extra.split())
+
+
+@app.function(gpu="B200", timeout=4 * 3600, **COMMON)
 def claims_prebank(adapter: str, tag: str, extra: str = ""):
     """double-difference twin control against same-document activations before the detail's first mention (scripts/claims_prebank.py)"""
     vol_glp.reload()
@@ -525,6 +532,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", claims_compose_variants.remote(ckpt, tag, extra))
     elif task == "fit_whiten_unitnorm":
         print("rc", fit_whiten_unitnorm.remote(extra))
+    elif task == "rl_pmi_judge":
+        print("rc", rl_pmi_judge.remote(ckpt, extra))
     elif task == "claims_prebank":
         print("rc", claims_prebank.remote(ckpt, tag, extra))
     elif task == "claims_redundancy":
