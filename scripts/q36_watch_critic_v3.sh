@@ -31,8 +31,9 @@ for i in $(seq 1 400); do
     if grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt || grep -q "\[${TAG}eval_$st\] QUEUED" $LOGD/evalq.txt; then launched[$st]=1; log "gate eval launched/queued for $st"; else log "gate eval launch for $st FAILED (retry next round)"; fi
   done
   # (d) passes per pool at each step, from the trainer's log lines ("passes max X" every 100 steps) -> data/critic_${TAG}_passes.json
-  TA=$(grep -E "^\[critic_${TAG}(_s[0-9]+)?\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+")
-  [ -n "$TA" ] && timeout 120 modal app logs $TA 2>/dev/null | grep -E "^\[train\] step [0-9]+ .*passes max" | python3 -c "
+  # every stage's app (staged one-pass critics resume across apps: stage 1 steps 0-1791, stage 2 from 1791, ...), later stages override on equal steps; passes restart at 0 in each stage because the pools are new rows
+  TAS=$(grep -E "^\[critic_${TAG}(_s[0-9]+)?\] https" $LOGD/apps.txt | grep -oE "ap-[A-Za-z0-9]+" | awk '!seen[$0]++')
+  [ -n "$TAS" ] && for TA in $TAS; do timeout 120 modal app logs $TA 2>/dev/null | grep -E "^\[train\] step [0-9]+ .*passes max"; done | python3 -c "
 import sys, re, json
 d = {}
 for l in sys.stdin:
