@@ -78,17 +78,17 @@ P(f"[rl] critic {args.critic} ({critic.n_params() / 1e6:.0f}M) co-train {not arg
 BAND = [int(x) for x in args.band.split(",")] if args.band else None
 store = Store(args.data_dir, "train", device=dev, layers=BAND, max_pos=args.max_train_pos, verbose=is_main); store_val = Store(args.data_dir, "val", device=dev, layers=BAND, verbose=False)
 band = BAND or store.layers
-vp = pq.read_table(os.path.join(args.data_dir, "pairs_val.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store_val.row_of)].iloc[: args.heldout].reset_index(drop=True)
+vp = pq.read_table(os.path.join(args.data_dir, "pairs_val.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store_val.row_of) & vp["i"].isin(band) & vp["j"].isin(band)].iloc[: args.heldout].reset_index(drop=True)
 Vh_rows = store_val.rows_for(vp["pos_idx"].values); Vh_i = torch.tensor(vp["i"].values.astype(np.int64)); Vh_j = torch.tensor(vp["j"].values.astype(np.int64))
 REPLAY = None
 if args.replay_text and not args.no_cotrain:
-    files = sorted(sum((glob.glob(g) for g in args.replay_text.split(",")), [])); df = load_text_pairs(files, os.path.join(args.data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of)].reset_index(drop=True)
+    files = sorted(sum((glob.glob(g) for g in args.replay_text.split(",")), [])); df = load_text_pairs(files, os.path.join(args.data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of) & df["i"].isin(band) & df["j"].isin(band)].reset_index(drop=True)
     REPLAY = {"rows": store.rows_for(df["pos_idx"].values), "i": torch.tensor(df["i"].values.astype(np.int64)), "j": torch.tensor(df["j"].values.astype(np.int64)), "text": df["text"].astype(str).tolist()}; P(f"[rl] replay pool {len(df)} rows from {len(files)} files")
 TWINS = None
 if args.twins:
     import pandas as pd
     tw = pd.concat([pq.read_table(f).to_pandas() for f in sorted(glob.glob(args.twins))], ignore_index=True); vpa = pq.read_table(os.path.join(args.data_dir, "pairs_val.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas().set_index("pair_id")
-    tw = tw[tw["pair_id"].isin(vpa.index) & tw["pair_id"].map(lambda p_: vpa.loc[p_, "pos_idx"] in store_val.row_of)]
+    tw = tw[tw["pair_id"].isin(vpa.index)]; tw = tw[tw["pair_id"].map(lambda p_: (vpa.loc[p_, "pos_idx"] in store_val.row_of) and (int(vpa.loc[p_, "i"]) in band) and (int(vpa.loc[p_, "j"]) in band))]
     tru = tw[tw["variant"] == "true"].drop_duplicates("pair_id").set_index("pair_id")["text"]; twn = tw[tw["variant"] == "twin_shift"].drop_duplicates("pair_id").set_index("pair_id")["text"]
     com = [p_ for p_ in tru.index if p_ in twn.index][: args.heldout]
     if com:
