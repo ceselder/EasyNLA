@@ -17,8 +17,11 @@ for i in $(seq 1 400); do
     # per-pool held-out content (orchestrator 09:12): the single-line and partial pools on the v1 held-out texts, n 128 (a separate lower-priority spec so the gate eval stays fast)
     PRIO=2 run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --out /vol/q36/results/bits_${TAG}_${st}_pools.json --sets 'craft_delta:$TX1/val/craft_delta__*.parquet,craft_newfaded:$TX1/val/craft_newfaded__*.parquet,craft_nojl:$TX1/val/craft_nojl__*.parquet,jlens:$TX1/val/jlens__*.parquet,olens_j:$TX1/val/olens_j__*.parquet,raw_all:$TX1/val/raw_all__*.parquet' --n 128 --n-fixed 1024 --ode-steps 64 --skip-samples --skip-sw" ${TAG}eval_${st}_pools
     # (e) of the amended criterion (orchestrator 09:25): a small TRAIN-row eval on the pools this critic trains on -> train - held-out PMI gap
-    TRAIN_GLOB=${TRAIN_GLOB:-/vol/q36/text/v3/train/craft_full__*.parquet}
-    run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --split train --out /vol/q36/results/bits_${TAG}_${st}_train.json --sets 'craft_full:$TRAIN_GLOB' --n 128 --n-fixed 512 --ode-steps 64 --skip-samples --skip-sw" ${TAG}eval_${st}_train
+    # the one-pass critics (v4 stages, v3c = v4 stage 1) train on harvested text/v3 shards whose pair ids are NOT in pairs_train -> the fixed set is built from the shard files themselves (--fixed-from-texts);
+    # the glob = exactly the shards the run has trained on (stage files), so the probe never scores rows the critic has not seen at all. At 0.x passes only that fraction of the probe rows has been seen -> gap diluted; the definitive (e) test is the one-pass end.
+    STG=$D/critic_v4_stage*.json; [ "$TAG" = v3c ] && STG=$D/critic_v4_stage1.json
+    if [ "$TAG" = v4 ] || [ "$TAG" = v3c ]; then TRAIN_GLOB=$(python3 -c "import json,glob; sh=sorted({s for f in glob.glob('$STG') for s in json.load(open(f))['shards']}); print(';'.join(f'/vol/q36/text/v3/train/craft_full__{s}.parquet' for s in sh))"); FFT="--fixed-from-texts"; else TRAIN_GLOB=${TRAIN_GLOB:-$TX1/train/craft_full__*.parquet}; FFT=""; fi
+    run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --split train --out /vol/q36/results/bits_${TAG}_${st}_train.json --sets 'craft_full:$TRAIN_GLOB' --n 128 --n-fixed 512 --ode-steps 64 --skip-samples --skip-sw $FFT" ${TAG}eval_${st}_train
     if grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt || grep -q "\[${TAG}eval_$st\] QUEUED" $LOGD/evalq.txt; then launched[$st]=1; log "gate eval launched/queued for $st"; else log "gate eval launch for $st FAILED (retry next round)"; fi
   done
   # (d) passes per pool at each step, from the trainer's log lines ("passes max X" every 100 steps) -> data/critic_${TAG}_passes.json

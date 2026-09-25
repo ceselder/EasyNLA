@@ -58,6 +58,7 @@ def main():
     p.add_argument("--sets", default="", help="label:glob[;glob],... text sets (val split)"); p.add_argument("--twins", default="", help="label:glob,... twin manifests [pair_id, variant, text]")
     p.add_argument("--n", type=int, default=512); p.add_argument("--n-fixed", type=int, default=2048); p.add_argument("--batch", type=int, default=32); p.add_argument("--ode-steps", type=int, default=64); p.add_argument("--probes", type=int, default=1)
     p.add_argument("--n-samples", type=int, default=4); p.add_argument("--sample-steps", type=int, default=32); p.add_argument("--skip-samples", action="store_true"); p.add_argument("--skip-sw", action="store_true")
+    p.add_argument("--fixed-from-texts", action="store_true", help="build the fixed test set from the FIRST --sets glob's own rows (seeded shuffle, then --n-fixed) instead of pairs_<split>.parquet: needed for harvested text/v3 rows whose pair ids (split:pos_idx:i:j) are not in the pairs file (train-row memorisation probe for the one-pass critics)")
     p.add_argument("--seed", type=int, default=0); p.add_argument("--data-device", default="cuda"); p.add_argument("--split", default="val", help="val (held-out, default) or train: score TRAIN rows with train text globs (over-epoching diagnostic)")
     p.add_argument("--neighbors", default=None, help="dir of extract_neighbors.py outputs: score each text against the SAME document's (h_i, h_j) at positions t-k (k in the file) -> content(own) - content(neighbour)")
     p.add_argument("--neighbor-n", type=int, default=256, help="rows per set for the neighbour control (exact ODE passes are 2 per offset)")
@@ -94,7 +95,13 @@ def main():
             out[q] = NB["H"][(int(layer_vec[q]), k)][n_]; ok[q] = True
         return out, ok
     encoder = TextEncoder(aa.get("enc_model", "Qwen/Qwen3-0.6B"), int(aa.get("enc_layer", 20)), dev, int(aa.get("enc_max_len", 192)))
-    vp = pq.read_table(os.path.join(a.data_dir, f"pairs_{a.split}.parquet"), columns=["pair_id", "pos_idx", "i", "j", "shard"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)].iloc[: a.n_fixed].reset_index(drop=True); NF = len(vp)
+    if a.fixed_from_texts:
+        first = [s_ for s_ in a.sets.split(",") if s_.strip()][0].split(":", 1)[1]
+        vp = load_text_pairs(first.split(";"), os.path.join(a.data_dir, f"pairs_{a.split}.parquet"), pools_verbose=False).drop_duplicates("pair_id")[["pair_id", "pos_idx", "i", "j"]]
+        vp = vp[vp["pos_idx"].isin(store.row_of)].sample(frac=1.0, random_state=a.seed).iloc[: a.n_fixed].reset_index(drop=True); NF = len(vp)
+        print(f"[bits] fixed set built from the first set's own rows ({first}): {NF} pairs", flush=True)
+    else:
+        vp = pq.read_table(os.path.join(a.data_dir, f"pairs_{a.split}.parquet"), columns=["pair_id", "pos_idx", "i", "j", "shard"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)].iloc[: a.n_fixed].reset_index(drop=True); NF = len(vp)
     rows_all = store.rows_for(vp["pos_idx"].values); I_all = torch.tensor(vp["i"].values.astype(np.int64)); J_all = torch.tensor(vp["j"].values.astype(np.int64)); pid_all = vp["pair_id"].tolist()
     g = torch.Generator().manual_seed(a.seed + 1); s_all = torch.exp(sigma_r * torch.randn(NF, generator=g)); eps_all = torch.randn(NF, d, generator=g); eps_samp = torch.randn(a.n_samples, NF, d, generator=g); iso_all = torch.randn(NF, d, generator=g)
     probe_bank = make_probe_bank(a.ode_steps, a.probes, d, torch.Generator().manual_seed(a.seed + 2)); rng_sw = np.random.default_rng(a.seed + 7)
