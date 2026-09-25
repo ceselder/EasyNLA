@@ -15,17 +15,19 @@ RUNS = {  # tag: (app id, uncond steps, label)
     "v1": ("ap-xLqiQeU1iXNyuPWTaMI0tL", 1500, "critic v1: 1500 unconditional steps, then text"),
     "v2": ("ap-v6k1AKzbDY0s5VzKlxJXGH", 1500, "critic v2: 1500 unconditional steps, full text mix"),
     "v1b": ("ap-qQSm6zb1BbwIbCAiEdvnJ2", 0, "critic v1b: NO unconditional phase (uncond rows 10%)"),
-    "v3b": (None, 0, "critic v3b: no unconditional phase + anchored contrast"),
+    "v3b": (None, 0, "critic v3b: no unconditional phase + anchored GAIN contrast (stopped: wrecked reconstruction)"),
+    "v4": (None, 0, "critic v4: one pass over the harvested pools, no contrast"),
+    "v3c": (None, 0, "critic v3c: same pools + margin-hinge anchor (w 0.1, m 0.02, guard)"),
 }
-COL = {"v1": "#2b6cb0", "v2": "#6b46c1", "v1b": "#c05621", "v3b": "#1a9c6e"}
+COL = {"v1": "#2b6cb0", "v2": "#6b46c1", "v1b": "#c05621", "v3b": "#1a9c6e", "v4": "#d69e2e", "v3c": "#e53e3e"}
 
 
 def app_id(tag):
     if RUNS[tag][0]: return RUNS[tag][0]
     try:
         for l in open("/home/celeste/nlt-q36-logs/apps.txt"):
-            m = re.match(rf"\[critic_{tag}\] https://modal.com/apps/\S+/(ap-[A-Za-z0-9]+)", l)
-            if m: aid = m.group(1)
+            m = re.match(rf"\[critic_{tag}(_s\d+)?\] https://modal.com/apps/\S+/(ap-[A-Za-z0-9]+)", l)
+            if m: aid = m.group(2)
         return aid
     except Exception: return None
 
