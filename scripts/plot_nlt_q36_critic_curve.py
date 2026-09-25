@@ -15,7 +15,7 @@ PASS_TWIN, PASS_CONTENT = 0.60, 25.0
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--tag", default="v3"); ap.add_argument("--ref", default="bits_v1best_main.json", help="reference judge file (critic v1 ckpt_best) for the dashed baselines"); a = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--tag", default="v3"); ap.add_argument("--ref", default="bits_v1best_main.json", help="reference judge file (critic v1 ckpt_best) for the dashed baselines"); ap.add_argument("--verdict", default=None, help="manual verdict override (e.g. a run stopped by hand at its gate)"); a = ap.parse_args()
     files = sorted(glob.glob(f"{REP}/data/bits_{a.tag}_step*.json"), key=lambda f: int(re.search(r"step(\d+)", f).group(1)))
     R = []
     for f in files:
@@ -54,6 +54,8 @@ def main():
         ref = {"content": s["content_bits"]["mean"], "p_dm": s["p_z_gt_dm"], "twin_shift": tw.get("twin_shift", {}).get("p_true_gt_twin"), "twin_new": tw.get("twin_new", {}).get("p_true_gt_twin"), "label": "critic v1 step 3500 (reference judge)"}
     final_step = 3000 if a.tag.endswith("b") else 4500
     verdict = "PASS" if any(r["pass"] for r in R) else ("CONTRAST LEARNED, RECONSTRUCTION LOST" if any(r.get("contrast_learned_reconstruction_lost") for r in R) and R and R[-1]["step"] >= final_step else ("FAIL" if R and R[-1]["step"] >= final_step else "pending"))
+    if a.verdict: verdict = a.verdict
+    elif os.path.exists(f"{REP}/data/critic_{a.tag}_verdict.txt"): verdict = open(f"{REP}/data/critic_{a.tag}_verdict.txt").read().strip()
     out = {"tag": a.tag, "rule": {"twin_p_min": PASS_TWIN, "content_min": PASS_CONTENT, "text": "twin_shift or twin_new P(true > twin) >= 0.60 with craft_full content >= 25 bits at some saved checkpoint AND cos(conditional mean, u_j | text) not below critic v1b's (else 'contrast learned, reconstruction lost'); sanity column (c) = log p(u_j | z) under this critic minus log p(u_j | null) under v1b"},
            "rows": R, "reference": ref, "v1b_reference": v1b_ref, "verdict": verdict}
     os.makedirs(f"{REP}/data", exist_ok=True); json.dump(out, open(f"{REP}/data/critic_{a.tag}_curve.json", "w"), indent=1)
