@@ -25,7 +25,7 @@ from critic_data import Store, Directions, load_text_pairs, dm_partner
 ap = argparse.ArgumentParser()
 ap.add_argument("--data-dir", required=True); ap.add_argument("--stats", default=None); ap.add_argument("--out", required=True); ap.add_argument("--band", default=None)
 ap.add_argument("--policy", required=True, help="SFT adapter dir (PEFT); 'none' = fresh zero LoRA (mechanics smoke only)"); ap.add_argument("--critic", required=True, help="critic ckpt (train_critic.py); 'none' = random init (mechanics smoke only)")
-ap.add_argument("--replay-text", default=None, help="glob(s) of the warm-start trace pool (train split) for critic replay"); ap.add_argument("--twins", default=None, help="glob of val twins__*.parquet for the twin-P guard")
+ap.add_argument("--ref-text", default=None, help="glob(s) of the teacher text (val) -> teacher pmi/content on the held-out pairs under both critics at every eval (reference + collusion check)"); ap.add_argument("--replay-text", default=None, help="glob(s) of the warm-start trace pool (train split) for critic replay"); ap.add_argument("--twins", default=None, help="glob of val twins__*.parquet for the twin-P guard")
 ap.add_argument("--steps", type=int, default=200); ap.add_argument("--batch", type=int, default=16, help="prompts per rank"); ap.add_argument("--group", type=int, default=8); ap.add_argument("--n-tok", type=int, default=176); ap.add_argument("--temp", type=float, default=1.0)
 ap.add_argument("--lr", type=float, default=1e-5); ap.add_argument("--critic-lr", type=float, default=3e-5); ap.add_argument("--kl", type=float, default=0.02); ap.add_argument("--lam", type=float, default=-1.0, help="per-token cost in FM-loss units; < 0 = calibrate at step 1 (20% of the group std at the median length)"); ap.add_argument("--depth-penalty", type=float, default=0.05, help="FM-loss units subtracted per text with a depth word / empty text (the FM loss is O(1) per dim; group stds are ~1e-3..1e-2)")
 ap.add_argument("--cispo-eps-max", type=float, default=5.0); ap.add_argument("--no-cotrain", action="store_true"); ap.add_argument("--replay-frac", type=float, default=0.5); ap.add_argument("--critic-micro", type=int, default=64)
@@ -87,6 +87,14 @@ REPLAY = None
 if args.replay_text and not args.no_cotrain:
     files = sorted(sum((glob.glob(g) for g in args.replay_text.split(",")), [])); df = load_text_pairs(files, os.path.join(args.data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of) & df["i"].isin(band) & df["j"].isin(band)].reset_index(drop=True)
     REPLAY = {"rows": store.rows_for(df["pos_idx"].values), "i": torch.tensor(df["i"].values.astype(np.int64)), "j": torch.tensor(df["j"].values.astype(np.int64)), "text": df["text"].astype(str).tolist()}; P(f"[rl] replay pool {len(df)} rows from {len(files)} files")
+with torch.no_grad():
+    _y = y_of(dirs.unit(store_val.gather(Vh_rows[:64], Vh_j[:64], dev), Vh_j[:64]), 1); P(f"[rl] target rms over 64 held-out pairs = {float(_y.pow(2).mean().sqrt()):.2f} (critic trained at ~sqrt(d) = {dirs.sqrt_d:.2f})")
+REF = None
+if args.ref_text:
+    dfr = load_text_pairs(sorted(sum((glob.glob(g) for g in args.ref_text.split(",")), [])), os.path.join(args.data_dir, "pairs_val.parquet"), pools_verbose=False)
+    if "sample" in dfr and len(dfr): dfr = dfr[dfr["sample"].fillna(0).astype(int) == 0]
+    ref_map = dfr.drop_duplicates("pair_id").set_index("pair_id")["text"].astype(str); REF = [ref_map.get(pid, "") for pid in vp["pair_id"].tolist()]
+    P(f"[rl] teacher reference text for {sum(1 for t in REF if t)}/{len(REF)} held-out pairs (scored with the same (t, eps) as the policy's dumps)")
 TWINS = None
 if args.twins:
     import pandas as pd
@@ -103,6 +111,13 @@ def sample_batch(B):
     return rows, Ls[torch.minimum(a, b)], Ls[torch.maximum(a, b)]
 def vecs_for(st, rows, i, j):
     u_i = dirs.unit(st.gather(rows, i, dev), i); u_j = dirs.unit(st.gather(rows, j, dev), j); return torch.stack([u_i, u_j], 1), dirs.source(st.gather(rows, i, dev), i), u_j
+def y_of(u, seed):
+    """the critic's TARGET for a unit direction u: sqrt(d) u s with the checkpoint's radial convention (lognormal s = exp(sigma_r eps_r), or fixed s = 1 + isotropic noise).
+    Deterministic given the seed so a prompt's G rollouts (and the two critics at eval) see the same target. The critic was trained on this scale (rms ~ sqrt(d)); feeding the
+    unit u itself (norm 1) puts x_t ~ t eps off-distribution and makes the reward text-blind (rl_v1 / rl_v2 bug)."""
+    g = torch.Generator(device=dev).manual_seed(int(seed))
+    if getattr(dirs, "radial", "lognormal") == "fixed": return dirs.sqrt_d * u + float(getattr(dirs, "sigma_iso", 0.0)) * torch.randn(u.shape, generator=g, device=dev)
+    return dirs.sqrt_d * u * torch.exp(dirs.sigma_r * torch.randn(u.shape[0], generator=g, device=dev))[:, None]
 
 # ---- critic scoring: proxy bits with shared (t, eps) ----
 @torch.no_grad()
@@ -199,17 +214,20 @@ def critic_step(src, u_j, texts, G):
 # ---- eval: greedy dumps on held-out pairs, both critics, twins, rp ----
 @torch.no_grad()
 def evaluate(step):
-    policy.eval(); vecs, src, u_j = vecs_for(store_val, Vh_rows, Vh_i, Vh_j); g = gen(vecs, 0.0); texts = decode(g); N = len(texts)
+    policy.eval(); vecs, src, u_j = vecs_for(store_val, Vh_rows, Vh_i, Vh_j); y_j = y_of(u_j, 4321); g = gen(vecs, 0.0); texts = decode(g); N = len(texts)
     eps_bank = eps_for(N, D_MODEL, 4321); dmp = dm_partner(Vh_i, Vh_j); dm_texts = [texts[q] for q in dmp]; rp_texts = [texts[(q + N // 2) % N] for q in range(N)]
     out = {"step": step, "tokens": float(np.mean([len(tok(t, add_special_tokens=False).input_ids) for t in texts])), "depth_hit_rate": float(np.mean([depth_hit(t) for t in texts])), "empty_rate": float(np.mean([not t.strip() for t in texts]))}
     for name, model in (("cotrained", critic.eval()), ("frozen", frozen)):
-        pmi, cont = proxy_bits(model, src, u_j, [t if t else " " for t in texts], eps_bank, [t if t else " " for t in dm_texts]); rp, _ = proxy_bits(model, src, u_j, [t if t else " " for t in rp_texts], eps_bank)
+        pmi, cont = proxy_bits(model, src, y_j, [t if t else " " for t in texts], eps_bank, [t if t else " " for t in dm_texts]); rp, _ = proxy_bits(model, src, y_j, [t if t else " " for t in rp_texts], eps_bank)
         out[f"{name}/pmi_bits"] = float(pmi.mean()); out[f"{name}/content_bits"] = float(cont.mean()); out[f"{name}/p_z_gt_dm"] = float((cont > 0).float().mean()); out[f"{name}/rp_bits"] = float(rp.mean())
+        if REF is not None:
+            ok = torch.tensor([bool(t) for t in REF], device=dev); pmi_r, cont_r = proxy_bits(model, src, y_j, [t if t else " " for t in REF], eps_bank, [REF[q] if REF[q] else " " for q in dmp])
+            out[f"{name}/teacher_pmi_bits"] = float(pmi_r[ok].mean()); out[f"{name}/teacher_content_bits"] = float(cont_r[ok].mean()); out[f"{name}/teacher_p_z_gt_dm"] = float((cont_r[ok] > 0).float().mean())
         if TWINS is not None:
-            _, s_t, y_t = vecs_for(store_val, TWINS["rows"], TWINS["i"], TWINS["j"]); eb = eps_for(len(TWINS["true"]), D_MODEL, 999)
+            _, s_t, u_t = vecs_for(store_val, TWINS["rows"], TWINS["i"], TWINS["j"]); y_t = y_of(u_t, 999); eb = eps_for(len(TWINS["true"]), D_MODEL, 999)
             bt, _ = proxy_bits(model, s_t, y_t, TWINS["true"], eb); bw, _ = proxy_bits(model, s_t, y_t, TWINS["twin"], eb); out[f"{name}/twin_p_true_gt_twin"] = float((bt > bw).float().mean()); out[f"{name}/twin_true_bits"] = float(bt.mean())
     critic.train(); policy.train()
-    P(f"  [eval {step}] cotrained pmi {out['cotrained/pmi_bits']:.1f} content {out['cotrained/content_bits']:.1f} P {out['cotrained/p_z_gt_dm']:.2f} rp {out['cotrained/rp_bits']:.1f} | FROZEN pmi {out['frozen/pmi_bits']:.1f} content {out['frozen/content_bits']:.1f} P {out['frozen/p_z_gt_dm']:.2f} rp {out['frozen/rp_bits']:.1f}" + (f" | twins co {out['cotrained/twin_p_true_gt_twin']:.2f} fr {out['frozen/twin_p_true_gt_twin']:.2f}" if TWINS is not None else "") + f" | tokens {out['tokens']:.0f} depth-hits {out['depth_hit_rate']:.2%} empty {out['empty_rate']:.2%}")
+    P(f"  [eval {step}] cotrained pmi {out['cotrained/pmi_bits']:.1f} content {out['cotrained/content_bits']:.1f} P {out['cotrained/p_z_gt_dm']:.2f} rp {out['cotrained/rp_bits']:.1f} | FROZEN pmi {out['frozen/pmi_bits']:.1f} content {out['frozen/content_bits']:.1f} P {out['frozen/p_z_gt_dm']:.2f} rp {out['frozen/rp_bits']:.1f}" + (f" | twins co {out['cotrained/twin_p_true_gt_twin']:.2f} fr {out['frozen/twin_p_true_gt_twin']:.2f}" if TWINS is not None else "") + f" | tokens {out['tokens']:.0f} depth-hits {out['depth_hit_rate']:.2%} empty {out['empty_rate']:.2%}" + (f" | TEACHER content co {out['cotrained/teacher_content_bits']:.1f} (P {out['cotrained/teacher_p_z_gt_dm']:.2f}) fr {out['frozen/teacher_content_bits']:.1f} (P {out['frozen/teacher_p_z_gt_dm']:.2f})" if REF is not None else ""))
     for q in range(2): P(f"    [{int(Vh_i[q])}->{int(Vh_j[q])}] {texts[q][:300]!r}")
     out["examples"] = texts[:8]; return out
 
@@ -221,7 +239,7 @@ if is_main: ev0 = evaluate(0); json.dump(ev0, open(f"{args.out}/eval_0000.json",
 if is_dist: dist.barrier()
 t0 = time.time(); B, G = args.batch, args.group
 for step in range(1, args.steps + 1):
-    rows, i, j = sample_batch(B); vecs, src, u_j = vecs_for(store, rows, i, j); vG = vecs.repeat_interleave(G, 0); sG = src.repeat_interleave(G, 0); yG = u_j.repeat_interleave(G, 0)
+    rows, i, j = sample_batch(B); vecs, src, u_j = vecs_for(store, rows, i, j); vG = vecs.repeat_interleave(G, 0); sG = src.repeat_interleave(G, 0); uG = u_j.repeat_interleave(G, 0); yG = y_of(u_j, args.seed + 7919 * step + RANK).repeat_interleave(G, 0)
     with torch.no_grad():
         policy.eval(); samp = gen(vG, args.temp); policy.train(); texts = decode(samp)
         rew, pmi, ntok, hits = rewards_for(sG, yG, texts, G, seed=args.seed + 1000 * step + RANK); rg = rew.view(B, G); adv = rg - rg.mean(1, keepdim=True)
@@ -246,7 +264,7 @@ for step in range(1, args.steps + 1):
             if q.grad is None: q.grad = torch.zeros_like(q)
             q.grad.mul_(float(n_eff_g)); dist.all_reduce(q.grad); q.grad.div_(wsum.item())
     gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); optim.step()
-    c_loss = critic_step(sG, yG, texts, G)
+    c_loss = critic_step(sG, uG, texts, G)
     if is_main:
         log = {"step": step, "reward": rew.mean().item(), "neg_fm_loss": pmi.mean().item(), "lam": LAM[0], "tokens": ntok.mean().item(), "depth_hit_rate": hits.mean().item(), "groups_kept": int(nz.sum()), "kl_k3": kl_tot / max(1, (B * G) // args.bwd_chunk), "grad_norm": float(gn), "critic_loss": c_loss, "min": (time.time() - t0) / 60}
         print(f"step {step:04d} | reward {log['reward']:.4f} | -fm {log['neg_fm_loss']:.4f} | tokens {log['tokens']:.0f} | depth-hits {log['depth_hit_rate']:.1%} | groups {log['groups_kept']}/{B} | kl {log['kl_k3']:.4f} | critic {c_loss:.4f} | gn {float(gn):.2f} | {log['min']:.1f} min", flush=True)

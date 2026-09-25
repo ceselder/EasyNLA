@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# RL v3 = rl_v2 (auto lambda, 176-token budget) + the target-scale fix (reward / eval on sqrt(d) u_j s, as the critic was trained) + teacher reference in the eval.
+set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt; source /home/celeste/nlt-q36-logs/gpu_lib.sh
+BAND=12,16,20,24,28,30,32,36,40,42,44,48,52,54,56,60; TAG=v1; TX=/vol/q36/text/$TAG; CK=/vol/q36/critic/$TAG/ckpt_final.pt; LOGD=/home/celeste/nlt-q36-logs; RL_TAG=${RL_TAG:-rl_v3}
+log(){ echo "[rl3] $(date -u +%H:%M) $*"; }
+others_pending(){ echo 0; }   # RL has priority over the v1b ablation; v1b waits with its own ledger-aware guard
+for i in $(seq 1 900); do g=$(gpus_in_use); cap=$(( 8 - $(others_pending) )); [ $((g + 4)) -le $cap ] && break; [ $((i % 5)) -eq 0 ] && log "waiting for GPU headroom ($g in use, cap $cap, need 4)"; sleep 120; done; log "launching RL $RL_TAG ($g in use, cap $cap)"
+out=$(NLT_Q36_GPU=H200 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 4 --nproc 4 --script rl_verbalizer.py --args "--data-dir /vol/q36/data --policy /vol/q36/verbalizer/$TAG/final --critic $CK --replay-text '$TX/train/craft_full__*.parquet,$TX/train/describer_sonnet5_A__*.parquet' --twins '$TX/val/twins__*.parquet' --ref-text '$TX/val/craft_full__*.parquet' --out /vol/q36/rl/$RL_TAG --band $BAND --max-train-pos 60000 --steps ${STEPS:-150} --batch 16 --group 8 --n-tok 176 --lr 1e-5 --critic-lr 3e-5 --kl 0.02 --lam -1 --eval-every 10 --save-every 25 --heldout 128 --gen-chunk 32 --bwd-chunk 2 --no-grad-ckpt --wandb-name $RL_TAG" 2>&1 | grep -E "SPAWNED|modal.com/apps|Error|rror:")
+echo "$out" | sed "s/^/[$RL_TAG] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 4 $RL_TAG; echo "$out" | grep -oE "ap-[A-Za-z0-9]+" | head -1 > $LOGD/rl_app.txt; log "RL app $(cat $LOGD/rl_app.txt)"
