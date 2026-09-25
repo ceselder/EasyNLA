@@ -64,3 +64,30 @@ def test_singles_red_matches_eval_definition():
         assert abs(r2["reward"][i] - (min(sum(r2["singles"][i]), r2["pmi"][i]) - cost * len(split_claims(expl[i])))) < 1e-5
     try: fc.score_claims_composed(expl, A, groups, reward="singles_red", eps_fn=ef); assert False, "singles_red without an LM must fail"
     except AssertionError as e: assert "needs the text LM" in str(e)
+
+
+class _StubSim:
+    """deterministic similarity: 0.9 for claims sharing their first word, else 0.1"""
+    def matrix(self, claims):
+        m = len(claims); S = torch.zeros(m, m)
+        for i in range(m):
+            for j in range(m): S[i, j] = 1.0 if i == j else (0.9 if claims[i].split()[0] == claims[j].split()[0] else 0.1)
+        return S
+
+
+def test_redundancy_modes():
+    from nla.flow.claim_redundancy import ClaimRedundancy, semdup_score
+    fc = _critic(); lm = _StubLM(); sim = _StubSim(); cost = 3.0
+    acts = [torch.randn(D) for _ in range(2)]; expl = ["• cats sit on mats\n• cats sit on rugs\n• dogs bark at night", "• birds fly south"]; groups = [0, 1]; A = [acts[g] for g in groups]
+    ef = lambda g, k: torch.randn(D, generator=torch.Generator().manual_seed(7 + 3 * g + k))
+    from nla.flow.claims import split_claims
+    for red in (ClaimRedundancy("lm", lm=lm, alpha=2.0), ClaimRedundancy("semdup", sim=sim), ClaimRedundancy("semdup", sim=sim, floor=0.5)):
+        r = fc.score_claims_composed(expl, A, groups, cost=cost, loo_rows=[0, 1], reward="singles_red", redundancy=red, eps_fn=ef)
+        for i in (0, 1):
+            cl = split_claims(expl[i]); v = r["singles"][i]
+            want = (sum(v) - 2.0 * lm.redundancy(cl)) if red.mode == "lm" else semdup_score(cl, v, sim, red.floor)
+            assert abs(r["reward"][i] - (want - cost * len(cl))) < 1e-9
+            loo_want = [want - ((sum(v[:j] + v[j + 1:]) - 2.0 * lm.redundancy(cl[:j] + cl[j + 1:])) if red.mode == "lm" else semdup_score(cl[:j] + cl[j + 1:], v[:j] + v[j + 1:], sim, red.floor)) for j in range(len(cl))]
+            assert all(abs(x - y) < 1e-9 for x, y in zip(r["credits"][i], loo_want))
+    # semdup discounts the near-duplicate (second "cats" claim) by 0.9 and leaves the distinct one alone
+    v = [10.0, 10.0, 10.0]; assert abs(semdup_score(["cats a b c", "cats d e f", "dogs g h i"], v, sim) - (10 + 1 + 9)) < 1e-6

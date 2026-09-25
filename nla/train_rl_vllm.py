@@ -1924,6 +1924,13 @@ def main():
                         "(under --compose mean ~ the mean reward, cannot pay for more claims; comparison only)")
     p.add_argument("--claim-lm", default="Qwen/Qwen3-8B-Base", help="text LM of the singles_red redundancy term")
     p.add_argument("--claim-lm-device", default=None, help="device of --claim-lm (default: --flow-enc-device, else the flow device); bf16 8B = ~17 GB")
+    p.add_argument("--claim-redundancy", choices=["lm", "semdup"], default="lm",
+                   help="redundancy rule of singles_red (nla.flow.claim_redundancy, shared with scripts/claims_redundancy_eval.py): lm = sum v_i - alpha*R_LM(C); "
+                        "semdup = sum_i v_i * (1 - max_{j<i} sim(c_i, c_j)) (paraphrases ~0, no charge for inconsistency)")
+    p.add_argument("--claim-redundancy-alpha", type=float, default=1.0, help="lm: weight of R_LM")
+    p.add_argument("--claim-sim", choices=["emb", "nli"], default="nli", help="semdup similarity: embedding cosine or NLI entailment (max of both directions)")
+    p.add_argument("--claim-sim-model", default=None, help="default sentence-transformers/all-MiniLM-L6-v2 (emb) / cross-encoder/nli-deberta-v3-base (nli)")
+    p.add_argument("--claim-sim-floor", type=float, default=None, help="semdup: similarity rescaled to clip((s - floor)/(1 - floor), 0, 1)")
     p.add_argument("--claim-value", choices=["pmi"], default="pmi", help="per-claim value in singles_red: raw single-claim PMI (bank-normalised values for contrastive critics: pending)")
     p.add_argument("--claim-set-encode", choices=["auto", "on", "off"], default="auto",
                    help="claim-set condition as concatenated per-claim memories (auto = what the critic adapter was trained with)")
@@ -2397,12 +2404,19 @@ def main():
                           grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
                           grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora, base_path=args.av_ckpt, enc_device=(torch.device(args.flow_enc_device) if args.flow_enc_device else None), cotrain_max_pairs=args.flow_cotrain_max_pairs)
         if args.flow_cotrain != "rollouts": assert flow.pool is not None, "--flow-cotrain grounded/mix needs --flow-grounded-shards"
-        claim_lm = None
+        claim_lm = claim_red = None
         if args.reward_mode == "claims" and args.claim_reward == "singles_red":
-            from nla.flow.claim_lm import ClaimLM
+            from nla.flow.claim_redundancy import ClaimRedundancy, EmbSim, NLISim
             _lm_dev = args.claim_lm_device or args.flow_enc_device or str(_flow_dev)
-            claim_lm = ClaimLM(args.claim_lm, _lm_dev)
-            print(f"[flow] singles_red text LM {args.claim_lm} on {_lm_dev} (nla.flow.claim_lm, same redundancy as the composition eval)", flush=True)
+            if args.claim_redundancy == "lm":
+                from nla.flow.claim_lm import ClaimLM
+                claim_lm = ClaimLM(args.claim_lm, _lm_dev); claim_red = ClaimRedundancy("lm", lm=claim_lm, alpha=args.claim_redundancy_alpha)
+            else:
+                _sim = (EmbSim(args.claim_sim_model or "sentence-transformers/all-MiniLM-L6-v2", _lm_dev) if args.claim_sim == "emb"
+                        else NLISim(args.claim_sim_model or "cross-encoder/nli-deberta-v3-base", _lm_dev))
+                claim_red = ClaimRedundancy("semdup", sim=_sim, floor=args.claim_sim_floor)
+            print(f"[flow] singles_red redundancy {args.claim_redundancy} (alpha {args.claim_redundancy_alpha}, sim {args.claim_sim}, floor {args.claim_sim_floor}) on {_lm_dev} "
+                  f"(nla.flow.claim_redundancy, shared with the evals)", flush=True)
         _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
         if args.resume_from_lora is not None and _flow_latest.exists():
             print(f"[flow] RESUMING co-trained flow adapter from {_flow_latest} (rl step {flow.load(str(_flow_latest))})", flush=True)
@@ -3164,12 +3178,12 @@ def main():
                     if args.compose == "mean":   # single-claim critic, velocity composition (singles + leave-one-out come free from the cached deltas)
                         claim_res = flow.score_claims_composed(all_explanations, all_activations, all_prompt_group, seed=step, cost=args.claim_cost,
                                                                claim_max=args.claim_max, loo_rows=[i for i in _loo if not all_truncated[i]],
-                                                               reward=args.claim_reward, weight=args.compose_weight, lm=claim_lm, claim_value=args.claim_value)
+                                                               reward=args.claim_reward, weight=args.compose_weight, lm=claim_lm, claim_value=args.claim_value, redundancy=claim_red)
                     else:
                         claim_res = flow.score_claims(all_explanations, all_activations, all_prompt_group, seed=step, cost=args.claim_cost,
                                                       claim_max=args.claim_max, loo_rows=[i for i in _loo if not all_truncated[i]],
                                                       single_rows=[i for i in _sgl if not all_truncated[i]], reward=args.claim_reward,
-                                                      set_encode={"auto": None, "on": True, "off": False}[args.claim_set_encode], lm=claim_lm, claim_value=args.claim_value)
+                                                      set_encode={"auto": None, "on": True, "off": False}[args.claim_set_encode], lm=claim_lm, claim_value=args.claim_value, redundancy=claim_red)
                     flow_rewards, rewards, recon_preds = claim_res["reward"], claim_res["vr"], claim_res["preds"]
                 elif flow is not None:
                     # flow reward (shared eps per group, fixed t grid) + vector-MSE of the x0-prediction @ t=0.9 (the FVE curve)
