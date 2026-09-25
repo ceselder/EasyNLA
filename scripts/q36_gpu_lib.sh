@@ -10,7 +10,7 @@ cap_now(){ if harvest_active; then echo 12; else echo 8; fi; }   # orchestrator 
 # PRIORITY (orchestrator 07:57): a waiter with a lower PRIO number goes first. While waiting, each chain advertises $LOGD/gpu_want_<PRIO>_<pid>; a waiter yields whenever a LIVE higher-priority waiter exists.
 #   PRIO 0 harvest engines | 1 v3b gate evals | 2 v1b twins+neighbours (RL v4 judge) | 3 v1b train-vs-val | 4 fair describers | 5 v2 LOO/singles | 9 default
 PRIO=${PRIO:-9}; WANTDIR=/home/celeste/nlt-q36-logs/gpu_want; mkdir -p $WANTDIR
-higher_waiting(){ for f in $WANTDIR/want_*; do [ -e "$f" ] || continue; b=$(basename $f); pr=${b#want_}; pr=${pr%%_*}; pid=${b##*_}; kill -0 $pid 2>/dev/null || { rm -f $f; continue; }; [ "$pr" -lt "$PRIO" ] && return 0; done; return 1; }
+higher_waiting(){ local f b pr pid; for f in $WANTDIR/want_*; do [ -e "$f" ] || continue; b=$(basename $f); pr=${b#want_}; pr=${pr%%_*}; pid=${b##*_}; kill -0 $pid 2>/dev/null || { rm -f $f; continue; }; [ "$pr" -lt "$PRIO" ] && return 0; done; return 1; }
 wait_gpu(){ need=${1:-1}; cap=${2:-$(cap_now)}; touch $WANTDIR/want_${PRIO}_$$; trap 'rm -f $WANTDIR/want_${PRIO}_$$' EXIT
   exec 9>$LOCK; flock 9; for i in $(seq 1 900); do g=$(gpus_in_use); cap=${2:-$(cap_now)}
     if [ $((g + need)) -le $cap ] && ! higher_waiting; then rm -f $WANTDIR/want_${PRIO}_$$; echo "[gpu] $(date -u +%H:%M) headroom: $g in use (cap $cap), launching $need (prio $PRIO)"; return 0; fi

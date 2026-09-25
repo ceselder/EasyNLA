@@ -16,7 +16,7 @@ for i in $(seq 1 400); do
     todo=1; [ -n "${LAUNCHED[$tok]:-}" ] && continue
     n=$(timeout 120 modal volume ls nlt q36/rollouts_layers/$sp/$f 2>/dev/null | grep -c "h_L.*\.parquet$"); m=$(timeout 120 modal volume ls nlt q36/rollouts_delta/$sp/$f 2>/dev/null | grep -c "v_delta.parquet")
     [ "$n" -ge 16 ] && [ "$m" -ge 1 ] || continue
-    wait_gpu 1 || exit 1
+    PRIO=1 wait_gpu 1 || exit 1                                                   # crafting feeds critic v4 (the main next judge): same priority as its gate evals
     TW=""; [ "$tok" = "val:3" ] && TW="--twins"
     run "--data-dir /vol/q36/data --split $sp --shards $si --rollouts-root /vol/q36/rollouts/$sp --layer-root /vol/q36/rollouts_layers --delta-root /vol/q36/rollouts_delta --extra-pairs /vol/q36/data/pairs_all_x4.parquet --m-extra $M_EXTRA --out-dir /vol/q36/text/v3/$sp --greedy-only $TW" craft3_${sp}_$si
     LAUNCHED[$tok]=1; log "craft launched for $tok ($f: $n layer files, delta ok)"

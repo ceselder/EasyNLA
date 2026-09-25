@@ -16,9 +16,11 @@ for i in $(seq 1 400); do grep -q "bits_verb_v1b\] SPAWNED" $LOGD/apps.txt && gr
 for V in v2 v1b; do
   ( PAT='ckpt_final.pt'; [ "$V" = v2 ] && PAT='ckpt_step3000.pt|ckpt_final.pt'      # v2's judge is the captured step-3000 checkpoint: no need to wait for its final
     for i in $(seq 1 400); do [ "$(nfiles q36/critic/$V "$PAT")" -ge 1 ] && break; [ $((i % 10)) -eq 0 ] && log "waiting for critic $V ($PAT)"; sleep 180; done; log "critic $V judge checkpoint exists"
-    CKP=/vol/q36/critic/$V/ckpt_best.pt; [ "$V" = v2 ] && [ "$(nfiles q36/critic/v2 'ckpt_step3000.pt')" -ge 1 ] && CKP=/vol/q36/critic/v2/ckpt_step3000.pt; log "judge for $V: $CKP"
-    GT=H100 PRIO=4 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt $CKP --out /vol/q36/results/bits_${V}_describers.json --sets '$SAME' --twins 'craft_twins:$TX/val/twins__*.parquet' --n 300 --ode-steps 64 --skip-samples" bits_desc_$V
-    GT=H100 PRIO=4 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt $CKP --out /vol/q36/results/bits_${V}_describersW.json --sets '$WITHW' --n 512 --ode-steps 64 --skip-samples" bits_descW_$V
+    CKP=/vol/q36/critic/$V/ckpt_best.pt; [ "$V" = v2 ] && [ "$(nfiles q36/critic/v2 'ckpt_step3000.pt')" -ge 1 ] && CKP=/vol/q36/critic/v2/ckpt_step3000.pt
+    [ "$V" = v1b ] && CKP=/vol/q36/critic/v1b/ckpt_step000500.pt          # v1b's judge by the pre-registered P(z>z_dm) rule = step 500 (its ckpt_best is the drifted step 1500)
+    log "judge for $V: $CKP"
+    bits_complete bits_${V}_describers || { GT=H100 PRIO=4 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt $CKP --out /vol/q36/results/bits_${V}_describers.json --sets '$SAME' --twins 'craft_twins:$TX/val/twins__*.parquet' --n 300 --ode-steps 64 --skip-samples" bits_desc_$V ; }
+    bits_complete bits_${V}_describersW || { GT=H100 PRIO=4 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt $CKP --out /vol/q36/results/bits_${V}_describersW.json --sets '$WITHW' --n 512 --ode-steps 64 --skip-samples" bits_descW_$V ; }
     wait_bits bits_${V}_describers bits_${V}_describersW || exit 1
     for n in describers describersW; do cp /tmp/q36_chk_bits_${V}_$n.json $D/bits_${V}_$n.json; done; log "$V describer comparisons pulled" ) &
 done
