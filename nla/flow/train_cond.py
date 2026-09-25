@@ -379,6 +379,7 @@ def main():
     p.add_argument("--health-n", type=int, default=256)
     p.add_argument("--ctr-neg-floor", type=float, default=None, help="bounded negatives: a negative cell's PMI enters the InfoNCE as max(PMI, -m) (nats), so negatives already below -m get no "
                    "gradient (only hub negatives are pushed down) and the conditional density cannot be degraded globally to win the contrast")
+    p.add_argument("--cache-every", type=int, default=50, help="contrastive runs: release the CUDA allocator cache every N steps")
     p.add_argument("--ctr-gradcap", action="store_true", help="replicated DDP: scale the contrastive gradient so its norm <= the FM gradient norm of the same step")
     p.add_argument("--unit-norm", action="store_true", help="direction-only critic: rescale every activation to the RMS training norm before the normaliser (stored in the adapter args; FlowBundle / FlowCritic apply it automatically)")
     p.add_argument("--rewarm", type=int, default=0, help="continuation runs: linear lr re-warm-up over this many steps after --start-step (AdamW state is not restored under FSDP)")
@@ -1104,7 +1105,7 @@ def main():
                 g_ = torch.nn.utils.clip_grad_norm_(grp, 1.0); g_ = g_.full_tensor() if hasattr(g_, "full_tensor") else g_; gn2 += float(g_) ** 2
         gn = torch.tensor(gn2 ** 0.5); opt.step()
         if a.health_every and step % a.health_every == 0: _log_health(step)
-        if a.ctr_template and step % 50 == 0: torch.cuda.empty_cache()   # the chunked contrastive recompute fragments the allocator (c1_ctr crept 144 -> 160 GiB and OOM'd at step ~2750)
+        if a.ctr_template and step % a.cache_every == 0: torch.cuda.empty_cache()   # the chunked contrastive recompute fragments the allocator (c1_ctr crept 144 -> 160 GiB and OOM'd at step ~2750)
         if (step % 50 == 0 or step <= a.start_step + 3) and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step | peak mem {torch.cuda.max_memory_allocated()/2**30:.0f} GiB", flush=True)
             cfm_st = {f"train/cfm_{k}": float(v) for k, v in getattr(cond_fm_loss, "last", {}).items()} if a.cfm_lambda > 0 else {}

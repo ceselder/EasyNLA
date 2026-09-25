@@ -521,15 +521,15 @@ class FlowCritic:
                 gens[(g, k)] = torch.randn(self.d, generator=gen, device=self.device)
             return gens[(g, k)]
         self.model.eval(); half_d = 0.5 * self.d; loo_set = set(loo_rows)
-        uniq = {}
-        for i in valid:
-            for c in cl[i][:claim_max]: uniq.setdefault(c, len(uniq))
         from nla.flow.claims import format_claims
         bullet = self.adapter_args.get("claim_subsets", 0) > 0 and not self.adapter_args.get("set_encode", False)   # train_cond's one-claim format "• c"
-        C_enc, C_mk = self._tok_states([format_claims([c]) if bullet else c for c in uniq])
         tvals = list(self.t_grid); K = self.eps_per_t
         for c0 in range(0, len(valid), rows_per_chunk):
             ch = valid[c0: c0 + rows_per_chunk]; R = len(ch)
+            uniq = {}                                                                       # claims encoded per chunk: memory bounded by the chunk, not the step
+            for i in ch:
+                for c in cl[i][:claim_max]: uniq.setdefault(c, len(uniq))
+            C_enc, C_mk = self._tok_states([format_claims([c]) if bullet else c for c in uniq])
             rows = [(r, uniq[c]) for r, i in enumerate(ch) for c in cl[i][:claim_max]]; owner = torch.tensor([r for r, _ in rows], device=self.device)
             ms = [min(len(cl[i]), claim_max) for i in ch]
             gold = torch.stack([activations[i].to(self.device).float() for i in ch]); x0 = self.norm.normalize(gold)

@@ -36,6 +36,7 @@ def main():
     p.add_argument("--av-lora", required=True); p.add_argument("--parquet", required=True); p.add_argument("--sidecar", default=None)
     p.add_argument("--base-ckpt", default="Qwen/Qwen3.6-27B"); p.add_argument("--n", type=int, default=96)
     p.add_argument("--temperature", type=float, default=1.0); p.add_argument("--max-new-tokens", type=int, default=200); p.add_argument("--out", required=True)
+    p.add_argument("--save-all", action="store_true", help="keep every generated response (row index, mode, text) in the output json")
     a = p.parse_args(); dev = "cuda"
     tok = AutoTokenizer.from_pretrained(a.base_ckpt); cfg = load_nla_config(a.sidecar or a.parquet, tok)
     t = pq.read_table(a.parquet, columns=["prompt", "activation_vector", "response"]).slice(0, a.n).to_pylist()
@@ -59,6 +60,7 @@ def main():
                 vref[0] = None
             resps.append(tok.decode(g[0, pt.shape[1]:], skip_special_tokens=True))
         out[mode] = stats(resps, tok)
+        if a.save_all: out.setdefault("all", []).extend({"row": i, "mode": mode, "generated": g} for i, g in enumerate(resps))
         out["examples"] += [{"mode": mode, "target": tr, "generated": gr} for tr, gr in list(zip(tgt, resps))[:4]]
         print(f"[ws-sft-eval] {mode}: {json.dumps(out[mode])}", flush=True)
     print(f"[ws-sft-eval] targets: {json.dumps(out['targets'])}", flush=True)
