@@ -79,8 +79,11 @@ def main():
     p.add_argument("--null-dm", type=float, default=0.0, help="8B v1.16 regulariser: at the same (x_t, t, eps) pull the velocity under a depth-matched WRONG text (another micro-batch row, same (i,j) else same j else rolled) toward the no-text velocity (detached), so a wrong text earns no bits and the text path stays calibrated to the null path")
     p.add_argument("--max-passes", type=float, default=1.0, help="ONE-PASS RULE (orchestrator 07:45): stop (save ckpt_final) as soon as the most-sampled text pool has been drawn more than this many times over its distinct (pair, text) rows; <= 0 disables. Passes per pool are logged every 25 steps.")
     p.add_argument("--anchor", type=float, default=0.0, help="ACTIVATION-ANCHORED contrast weight (critic v3): text fixed, activation varied - the text-conditioned gain over the unconditional velocity error must be larger on the text's own (u_i, u_j) than on a depth-matched OTHER pair's (same (i, j), same eps and t); logistic loss softplus((gain_other - gain_own) / tau). Never a text-edit negative.")
-    p.add_argument("--anchor-mode", default="gain", choices=["gain", "capped"], help="gain (v3b): softplus((gain_other - gain_own)/tau) - satisfiable by WRECKING the mismatched-text prediction (FM_other -> inf), which is what v3b did. capped: relu(FM_own - min(FM_other, FM_own + margin) + margin): the own-target loss must beat the other-target loss by a margin, and once FM_other exceeds FM_own + margin the term is exactly 0 with NO gradient, so inflating FM_other buys nothing")
+    p.add_argument("--anchor-mode", default="gain", choices=["gain", "hinge", "capped"], help="gain (v3b): softplus((gain_other - gain_own)/tau) with gain = FM_uncond - FM_text - the shared unconditional term let v3b inflate the contrast by wrecking the mismatched-text prediction. hinge (= 'capped', same function: relu(FM_own - FM_other + m) is 0 with zero gradient once FM_other >= FM_own + m): the own-target FM loss must beat the other-target FM loss by a margin m. What bounds the shortcut is NOT the form but (a) m small vs the natural own-vs-dm gap, (b) a small weight with --anchor-warmup, (c) the reconstruction GUARD (--guard-ref)")
     p.add_argument("--anchor-margin", type=float, default=0.05, help="capped mode: margin in inner per-dim MSE units")
+    p.add_argument("--anchor-warmup", type=int, default=0, help="linear warm-up of the anchor weight over this many TEXT steps (orchestrator 08:15: small weight with warm-up)")
+    p.add_argument("--guard-ref", default=None, help="GUARD (orchestrator 08:15): JSON {step: {cos_c, fm_cond}} of a reference critic's held-out spot evals (v1b); at each eval, held-out cos(E[u_j|z],u_j) must stay >= (1 - tol) x ref and held-out FM loss with text <= (1 + tol) x ref at the matched step, else the run stops (ckpt_final saved)")
+    p.add_argument("--guard-tol", type=float, default=0.05); p.add_argument("--guard-set", default="craft_full")
     p.add_argument("--anchor-tau", type=float, default=0.05, help="temperature of the anchored contrast in inner per-dim MSE units"); p.add_argument("--anchor-frac", type=float, default=1.0, help="fraction of each text micro-batch that gets the anchored contrast (compute: 2 extra forwards per anchored row)")
     p.add_argument("--sigma-r", type=float, default=0.1); p.add_argument("--radial", default="lognormal", choices=["lognormal", "fixed"], help="fixed: s = 1 + isotropic dequantisation noise --sigma-iso (radial density shared by the text and null paths)"); p.add_argument("--sigma-iso", type=float, default=0.05); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=256); p.add_argument("--eval-offset", type=int, default=2048, help="val pairs before this index are the FIXED test set (eval_bits.py); monitoring uses pairs after it"); p.add_argument("--spot-exact-n", type=int, default=64); p.add_argument("--spot-ode-steps", type=int, default=16)
@@ -130,7 +133,7 @@ def main():
             rows, i, j, texts, pname = pools.sample(n_txt, gen); DRAWN[pname] += n_txt
             if a.max_passes > 0 and DRAWN[pname] / POOL_ROWS[pname] > a.max_passes:
                 print(f"[train] ONE-PASS RULE: pool {pname} has been drawn {DRAWN[pname] / POOL_ROWS[pname]:.2f} times over its {POOL_ROWS[pname]} rows (> {a.max_passes}); stopping at step {step} and saving ckpt_final (passes: " + ", ".join(f"{k} {DRAWN[k] / POOL_ROWS[k]:.2f}" for k in DRAWN) + ")", flush=True)
-                save(step, "ckpt_final.pt", with_opt=False); json.dump({"stopped_at_step": step, "passes": {k: DRAWN[k] / POOL_ROWS[k] for k in DRAWN}}, open(os.path.join(a.out, "one_pass_stop.json"), "w")); break
+                save(step, "ckpt_final.pt", with_opt=False); save(step, "ckpt_latest.pt", with_opt=True); json.dump({"stopped_at_step": step, "passes": {k: DRAWN[k] / POOL_ROWS[k] for k in DRAWN}}, open(os.path.join(a.out, "one_pass_stop.json"), "w")); break
             if n_unc:
                 ru, iu, ju = store.sample_pairs(n_unc, gen, band); rows = torch.cat([rows, ru]); i = torch.cat([i, iu]); j = torch.cat([j, ju]); texts = texts + [""] * n_unc
         if step == a.uncond_steps and a.uncond_steps > 0: print(f"[train] unconditional pretraining done ({a.uncond_steps} steps x {a.batch}); switching to the text pools", flush=True); save(step, "ckpt_uncond.pt", with_opt=False)
@@ -158,12 +161,13 @@ def main():
                 e_unc = ((r_unc.float() - v_in) ** 2).mean(-1).detach(); g_own = e_unc[:na] - l[:na]; g_oth = e_unc[perm][:na] - ((r_sw.float() - v_in[perm][:na]) ** 2).mean(-1)
                 valid = (perm[:na] != torch.arange(na, device=dev)) & keep[sl][:na]                                            # rows whose partner is a different row and whose text was kept
                 if a.anchor_mode == "gain": anc = torch.nn.functional.softplus((g_oth - g_own) / a.anchor_tau)
-                else:
-                    l_oth = ((r_sw.float() - v_in[perm][:na]) ** 2).mean(-1); cap = (l[:na] + a.anchor_margin).detach()
-                    anc = torch.relu(l[:na] - torch.minimum(l_oth, cap) + a.anchor_margin)                  # zero, with zero gradient, once FM_other >= FM_own + margin
+                else:                                                                                           # plain margin hinge on the two FM losses (no unconditional term); 'capped' is the same function
+                    l_oth = ((r_sw.float() - v_in[perm][:na]) ** 2).mean(-1); anc = torch.relu(l[:na] - l_oth + a.anchor_margin)
                 anc = anc[valid].mean() if valid.any() else anc.sum() * 0
-                step_loss = l.mean() + a.anchor * anc
-                if valid.any(): ANC.append((float(g_own[valid].mean()), float(g_oth[valid].mean()), float((g_own[valid] > g_oth[valid]).float().mean()), float(anc)))
+                w_anc = a.anchor * (min(1.0, (step - a.uncond_steps + 1) / a.anchor_warmup) if a.anchor_warmup > 0 else 1.0)
+                step_loss = l.mean() + w_anc * anc
+                l_oth_log = ((r_sw.float() - v_in[perm][:na]) ** 2).mean(-1).detach()
+                if valid.any(): ANC.append((float(g_own[valid].mean()), float(g_oth[valid].mean()), float((g_own[valid] > g_oth[valid]).float().mean()), float(anc), float(l[:na][valid].mean()), float(l_oth_log[valid].mean()), w_anc))
             else:
                 with torch.autocast("cuda", dtype=torch.bfloat16): l, v_mse = model.loss(x0, src, t, eps, enc, mask)
                 step_loss = l.mean()
@@ -182,15 +186,26 @@ def main():
             el = time.time() - t0; has_txt = keep & torch.tensor([len(z) > 0 for z in texts], device=dev)
             log = {"train/loss": loss.item(), "train/loss_ema": ema_loss, "train/v_mse": float(v_all.mean()), "train/loss_text": float(l_all[has_txt].mean()) if has_txt.any() else float("nan"), "train/loss_notext": float(l_all[~has_txt].mean()) if (~has_txt).any() else float("nan"),
                    "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/rows_per_s": (step - step0 + 1) * a.batch / max(1e-6, el), "train/rows_seen": rows_seen, "train/seq_len": mask_T + 3 * a.k_chunks + 2}
-            if ANC: log.update({"anchor/gain_own": sum(x[0] for x in ANC) / len(ANC), "anchor/gain_other": sum(x[1] for x in ANC) / len(ANC), "anchor/p_own_gt_other": sum(x[2] for x in ANC) / len(ANC), "anchor/loss": sum(x[3] for x in ANC) / len(ANC)})
+            if ANC: log.update({"anchor/gain_own": sum(x[0] for x in ANC) / len(ANC), "anchor/gain_other": sum(x[1] for x in ANC) / len(ANC), "anchor/p_own_gt_other": sum(x[2] for x in ANC) / len(ANC), "anchor/loss": sum(x[3] for x in ANC) / len(ANC),
+                                 "anchor/fm_own": sum(x[4] for x in ANC) / len(ANC), "anchor/fm_other": sum(x[5] for x in ANC) / len(ANC), "anchor/weight": ANC[-1][6]})
             log.update({f"passes/{k}": DRAWN[k] / POOL_ROWS[k] for k in DRAWN}); log["passes/max"] = max((DRAWN[k] / POOL_ROWS[k] for k in DRAWN), default=0.0)
             if wb: wb.log(log, step=step)
-            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} text {log['train/loss_text']:.4f} notext {log['train/loss_notext']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']} pool={pname}" + (f" | anchor gain own {log['anchor/gain_own']:.4f} other {log['anchor/gain_other']:.4f} P(own>other) {log['anchor/p_own_gt_other']:.3f} loss {log['anchor/loss']:.3f}" if ANC else "") + f" | passes max {log['passes/max']:.2f}", flush=True)
+            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} text {log['train/loss_text']:.4f} notext {log['train/loss_notext']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']} pool={pname}" + (f" | anchor gain own {log['anchor/gain_own']:.4f} other {log['anchor/gain_other']:.4f} P(own>other) {log['anchor/p_own_gt_other']:.3f} loss {log['anchor/loss']:.3f} FM own {log['anchor/fm_own']:.4f} FM_other {log['anchor/fm_other']:.4f} w {log['anchor/weight']:.3f}" if ANC else "") + f" | passes max {log['passes/max']:.2f}", flush=True)
         if ((step + 1) % a.eval_every == 0 and step + 1 >= a.uncond_steps) or step + 1 == a.steps:
             te = time.time(); out = evaluate(ema_model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a, probe_bank, iso_bank); out["eval/seconds"] = time.time() - te; out["eval/rows_seen"] = rows_seen
             if wb: wb.log(out, step=step)
             json.dump({"step": step + 1, "rows_seen": rows_seen, "scalars": out}, open(os.path.join(a.out, "eval_latest.json"), "w"), indent=1)
             print(f"[eval@{step+1} rows {rows_seen}] " + " | ".join(f"{k}={v:.3f}" for k, v in out.items() if ("exact" in k or "content" in k or "p_z" in k or "cos_mean" in k)), flush=True)
+            if a.guard_ref:
+                try:
+                    REF = json.load(open(a.guard_ref)); rk = str(step + 1) if str(step + 1) in REF else (min(REF, key=lambda k_: abs(int(k_) - (step + 1))) if REF else None)
+                    if rk is not None:
+                        rc, rf = REF[rk].get("cos_c"), REF[rk].get("fm_cond"); cc, cf = out.get(f"{a.guard_set}/cos_mean_c"), out.get(f"{a.guard_set}/fm_cond")
+                        bad = (rc is not None and cc is not None and cc < rc * (1 - a.guard_tol)) or (rf is not None and cf is not None and cf > rf * (1 + a.guard_tol))
+                        print(f"[guard] step {step + 1} vs ref step {rk}: cos_c {cc:.3f} (ref {rc}) fm_cond {cf:.4f} (ref {rf}) tol {a.guard_tol} -> {'STOP' if bad else 'ok'}", flush=True)
+                        if bad:
+                            save(step + 1, "ckpt_final.pt", with_opt=False); json.dump({"guard_stop_step": step + 1, "cos_c": cc, "ref_cos_c": rc, "fm_cond": cf, "ref_fm_cond": rf}, open(os.path.join(a.out, "guard_stop.json"), "w")); print("[guard] reconstruction degraded beyond tolerance -> stopping", flush=True); break
+                except Exception as e_: print(f"[guard] check failed: {e_}", flush=True)
             score = float(np.mean([v for k, v in out.items() if k.endswith("/exact_content_bits")] or [0.0]))
             if best is None or score > best[0]: best = (score, step + 1); save(step + 1, "ckpt_best.pt", with_opt=False); json.dump({"step": step + 1, "score": score}, open(os.path.join(a.out, "best.json"), "w"))
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps: save(step + 1)
