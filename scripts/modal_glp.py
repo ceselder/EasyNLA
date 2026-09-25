@@ -420,21 +420,20 @@ def ws_margin(adapter: str, critic_tag: str, parts: str, extra: str = ""):
 @app.function(timeout=2 * 3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=128 * 1024)
 def ws_sft_subset(src: str, dst: str, n_train: int = 20000, n_val: int = 512):
     """random subset of a warm-start SFT set (nla-glp) -> nla-exp:<dst>/av_sft_{train,test}.parquet + sidecars, readable by modal_nla_exp.py --task sft"""
-    import random, shutil, pyarrow as pa, pyarrow.parquet as pq
-    vol_glp.reload(); os.makedirs(dst, exist_ok=True); rng = random.Random(0)
-    sch = pa.schema([("prompt", pa.list_(pa.struct([("content", pa.string()), ("role", pa.string())]))), ("response", pa.string()),
-                     ("activation_vector", pa.list_(pa.float32(), 5120)), ("activation_layer", pa.int64()), ("doc_id", pa.string()), ("source", pa.string())])
-    for split, n, name in (("train", n_train, "av_sft_train"), ("val", n_val, "av_sft_test")):
-        pf = pq.ParquetFile(f"{src}/{split}.parquet"); tot = pf.metadata.num_rows; frac = min(1.0, 1.3 * n / tot); rows = []
-        for rb in pf.iter_batches(batch_size=2048, columns=["prompt", "response", "activation_vector", "doc_id", "source"]):   # row groups hold > 2^31 floats
-            keep = [i for i in range(rb.num_rows) if rng.random() < frac]
-            if keep: rows += rb.take(keep).to_pylist()
-            if len(rows) >= 1.2 * n: break
-        rng.shuffle(rows); rows = rows[:n]
-        for r in rows: r["activation_layer"] = 42; r["prompt"] = [{"content": m["content"], "role": m["role"]} for m in r["prompt"]]
-        pq.write_table(pa.Table.from_pylist(rows, schema=sch), f"{dst}/{name}.parquet", compression="zstd")
+    import shutil, pyarrow as pa, pyarrow.parquet as pq
+    vol_glp.reload(); os.makedirs(dst, exist_ok=True)
+    cols = ["prompt", "response", "activation_vector", "activation_layer", "doc_id", "source"]
+    for split, n, name in (("train", n_train, "av_sft_train"), ("val", n_val, "av_sft_test")):   # rows are pre-shuffled by the build: stream the first n
+        pf = pq.ParquetFile(f"{src}/{split}.parquet"); tot = pf.metadata.num_rows; got = 0; w = None
+        for rb in pf.iter_batches(batch_size=2048, columns=cols):
+            tb = pa.Table.from_batches([rb]).slice(0, n - got)
+            tb = tb.set_column(tb.schema.get_field_index("activation_vector"), "activation_vector", tb.column("activation_vector").cast(pa.list_(pa.float32(), 5120)))
+            if w is None: w = pq.ParquetWriter(f"{dst}/{name}.parquet", tb.schema, compression="zstd")
+            w.write_table(tb); got += tb.num_rows
+            if got >= n: break
+        if w is not None: w.close()
         shutil.copy2("/vol_q36/data/sft/av_sft_train.parquet.nla_meta.yaml", f"{dst}/{name}.parquet.nla_meta.yaml")
-        print(f"[ws-sft-subset] {split}: {len(rows)} of {tot} rows -> {dst}/{name}.parquet", flush=True)
+        print(f"[ws-sft-subset] {split}: {got} of {tot} rows -> {dst}/{name}.parquet", flush=True)
     vol_exp.commit(); return 0
 
 
@@ -546,8 +545,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
     elif task == "ws_margin":   # --ckpt adapter, --tag critic tag, --sets parts, --nshards containers (<= 8), --extra e.g. "--K 64"
         ps = [x for x in sets.split(",") if x]; k = min(nshards, len(ps), 8)
         print("rc", _gather([ws_margin.spawn(ckpt, tag, ",".join(ps[i::k]), extra) for i in range(k)]))
-    elif task == "ws_sft_subset":   # --sets <src dir on nla-glp>, --root <dst dir on nla-exp>
-        print("rc", ws_sft_subset.remote(sets, root))
+    elif task == "ws_sft_subset":   # --sets <src dir on nla-glp>, --root <dst dir on nla-exp>, --extra "<n_train> <n_val>"
+        xs = extra.split(); print("rc", ws_sft_subset.remote(sets, root, int(xs[0]) if xs else 20000, int(xs[1]) if len(xs) > 1 else 512))
     elif task == "ws_margin_stats":
         print("rc", ws_margin_stats.remote(tag))
     elif task == "ws_build":

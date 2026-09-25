@@ -1931,6 +1931,7 @@ def main():
     p.add_argument("--claim-sim", choices=["emb", "nli"], default="nli", help="semdup similarity: embedding cosine or NLI entailment (max of both directions)")
     p.add_argument("--claim-sim-model", default=None, help="default sentence-transformers/all-MiniLM-L6-v2 (emb) / cross-encoder/nli-deberta-v3-base (nli)")
     p.add_argument("--claim-sim-floor", type=float, default=None, help="semdup: similarity rescaled to clip((s - floor)/(1 - floor), 0, 1)")
+    p.add_argument("--claim-dup-model", default="sentence-transformers/all-MiniLM-L6-v2", help="monitoring: embedding model of critic/claims_dup_rate (cosine > 0.9 to an earlier claim of the same rollout); '' = off")
     p.add_argument("--claim-value", choices=["pmi"], default="pmi", help="per-claim value in singles_red: raw single-claim PMI (bank-normalised values for contrastive critics: pending)")
     p.add_argument("--claim-set-encode", choices=["auto", "on", "off"], default="auto",
                    help="claim-set condition as concatenated per-claim memories (auto = what the critic adapter was trained with)")
@@ -2404,7 +2405,7 @@ def main():
                           grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
                           grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora, base_path=args.av_ckpt, enc_device=(torch.device(args.flow_enc_device) if args.flow_enc_device else None), cotrain_max_pairs=args.flow_cotrain_max_pairs)
         if args.flow_cotrain != "rollouts": assert flow.pool is not None, "--flow-cotrain grounded/mix needs --flow-grounded-shards"
-        claim_lm = claim_red = None
+        claim_lm = claim_red = claim_dup = None
         if args.reward_mode == "claims" and args.claim_reward == "singles_red":
             from nla.flow.claim_redundancy import ClaimRedundancy, EmbSim, NLISim
             _lm_dev = args.claim_lm_device or args.flow_enc_device or str(_flow_dev)
@@ -2415,6 +2416,8 @@ def main():
                 _sim = (EmbSim(args.claim_sim_model or "sentence-transformers/all-MiniLM-L6-v2", _lm_dev) if args.claim_sim == "emb"
                         else NLISim(args.claim_sim_model or "cross-encoder/nli-deberta-v3-base", _lm_dev))
                 claim_red = ClaimRedundancy("semdup", sim=_sim, floor=args.claim_sim_floor)
+            if args.claim_dup_model:
+                claim_dup = EmbSim(args.claim_dup_model, _lm_dev)
             print(f"[flow] singles_red redundancy {args.claim_redundancy} (alpha {args.claim_redundancy_alpha}, sim {args.claim_sim}, floor {args.claim_sim_floor}) on {_lm_dev} "
                   f"(nla.flow.claim_redundancy, shared with the evals)", flush=True)
         _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
@@ -3341,6 +3344,10 @@ def main():
             _nc = [claim_res["n_claims"][i] for i in range(len(all_explanations)) if not all_truncated[i]]
             if _nc: shape_terms["critic/n_claims_mean"] = float(np.mean(_nc)); shape_terms["critic/n_claims_over_max_frac"] = float(np.mean([c > args.claim_max for c in _nc]))
             shape_terms["critic/claims_fail_frac"] = 1.0 - len(_ok) / max(len(all_explanations), 1)
+            shape_terms["critic/claims_parse_rate"] = float(np.mean([claim_res["n_claims"][i] > 0 for i in range(len(all_explanations))])) if all_explanations else 0.0
+            if claim_dup is not None:
+                from nla.flow.claim_redundancy import dup_rate as _dup_rate
+                shape_terms["critic/claims_dup_rate"] = _dup_rate(claim_dup, [claim_res["claims"][i][: args.claim_max] for i in range(len(all_explanations)) if claim_res["claims"][i]])
             if _ok:
                 _pm = [claim_res["pmi"][i] for i in _ok]
                 shape_terms["critic/claims_pmi_nats_mean"] = float(np.mean(_pm)); shape_terms["critic/claims_pmi_bits_mean"] = float(np.mean(_pm)) / math.log(2)
@@ -4028,6 +4035,7 @@ def main():
         if args.reward_mode == "claims":   # compositional reward summary (the same keys go to wandb under critic/*)
             _g = lambda k: shape_terms.get(k, float("nan"))
             print(f"  [claims@{step}] n_claims {_g('critic/n_claims_mean'):.2f} (>{args.claim_max}: {_g('critic/n_claims_over_max_frac'):.2f}) | fail {_g('critic/claims_fail_frac'):.2f} | "
+                  f"parse {_g('critic/claims_parse_rate'):.3f} | dup {_g('critic/claims_dup_rate'):.3f} | "
                   f"PMI {_g('critic/claims_pmi_nats_mean'):.1f} nats ({_g('critic/claims_pmi_per_claim_nats'):.1f}/claim) | reward {_g('critic/claim_reward_mean'):.1f} | "
                   f"LOO credit mean {_g('critic/claim_credit_mean'):.1f} p10/p90 {_g('critic/claim_credit_p10'):.1f}/{_g('critic/claim_credit_p90'):.1f} "
                   f"frac<cost {_g('critic/claim_credit_frac_below_cost'):.2f} (n {_g('critic/claim_credit_n'):.0f}) | single PMI median {_g('critic/claim_single_pmi_median'):.1f} "

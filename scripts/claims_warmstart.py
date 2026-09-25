@@ -328,7 +328,10 @@ def cmd_build(a):
                 keep = sorted([(m_, c, t_) for m_, c, t_ in zip(r[a.margin_key], r["claims"], r["types"]) if m_ is not None and m_ > a.margin and t_ not in FUTURE_TYPES], key=lambda x: -x[0])
                 if a.number_window > 0:
                     px = pfx(r["id"]); k0 = len(keep); keep = [x for x in keep if _number_ok(x[1], x[2], px, a.number_window)]; st["number_dropped"] += k0 - len(keep)
-            else: keep = sorted([(p, c, t_) for p, c, t_ in zip(r["pmi"], r["claims"], r["types"]) if p is not None and p > a.lam], key=lambda x: -x[0])
+            else:
+                keep = sorted([(p, c, t_) for p, c, t_ in zip(r["pmi"], r["claims"], r["types"]) if p is not None and p > a.lam and not (a.drop_future and t_ in FUTURE_TYPES)], key=lambda x: -x[0])
+                if a.number_window > 0:
+                    px = pfx(r["id"]); k0 = len(keep); keep = [x for x in keep if _number_ok(x[1], x[2], px, a.number_window)]; st["number_dropped"] += k0 - len(keep)
             seen, sel = set(), []
             for p, c, t_ in keep:
                 if c.lower() in seen: continue
@@ -339,10 +342,17 @@ def cmd_build(a):
             rows[split].append({"prompt": prompt, "activation_vector": r["activation_vector"], "activation_layer": 42, "doc_id": r["doc_id"], "source": r["source"], "id": r["id"],
                                 "response": "<explanation>\n" + "\n".join(f"• {c}" for _, c, _ in sel) + "\n</explanation>", "bullet_pmi": [p for p, _, _ in sel], "bullet_types": [t_ for _, _, t_ in sel]})
             st["kept"] += 1; st["bullets_kept"] += len(sel); s_ = st["by_source"].setdefault(r["source"], {"activations": 0, "kept": 0, "bullets": 0}); s_["activations"] += 1; s_["kept"] += 1; s_["bullets"] += len(sel)
-    out = f"{WS}/sft_{a.critic_tag}" + (f"_margin{a.margin:g}" if a.margin is not None else ""); os.makedirs(out, exist_ok=True)
+    out = f"{WS}/sft_{a.critic_tag}" + (f"_margin{a.margin:g}" if a.margin is not None else "") + (f"_{a.out_tag}" if a.out_tag else ""); os.makedirs(out, exist_ok=True)
     for k, v in rows.items():
-        if v: pq.write_table(pa.Table.from_pylist(v), f"{out}/{k}.parquet", compression="zstd")
-    st.update(train=len(rows["train"]), val=len(rows["val"]), lam=a.lam, margin=a.margin, margin_key=a.margin_key, number_window=a.number_window, cap=a.cap, critic=a.critic_tag, bullets_per_kept=st["bullets_kept"] / max(st["kept"], 1))
+        random.Random(1).shuffle(v)                                                          # gold / synthetic parts interleaved for streaming SFT loaders
+        if v:
+            sch = pa.schema([("prompt", pa.list_(pa.struct([("content", pa.string()), ("role", pa.string())]))), ("activation_vector", pa.list_(pa.float32(), 5120)),
+                             ("activation_layer", pa.int64()), ("doc_id", pa.string()), ("source", pa.string()), ("id", pa.string()), ("response", pa.string()),
+                             ("bullet_pmi", pa.list_(pa.float64())), ("bullet_types", pa.list_(pa.string()))])
+            for r in v: r["prompt"] = [{"content": m["content"], "role": m["role"]} for m in r["prompt"]]
+            with pq.ParquetWriter(f"{out}/{k}.parquet", sch, compression="zstd") as w:
+                for b0 in range(0, len(v), 4096): w.write_table(pa.Table.from_pylist(v[b0: b0 + 4096], schema=sch))
+    st.update(train=len(rows["train"]), val=len(rows["val"]), lam=a.lam, margin=a.margin, margin_key=a.margin_key, number_window=a.number_window, drop_future=a.drop_future, cap=a.cap, critic=a.critic_tag, bullets_per_kept=st["bullets_kept"] / max(st["kept"], 1))
     json.dump(st, open(f"{out}/stats.json", "w"), indent=1)
     ex = random.Random(0).sample(rows["train"], min(12, len(rows["train"])))
     json.dump([{k: v for k, v in e.items() if k not in ("activation_vector", "prompt")} for e in ex], open(f"{out}/examples.json", "w"), indent=1)
@@ -353,6 +363,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("score"); s.add_argument("--adapter", required=True); s.add_argument("--critic-tag", required=True); s.add_argument("--parts", required=True); s.add_argument("--D", type=int, default=1)
     b = sub.add_parser("build"); b.add_argument("--critic-tag", required=True); b.add_argument("--lam", type=float, default=20.0); b.add_argument("--cap", type=int, default=6)
+    b.add_argument("--drop-future", action="store_true", help="never use true-continuation claim types (FUTURE_TYPES) as targets (always on with --margin)")
+    b.add_argument("--out-tag", default="", help="suffix of the output dir sft_<critic>[_margin..]_<out-tag>")
     b.add_argument("--number-window", type=int, default=0, help="drop bullets quoting a document number that is not within the last N characters of the prefix (0 = off; v2: 12)")
     b.add_argument("--margin", type=float, default=None, help="v2: keep bullets with contrastive margin > this (reads scores_margin_<critic>)"); b.add_argument("--margin-key", default="margin_lse", choices=["margin_lse", "margin_mean"])
     m = sub.add_parser("score_margin"); m.add_argument("--adapter", required=True); m.add_argument("--critic-tag", required=True); m.add_argument("--parts", required=True)

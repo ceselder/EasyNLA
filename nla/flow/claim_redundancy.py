@@ -30,6 +30,9 @@ class EmbSim:
     def matrix(self, claims):
         E = self._emb(list(claims)); return (E @ E.T).clamp(-1, 1).float().cpu()
 
+    def prefetch(self, claim_lists):
+        self._emb([c for cl in claim_lists for c in cl])
+
 
 class NLISim:
     """max over both directions of P(entailment) from an NLI cross-encoder, cached per ordered pair"""
@@ -42,11 +45,16 @@ class NLISim:
     @torch.no_grad()
     def _p(self, pairs):
         todo = [p for p in dict.fromkeys(pairs) if p not in self.cache]
-        for i in range(0, len(todo), 128):
-            ch = todo[i:i + 128]; enc = self.tok([a for a, _ in ch], [b for _, b in ch], return_tensors="pt", padding=True, truncation=True, max_length=256).to(self.dev)
+        todo.sort(key=lambda p: len(p[0]) + len(p[1]))                                        # length-sorted batches (less padding)
+        for i in range(0, len(todo), 256):
+            ch = todo[i:i + 256]; enc = self.tok([a for a, _ in ch], [b for _, b in ch], return_tensors="pt", padding=True, truncation=True, max_length=256).to(self.dev)
             pr = torch.softmax(self.m(**enc).logits.float(), -1)[:, self.ent]
             for p, v in zip(ch, pr.tolist()): self.cache[p] = v
         return [self.cache[p] for p in pairs]
+
+    def prefetch(self, claim_lists):   # every ordered pair of every set in one batched pass
+        self._p([(a, b) for cl in claim_lists for i, a in enumerate(cl) for j, b in enumerate(cl) if i != j])
+        if len(self.cache) > 2_000_000: self.cache = {}
 
     def matrix(self, claims):
         cl = list(claims); m = len(cl); S = torch.zeros(m, m)
@@ -80,9 +88,20 @@ class ClaimRedundancy:
     def values(self, claim_lists, value_lists):
         if self.mode == "lm":
             R = self.lm.redundancies(claim_lists); return [sum(v) - self.alpha * r for v, r in zip(value_lists, R)]
+        if hasattr(self.sim, "prefetch"): self.sim.prefetch(claim_lists)
         return [semdup_score(c, v, self.sim, self.floor) for c, v in zip(claim_lists, value_lists)]
 
     def loo(self, claims, values):
         if self.mode == "lm": return [v - self.alpha * r for v, r in zip(values, self.lm.loo(claims))]
         full = semdup_score(claims, values, self.sim, self.floor)
         return [full - semdup_score(claims[:j] + claims[j + 1:], values[:j] + values[j + 1:], self.sim, self.floor) for j in range(len(claims))]
+
+
+def dup_rate(sim, claim_lists, thr=0.9):
+    """share of claims (after the first of each list) whose similarity to an EARLIER claim of the same list exceeds thr (monitoring)"""
+    if hasattr(sim, "prefetch"): sim.prefetch(claim_lists)
+    n = d = 0
+    for cl in claim_lists:
+        if len(cl) < 2: n += len(cl); continue
+        S = sim.matrix(cl); n += len(cl); d += sum(int(float(S[i, :i].max()) > thr) for i in range(1, len(cl)))
+    return d / max(n, 1)
