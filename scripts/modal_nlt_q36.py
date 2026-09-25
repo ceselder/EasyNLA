@@ -95,11 +95,15 @@ def run_evalq(idle_min: int = 20, worker: str = "w0"):
     Loops over /vol/q36/evalq/<prio>_<time>_<label>.json specs {label, args, script?}: claims the first (priority order = filename order) by renaming it, runs the script
     (default eval_bits.py) with _run (log tee'd to /vol/q36/logs, volume committed at the end), marks it .done<rc>.json, repeats; exits after idle_min minutes without work."""
     import glob, json, time as _t
-    q = "/vol/q36/evalq"; os.makedirs(q, exist_ok=True); idle = 0.0; n = 0
+    q = "/vol/q36/evalq"; os.makedirs(q, exist_ok=True); idle = 0.0; n = 0; t_up = _t.time()
     print(f"[evalq] worker {worker} up; queue {q}", flush=True)
     while idle < idle_min * 60:
         try: vol.reload()
         except Exception as e: print(f"[evalq] reload failed: {e}", flush=True)
+        # GRACEFUL RECYCLE: a worker runs the code snapshot of its launch; when the local code changes (eval_bits / critic_data), `touch` /vol/q36/evalq/.code_epoch and every worker exits
+        # BETWEEN jobs (no job is interrupted) - the eval_workers.sh manager respawns fresh workers. (11:20: the v5 train probe needs eval_bits --pair-ids-file, which the 10:43 workers do not have.)
+        ep = f"{q}/.code_epoch"
+        if os.path.exists(ep) and os.path.getmtime(ep) > t_up: print(f"[evalq] worker {worker}: code epoch newer than my launch -> exit after {n} jobs for a fresh worker", flush=True); return
         specs = sorted(f for f in glob.glob(f"{q}/*.json") if ".running" not in f and ".done" not in f)
         if not specs: _t.sleep(60); idle += 60; continue
         spec = specs[0]; claimed = spec[:-5] + f".running.{worker}.json"
