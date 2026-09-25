@@ -54,35 +54,47 @@ def base_rows(base):
     return [(f"{lab.get(c, c)} (best: {crit})", s) for c, (crit, s) in out.items() if c in lab]
 
 
-def fig_methods(tag, res, base, label):
+def fig_methods(tag, res, base, label, top=None):
+    """top=None: every condition (report version); top=N: references + earlier critics + the N best unCLIP edits + controls (phone version)."""
     S = res["summary"]; rows = []                                                      # (label, summary, color, hatch)
     for nm in ("none", "jadd_b1", "jadd_on_b0.25"):
         if nm in S: rows.append((pretty(nm), S[nm], C_REF, None))
-    for lb, s in sorted(base_rows(base), key=lambda x: -x[1]["tgt_mention"]): rows.append((lb, s, C_BASE, None))
+    brows = sorted(base_rows(base), key=lambda x: -x[1]["tgt_mention"])
+    for lb, s in (brows if top is None else brows[:1]): rows.append((lb, s, C_BASE, None))
     ctrl = [nm for nm in S if nm == "recon" or nm.startswith("var_")]
     edits = [nm for nm in S if nm not in ("none", "jadd_b1", "jadd_on_b0.25") and nm not in ctrl]
-    for nm in sorted(edits, key=lambda k: -S[k]["tgt_mention"]): rows.append((pretty(nm), S[nm], C_UNCLIP, None))
-    for nm in ctrl: rows.append((pretty(nm), S[nm], C_UNCLIP, "///"))
-    n = len(rows); fig, axes = plt.subplots(1, 2, figsize=(13, max(6, 0.36 * n + 2.2)), sharey=True)
+    ranked = sorted(edits, key=lambda k: -S[k]["tgt_mention"])
+    for nm in (ranked if top is None else ranked[:top]): rows.append((pretty(nm), S[nm], C_UNCLIP, None))
+    note = None
+    if top is not None and len(ranked) > top:
+        rest = ranked[top:]; mx = max(S[k]["tgt_mention"] for k in rest); note = f"all other {len(rest)} unCLIP rows: {100 * mx:.0f}% target mention" if mx < 0.005 else f"all other {len(rest)} unCLIP rows: ≤ {100 * mx:.1f}% target mention"
+    for nm in (ctrl if top is None else ctrl[:2]): rows.append((pretty(nm), S[nm], C_UNCLIP, "///"))
+    n = len(rows); fig, axes = plt.subplots(1, 2, figsize=(13, max(6, 0.36 * n + 2.2)) if top is None else (12, 8.5), sharey=True)
     y = np.arange(n)[::-1]
     for ax, key, xl in ((axes[0], "tgt_mention", "continuations mentioning the TARGET animal (%)"), (axes[1], "clean_swap", "clean swap: target and not source (%)")):
         vals = [100 * s[key] for _, s, _, _ in rows]
         ax.barh(y, vals, color=[c for _, _, c, _ in rows], hatch=[h or "" for _, _, _, h in rows], edgecolor="white", linewidth=0.8, height=0.72)
         for yi, v in zip(y, vals): ax.text(v + 0.8, yi, f"{v:.0f}", va="center", ha="left", fontsize=10, color=INK2)
-        ax.set_xlabel(xl.replace("TARGET animal", "TARGET concept")); ax.set_xlim(0, max(vals + [35]) * 1.18); ax.grid(axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
+        ax.set_xlabel(xl.replace("TARGET animal", "TARGET concept") if top is None else ("target-concept mention in continuations (%)" if key == "tgt_mention" else "clean swap: target and not source (%)"))
+        ax.set_xlim(0, max(vals + [35]) * 1.18); ax.grid(axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for sp in ("top", "right"): ax.spines[sp].set_visible(False)
     axes[0].set_yticks(y); axes[0].set_yticklabels([lb for lb, _, _, _ in rows], fontsize=10)
     best_e = max((S[k]["tgt_mention"] for k in edits), default=0.0); j = S.get("jadd_b1", {}).get("tgt_mention", 0.31); bb = max((s["tgt_mention"] for _, s in base_rows(base)), default=0.05)
     verdict = ("matches the J-lens direction" if best_e >= 0.9 * j else "beats the earlier critics but stays below the J-lens direction" if best_e > 1.5 * bb else "steers no better than the earlier critics")
-    fig.suptitle(f"unCLIP embedding edits of the anchor activation: best {100 * best_e:.0f}% target mention {verdict} ({100 * j:.0f}%)\n"
-                 f"{res.get('concept', 'animal')} swap, {res['n']} prompts × {1 + res['k']} continuations of 40 tokens; decoder: {label}", fontsize=14, x=0.02, ha="left")
+    cpt = res.get("concept", "animal")
+    if top is None: fig.suptitle(f"unCLIP embedding edits of the anchor activation: best {100 * best_e:.0f}% target mention {verdict} (J-lens direction {100 * j:.0f}%, earlier critics {100 * bb:.0f}%)\n"
+                                 f"{cpt} swap, {res['n']} prompts × {1 + res['k']} continuations of 40 tokens; decoder: {label}", fontsize=14, x=0.02, ha="left")
+    else: fig.suptitle(f"unCLIP embedding edits steer the {cpt} swap at most {100 * best_e:.0f}% vs {100 * j:.0f}% for the J-lens direction\n"
+                       f"({res['n']} prompts × {1 + res['k']} continuations; decoder {label})" + (f"\n{note}" if note else ""), fontsize=14, x=0.02, ha="left")
     from matplotlib.patches import Patch
-    axes[1].legend(handles=[Patch(color=C_REF, label="references (no edit, J-lens direction)"), Patch(color=C_BASE, label="earlier critics, best row per method (steer_base)"),
-                            Patch(color=C_UNCLIP, label="unCLIP decoder edits"), Patch(facecolor=C_UNCLIP, hatch="///", edgecolor="white", label="unCLIP controls (round trip, variations)")],
-                   loc="lower right", frameon=False)
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
-    for ext in ("png", "pdf"): fig.savefig(f"{REP}/unclip_steer_{tag}.{ext}", dpi=150)
+    handles = [Patch(color=C_REF, label="references (no edit, J-lens direction)"), Patch(color=C_BASE, label="earlier critics, best row (steer_base)"),
+               Patch(color=C_UNCLIP, label="unCLIP decoder edits"), Patch(facecolor=C_UNCLIP, hatch="///", edgecolor="white", label="unCLIP controls (round trip, variation)")]
+    if top is None: axes[1].legend(handles=handles, loc="lower right", frameon=False); fig.tight_layout(rect=(0, 0, 1, 0.93))
+    else: fig.legend(handles=handles, loc="lower center", ncol=2, frameon=False, fontsize=11, bbox_to_anchor=(0.5, 0.0)); fig.tight_layout(rect=(0, 0.08, 1, 0.9))
+    stem = f"{REP}/unclip_steer_{tag}" + ("" if top is None else "_phone")
+    for ext in ("png", "pdf"): fig.savefig(f"{stem}.{ext}", dpi=150)
     plt.close(fig)
+    if top is not None: return
     json.dump({"tag": tag, "decoder": label, "rows": [dict(label=lb, group="reference" if c == C_REF else "earlier_critics" if c == C_BASE else "unclip_control" if h else "unclip",
                                                           tgt_mention=s["tgt_mention"], clean_swap=s["clean_swap"], src_mention=s["src_mention"], tgt_rank_median=s["tgt_rank_median"],
                                                           kl1_median=s["kl1_median"], edit_rel_median=s["edit_rel_median"], **{k: s[k] for k in s if k.startswith("e_cos") or k.startswith("readback")})
@@ -120,7 +132,9 @@ def main():
     p = argparse.ArgumentParser(); p.add_argument("--tags", required=True); p.add_argument("--base", default="steer_base"); p.add_argument("--steps", default="")
     p.add_argument("--label", default=""); a = p.parse_args()
     tags = a.tags.split(","); base = json.load(open(f"{BASE_D}/{a.base}.json")); results = [json.load(open(f"{D}/steer_{t}.json")) for t in tags]
-    for t, r in zip(tags, results): fig_methods(t, r, base, a.label or os.path.basename(str(r.get("decoder", "")).rstrip("/")))
+    for t, r in zip(tags, results):
+        lab = a.label or os.path.basename(str(r.get("decoder", {}).get("path", r.get("decoder", ""))).rstrip("/"))
+        fig_methods(t, r, base, lab); fig_methods(t, r, base, lab, top=10)
     if len(tags) > 1:
         steps = [float(x) for x in a.steps.split(",")] if a.steps else list(range(len(tags)))
         fig_train(tags, steps, results, base)
