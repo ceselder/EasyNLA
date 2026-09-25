@@ -76,8 +76,10 @@ def main():
     vk = [k for k in ("teacher", "teacher_trunc176", "teacher_trunc96", "verbalizer", f"verbalizer_{a.tag}b", "base_control") if k in S]
     if vk:
         fig, axes = plt.subplots(1, 2, figsize=(11, 5.2))
-        share = f"{100 * S['verbalizer']['content'] / S['teacher']['content']:.0f}% of the teacher's bits" if "verbalizer" in S and "teacher" in S and S["teacher"]["content"] > 0 else "vs its crafted teacher"
-        bars(axes[0], [NICE.get(k, k) for k in vk], [S[k]["content"] for k in vk], [S[k]["content_sem"] for k in vk], C1, f"The distilled verbalizer carries {share}\n(same held-out pairs, one judge)", "content bits", 0)
+        vb = f"verbalizer_{a.tag}b"; best_v = max([k for k in ("verbalizer", vb) if k in S], key=lambda k: S[k]["content"], default=None)
+        share = f"{100 * S[best_v]['content'] / S['teacher']['content']:.0f}% of the teacher's bits" if best_v and "teacher" in S and S["teacher"]["content"] > 0 else "vs its crafted teacher"
+        sub = "; full-length outputs do not close the gap" if (vb in S and "verbalizer" in S and abs(S[vb]["content"] - S["verbalizer"]["content"]) < 2 * max(S[vb]["content_sem"], S["verbalizer"]["content_sem"])) else ""
+        bars(axes[0], [NICE.get(k, k) for k in vk], [S[k]["content"] for k in vk], [S[k]["content_sem"] for k in vk], C1, f"The distilled verbalizer carries {share}\n(same held-out pairs, one judge{sub})", "content bits", 0)
         ax = axes[1]; x = np.arange(len(vk)); w = 0.25
         ax.bar(x - w, [S[k]["cos_condmean"]["u"] for k in vk], w, color=CG, label="no text")
         ax.bar(x, [S[k]["cos_condmean"]["c"] for k in vk], w, color=C1, label="true text"); ax.bar(x + w, [S[k]["cos_condmean"]["dm"] for k in vk], w, color=C2, label="depth-matched wrong text")
