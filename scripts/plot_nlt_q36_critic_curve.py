@@ -1,0 +1,69 @@
+"""Gate curve of a critic over its saved checkpoints (nlt-27b-olens, critic v3 = activation-anchored contrast).
+
+Reads report data/bits_<tag>_stepNNNNNN.json (eval_bits.py on held-out rows: craft_full content / P(z>z_dm) / rp, claim twins exact + FM view,
+same-document neighbour double differences) -> data/critic_<tag>_curve.json + fig_critic_<tag>_curve.{png,pdf}.
+Pre-registered pass rule (orchestrator 2026-09-25 06:58 UTC): twin_shift or twin_new P(true > twin) >= 0.60 with craft_full content >= 25 bits at some checkpoint.
+"""
+import argparse, glob, json, os, re
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+REP = "/home/celeste/shared/reports/nlt-27b-olens"
+C1, C2, C3, C4, CG = "#2b6cb0", "#c05621", "#1a9c6e", "#6b46c1", "#888888"
+PASS_TWIN, PASS_CONTENT = 0.60, 25.0
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--tag", default="v3"); ap.add_argument("--ref", default="bits_v1best_main.json", help="reference judge file (critic v1 ckpt_best) for the dashed baselines"); a = ap.parse_args()
+    files = sorted(glob.glob(f"{REP}/data/bits_{a.tag}_step*.json"), key=lambda f: int(re.search(r"step(\d+)", f).group(1)))
+    R = []
+    for f in files:
+        d = json.load(open(f)); s = d["sets"]["craft_full"]; tw = d.get("twins", {}).get("craft_twins", {}).get("variants", {}); nb = s.get("neighbours") or {}
+        row = {"step": int(re.search(r"step(\d+)", f).group(1)), "content": s["content_bits"]["mean"], "content_sem": s["content_bits"]["sem"], "p_dm": s["p_z_gt_dm"], "p_rp": s.get("p_z_gt_rp"),
+               "content_rp": s.get("content_rp_bits"), "pmi": s["pmi_bits"]["mean"] if isinstance(s["pmi_bits"], dict) else s["pmi_bits"], "p_null": s.get("p_z_gt_null"), "p_sw": s.get("p_z_gt_sw"),
+               "describer_content": d["sets"].get("describer_A", {}).get("content_bits", {}).get("mean"), "describer_p": d["sets"].get("describer_A", {}).get("p_z_gt_dm"),
+               "twins": {v: {"p": x["p_true_gt_twin"], "bits": x["mean_bits_true_minus_twin"], "sem": x["sem"], "proxy_p": x.get("proxy_p_true_gt_twin")} for v, x in tw.items()},
+               "neigh": {k: {"double_diff": v["double_diff"], "sem": v["double_diff_sem"], "kept": v["frac_content_kept_at_neighbour"]} for k, v in nb.items()}, "file": os.path.basename(f)}
+        row["pass"] = bool(row["content"] >= PASS_CONTENT and max(row["twins"].get("twin_shift", {}).get("p", 0), row["twins"].get("twin_new", {}).get("p", 0)) >= PASS_TWIN)
+        R.append(row)
+    ref = None
+    if os.path.exists(f"{REP}/data/{a.ref}"):
+        d = json.load(open(f"{REP}/data/{a.ref}")); s = d["sets"]["craft_full"]; tw = d.get("twins", {}).get("craft_twins", {}).get("variants", {})
+        ref = {"content": s["content_bits"]["mean"], "p_dm": s["p_z_gt_dm"], "twin_shift": tw.get("twin_shift", {}).get("p_true_gt_twin"), "twin_new": tw.get("twin_new", {}).get("p_true_gt_twin"), "label": "critic v1 step 3500 (reference judge)"}
+    out = {"tag": a.tag, "rule": {"twin_p_min": PASS_TWIN, "content_min": PASS_CONTENT, "text": "twin_shift or twin_new P(true > twin) >= 0.60 with craft_full content >= 25 bits at some saved checkpoint"}, "rows": R, "reference": ref,
+           "verdict": ("PASS" if any(r["pass"] for r in R) else ("FAIL" if R and R[-1]["step"] >= 4500 else "pending"))}
+    os.makedirs(f"{REP}/data", exist_ok=True); json.dump(out, open(f"{REP}/data/critic_{a.tag}_curve.json", "w"), indent=1)
+    if not R: print("no checkpoint evals yet"); return
+    st = [r["step"] for r in R]
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+    ax = axes[0, 0]
+    for var, c, lab in (("twin_shift", C1, "one Shift bullet swapped"), ("twin_new", C2, "one 'Now present' bullet swapped"), ("twin_jlens", C4, "one J-lens word flipped"), ("dm_full", CG, "whole other text")):
+        ys = [r["twins"].get(var, {}).get("p") for r in R]
+        if any(y is not None for y in ys): ax.plot(st, ys, "o-", color=c, lw=2, label=lab)
+    ax.axhline(0.5, color="k", lw=0.8); ax.axhline(PASS_TWIN, color=C3, ls="--", lw=1.2, label=f"pass bar {PASS_TWIN}")
+    if ref and ref.get("twin_shift") is not None: ax.axhline(ref["twin_shift"], color=C1, ls=":", lw=1, label="reference judge, Shift twin")
+    ax.set_ylim(0, 1); ax.set_xlabel("training step (500-step saves)"); ax.set_ylabel("P(true text > twin), exact bits"); ax.set_title("Does the anchored critic see ONE swapped claim?", fontsize=13); ax.legend(frameon=False, fontsize=8)
+    ax = axes[0, 1]; ax.errorbar(st, [r["content"] for r in R], yerr=[r["content_sem"] for r in R], fmt="o-", color=C1, lw=2, capsize=3, label="crafted change text")
+    dc = [r["describer_content"] for r in R]
+    if any(v is not None for v in dc): ax.plot(st, dc, "s-", color=C2, lw=1.5, label="Sonnet trace (A)")
+    ax.axhline(PASS_CONTENT, color=C3, ls="--", lw=1.2, label=f"content floor {PASS_CONTENT:.0f} bits")
+    if ref: ax.axhline(ref["content"], color=C1, ls=":", lw=1, label="reference judge, crafted")
+    ax.set_xlabel("training step"); ax.set_ylabel("content bits (PMI(z) − PMI(z_dm))"); ax.set_title("Held-out content stays above the floor?", fontsize=13); ax.legend(frameon=False, fontsize=8)
+    ax = axes[1, 0]; ax.plot(st, [r["p_dm"] for r in R], "o-", color=C1, lw=2, label="P(z > z_dm), crafted")
+    pr = [r["p_rp"] for r in R]
+    if any(v is not None for v in pr): ax.plot(st, pr, "s-", color=C4, lw=1.5, label="P(z > random-pair text)")
+    if ref: ax.axhline(ref["p_dm"], color=C1, ls=":", lw=1, label="reference judge")
+    ax.axhline(0.5, color="k", lw=0.8); ax.set_ylim(0.4, 1); ax.set_xlabel("training step"); ax.set_ylabel("paired win rate"); ax.set_title("Own text vs wrong text: calibration over training", fontsize=13); ax.legend(frameon=False, fontsize=8)
+    ax = axes[1, 1]
+    for k, c, lab in (("m1", C1, "t−1"), ("m4", C2, "t−4"), ("m16", C4, "t−16")):
+        ys = [r["neigh"].get(k, {}).get("double_diff") for r in R]; es = [r["neigh"].get(k, {}).get("sem", 0) for r in R]
+        if any(y is not None for y in ys): ax.errorbar(st, ys, yerr=es, fmt="o-", color=c, lw=1.5, capsize=3, label=f"same-document neighbour {lab}")
+    ax.axhline(0, color="k", lw=0.8); ax.set_xlabel("training step"); ax.set_ylabel("content(own) − content(neighbour), bits"); ax.set_title("Position specificity: own state vs a neighbour's", fontsize=13); ax.legend(frameon=False, fontsize=8)
+    fig.suptitle(f"Critic {a.tag} (activation-anchored contrast) over its saved checkpoints - verdict so far: {out['verdict']}", fontsize=14, y=1.0); fig.tight_layout()
+    fig.savefig(f"{REP}/fig_critic_{a.tag}_curve.png", dpi=150, bbox_inches="tight"); fig.savefig(f"{REP}/fig_critic_{a.tag}_curve.pdf", bbox_inches="tight"); print("saved", f"fig_critic_{a.tag}_curve", "|", out["verdict"])
+    for r in R: print(f"step {r['step']}: content {r['content']:.1f} P {r['p_dm']:.3f} twin_shift {r['twins'].get('twin_shift', {}).get('p')} twin_new {r['twins'].get('twin_new', {}).get('p')} pass {r['pass']}")
+
+
+if __name__ == "__main__":
+    main()
