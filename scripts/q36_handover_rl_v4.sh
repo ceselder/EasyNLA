@@ -57,15 +57,14 @@ for i in range(min(3, len(ex0), len(exL))):
     print(f"    example {i + 1} step {st[-1]}: {exL[i][:260].replace(chr(10), ' | ')}")
 PY
 tail -n 12 /home/celeste/shared/reports/nlt-27b-olens/notes/LOG.md | cut -c1-200
-# ---- 3. stop RL v3 (holding the launch lock so no waiter grabs the freed GPUs before RL v4 is ledgered; launch_rl_v4's ledger_add releases fd 9)
-exec 9>$LOCK; flock 9
+# ---- 3. stop RL v3. (An earlier version held the launch lock here; launch_rl_v4.sh takes the same lock in wait_gpu -> DEADLOCK. RL v4 gets the freed GPUs by priority (PRIO=1) instead.)
 timeout 120 modal app stop -y $A3 >/dev/null 2>&1; sed -i "s/^$A3 /# $A3 (stopped $(date -u +%H:%M) for RL v4) /" $LOGD/gpu_ledger.txt; log "RL v3 $A3 stopped"; sleep 30
 # cap_now is 12 while the harvest runs (orchestrator 08:05), 8 after: only then make room for RL v4's 4 GPUs by stopping harvest engines (highest slot first; harvest.sh relaunches them when headroom returns, work already written is skipped)
 for p_ in 5 4 3 2 1 0; do g=$(gpus_in_use); [ $((g + 4)) -le $(cap_now) ] && break; a_=$(cat $LOGD/harvest_app_$p_.txt 2>/dev/null || true); [ -z "$a_" ] && continue
   timeout 90 modal app list 2>/dev/null | grep -vE "stopped|stopping" | grep -q "$a_" || continue
   timeout 120 modal app stop -y $a_ >/dev/null 2>&1; sed -i "s/^$a_ /# $a_ (stopped $(date -u +%H:%M) for RL v4) /" $LOGD/gpu_ledger.txt; log "stopped harvest engine $p_ ($a_) to make room for RL v4"; sleep 20; done
 # ---- 4. launch RL v4 with the chosen judge, 5. watcher
-CRITIC_CK=$CKPATH FROZEN_CK=$CKPATH bash $LOGD/launch_rl_v4.sh 2>&1 | sed "s/^/[handover] /"
+CRITIC_CK=$CKPATH FROZEN_CK=$CKPATH PRIO=1 bash $LOGD/launch_rl_v4.sh 2>&1 | sed "s/^/[handover] /"
 (RL_TAG=rl_v4 APPFILE=$LOGD/rl_app_rl_v4.txt systemd-run --user --scope -q -p MemoryMax=1G --setenv=RL_TAG=rl_v4 --setenv=APPFILE=$LOGD/rl_app_rl_v4.txt bash $LOGD/watch_rl_v3.sh >> $LOGD/watch_rl_v4.out 2>&1 &)
 (cd $REP && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); log "HANDOVER DONE: RL v4 app $(cat $LOGD/rl_app_rl_v4.txt 2>/dev/null)"
 # ---- 6. cross-judge table for RL v3 (orchestrator 07:33): step-0 and last-saved-policy dumps + teacher under critics of OTHER lineages (v2 step 3000, v1b's judge) and the frozen v1 judge
