@@ -60,8 +60,8 @@ tail -n 12 /home/celeste/shared/reports/nlt-27b-olens/notes/LOG.md | cut -c1-200
 # ---- 3. stop RL v3 (holding the launch lock so no waiter grabs the freed GPUs before RL v4 is ledgered; launch_rl_v4's ledger_add releases fd 9)
 exec 9>$LOCK; flock 9
 timeout 120 modal app stop -y $A3 >/dev/null 2>&1; sed -i "s/^$A3 /# $A3 (stopped $(date -u +%H:%M) for RL v4) /" $LOGD/gpu_ledger.txt; log "RL v3 $A3 stopped"; sleep 30
-# cap is 8 from here (cap_now): make room for RL v4's 4 GPUs by stopping harvest engines (highest slot first; harvest.sh relaunches them when headroom returns, work already written is skipped)
-for p_ in 5 4 3 2 1 0; do g=$(gpus_in_use); [ $((g + 4)) -le 8 ] && break; a_=$(cat $LOGD/harvest_app_$p_.txt 2>/dev/null || true); [ -z "$a_" ] && continue
+# cap_now is 12 while the harvest runs (orchestrator 08:05), 8 after: only then make room for RL v4's 4 GPUs by stopping harvest engines (highest slot first; harvest.sh relaunches them when headroom returns, work already written is skipped)
+for p_ in 5 4 3 2 1 0; do g=$(gpus_in_use); [ $((g + 4)) -le $(cap_now) ] && break; a_=$(cat $LOGD/harvest_app_$p_.txt 2>/dev/null || true); [ -z "$a_" ] && continue
   timeout 90 modal app list 2>/dev/null | grep -vE "stopped|stopping" | grep -q "$a_" || continue
   timeout 120 modal app stop -y $a_ >/dev/null 2>&1; sed -i "s/^$a_ /# $a_ (stopped $(date -u +%H:%M) for RL v4) /" $LOGD/gpu_ledger.txt; log "stopped harvest engine $p_ ($a_) to make room for RL v4"; sleep 20; done
 # ---- 4. launch RL v4 with the chosen judge, 5. watcher

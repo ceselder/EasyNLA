@@ -30,6 +30,6 @@ for i in $(seq 1 400); do
     if done_p $p; then continue; fi                                                                    # finished
     alldone=0; wait_gpu 1 || exit 1; launch $p
   done
-  [ $alldone -eq 1 ] && { log "HARVEST DONE"; break; }
+  [ $alldone -eq 1 ] && { log "HARVEST DONE"; touch $LOGD/.harvest_done; break; }
   sleep 600
 done
