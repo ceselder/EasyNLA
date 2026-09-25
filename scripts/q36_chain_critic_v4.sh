@@ -36,9 +36,14 @@ json.dump({"stage": stage, "shards": shards, "rows": rows, "total_text_rows": S,
 PY
 )
   ONE=$(python3 -c "import json; print(json.load(open('/tmp/q36_v4_stage.json'))['one_pass_steps'])"); STEP0=0; RESUME=""
+  if [ $stage -gt 1 ]; then
+    PREV=$(grep -E "^\[critic_${TAG}_s$((stage - 1))\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+")
+    for i in $(seq 1 600); do L=$(timeout 90 modal app list 2>/dev/null); [ -n "$L" ] && ! echo "$L" | grep -vE "stopped|stopping" | grep -q "$PREV" && break; [ $((i % 6)) -eq 0 ] && log "stage $stage: previous stage $PREV still running"; sleep 300; done
+    for i in $(seq 1 60); do [ "$(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null | grep -c one_pass_stop.json)" -ge 1 ] && break; sleep 60; done
+  fi
   if [ $stage -gt 1 ]; then STEP0=$(timeout 60 modal volume get nlt q36/critic/$TAG/one_pass_stop.json /tmp/q36_v4_stop.json --force >/dev/null 2>&1 && python3 -c "import json; print(json.load(open('/tmp/q36_v4_stop.json'))['stopped_at_step'])" || echo 0); RESUME="--resume /vol/q36/critic/$TAG/ckpt_latest.pt"; fi
   STEPS=$(( STEP0 + ONE * 115 / 100 + 50 ))
-  VALS="craft_full:$TX1/val/craft_full__*.parquet,describer:$TX1/val/describer_sonnet5_A__*.parquet,raw_all:$TX1/val/raw_all__*.parquet"
+  VALS="craft_full:$TX1/val/craft_full__*.parquet,describer:$TX1/val/describer_sonnet5_A__*.parquet,raw_all:$TX1/val/raw_all__*.parquet,craft_delta:$TX1/val/craft_delta__*.parquet,craft_newfaded:$TX1/val/craft_newfaded__*.parquet,craft_nojl:$TX1/val/craft_nojl__*.parquet,jlens:$TX1/val/jlens__*.parquet,olens_j:$TX1/val/olens_j__*.parquet"   # per-pool held-out content (orchestrator 09:12); stage 1 launched with the first three only
   [ "$(nfiles q36/text/v3/val 'craft_full__')" -ge 1 ] && VALS="$VALS,craft_full_v3:$TX3/val/craft_full__*.parquet,craft_nodelta_v3:$TX3/val/craft_nodelta__*.parquet"
   log "stage $stage: rows $(cat /tmp/q36_v4_stage.json | cut -c1-300) -> steps $STEP0 + $ONE (x1.15) = $STEPS"
   PRIO=1 wait_gpu 1 || exit 1
@@ -46,6 +51,6 @@ PY
   grep -q "critic_${TAG}_s$stage\] SPAWNED" $LOGD/apps.txt || { log "stage $stage launch FAILED; retrying in 5 min"; sleep 300; continue; }
   cp /tmp/q36_v4_stage.json $D/critic_${TAG}_stage$stage.json; echo "stage $stage $(date -u +%H:%M)" >> $USED; for f in $new; do echo $f >> $USED; done
   A=$(grep -E "^\[critic_${TAG}_s$stage\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+"); log "stage $stage launched: $A"
-  for i in $(seq 1 600); do timeout 90 modal app list 2>/dev/null | grep -vE "stopped|stopping" | grep -q "$A" || break; sleep 300; done; log "stage $stage app ended"
+  miss=0; for i in $(seq 1 600); do L=$(timeout 90 modal app list 2>/dev/null); if [ -z "$L" ]; then sleep 60; continue; fi; if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); [ $miss -ge 3 ] && break; fi; sleep 300; done; log "stage $stage app ended (3 consecutive absences)"
   stage=$((stage + 1))
 done

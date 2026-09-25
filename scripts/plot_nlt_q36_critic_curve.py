@@ -51,6 +51,8 @@ def main():
         r["b_calibrated"] = bool(r.get("p_null") is not None and r["p_null"] >= 0.80)
         r["c_content"] = bool(r["content"] >= PASS_CONTENT)
         ps = [v for k, v in PASSES.items() if int(k) <= r["step"]]; r["passes_max"] = max(ps) if ps else None; r["d_one_pass"] = bool(r["passes_max"] is not None and r["passes_max"] <= 1.0)
+        pf = f"{REP}/data/bits_{a.tag}_step{r['step']:06d}_pools.json"
+        r["per_pool"] = {k: {"content": v["content_bits"]["mean"], "p_dm": v["p_z_gt_dm"], "p_null": v.get("p_z_gt_null")} for k, v in json.load(open(pf))["sets"].items()} if os.path.exists(pf) else {}
         tf = f"{REP}/data/bits_{a.tag}_step{r['step']:06d}_train.json"
         if os.path.exists(tf):
             st_ = json.load(open(tf))["sets"]["craft_full"]; r["pmi_train"] = st_["pmi_bits"]["mean"] if isinstance(st_["pmi_bits"], dict) else st_["pmi_bits"]; r["pmi_gap"] = r["pmi_train"] - r["pmi"]
