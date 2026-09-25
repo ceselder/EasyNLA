@@ -21,7 +21,10 @@ def main():
     steps = [e["step"] for e in E]
     curves = {"step": steps, "cotrained_content": [e["cotrained/content_bits"] for e in E], "frozen_content": [e["frozen/content_bits"] for e in E], "cotrained_pmi": [e["cotrained/pmi_bits"] for e in E], "frozen_pmi": [e["frozen/pmi_bits"] for e in E],
               "cotrained_rp": [e["cotrained/rp_bits"] for e in E], "frozen_rp": [e["frozen/rp_bits"] for e in E], "tokens": [e["tokens"] for e in E], "depth_hit_rate": [e["depth_hit_rate"] for e in E],
-              "twins_cotrained": [e.get("cotrained/twin_p_true_gt_twin") for e in E], "twins_frozen": [e.get("frozen/twin_p_true_gt_twin") for e in E], "examples": {str(e["step"]): e.get("examples", [])[:4] for e in E}}
+              "twins_cotrained": [e.get("cotrained/twin_p_true_gt_twin") for e in E], "twins_frozen": [e.get("frozen/twin_p_true_gt_twin") for e in E], "examples": {str(e["step"]): e.get("examples", [])[:4] for e in E},
+              "teacher_frozen_content": [e.get("frozen/teacher_content_bits") for e in E] if any("frozen/teacher_content_bits" in e for e in E) else None,
+              "teacher_cotrained_content": [e.get("cotrained/teacher_content_bits") for e in E] if any("cotrained/teacher_content_bits" in e for e in E) else None,
+              "cotrained_p": [e.get("cotrained/p_z_gt_dm") for e in E], "frozen_p": [e.get("frozen/p_z_gt_dm") for e in E]}
     train = []
     if a.log and os.path.exists(a.log):
         for line in open(a.log, errors="replace"):
@@ -33,7 +36,8 @@ def main():
     ax = axes[0, 0]
     if train: ax.plot([t["step"] for t in train], [t["pmi"] for t in train], color=CG, lw=1, alpha=0.6, label="co-trained proxy bits (train rollouts)")
     ax.plot(steps, curves["cotrained_content"], "o-", color=C1, lw=2, label="co-trained critic: content (held-out greedy)"); ax.plot(steps, curves["frozen_content"], "s-", color=C2, lw=2, label="FROZEN warm-start critic: content (guard)")
-    ax.axhline(0, color="k", lw=0.8); ax.set_xlabel("RL step"); ax.set_ylabel("bits"); ax.set_title("Does the reward rise without the frozen judge falling?", fontsize=13); ax.legend(frameon=False, fontsize=9)
+    if curves["teacher_frozen_content"]: ax.plot(steps, curves["teacher_frozen_content"], ":", color=C2, lw=2, label="teacher text, same pairs (frozen critic)"); ax.plot(steps, curves["teacher_cotrained_content"], ":", color=C1, lw=1.5, label="teacher text (co-trained critic)")
+    ax.axhline(0, color="k", lw=0.8); ax.set_xlabel("RL step"); ax.set_ylabel("bits"); ax.set_title("Does the reward rise without the frozen judge falling?", fontsize=13); ax.legend(frameon=False, fontsize=8)
     ax = axes[0, 1]; ax.plot(steps, curves["cotrained_rp"], "o-", color=C1, lw=2, label="co-trained: random-pair text bits"); ax.plot(steps, curves["frozen_rp"], "s-", color=C2, lw=2, label="frozen: random-pair text bits"); ax.axhline(0, color="k", lw=0.8)
     ax.set_xlabel("RL step"); ax.set_ylabel("bits"); ax.set_title("Text-presence bonus stays near zero?", fontsize=13); ax.legend(frameon=False, fontsize=9)
     ax = axes[1, 0]
