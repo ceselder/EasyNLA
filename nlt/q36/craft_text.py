@@ -24,7 +24,7 @@ ap.add_argument("--writes-dir", default=None, help="A_L*/M_L* prefix-sum store (
 ap.add_argument("--tau", type=float, default=0.8, help="embedding cos threshold for 'same bullet'"); ap.add_argument("--k", type=int, default=4); ap.add_argument("--max-bullet-tok", type=int, default=16)
 ap.add_argument("--jl-k", type=int, default=6, help="J-lens words per direction in the Leaning line"); ap.add_argument("--jl-pool", type=int, default=40, help="top-k pool filtered down to clean words")
 ap.add_argument("--jlens", default="/vol_ol1/jlens/qwen36_27b_jlens.pt"); ap.add_argument("--frozen", default="/vol_ol1/frozen/qwen36_27b_embed_head.pt")
-ap.add_argument("--embed-model", default="Qwen/Qwen3-Embedding-0.6B"); ap.add_argument("--twins", action="store_true"); ap.add_argument("--greedy-only", action="store_true"); ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--embed-model", default="Qwen/Qwen3-Embedding-0.6B"); ap.add_argument("--twins", action="store_true"); ap.add_argument("--force", action="store_true", help="redo shards whose stats file exists"); ap.add_argument("--greedy-only", action="store_true"); ap.add_argument("--seed", type=int, default=0)
 args = ap.parse_args(); dev = "cuda"; T_ALL = time.time(); tok = load_tokenizer(); os.makedirs(args.out_dir, exist_ok=True)
 JUNK = ("</s>", "<s>", "<|", "##", "</p>", "</div", "�")
 WORD_RE = re.compile(r"^[A-Za-z][A-Za-z'\-]{1,}$")
@@ -58,11 +58,16 @@ def clean_bullets(bs):
 
 
 def words(ids):
-    out, seen = [], set()
+    """clean J-lens words: prefer SPACE-INITIAL whole-word tokens (' policy'), which are real words; bare subword pieces ('xeda', 'togroup', 'ës') are junk
+    directions of the unembedding and are only used as a fallback when fewer than 2 clean words exist."""
+    out, seen, fallback = [], set(), []
     for t_ in ids:
-        w = tok.decode([int(t_)]).strip()
-        if WORD_RE.match(w) and w.lower() not in seen: seen.add(w.lower()); out.append(w)
+        raw = tok.decode([int(t_)]); w = raw.strip()
+        if not WORD_RE.match(w) or w.lower() in seen or len(w) < 3: continue
+        if raw.startswith(" "): seen.add(w.lower()); out.append(w)
+        else: fallback.append(w)
         if len(out) >= args.jl_k: break
+    if len(out) < 2: out += [w for w in fallback if w.lower() not in seen][: args.jl_k - len(out)]
     return out
 
 
@@ -81,7 +86,7 @@ def lines(new, faded, shift, lean, jl=True):
 
 def craft_shard(shard_index):
     t0 = time.time(); rng = np.random.default_rng(args.seed + shard_index); acts_file = SPLITS[shard_index]; tag = os.path.basename(acts_file).replace(".parquet", "")
-    if os.path.exists(os.path.join(args.out_dir, f"stats__{tag}.json")): print(f"[craft] skip existing {tag}", flush=True); return
+    if os.path.exists(os.path.join(args.out_dir, f"stats__{tag}.json")) and not args.force: print(f"[craft] skip existing {tag}", flush=True); return
     rollouts_dir = os.path.join(args.rollouts_root, tag)
     pairs = PAIRS_ALL[PAIRS_ALL["shard"] == shard_index].reset_index(drop=True); n = len(pairs)
     RO = {}; WSPECS = ["v_attn", "v_mlp"] if args.writes_dir else []
