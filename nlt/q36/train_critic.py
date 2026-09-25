@@ -77,6 +77,8 @@ def main():
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=1024); p.add_argument("--micro-batch", type=int, default=128); p.add_argument("--lr", type=float, default=1.2e-4); p.add_argument("--warmup", type=int, default=300); p.add_argument("--wd", type=float, default=0.01)
     p.add_argument("--uncond-steps", type=int, default=0, help="PRETRAIN p(u_j | u_i) with NO text on random band pairs from the whole store for this many steps (unlabelled pairs are free), then switch to the text pools (tip from the NLA flow-critic session: freeze-then-condition worked best there)"); p.add_argument("--beta2", type=float, default=0.999); p.add_argument("--ema", type=float, default=0.999); p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--uncond-frac", type=float, default=0.15); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-floor", type=float, default=0.05)
     p.add_argument("--null-dm", type=float, default=0.0, help="8B v1.16 regulariser: at the same (x_t, t, eps) pull the velocity under a depth-matched WRONG text (another micro-batch row, same (i,j) else same j else rolled) toward the no-text velocity (detached), so a wrong text earns no bits and the text path stays calibrated to the null path")
+    p.add_argument("--anchor", type=float, default=0.0, help="ACTIVATION-ANCHORED contrast weight (critic v3): text fixed, activation varied - the text-conditioned gain over the unconditional velocity error must be larger on the text's own (u_i, u_j) than on a depth-matched OTHER pair's (same (i, j), same eps and t); logistic loss softplus((gain_other - gain_own) / tau). Never a text-edit negative.")
+    p.add_argument("--anchor-tau", type=float, default=0.05, help="temperature of the anchored contrast in inner per-dim MSE units"); p.add_argument("--anchor-frac", type=float, default=1.0, help="fraction of each text micro-batch that gets the anchored contrast (compute: 2 extra forwards per anchored row)")
     p.add_argument("--sigma-r", type=float, default=0.1); p.add_argument("--radial", default="lognormal", choices=["lognormal", "fixed"], help="fixed: s = 1 + isotropic dequantisation noise --sigma-iso (radial density shared by the text and null paths)"); p.add_argument("--sigma-iso", type=float, default=0.05); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=256); p.add_argument("--eval-offset", type=int, default=2048, help="val pairs before this index are the FIXED test set (eval_bits.py); monitoring uses pairs after it"); p.add_argument("--spot-exact-n", type=int, default=64); p.add_argument("--spot-ode-steps", type=int, default=16)
     p.add_argument("--save-every", type=int, default=1000); p.add_argument("--keep-every", type=int, default=0); p.add_argument("--max-hours", type=float, default=20.0); p.add_argument("--max-train-pos", type=int, default=None); p.add_argument("--data-device", default="cuda"); p.add_argument("--seed", type=int, default=0)
@@ -128,7 +130,7 @@ def main():
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
         opt.zero_grad(set_to_none=True); keep = torch.rand(a.batch, device=dev) >= a.p_uncond
         order = sorted(range(a.batch), key=lambda q: len(texts[q])); rows, i, j = rows[order], i[order], j[order]; texts = [texts[q] for q in order]; keep = keep[torch.tensor(order, device=dev)]
-        l_all = torch.zeros(a.batch, device=dev); v_all = torch.zeros(a.batch, device=dev); mask_T = 0
+        l_all = torch.zeros(a.batch, device=dev); v_all = torch.zeros(a.batch, device=dev); mask_T = 0; ANC = []
         for s0 in range(0, a.batch, a.micro_batch):
             sl = slice(s0, min(a.batch, s0 + a.micro_batch)); nb = sl.stop - sl.start
             h_i = store.gather(rows[sl], i[sl], dev); h_j = store.gather(rows[sl], j[sl], dev); src = dirs.source(h_i, i[sl]); x0, _ = dirs.target(h_j, j[sl])
@@ -138,8 +140,22 @@ def main():
                 with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder([t if t.strip() else " " for t in tx])
                 mask = mask & keep[sl][:, None]; mask_T = max(mask_T, int(mask.shape[1]))
             t = torch.rand(nb, device=dev); eps = torch.randn_like(x0)
-            with torch.autocast("cuda", dtype=torch.bfloat16): l, v_mse = model.loss(x0, src, t, eps, enc, mask)
-            step_loss = l.mean()
+            if a.anchor > 0 and enc is not None and model.param == "v":
+                # activation-anchored contrast: for text z_b, compare its gain on its own target with its gain on a depth-matched OTHER pair's target (same eps/t slot): softplus((g_oth - g_own)/tau)
+                x_t = (1 - t)[:, None] * x0 + t[:, None] * eps; v_in = (eps - x0) / model.x0_scale; na = max(2, int(round(nb * a.anchor_frac))); perm = torch.tensor(dm_partner(i[sl], j[sl]), device=dev)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    r_own = model.raw(x_t, t, src, enc, mask)                                                                   # own text on own target (the FM loss)
+                    with torch.no_grad(): r_unc = model.raw(x_t, t, src)                                                       # unconditional velocity, every row
+                    r_sw = model.raw(x_t[perm][:na], t[perm][:na], src[perm][:na], enc[:na], mask[:na])                         # own text on the PARTNER's target / noise
+                l = ((r_own.float() - v_in) ** 2).mean(-1); v_mse = l.detach()
+                e_unc = ((r_unc.float() - v_in) ** 2).mean(-1).detach(); g_own = e_unc[:na] - l[:na]; g_oth = e_unc[perm][:na] - ((r_sw.float() - v_in[perm][:na]) ** 2).mean(-1)
+                valid = (perm[:na] != torch.arange(na, device=dev)) & keep[sl][:na]                                            # rows whose partner is a different row and whose text was kept
+                anc = torch.nn.functional.softplus((g_oth - g_own) / a.anchor_tau); anc = anc[valid].mean() if valid.any() else anc.sum() * 0
+                step_loss = l.mean() + a.anchor * anc
+                if valid.any(): ANC.append((float(g_own[valid].mean()), float(g_oth[valid].mean()), float((g_own[valid] > g_oth[valid]).float().mean()), float(anc)))
+            else:
+                with torch.autocast("cuda", dtype=torch.bfloat16): l, v_mse = model.loss(x0, src, t, eps, enc, mask)
+                step_loss = l.mean()
             if a.null_dm > 0 and enc is not None:
                 perm = torch.tensor(dm_partner(i[sl], j[sl]), device=dev); x_t = (1 - t)[:, None] * x0 + t[:, None] * eps
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -155,8 +171,9 @@ def main():
             el = time.time() - t0; has_txt = keep & torch.tensor([len(z) > 0 for z in texts], device=dev)
             log = {"train/loss": loss.item(), "train/loss_ema": ema_loss, "train/v_mse": float(v_all.mean()), "train/loss_text": float(l_all[has_txt].mean()) if has_txt.any() else float("nan"), "train/loss_notext": float(l_all[~has_txt].mean()) if (~has_txt).any() else float("nan"),
                    "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/rows_per_s": (step - step0 + 1) * a.batch / max(1e-6, el), "train/rows_seen": rows_seen, "train/seq_len": mask_T + 3 * a.k_chunks + 2}
+            if ANC: log.update({"anchor/gain_own": sum(x[0] for x in ANC) / len(ANC), "anchor/gain_other": sum(x[1] for x in ANC) / len(ANC), "anchor/p_own_gt_other": sum(x[2] for x in ANC) / len(ANC), "anchor/loss": sum(x[3] for x in ANC) / len(ANC)})
             if wb: wb.log(log, step=step)
-            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} text {log['train/loss_text']:.4f} notext {log['train/loss_notext']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']} pool={pname}", flush=True)
+            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} text {log['train/loss_text']:.4f} notext {log['train/loss_notext']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']} pool={pname}" + (f" | anchor gain own {log['anchor/gain_own']:.4f} other {log['anchor/gain_other']:.4f} P(own>other) {log['anchor/p_own_gt_other']:.3f} loss {log['anchor/loss']:.3f}" if ANC else ""), flush=True)
         if ((step + 1) % a.eval_every == 0 and step + 1 >= a.uncond_steps) or step + 1 == a.steps:
             te = time.time(); out = evaluate(ema_model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a, probe_bank, iso_bank); out["eval/seconds"] = time.time() - te; out["eval/rows_seen"] = rows_seen
             if wb: wb.log(out, step=step)
