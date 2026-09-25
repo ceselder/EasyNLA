@@ -248,6 +248,15 @@ def build_av_prompt(tok, marker_char=MARKER_CHAR):
     return tok(s, add_special_tokens=False).input_ids
 
 
+def skiplens_prompt(tok):
+    """The skip-lens (futurelens) actor prompt, verbatim from ceselder/skip-lens-qwen36-27b-repeatafterme TRAINING_PROMPTS.md; chat template, no thinking.
+    The reader was trained on raw block-62 outputs injected norm-matched at the ㈜ marker after block 1 (same recipe as InjectL1)."""
+    msg = ("You are shown an internal activation vector captured from a language model as it reads a passage of text. The vector, enclosed in <concept> tags, is taken at one position "
+           "and encodes what the model is about to generate next. Output the text the model most likely produces immediately after this point.\n\n<concept>㈜</concept>")
+    s = tok.apply_chat_template([{"role": "user", "content": msg}], add_generation_prompt=True, tokenize=False, enable_thinking=False)
+    return tok(s, add_special_tokens=False).input_ids
+
+
 CHANGE_QUESTION = ("These are two snapshots of a language model's internal state at the same token, the first taken before the second. "
                    "Describe what changed between them: what became present, what faded, and what the model now leans toward.")
 

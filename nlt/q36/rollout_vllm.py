@@ -18,7 +18,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--data", default=None, help="COLUMN MODE: parquet or glob with the activation columns"); ap.add_argument("--out-dir", required=True)
 ap.add_argument("--data-dir", default=None, help="PAIR MODE: store dir with splits.json and pairs_<split>.parquet"); ap.add_argument("--writes-dir", default="/vol/q36/data/writes", help="pair mode: A_L*/M_L* prefix-sum store for the v_attn / v_mlp specs"); ap.add_argument("--pairs-split", default="train"); ap.add_argument("--pairs-shards", default="", help="comma list of shard indices of that split")
 ap.add_argument("--adapter", default=None, help="PEFT LoRA dir to merge into the served base (None = base model)")
-ap.add_argument("--prompt", default="bullets", choices=["bullets", "av"]); ap.add_argument("--k", type=int, default=4, help="bullets in the prompt")
+ap.add_argument("--prompt", default="bullets", choices=["bullets", "av", "skiplens"]); ap.add_argument("--min-tokens", type=int, default=0); ap.add_argument("--k", type=int, default=4, help="bullets in the prompt")
 ap.add_argument("--specs", required=True, help="';'-separated: h_L24 | h_L42-h_L24 | v_i | v_j | v_delta | v_attn | v_mlp")
 ap.add_argument("--n-rows", type=int, default=0, help="0 = all rows"); ap.add_argument("--skip-rows", type=int, default=0)
 ap.add_argument("--n-samples", type=int, default=3); ap.add_argument("--no-greedy", action="store_true"); ap.add_argument("--max-tokens", type=int, default=80)
@@ -41,7 +41,7 @@ def main():
     os.environ.setdefault("VLLM_LENS_CUDA_GRAPHS", "1")
     from vllm import LLM, SamplingParams
     from vllm_lens import SteeringVector
-    from common import MARKER_ID, build_av_prompt, load_tokenizer, olens_prompt
+    from common import MARKER_ID, build_av_prompt, load_tokenizer, olens_prompt, skiplens_prompt
 
     def resolve_local(model):
         if os.path.isdir(model): return model
@@ -73,7 +73,7 @@ def main():
     REPO_ID = args.model
     args.model = local_model_dir(REPO_ID, resolve_local(REPO_ID), args.hf_extra) if not os.path.isdir(REPO_ID) else REPO_ID
     tok = load_tokenizer()
-    PROMPT = olens_prompt(tok, args.k) if args.prompt == "bullets" else build_av_prompt(tok); MPOS = PROMPT.index(MARKER_ID)
+    PROMPT = olens_prompt(tok, args.k) if args.prompt == "bullets" else (skiplens_prompt(tok) if args.prompt == "skiplens" else build_av_prompt(tok)); MPOS = PROMPT.index(MARKER_ID)
     print(f"[rollout] model {args.model} | prompt {args.prompt} {len(PROMPT)} tokens, marker at {MPOS}", flush=True)
     specs = [s.strip() for s in args.specs.split(";") if s.strip()]
 
@@ -150,9 +150,9 @@ def main():
             prompts, params = [], []
             for i in range(n):
                 if not args.no_greedy:
-                    prompts.append({"prompt_token_ids": PROMPT}); params.append(SamplingParams(n=1, temperature=0.0, max_tokens=args.max_tokens, extra_args={"apply_steering_vectors": [sv(V[i])]}, seed=args.seed, logit_bias=ban or None, **SO))
+                    prompts.append({"prompt_token_ids": PROMPT}); params.append(SamplingParams(n=1, temperature=0.0, max_tokens=args.max_tokens, min_tokens=args.min_tokens, extra_args={"apply_steering_vectors": [sv(V[i])]}, seed=args.seed, logit_bias=ban or None, **SO))
                 if args.n_samples > 0:
-                    prompts.append({"prompt_token_ids": PROMPT}); params.append(SamplingParams(n=args.n_samples, temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens, extra_args={"apply_steering_vectors": [sv(V[i])]}, seed=args.seed + i, logit_bias=ban or None, **SO))
+                    prompts.append({"prompt_token_ids": PROMPT}); params.append(SamplingParams(n=args.n_samples, temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens, min_tokens=args.min_tokens, extra_args={"apply_steering_vectors": [sv(V[i])]}, seed=args.seed + i, logit_bias=ban or None, **SO))
             t1 = time.time(); outs = llm.generate(prompts, params, use_tqdm=False); t2 = time.time()
             rows, samples, ids_col, texts = [], [], [], []; q = 0
             for i in range(n):
