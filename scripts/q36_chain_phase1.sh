@@ -17,7 +17,9 @@ if [ "$(nfiles q36/data 'pairs_val.parquet')" -lt 1 ]; then
   waitn q36/data "pairs_val.parquet" 1 || exit 1
 fi
 # 3. rollouts, pair mode, 6 engines. shard-jobs: val 0..N_VAL-1 first, then train 0..N_TRAIN-1, round-robin over 6 processes
-if [ "$(nfiles q36/rollouts/train 'parquet$')" -lt 1 ] && [ "$SKIP_TO" = "" ]; then
+MARK=/home/celeste/nlt-q36-logs/.rollouts_launched_$TAG      # the rollout dir holds SUBDIRS (one per shard), so a file count cannot detect a running launch: use a local marker
+if [ ! -f "$MARK" ] && [ "$SKIP_TO" = "" ]; then
+  touch "$MARK"
   JOBS=(); for v in $(seq 0 $((N_VAL - 1))); do JOBS+=("val:$v"); done; for t in $(seq 0 $((N_TRAIN - 1))); do JOBS+=("train:$t"); done
   ARGS=""; for p in 0 1 2 3 4 5; do L=""; for k in "${!JOBS[@]}"; do [ $((k % 6)) -eq $p ] && L+="${JOBS[$k]},"; done; L=${L%,}; [ -n "$L" ] && ARGS+="--data-dir /vol/q36/data --pairs-shards '$L' --specs 'v_i;v_j;v_delta' --adapter /vol_go/ckpt/ar_ivrl/final --prompt bullets --n-samples $NSAMP --max-tokens $MAXTOK --grammar --out-dir /vol/q36/rollouts ;; "; done
   run vllm-many 1 rollout_vllm.py "${ARGS% ;; }" rollouts
