@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # skip-lens(J̄Δ) as a text source on the phase-1 VAL pairs (shard 0 = the fixed eval set): vectors -> skip-lens rollout -> text pool skiplens_jd__<part>.parquet
 set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt; MAXG=${MAXG:-8}
-GPUS_HF=${GPUS_HF:-"H100"}; GPUS_VLLM=${GPUS_VLLM:-"H100"}; GPUS_BIG=${GPUS_BIG:-"H200"}   # Modal 1.5.4 takes ONE gpu type per function (no fallback lists): route around the B200 queue explicitly
+GPUS_HF=${GPUS_HF:-"H100"}; GPUS_VLLM=${GPUS_VLLM:-"B200"}; GPUS_BIG=${GPUS_BIG:-"H200"}   # Modal 1.5.4 takes ONE gpu type per function (no fallback lists): route around the B200 queue explicitly
 log(){ echo "[sltext] $(date -u +%H:%M) $*"; }
 nfiles(){ timeout 120 modal volume ls nlt "$1" 2>/dev/null | grep -cE "$2" || true; }
 waitn(){ for i in $(seq 1 300); do n=$(nfiles "$1" "$2"); [ "$n" -ge "$3" ] && { log "ready: $1"; return 0; }; sleep 90; done; log "TIMEOUT $1"; return 1; }

@@ -6,7 +6,7 @@
 set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt
 BAND=${BAND:?set BAND}; N_TRAIN=${N_TRAIN:-12}; N_VAL=${N_VAL:-3}; TAG=${TAG:-v2}; V1=${V1:-v1}; NSAMP=${NSAMP:-1}; MAXTOK=${MAXTOK:-80}; N_DESC_TRAIN=${N_DESC_TRAIN:-4}
 CRITIC_STEPS=${CRITIC_STEPS:-4500}; UNCOND_STEPS=${UNCOND_STEPS:-1500}; ENGINES=${ENGINES:-4}
-GPUS_HF=${GPUS_HF:-"H100"}; GPUS_VLLM=${GPUS_VLLM:-"H100"}; GPUS_BIG=${GPUS_BIG:-"H200"}   # Modal 1.5.4 takes ONE gpu type per function (no fallback lists): route around the B200 queue explicitly
+GPUS_HF=${GPUS_HF:-"H100"}; GPUS_VLLM=${GPUS_VLLM:-"B200"}; GPUS_BIG=${GPUS_BIG:-"H200"}   # Modal 1.5.4 takes ONE gpu type per function (no fallback lists): route around the B200 queue explicitly
 log(){ echo "[chain2] $(date -u +%H:%M) $*"; }
 nfiles(){ timeout 120 modal volume ls nlt "$1" 2>/dev/null | grep -cE "$2" || true; }
 waitn(){ for i in $(seq 1 400); do n=$(nfiles "$1" "$2"); [ "$n" -ge "$3" ] && { log "ready: $1 ($n >= $3)"; return 0; }; [ $((i % 5)) -eq 0 ] && log "waiting $1: $n/$3"; sleep 120; done; log "TIMEOUT waiting $1"; return 1; }
