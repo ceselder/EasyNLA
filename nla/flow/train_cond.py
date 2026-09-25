@@ -377,6 +377,8 @@ def main():
     p.add_argument("--ctr-tau-lr", type=float, default=1e-3, help="learning rate of log tau"); p.add_argument("--ctr-tau-max", type=float, default=100.0, help="tau clamp (nats)")
     p.add_argument("--health-every", type=int, default=0, help="density health every N steps (and before training): median / mean single-claim PMI of held-out true claims on their own activation + mean cond / uncond FM loss (fixed noise)")
     p.add_argument("--health-n", type=int, default=256)
+    p.add_argument("--ctr-neg-floor", type=float, default=None, help="bounded negatives: a negative cell's PMI enters the InfoNCE as max(PMI, -m) (nats), so negatives already below -m get no "
+                   "gradient (only hub negatives are pushed down) and the conditional density cannot be degraded globally to win the contrast")
     p.add_argument("--ctr-gradcap", action="store_true", help="replicated DDP: scale the contrastive gradient so its norm <= the FM gradient norm of the same step")
     p.add_argument("--unit-norm", action="store_true", help="direction-only critic: rescale every activation to the RMS training norm before the normaliser (stored in the adapter args; FlowBundle / FlowCritic apply it automatically)")
     p.add_argument("--rewarm", type=int, default=0, help="continuation runs: linear lr re-warm-up over this many steps after --start-step (AdamW state is not restored under FSDP)")
@@ -998,7 +1000,11 @@ def main():
                 canon_t = torch.tensor(canon, device=dev); ar_ = torch.arange(Ng, device=dev)
                 is_can = valid & (canon_t == ar_); cols = is_can.nonzero().squeeze(1); vr = valid.nonzero().squeeze(1); n_ans = len(cols)
                 Lleaf = Lm.detach().requires_grad_(True); tau = log_tau.exp().clamp(1.0, a.ctr_tau_max)
-                base = (0.5 * d_x) * (L0[:, None] - Lleaf) / tau                          # FM-proxy PMI / tau, [activation i, claim of activation j]
+                pmi_ = (0.5 * d_x) * (L0[:, None] - Lleaf)                                   # FM-proxy PMI, [activation i, claim of activation j]
+                if a.ctr_neg_floor is not None:                                              # bounded negatives: cells that are not positives enter as max(PMI, -m)
+                    posm = (canon_t[:, None] == canon_t[None, :]) & valid[:, None] & valid[None, :]
+                    pmi_ = torch.where(posm, pmi_, pmi_.clamp(min=-a.ctr_neg_floor))
+                base = pmi_ / tau
                 if n_ans >= 2 and len(vr) >= 4:
                     ninf = float("-inf")
                     rowl = base[vr][:, cols]; tgt_r = torch.searchsorted(cols, canon_t[vr])   # activation -> its answer among the DISTINCT answers

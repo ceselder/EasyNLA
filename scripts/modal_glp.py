@@ -354,6 +354,13 @@ def fit_whiten_unitnorm(extra: str = ""):
     return _claims([f"{REPO_REMOTE}/scripts/fit_whitening_unitnorm.py"] + extra.split())
 
 
+@app.function(gpu="B200", timeout=4 * 3600, **COMMON)
+def claims_g2eval(adapter: str, tag: str, extra: str = ""):
+    """programmatic-twin benchmark + specificity-ladder calibration on the peer session's g2 positions (read only; scripts/claims_g2eval.py)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_g2eval.py", "--adapter", adapter, "--tag", tag] + extra.split())
+
+
 @app.function(gpu="B200", timeout=2 * 3600, **COMMON)
 def claims_hubness(adapter: str, tag: str, extra: str = ""):
     """claim->activation hubness vs activation norm on same-template retrieval matrices (scripts/claims_hubness.py)"""
@@ -491,6 +498,8 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", claims_compose_variants.remote(ckpt, tag, extra))
     elif task == "fit_whiten_unitnorm":
         print("rc", fit_whiten_unitnorm.remote(extra))
+    elif task == "claims_g2eval":
+        print("rc", claims_g2eval.remote(ckpt, tag, extra))
     elif task == "claims_hubness":
         print("rc", claims_hubness.remote(ckpt, tag, extra))
     elif task == "claims_controls":   # --ckpt = adapter path, --tag = output tag
