@@ -184,18 +184,29 @@ def main():
         label, path = item.split(":", 1); import glob as _g, pandas as pd
         tw = pd.concat([pq.read_table(f).to_pandas() for f in sorted(_g.glob(path))], ignore_index=True); tw = tw[tw["pair_id"].isin(set(pid_all))]
         by_pid = {pid: k for k, pid in enumerate(pid_all)}; tw["k"] = tw["pair_id"].map(by_pid); tw = tw.sort_values(["k", "variant"]).reset_index(drop=True)
-        pids = [pid for pid in tw["pair_id"].drop_duplicates().tolist()][: a.n]; tw = tw[tw["pair_id"].isin(set(pids))].reset_index(drop=True); n = len(tw); lp = np.zeros(n); t0 = time.time()
+        pids = [pid for pid in tw["pair_id"].drop_duplicates().tolist()][: a.n]; tw = tw[tw["pair_id"].isin(set(pids))].reset_index(drop=True); n = len(tw); lp = np.zeros(n); fm = np.zeros(n); t0 = time.time()
+        T_PROXY = [0.1, 0.3, 0.5, 0.7, 0.9]
+        def proxy_fm(kk, texts):
+            # the RL reward's view: flow-matching loss on a fixed t grid with the pair's fixed eps (common random numbers across the variants of one pair)
+            x0, src, _, _ = inputs(kk); e = eps_all[kk].to(dev); out = torch.zeros(len(kk), device=dev)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                enc, mask = encoder(texts)
+                for tv in T_PROXY:
+                    tt = torch.full((len(kk),), tv, device=dev); x_t = (1 - tt)[:, None] * x0 + tt[:, None] * e
+                    v = model(x_t, tt, src, enc=enc, enc_mask=mask); out = out + ((v.float() - (e - x0)) ** 2).mean(-1)
+            return (out / len(T_PROXY)).cpu()
         for s0 in range(0, n, a.batch):
-            sub = tw.iloc[s0:s0 + a.batch]; kk = sub["k"].tolist()
-            lp[s0:s0 + len(kk)] = lp_batch(kk, sub["text"].astype(str).tolist())[0].numpy()
+            sub = tw.iloc[s0:s0 + a.batch]; kk = sub["k"].tolist(); texts = sub["text"].astype(str).tolist()
+            lp[s0:s0 + len(kk)] = lp_batch(kk, texts)[0].numpy(); fm[s0:s0 + len(kk)] = proxy_fm(kk, texts).numpy()
             if (s0 // a.batch) % 10 == 0: print(f"[twins] {label}: {min(n, s0 + a.batch)}/{n} rows, {time.time() - t0:.0f}s", flush=True)
-        tw["logp"] = lp; res = {"n_pairs": len(pids), "variants": {}}
-        tru = tw[tw["variant"] == "true"].set_index("pair_id")["logp"]
+        tw["logp"] = lp; tw["fm"] = fm; res = {"n_pairs": len(pids), "variants": {}}
+        tru = tw[tw["variant"] == "true"].set_index("pair_id")["logp"]; tru_fm = tw[tw["variant"] == "true"].set_index("pair_id")["fm"]
         for var in sorted(set(tw["variant"]) - {"true"}):
             sub = tw[tw["variant"] == var].set_index("pair_id"); com = [pid for pid in sub.index if pid in tru.index]
-            dlt = (tru.loc[com].values - sub.loc[com, "logp"].values) / math.log(2)
-            res["variants"][var] = {"n": len(com), "p_true_gt_twin": float((dlt > 0).mean()), "mean_bits_true_minus_twin": float(dlt.mean()), "sem": float(dlt.std() / math.sqrt(max(1, len(dlt))))}
-            print(f"[twins] {label}/{var}: P(true > twin) {res['variants'][var]['p_true_gt_twin']:.3f} | true - twin {dlt.mean():.2f} +- {res['variants'][var]['sem']:.2f} bits (n {len(com)})", flush=True)
+            dlt = (tru.loc[com].values - sub.loc[com, "logp"].values) / math.log(2); dfm = sub.loc[com, "fm"].values - tru_fm.loc[com].values      # dfm > 0: the true text has the LOWER FM loss (= higher RL reward)
+            res["variants"][var] = {"n": len(com), "p_true_gt_twin": float((dlt > 0).mean()), "mean_bits_true_minus_twin": float(dlt.mean()), "sem": float(dlt.std() / math.sqrt(max(1, len(dlt)))),
+                                    "proxy_p_true_gt_twin": float((dfm > 0).mean()), "proxy_fm_twin_minus_true": float(dfm.mean()), "proxy_sem": float(dfm.std() / math.sqrt(max(1, len(dfm))))}
+            print(f"[twins] {label}/{var}: P(true > twin) {res['variants'][var]['p_true_gt_twin']:.3f} | true - twin {dlt.mean():.2f} +- {res['variants'][var]['sem']:.2f} bits (n {len(com)}) | FM-loss (RL reward) view: P(true better) {res['variants'][var]['proxy_p_true_gt_twin']:.3f}, twin - true {dfm.mean():.4f} +- {res['variants'][var]['proxy_sem']:.4f}", flush=True)
         results["twins"][label] = res; json.dump(results, open(a.out, "w"), indent=1)
     results["elapsed_min"] = (time.time() - t_all) / 60; json.dump(results, open(a.out, "w"), indent=1)
     print("[bits] DONE ->", a.out, flush=True)
