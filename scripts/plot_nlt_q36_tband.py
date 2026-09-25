@@ -30,7 +30,7 @@ def main():
         ax.axhline(0.5, color="k", lw=0.8); ax.axhline(0.6, color="green", ls="--", lw=1); ax.set_ylim(0.44, 0.72); ax.grid(alpha=0.3)
         ax.set_xlabel("noise level t of the FM loss (x_t = (1−t)·target + t·noise)", fontsize=11); ax.set_title(vlab, fontsize=13); ax.set_xticks([0.1, 0.3, 0.5, 0.7, 0.9])
     axes[0].set_ylabel("P(true text > twin), FM loss at that t", fontsize=11); axes[0].legend(fontsize=8, frameon=False, loc="lower right")
-    axes[0].text(0.12, 0.605, "bar 0.60", fontsize=9, color="green"); axes[0].text(0.12, 0.455, "dotted = exact-likelihood P for the same judge", fontsize=8, color="grey")
+    axes[0].text(0.12, 0.605, "bar 0.60", fontsize=9, color="green"); axes[0].text(0.12, 0.71, "dotted = exact-likelihood P for the same judge", fontsize=8, color="grey")
     fig.suptitle("Claim sensitivity of the FM reward lives at HIGH noise (t ≥ 0.5) and it is the high-t part that training erodes; EMA vs RAW weights barely differ", fontsize=12, y=1.02)
     fig.tight_layout(); fig.savefig(f"{REP}/fig_tband.png", dpi=150, bbox_inches="tight"); fig.savefig(f"{REP}/fig_tband.pdf", bbox_inches="tight"); json.dump(out, open(f"{REP}/data/tband.json", "w"), indent=1)
     print("saved fig_tband |", len(out["runs"]), "runs")
