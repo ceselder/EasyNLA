@@ -109,10 +109,13 @@ def load_text_pairs(paths, pairs_parquet, pools_verbose=True):
     pairs = pq.read_table(pairs_parquet, columns=["pair_id", "pos_idx", "i", "j"]).to_pandas()
     dfs = []
     for pat in paths:
-        for p in (sorted(glob.glob(pat)) or [pat]):
+        hits = sorted(glob.glob(pat)) if any(c in pat for c in "*?[") else [pat]
+        if not hits: print(f"[text] WARNING no files match {pat}; skipped", flush=True); continue
+        for p in hits:
             df = pq.read_table(p).to_pandas()
             if "source" not in df: df["source"] = os.path.basename(p).replace(".parquet", "")
             dfs.append(df[[c for c in ("pair_id", "text", "source", "sample") if c in df]])
+    if not dfs: return pd.DataFrame(columns=["pair_id", "text", "source", "pos_idx", "i", "j"])
     tx = pd.concat(dfs, ignore_index=True); tx = tx[tx["text"].astype(str).str.strip().str.len() > 0]
     return tx.merge(pairs, on="pair_id", how="inner")
 
