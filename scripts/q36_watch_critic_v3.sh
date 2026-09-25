@@ -11,7 +11,7 @@ for i in $(seq 1 400); do
   for ck in $(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null | grep -oE "ckpt_step[0-9]+\.pt" | sort -u); do
     st=${ck#ckpt_}; st=${st%.pt}; stn=$((10#${st#step})); [ $stn -lt $MINSTEP ] && continue; [ -n "${launched[$st]:-}" ] && continue
     [ -f $D/bits_${TAG}_$st.json ] && { launched[$st]=1; continue; }
-    grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt && { launched[$st]=1; continue; }        # already launched by an earlier incarnation of this watcher
+    { grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt || grep -q "\[${TAG}eval_$st\] QUEUED" $LOGD/evalq.txt; } && { launched[$st]=1; continue; }        # already launched / queued by an earlier incarnation
     PRIO=1 wait_gpu 1 || exit 1
     run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --out /vol/q36/results/bits_${TAG}_$st.json --sets 'craft_full:$TX/val/craft_full__*.parquet,describer_A:$TX1/val/describer_sonnet5_A__*.parquet' --twins 'craft_twins:$TX/val/twins__*.parquet' --neighbors /vol/q36/data/neigh --neighbor-n 256 --n 256 --ode-steps 64 --skip-samples" ${TAG}eval_$st
     # per-pool held-out content (orchestrator 09:12): the single-line and partial pools on the v1 held-out texts, n 128 (a separate lower-priority spec so the gate eval stays fast)
@@ -19,7 +19,7 @@ for i in $(seq 1 400); do
     # (e) of the amended criterion (orchestrator 09:25): a small TRAIN-row eval on the pools this critic trains on -> train - held-out PMI gap
     TRAIN_GLOB=${TRAIN_GLOB:-/vol/q36/text/v3/train/craft_full__*.parquet}
     run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --split train --out /vol/q36/results/bits_${TAG}_${st}_train.json --sets 'craft_full:$TRAIN_GLOB' --n 128 --n-fixed 512 --ode-steps 64 --skip-samples --skip-sw" ${TAG}eval_${st}_train
-    if grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt; then launched[$st]=1; log "gate eval launched for $st"; else log "gate eval launch for $st FAILED (retry next round)"; fi
+    if grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt || grep -q "\[${TAG}eval_$st\] QUEUED" $LOGD/evalq.txt; then launched[$st]=1; log "gate eval launched/queued for $st"; else log "gate eval launch for $st FAILED (retry next round)"; fi
   done
   # (d) passes per pool at each step, from the trainer's log lines ("passes max X" every 100 steps) -> data/critic_${TAG}_passes.json
   TA=$(grep -E "^\[critic_${TAG}(_s[0-9]+)?\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+")
