@@ -131,8 +131,11 @@ def main():
         for s0 in range(0, a.batch, a.micro_batch):
             sl = slice(s0, min(a.batch, s0 + a.micro_batch)); nb = sl.stop - sl.start
             h_i = store.gather(rows[sl], i[sl], dev); h_j = store.gather(rows[sl], j[sl], dev); src = dirs.source(h_i, i[sl]); x0, _ = dirs.target(h_j, j[sl])
-            with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts[sl])
-            mask = mask & keep[sl][:, None]; mask_T = max(mask_T, int(mask.shape[1]))
+            tx = texts[sl]
+            if all(not t.strip() for t in tx): enc = mask = None                                                       # unconditional micro-batch (uncond phase / all rows dropped): no encoder call (a 0-length batch breaks it)
+            else:
+                with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder([t if t.strip() else " " for t in tx])
+                mask = mask & keep[sl][:, None]; mask_T = max(mask_T, int(mask.shape[1]))
             t = torch.rand(nb, device=dev); eps = torch.randn_like(x0)
             with torch.autocast("cuda", dtype=torch.bfloat16): l, v_mse = model.loss(x0, src, t, eps, enc, mask)
             (l.mean() * nb / a.batch).backward(); l_all[sl] = l.detach(); v_all[sl] = v_mse
