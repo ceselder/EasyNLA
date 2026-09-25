@@ -43,7 +43,7 @@ TX=/vol/q36/text/$TAG
 # 4b. DESCRIBER pool (user request): Sonnet 5 writes atomic change claims from the readouts. Local box only (with-local-keys), <= 2 capped drivers, conc 48.
 #     val: all pairs of the first 2 val parts (variant A) + 300 pairs variant B; train: the first N_DESC_TRAIN parts (variant A). Open-model side-by-side: 300 val pairs on Modal.
 N_DESC_TRAIN=${N_DESC_TRAIN:-4}; DL=/home/celeste/nlt-q36-data/describer; mkdir -p $DL/in $DL/out
-if [ "$(nfiles q36/text/$TAG/val 'describer_sonnet5_A__')" -lt 1 ]; then
+if [ "$(nfiles q36/text/$TAG/val 'describer_sonnet5_A__')" -lt 1 ] && [ ! -f $DL/desc_val_A.log ]; then     # skip when the local describer (describer_upload.sh) already runs / ran
   for f in $(timeout 120 modal volume ls nlt q36/text/$TAG/val 2>/dev/null | grep describer_inputs__); do timeout 300 modal volume get nlt "$f" $DL/in/val__$(basename $f) --force >/dev/null 2>&1; done
   TR=$(timeout 120 modal volume ls nlt q36/text/$TAG/train 2>/dev/null | grep describer_inputs__ | sort | head -n $N_DESC_TRAIN)
   for f in $TR; do timeout 300 modal volume get nlt "$f" $DL/in/train__$(basename $f) --force >/dev/null 2>&1; done
