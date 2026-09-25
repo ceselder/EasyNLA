@@ -6,8 +6,8 @@ COLUMN MODE: specs (--specs, ';'-separated) name columns of the --data parquet(s
 difference (later minus earlier). One parquet per spec in --out-dir: row int32, sample int32 (0 = greedy, 1..n sampled), spec, ids, text.
   python rollout_vllm.py --data /vol/q36/phase0/acts_4k.parquet --n-rows 2048 --adapter /vol_go/ckpt/ar_ivrl/final --prompt bullets \
       --specs 'h_L12;h_L16;h_L42-h_L24' --n-samples 3 --max-tokens 80 --out-dir /vol/q36/phase0/rollouts
-PAIR MODE: --data-dir + --pairs-split + --pairs-shards: for each store shard, rows = that shard's pairs (pairs_<split>.parquet, one (i, j) per row) and the
-specs are v_i / v_j / v_delta built from the shard's acts parquet (splits.json). Output <out-dir>/<shard basename>/<spec>.parquet with a pair_id column.
+PAIR MODE: --data-dir + --pairs-shards 'val:0,train:0,train:1' (or plain indices of --pairs-split): for each store shard, rows = that shard's pairs (pairs_<split>.parquet, one (i, j) per row) and the
+specs are v_i / v_j / v_delta built from the shard's acts parquet (splits.json). Output <out-dir>/<split>/<shard basename>/<spec>.parquet with a pair_id column.
   python rollout_vllm.py --data-dir /vol/q36/data --pairs-split train --pairs-shards 0,1,2 --specs 'v_i;v_j;v_delta' --adapter ... --out-dir /vol/q36/rollouts/train
 Vectors are unit-normalised (norm-matched injection makes the scale irrelevant).
 """
@@ -78,19 +78,20 @@ def main():
     # ---- jobs: (label, out_dir, loader) where loader() -> (COL dict of [n, d] float tensors, n, pair_ids or None)
     jobs = []
     if args.data_dir:
-        sp = json.load(open(os.path.join(args.data_dir, "splits.json")))[args.pairs_split]
-        P_all = pq.read_table(os.path.join(args.data_dir, f"pairs_{args.pairs_split}.parquet")).to_pandas()
-        for si in [int(x) for x in args.pairs_shards.split(",") if x.strip()]:
-            f = sp[si]; od = os.path.join(args.out_dir, os.path.basename(f).replace(".parquet", ""))
-            def loader(f=f, si=si):
-                P = P_all[P_all["shard"] == si].reset_index(drop=True)
+        SPL = json.load(open(os.path.join(args.data_dir, "splits.json"))); PAIRS = {}
+        for tokn in [x.strip() for x in args.pairs_shards.split(",") if x.strip()]:          # 'train:3' or '3' (= --pairs-split)
+            split, si = (tokn.split(":") if ":" in tokn else (args.pairs_split, tokn)); si = int(si)
+            if split not in PAIRS: PAIRS[split] = pq.read_table(os.path.join(args.data_dir, f"pairs_{split}.parquet")).to_pandas()
+            f = SPL[split][si]; od = os.path.join(args.out_dir, split, os.path.basename(f).replace(".parquet", ""))
+            def loader(f=f, si=si, split=split):
+                P_all = PAIRS[split]; P = P_all[P_all["shard"] == si].reset_index(drop=True)
                 if args.n_rows: P = P.iloc[args.skip_rows: args.skip_rows + args.n_rows].reset_index(drop=True)
                 layers = sorted(set(P["i"].tolist()) | set(P["j"].tolist())); tb = pq.read_table(f, columns=[f"h_L{L}" for L in layers] + ["row"])
                 rowpos = {int(r): k for k, r in enumerate(tb.column("row").to_numpy())}; ridx = [rowpos[int(r)] for r in P["row"]]
                 HL = {L: torch.tensor(fsl(tb, f"h_L{L}", D_MODEL, np.float32)) for L in layers}
                 vi = torch.stack([HL[int(L)][k] for L, k in zip(P["i"], ridx)]); vj = torch.stack([HL[int(L)][k] for L, k in zip(P["j"], ridx)])
                 return {"v_i": vi, "v_j": vj, "v_delta": vj - vi}, len(P), P["pair_id"].tolist()
-            jobs.append((f"shard{si}:{os.path.basename(f)}", od, loader))
+            jobs.append((f"{split}:shard{si}:{os.path.basename(f)}", od, loader))
     else:
         files = sorted(sum((glob.glob(x.strip()) for x in args.data.split(",")), [])); assert files, f"no files match {args.data}"
         def loader():
