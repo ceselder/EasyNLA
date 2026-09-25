@@ -16,7 +16,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--data-dir", required=True); p.add_argument("--text", required=True, help="comma list of globs (train pools)"); p.add_argument("--val-text", default=None); p.add_argument("--out", required=True)
 p.add_argument("--steps", type=int, default=400); p.add_argument("--batch", type=int, default=8, help="per-GPU micro-batch"); p.add_argument("--grad-accum", type=int, default=4); p.add_argument("--lr", type=float, default=3e-5)
 p.add_argument("--lora-r", type=int, default=64); p.add_argument("--lora-alpha", type=int, default=16); p.add_argument("--max-len", type=int, default=160); p.add_argument("--init-adapter", default=None)
-p.add_argument("--band", default=None, help="comma list of layers to load from the store (RAM)"); p.add_argument("--samples", default=None, help="comma list of readout sample ids to keep (default all)"); p.add_argument("--val-rows", type=int, default=512); p.add_argument("--eval-every", type=int, default=100); p.add_argument("--save-every", type=int, default=200); p.add_argument("--warmup", type=int, default=20)
+p.add_argument("--band", default=None, help="comma list of layers to load from the store (RAM)"); p.add_argument("--store-device", default="cpu", help="cpu (default: the 17 GB store stays off the GPU) or cuda"); p.add_argument("--no-grad-ckpt", action="store_true", help="disable gradient checkpointing (on by default: 27B activations for batch 8 x 230 tokens OOM a 140 GB H200 without it)"); p.add_argument("--samples", default=None, help="comma list of readout sample ids to keep (default all)"); p.add_argument("--val-rows", type=int, default=512); p.add_argument("--eval-every", type=int, default=100); p.add_argument("--save-every", type=int, default=200); p.add_argument("--warmup", type=int, default=20)
 p.add_argument("--seed", type=int, default=0); p.add_argument("--wandb-project", default="nlt-qwen36-27b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--wandb-name", default=None); p.add_argument("--no-wandb", action="store_true")
 args = p.parse_args()
 import torch.distributed as dist
@@ -34,6 +34,9 @@ model = load_base(dev)
 if args.init_adapter: model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
 else: model = get_peft_model(model, LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, use_rslora=True, lora_dropout=0.0, bias="none", target_modules=lora_target_re(None), task_type="CAUSAL_LM"))
 if is_main: model.print_trainable_parameters()
+if not args.no_grad_ckpt:
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False}); model.enable_input_require_grads(); model.config.use_cache = False
+    P("[sft] gradient checkpointing ON")
 inj = InjectMarkers(model, positions=[k for k, t in enumerate(PROMPT) if t == MARKER_ID])
 
 # ---- data: text rows joined to pairs; activations from the store (CPU) ----
@@ -44,11 +47,11 @@ def load_rows(paths, split, store):
     if args.samples and "sample" in df: df = df[df["sample"].isin([int(x) for x in args.samples.split(",")])].reset_index(drop=True)
     return df
 BAND = [int(x) for x in args.band.split(",")] if args.band else None
-store = Store(args.data_dir, "train", device=dev, layers=BAND, verbose=is_main); df = load_rows(args.text, "train", store); df = df.iloc[RANK::WORLD].reset_index(drop=True)   # store on the GPU: 16 layers x 100k positions = 17 GB per rank (too much for CPU RAM x 4 ranks)
+store = Store(args.data_dir, "train", device=args.store_device, layers=BAND, verbose=is_main); df = load_rows(args.text, "train", store); df = df.iloc[RANK::WORLD].reset_index(drop=True)   # store on the GPU: 16 layers x 100k positions = 17 GB per rank (too much for CPU RAM x 4 ranks)
 P(f"[sft] {len(df)} train text rows per rank (sources {df['source'].value_counts().to_dict()}); eff batch {args.batch * args.grad_accum * WORLD}")
 store_val = dfv = None
 if args.val_text and is_main:
-    store_val = Store(args.data_dir, "val", device=dev, layers=BAND, verbose=False); dfv = load_rows(args.val_text, "val", store_val).drop_duplicates("pair_id").iloc[: args.val_rows].reset_index(drop=True)
+    store_val = Store(args.data_dir, "val", device=args.store_device, layers=BAND, verbose=False); dfv = load_rows(args.val_text, "val", store_val).drop_duplicates("pair_id").iloc[: args.val_rows].reset_index(drop=True)
     P(f"[sft] {len(dfv)} val rows")
 
 def make_batch(sub, st):
@@ -63,13 +66,14 @@ def ce_loss(sub, st):
     ids, attn, lab, vec = make_batch(sub, st); inj.set(vec, ids)
     try: out = model(input_ids=ids, attention_mask=attn, use_cache=False)
     finally: inj.off()
-    lg = out.logits[:, :-1].float(); return F.cross_entropy(lg.reshape(-1, lg.shape[-1]), lab[:, 1:].reshape(-1), ignore_index=-100)
+    lg = out.logits[:, :-1]; tgt = lab[:, 1:]; m = tgt != -100
+    return F.cross_entropy(lg[m].float(), tgt[m])                                       # response positions only: no full fp32 copy of the [B, T, 248k] logits
 @torch.no_grad()
 def evaluate():
     if dfv is None: return float("nan"), []
     model.eval(); ces = [ce_loss(dfv.iloc[a:a + args.batch], store_val).item() for a in range(0, len(dfv), args.batch)]
     sub = dfv.iloc[:3]; ids, attn, lab, vec = make_batch(sub, store_val); ids = PROMPT_T[None].repeat(3, 1).to(dev); inj.set(vec, ids)
-    try: g = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=96, do_sample=False, pad_token_id=pad_id)
+    try: g = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=96, do_sample=False, pad_token_id=pad_id, use_cache=True)
     finally: inj.off()
     model.train(); return float(np.mean(ces)), [(str(sub["text"].values[q])[:200], tok.decode(g[q, PLEN:], skip_special_tokens=True)) for q in range(3)]
 
