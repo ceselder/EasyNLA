@@ -124,7 +124,7 @@ def y_of(u, seed):
     return dirs.sqrt_d * u * torch.exp(dirs.sigma_r * torch.randn(u.shape[0], generator=g, device=dev))[:, None]
 
 with torch.no_grad():
-    _y = y_of(dirs.unit(store_val.gather(Vh_rows[:64], Vh_j[:64], dev), Vh_j[:64]), 1); P(f"[rl] target rms over 64 held-out pairs = {float(_y.pow(2).mean().sqrt()):.2f} (critic trained at ~sqrt(d) = {dirs.sqrt_d:.2f})")
+    _y = y_of(dirs.unit(store_val.gather(Vh_rows[:64], Vh_j[:64], dev), Vh_j[:64]), 1); P(f"[rl] target per-dim rms over 64 held-out pairs = {float(_y.pow(2).mean().sqrt()):.2f}, norm = {float(_y.norm(dim=-1).mean()):.1f} (critic trained on norm ~sqrt(d) = {dirs.sqrt_d:.2f}, per-dim rms ~1; a unit u would give per-dim rms {1 / dirs.sqrt_d:.3f})")
 
 # ---- critic scoring: proxy bits with shared (t, eps) ----
 @torch.no_grad()
