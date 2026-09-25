@@ -8,7 +8,13 @@ log(){ echo "[${TAG}eval] $(date -u +%H:%M) $*"; }
 run(){ if [ "${QUEUE_MODE:-0}" = 1 ]; then enqueue_eval "$1" "$2" "${PRIO:-9}"; return; fi; out=$(spawn_retry env NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script eval_bits.py --args "$1"); echo "$out" | sed "s/^/[$2] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$2"; }
 declare -A launched
 for i in $(seq 1 400); do
-  for ck in $(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null | grep -oE "ckpt_step[0-9]+\.pt" | sort -u); do
+  # the ONE-PASS stop saves ckpt_final.pt at an arbitrary step (v4 stage 1: 1791) with no ckpt_stepNNNNNN.pt -> give it a step-named copy so it gets a gate eval (the definitive one-pass-end row) and survives the next stage's ckpt_final
+  LS=$(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null)
+  if echo "$LS" | grep -q one_pass_stop.json && timeout 60 modal volume get nlt q36/critic/$TAG/one_pass_stop.json /tmp/q36_${TAG}_ops.json --force >/dev/null 2>&1; then
+    OPS=$(python3 -c "import json; print('%06d' % json.load(open('/tmp/q36_${TAG}_ops.json'))['stopped_at_step'])" 2>/dev/null)
+    if [ -n "$OPS" ] && ! echo "$LS" | grep -q "ckpt_step$OPS.pt"; then timeout 600 modal volume cp nlt q36/critic/$TAG/ckpt_final.pt q36/critic/$TAG/ckpt_step$OPS.pt >/dev/null 2>&1 && log "one-pass stop at step $OPS: ckpt_final.pt copied to ckpt_step$OPS.pt (gate eval follows)"; LS=$(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null); fi
+  fi
+  for ck in $(echo "$LS" | grep -oE "ckpt_step[0-9]+\.pt" | sort -u); do
     st=${ck#ckpt_}; st=${st%.pt}; stn=$((10#${st#step})); [ $stn -lt $MINSTEP ] && continue; [ -n "${launched[$st]:-}" ] && continue
     [ -f $D/bits_${TAG}_$st.json ] && { launched[$st]=1; continue; }
     { grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt || grep -q "\[${TAG}eval_$st\] QUEUED" $LOGD/evalq.txt; } && { launched[$st]=1; continue; }        # already launched / queued by an earlier incarnation
