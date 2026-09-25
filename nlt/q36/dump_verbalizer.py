@@ -19,7 +19,7 @@ args = ap.parse_args(); dev = "cuda"; t0 = time.time(); tok = load_tokenizer(); 
 PROMPT = change_prompt(tok); PLEN = len(PROMPT); PROMPT_T = torch.tensor(PROMPT, dtype=torch.long, device=dev)
 model = load_base(dev)
 if not args.base_only: model = PeftModel.from_pretrained(model, args.adapter); model.eval()
-inj = InjectMarkers(model); dirs = Directions(os.path.join(args.data_dir, "layer_stats.pt"), device=dev); store = Store(args.data_dir, args.split, device="cpu", layers=[int(x) for x in args.band.split(",")] if args.band else None)
+inj = InjectMarkers(model); dirs = Directions(os.path.join(args.data_dir, "layer_stats.pt"), device=dev); store = Store(args.data_dir, args.split, device=dev, layers=[int(x) for x in args.band.split(",")] if args.band else None)
 vp = pq.read_table(os.path.join(args.data_dir, f"pairs_{args.split}.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)]
 if args.pairs_text:
     have = set(load_text_pairs(sorted(sum((glob.glob(g) for g in args.pairs_text.split(",")), [])), os.path.join(args.data_dir, f"pairs_{args.split}.parquet"))["pair_id"]); vp = vp[vp["pair_id"].isin(have)]
