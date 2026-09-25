@@ -44,11 +44,11 @@ def main():
     if any(v is not None for v in curves["twins_cotrained"]): ax.plot(steps, curves["twins_cotrained"], "o-", color=C1, lw=2, label="co-trained critic"); ax.plot(steps, curves["twins_frozen"], "s-", color=C2, lw=2, label="frozen critic")
     ax.axhline(0.5, color="k", lw=0.8); ax.axhline(0.65, color=CG, ls="--", lw=1); ax.set_ylim(0.3, 1.0); ax.set_xlabel("RL step"); ax.set_ylabel("P(true crafted text > one-claim twin)"); ax.set_title("Critic health: claim twins stay separable?", fontsize=13); ax.legend(frameon=False, fontsize=9)
     ax = axes[1, 1]; ax.plot(steps, curves["tokens"], "o-", color=C4, lw=2, label="tokens per readout (held-out greedy)"); ax2 = ax.twinx(); ax2.plot(steps, np.array(curves["depth_hit_rate"]) * 100, "^--", color=C3, lw=1.5, label="depth-word hits (%)"); ax2.set_ylabel("% readouts with a depth word")
-    ax.set_xlabel("RL step"); ax.set_ylabel("tokens"); ax.set_title("Length and the no-depth-words filter", fontsize=13); ax.legend(loc="upper left", frameon=False, fontsize=9); ax2.legend(loc="upper right", frameon=False, fontsize=9)
+    ax.set_xlabel("RL step"); ax.set_ylabel("tokens"); ax.set_title("Length and the no-depth-words filter", fontsize=13); ax.legend(loc="upper left", frameon=False, fontsize=9); ax2.legend(loc="lower right", frameon=False, fontsize=9)
     ax = axes[2, 0]
     if train:
         ts = [t["step"] for t in train]; ax.plot(ts, [t["reward"] for t in train], color=C1, lw=1.5, label="mean reward per step (train rollouts)"); ax.set_xlabel("RL step"); ax.set_ylabel("reward"); ax2 = ax.twinx()
-        ax2.plot(ts, [t["kl"] for t in train], color=C3, lw=1.5, ls="--", label="KL to the SFT policy"); ax2.set_ylabel("KL (k3)"); ax2.axhline(1.0, color=C3, lw=0.8, ls=":"); ax.legend(loc="upper left", frameon=False, fontsize=9); ax2.legend(loc="upper right", frameon=False, fontsize=9)
+        ax2.plot(ts, [t["kl"] for t in train], color=C3, lw=1.5, ls="--", label="KL to the SFT policy"); ax2.set_ylabel("KL (k3)"); ax2.axhline(1.0, color=C3, lw=0.8, ls=":"); ax.legend(loc="upper left", frameon=False, fontsize=9); ax2.legend(loc="lower right", frameon=False, fontsize=9)
     ax.set_title("Reward rises while KL stays bounded?", fontsize=13)
     ax = axes[2, 1]
     if train: ax.plot([t["step"] for t in train], [t["tokens"] for t in train], color=C4, lw=1.5, label="tokens per rollout (train, mean)")
