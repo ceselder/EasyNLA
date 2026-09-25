@@ -31,8 +31,7 @@ print(f\"teacher {t['content_bits']['mean']:.1f}±{t['content_bits']['sem']:.1f}
       sed -i -E "s|^($A 4 $RL_TAG [0-9:]+)|# \1 (stopped $(date -u +%H:%M) by the exact-view rule at step $last)|" $LOGD/gpu_ledger.txt
       log "STOPPED $A at step $last by the pre-registered exact-view rule: $(echo "$V" | grep VERDICT | cut -c1-400)"; notify-discord "nlt-q36 RL $RL_TAG stopped at step $last: FM-reward RL does not move exact content (both judges within 1 sem)" 2>/dev/null || true
     fi; (cd /home/celeste/shared/reports/nlt-27b-olens && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); fi
-  A=$(grep -oE "ap-[A-Za-z0-9]+" $APPFILE 2>/dev/null | head -1); L=$(app_list)
-  if [ -n "$A" ] && [ -n "$L" ]; then if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); fi; fi     # an empty list is a transient read, not an absence
+  A=$(grep -oE "ap-[A-Za-z0-9]+" $APPFILE 2>/dev/null | head -1); if [ -n "$A" ]; then app_live "$A"; r=$?; [ $r -eq 0 ] && miss=0; [ $r -eq 1 ] && miss=$((miss + 1)); fi     # JSON liveness; a failed read (2) counts for nothing
   if [ ${miss:-0} -ge 3 ]; then     # app gone: keep pulling until every enqueued exact eval has its result (the step-40 verdict is computed from them), then stop
     pend=0; for out in "${!Q[@]}"; do [ -f $D/$out.json ] || pend=$((pend + 1)); done
     if [ $pend -eq 0 ]; then log "RL app $A ended and all $((${#Q[@]})) exact evals pulled; final pass done"; break; fi

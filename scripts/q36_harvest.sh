@@ -22,8 +22,8 @@ launch(){ p=$1; L=${LIST[$p]}
   APP[$p]=$(echo "$out" | grep -oE "ap-[A-Za-z0-9]+" | head -1); echo "${APP[$p]}" > $LOGD/harvest_app_$p.txt; log "engine $p launched: ${APP[$p]}"; }
 done_p(){ for tok in $(echo "${LIST[$1]}" | tr ',' ' '); do sp=${tok%%:*}; si=${tok##*:}; f=$(python3 -c "import json; print(json.load(open('/tmp/q36_splits.json'))['$sp'][$si].split('/')[-1].replace('.parquet',''))"); n=$(timeout 120 modal volume ls nlt q36/rollouts_layers/$sp/$f 2>/dev/null | grep -c "h_L"); m=$(timeout 120 modal volume ls nlt q36/rollouts_delta/$sp/$f 2>/dev/null | grep -c "v_delta.parquet"); [ "$n" -ge 16 ] && [ "$m" -ge 1 ] || return 1; done; return 0; }
 for i in $(seq 1 400); do
-  raw=$(app_list); [ -z "$raw" ] && { log "app list read failed (transient); skipping this round"; sleep 120; continue; }     # an empty list must never relaunch a live engine
-  live=$(echo "$raw" | grep nlt-q36 | grep -vE "stopped|stopping" | awk -F'│' '{gsub(/ /,"",$2); print $2}')
+  raw=$(app_json) || { log "app list (json) read failed (transient); skipping this round"; sleep 120; continue; }     # a failed read must never relaunch a live engine
+  live=$(echo "$raw" | awk '$2 != "stopped" && $2 != "stopping" {print $1}')
   alldone=1
   for p in $(seq 0 $((NENG - 1))); do
     a=$(cat $LOGD/harvest_app_$p.txt 2>/dev/null || true)

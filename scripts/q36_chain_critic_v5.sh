@@ -43,8 +43,7 @@ PY
 )
   ONE=$(python3 -c "import json; print(json.load(open('/tmp/q36_v5_stage.json'))['one_pass_steps_est'])"); STEP0=0; RESUME=""
   if [ $stage -gt 1 ]; then
-    PREV=$(grep -E "^\[critic_${TAG}_s$((stage - 1))\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+"); miss=0
-    for i in $(seq 1 600); do L=$(app_list); if [ -z "$L" ]; then sleep 60; continue; fi; if echo "$L" | grep -vE "stopped|stopping" | grep -q "$PREV"; then miss=0; else miss=$((miss + 1)); [ $miss -ge 3 ] && break; fi; [ $((i % 6)) -eq 0 ] && log "stage $stage: previous stage $PREV still running"; sleep 300; done
+    PREV=$(grep -E "^\[critic_${TAG}_s$((stage - 1))\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+"); log "stage $stage: waiting for the previous stage $PREV to end (JSON liveness, 3 consecutive not-live reads)"; wait_app_end "$PREV"
     for i in $(seq 1 60); do [ "$(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null | grep -c one_pass_stop.json)" -ge 1 ] && break; sleep 60; done
     STEP0=$(timeout 60 modal volume get nlt q36/critic/$TAG/one_pass_stop.json /tmp/q36_v5_stop.json --force >/dev/null 2>&1 && python3 -c "import json; print(json.load(open('/tmp/q36_v5_stop.json'))['stopped_at_step'])" || echo 0); RESUME="--resume /vol/q36/critic/$TAG/ckpt_latest.pt"
   fi
@@ -61,6 +60,6 @@ PY
   for i in $(seq 1 40); do [ "$(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null | grep -c "pair_slice_${SLICE}_critic_${TAG}_s$stage.txt")" -ge 1 ] && break; sleep 30; done
   rm -rf /tmp/q36_v5_pairs; mkdir -p /tmp/q36_v5_pairs; for f in $(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null | grep -oE "pair_slice_[0-9]+_critic_${TAG}_s[0-9]+\.txt" | sort -u); do timeout 120 modal volume get nlt q36/critic/$TAG/$f /tmp/q36_v5_pairs/$f --force >/dev/null 2>&1; done
   cat /tmp/q36_v5_pairs/*.txt 2>/dev/null | sort -u > /tmp/q36_v5_pairs_merged.txt; timeout 120 modal volume put -f nlt /tmp/q36_v5_pairs_merged.txt q36/critic/$TAG/pair_ids_trained.txt >/dev/null 2>&1 && log "trained pair ids merged: $(wc -l < /tmp/q36_v5_pairs_merged.txt) pairs -> /vol/q36/critic/$TAG/pair_ids_trained.txt"
-  miss=0; for i in $(seq 1 600); do L=$(app_list); if [ -z "$L" ]; then sleep 60; continue; fi; if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); [ $miss -ge 3 ] && break; fi; sleep 300; done; log "stage $stage app ended (3 consecutive complete listings without it)"
+  wait_app_end "$A"; log "stage $stage app $A ended (3 consecutive not-live JSON reads)"
   stage=$((stage + 1))
 done

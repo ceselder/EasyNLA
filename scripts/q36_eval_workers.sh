@@ -8,8 +8,8 @@ wid=0
 for i in $(seq 1 2000); do
   ls_=$(timeout 120 modal volume ls nlt q36/evalq 2>/dev/null | grep -oE "[0-9]_[0-9]+_[0-9]+_[A-Za-z0-9_.-]+\.json" | sort)
   pending=$(echo "$ls_" | grep -vE "\.running\.|\.done" | grep -c "\.json$" || true); running=$(echo "$ls_" | grep -c "\.running\." || true)
-  raw=$(app_list); [ -z "$raw" ] && { sleep 120; continue; }     # transient empty list: do not spawn extra workers
-  live=$(echo "$raw" | grep nlt-q36 | grep -vE "stopped|stopping" | awk -F'│' '{gsub(/ /,"",$2); print $2}' | while read a; do grep -qE "^$a 1 evalq_w" $LOGD/gpu_ledger.txt && echo $a; done | wc -l)
+  raw=$(app_json) || { sleep 120; continue; }     # failed read: do not spawn extra workers
+  live=$(echo "$raw" | awk '$2 != "stopped" && $2 != "stopping" {print $1}' | while read a; do grep -qE "^$a 1 evalq_w" $LOGD/gpu_ledger.txt && echo $a; done | wc -l)
   want=$(( pending + running )); [ $want -gt $EVAL_WORKERS ] && want=$EVAL_WORKERS
   [ $((i % 5)) -eq 0 ] && log "queue: $pending pending, $running running, $live workers live (target $want)"
   while [ "$live" -lt "$want" ]; do
