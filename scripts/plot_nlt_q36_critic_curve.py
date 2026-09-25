@@ -32,7 +32,7 @@ def main():
         d = json.load(open(f"{REP}/data/{a.ref}")); s = d["sets"]["craft_full"]; tw = d.get("twins", {}).get("craft_twins", {}).get("variants", {})
         ref = {"content": s["content_bits"]["mean"], "p_dm": s["p_z_gt_dm"], "twin_shift": tw.get("twin_shift", {}).get("p_true_gt_twin"), "twin_new": tw.get("twin_new", {}).get("p_true_gt_twin"), "label": "critic v1 step 3500 (reference judge)"}
     out = {"tag": a.tag, "rule": {"twin_p_min": PASS_TWIN, "content_min": PASS_CONTENT, "text": "twin_shift or twin_new P(true > twin) >= 0.60 with craft_full content >= 25 bits at some saved checkpoint"}, "rows": R, "reference": ref,
-           "verdict": ("PASS" if any(r["pass"] for r in R) else ("FAIL" if R and R[-1]["step"] >= 4500 else "pending"))}
+           "verdict": ("PASS" if any(r["pass"] for r in R) else ("FAIL" if R and R[-1]["step"] >= (3000 if a.tag.endswith("b") else 4500) else "pending"))}
     os.makedirs(f"{REP}/data", exist_ok=True); json.dump(out, open(f"{REP}/data/critic_{a.tag}_curve.json", "w"), indent=1)
     if not R: print("no checkpoint evals yet"); return
     st = [r["step"] for r in R]
