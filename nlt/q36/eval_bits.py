@@ -59,14 +59,42 @@ def main():
     p.add_argument("--n", type=int, default=512); p.add_argument("--n-fixed", type=int, default=2048); p.add_argument("--batch", type=int, default=32); p.add_argument("--ode-steps", type=int, default=64); p.add_argument("--probes", type=int, default=1)
     p.add_argument("--n-samples", type=int, default=4); p.add_argument("--sample-steps", type=int, default=32); p.add_argument("--skip-samples", action="store_true"); p.add_argument("--skip-sw", action="store_true")
     p.add_argument("--seed", type=int, default=0); p.add_argument("--data-device", default="cuda")
+    p.add_argument("--neighbors", default=None, help="dir of extract_neighbors.py outputs: score each text against the SAME document's (h_i, h_j) at positions t-k (k in the file) -> content(own) - content(neighbour)")
+    p.add_argument("--neighbor-n", type=int, default=256, help="rows per set for the neighbour control (exact ODE passes are 2 per offset)")
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed); t_all = time.time()
     from nlt.eval_bits.exact import exact_logp, make_probe_bank
     from nlt.critic.text_encoder import TextEncoder
     model, aa, step = load_critic(a.ckpt, dev); sigma_r = float(aa.get("sigma_r", 0.1))
     dirs = Directions(a.stats or aa.get("stats_path") or os.path.join(a.data_dir, "layer_stats.pt"), sigma_r, dev)
     store = Store(a.data_dir, "val", device=a.data_device); d = store.d
+    NB = None                                                     # neighbour activations: {(shard, row) -> index}, tensors per (L, k)
+    if a.neighbors:
+        import glob as _g, json as _json
+        spl = _json.load(open(os.path.join(a.data_dir, "splits.json")))["val"]; NB = {"idx": {}, "H": {}, "has": {}}
+        for si, f in enumerate(spl):
+            nf = os.path.join(a.neighbors, os.path.basename(f))
+            if not os.path.exists(nf): continue
+            tb = pq.read_table(nf); names = tb.schema.names; rows_ = tb.column("row").to_numpy(); offs = sorted(int(c[5:]) for c in names if c.startswith("has_m"))
+            base = len(NB["idx"])
+            for q, r in enumerate(rows_): NB["idx"][(si, int(r))] = base + q
+            for k in offs:
+                NB["has"].setdefault(k, []).append(torch.tensor(tb.column(f"has_m{k}").to_numpy()))
+                for L in store.layers:
+                    c = f"h_L{L}_m{k}"
+                    if c in names: NB["H"].setdefault((L, k), []).append(torch.tensor(tb.column(c).combine_chunks().flatten().to_numpy(zero_copy_only=False).reshape(tb.num_rows, d).astype(np.float16)))
+        NB["offs"] = sorted({k for (_, k) in NB["H"]}); NB["H"] = {key: torch.cat(v) for key, v in NB["H"].items()}; NB["has"] = {k: torch.cat(v) for k, v in NB["has"].items()}
+        print(f"[bits] neighbours: {len(NB['idx'])} positions, offsets {NB['offs']}", flush=True)
+    def nb_gather(kk, layer_vec, k):
+        """neighbour activations at t-k for the fixed-set rows kk (list) at per-row layers -> [B, d] fp16 (cpu); rows without a neighbour get zeros + mask False"""
+        out = torch.zeros((len(kk), d), dtype=torch.float16); ok = torch.zeros(len(kk), dtype=torch.bool)
+        for q, k_ in enumerate(kk):
+            key = (int(vp["shard"].iloc[k_]) if "shard" in vp else int(vp["pos_idx"].iloc[k_]) // 1_000_000, int(vp["pos_idx"].iloc[k_]) % 1_000_000)
+            n_ = NB["idx"].get(key)
+            if n_ is None or not bool(NB["has"][k][n_]): continue
+            out[q] = NB["H"][(int(layer_vec[q]), k)][n_]; ok[q] = True
+        return out, ok
     encoder = TextEncoder(aa.get("enc_model", "Qwen/Qwen3-0.6B"), int(aa.get("enc_layer", 20)), dev, int(aa.get("enc_max_len", 192)))
-    vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)].iloc[: a.n_fixed].reset_index(drop=True); NF = len(vp)
+    vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet"), columns=["pair_id", "pos_idx", "i", "j", "shard"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)].iloc[: a.n_fixed].reset_index(drop=True); NF = len(vp)
     rows_all = store.rows_for(vp["pos_idx"].values); I_all = torch.tensor(vp["i"].values.astype(np.int64)); J_all = torch.tensor(vp["j"].values.astype(np.int64)); pid_all = vp["pair_id"].tolist()
     g = torch.Generator().manual_seed(a.seed + 1); s_all = torch.exp(sigma_r * torch.randn(NF, generator=g)); eps_all = torch.randn(NF, d, generator=g); eps_samp = torch.randn(a.n_samples, NF, d, generator=g)
     probe_bank = make_probe_bank(a.ode_steps, a.probes, d, torch.Generator().manual_seed(a.seed + 2)); rng_sw = np.random.default_rng(a.seed + 7)
@@ -119,6 +147,26 @@ def main():
                 lp, cm, cs, csm = lp_batch(kk, tx[s0:s0 + B]); LP[key][s0:s0 + B] = lp; COS[key][s0:s0 + B] = cm
                 if cs is not None: CS[key][s0:s0 + B] = cs; CSM[key][s0:s0 + B] = csm
             print(f"[bits] {label}: {min(n, s0 + a.batch)}/{n} rows, {time.time() - t0:.0f}s", flush=True)
+        NBRES = {}
+        if NB is not None:
+            nn = min(a.neighbor_n, n); sub = idx[:nn]; sub_texts = texts[:nn]; sub_dm = dm_texts[:nn]
+            for k in NB["offs"]:
+                lp_u = torch.zeros(nn); lp_c = torch.zeros(nn); lp_d = torch.zeros(nn); okall = torch.zeros(nn, dtype=torch.bool)
+                for s0 in range(0, nn, a.batch):
+                    kk = sub[s0:s0 + a.batch]; B = len(kk); i = I_all[kk]; j = J_all[kk]
+                    hi_nb, ok_i = nb_gather(kk, i, k); hj_nb, ok_j = nb_gather(kk, j, k); ok = ok_i & ok_j; okall[s0:s0 + B] = ok
+                    if not ok.any(): continue
+                    src_nb = dirs.source(hi_nb.to(dev), i); y_nb, _ = dirs.target(hj_nb.to(dev), j, s=s_all[kk].to(dev))
+                    lp_u[s0:s0 + B] = exact_logp(model, y_nb, src_nb, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank).cpu()
+                    with torch.autocast("cuda", dtype=torch.bfloat16): e_c, m_c = encoder(sub_texts[s0:s0 + B]); e_d, m_d = encoder(sub_dm[s0:s0 + B])
+                    lp_c[s0:s0 + B] = exact_logp(model, y_nb, src_nb, enc=e_c, enc_mask=m_c, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank).cpu()
+                    lp_d[s0:s0 + B] = exact_logp(model, y_nb, src_nb, enc=e_d, enc_mask=m_d, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank).cpu()
+                okn = okall.numpy(); cont_nb = ((lp_c - lp_d) / math.log(2)).numpy(); cont_own = ((LP["c"][:nn] - LP["dm"][:nn]) / math.log(2)).numpy(); pmi_nb = ((lp_c - lp_u) / math.log(2)).numpy()
+                if okn.sum() >= 8:
+                    dd = cont_own[okn] - cont_nb[okn]
+                    NBRES[f"m{k}"] = {"n": int(okn.sum()), "content_neighbour": float(cont_nb[okn].mean()), "content_own_same_rows": float(cont_own[okn].mean()), "double_diff": float(dd.mean()), "double_diff_sem": float(dd.std() / math.sqrt(okn.sum())),
+                                      "frac_content_kept_at_neighbour": float(cont_nb[okn].mean() / cont_own[okn].mean()) if abs(cont_own[okn].mean()) > 1e-6 else None, "p_own_gt_neighbour": float((dd > 0).mean()), "pmi_neighbour": float(pmi_nb[okn].mean())}
+                    print(f"[bits] {label} neighbour -{k}: content own {cont_own[okn].mean():.1f} vs neighbour {cont_nb[okn].mean():.1f} bits (double diff {dd.mean():.1f} +- {dd.std() / math.sqrt(okn.sum()):.1f}, kept {NBRES[f'm{k}']['frac_content_kept_at_neighbour']}), n {okn.sum()}", flush=True)
         i_np = I_all[idx].numpy(); j_np = J_all[idx].numpy(); b = {k: ((LP[k] - LP["u"]) / math.log(2)).numpy() for k in ("c", "dm", "rp", "sw")}
         ntok = float(np.mean([len(encoder.tok(z, add_special_tokens=False)["input_ids"]) for z in texts]))
         res = {"n": n, "n_common": sum(1 for k in idx if k in set(common)), "pair_ids": [pid_all[k] for k in idx], "n_tokens_mean": ntok,
@@ -126,7 +174,7 @@ def main():
                "content_bits": summarize(b["c"] - b["dm"], i_np, j_np), "content_rp_bits": summarize(b["c"] - b["rp"], i_np, j_np),
                "p_z_gt_dm": float((b["c"] > b["dm"]).mean()), "p_z_gt_rp": float((b["c"] > b["rp"]).mean()), "p_z_gt_sw": float((b["c"] > b["sw"]).mean()) if not a.skip_sw else None, "p_z_gt_null": float((b["c"] > 0).mean()),
                "content_per_token": float((b["c"] - b["dm"]).mean() / max(1e-9, ntok)), "bits_per_token": float(b["c"].mean() / max(1e-9, ntok)), "uncond_nll_bits_per_dim": float(-LP["u"].mean() / (d * math.log(2))),
-               "cos_condmean": {k: float(COS[k].mean()) for k in COS}, "cos_samples": {k: float(CS[k].mean()) for k in CS}, "cos_sample_mean": {k: float(CSM[k].mean()) for k in CSM}, "p_cos_c_gt_u": float((COS["c"] > COS["u"]).mean()),
+               "neighbours": NBRES, "cos_condmean": {k: float(COS[k].mean()) for k in COS}, "cos_samples": {k: float(CS[k].mean()) for k in CS}, "cos_sample_mean": {k: float(CSM[k].mean()) for k in CSM}, "p_cos_c_gt_u": float((COS["c"] > COS["u"]).mean()),
                "per_row": {"pmi": b["c"].round(3).tolist(), "dm": b["dm"].round(3).tolist(), "rp": b["rp"].round(3).tolist(), "cos_c": COS["c"].numpy().round(4).tolist(), "cos_u": COS["u"].numpy().round(4).tolist()}}
         results["sets"][label] = res
         print(f"[bits] {label}: PMI {res['pmi_bits']['mean']:.1f} | dm {res['dm_bits']['mean']:.1f} | rp {res['rp_bits']['mean']:.1f} | CONTENT {res['content_bits']['mean']:.1f} +- {res['content_bits']['sem']:.1f} | P(z>dm) {res['p_z_gt_dm']:.3f} P(z>rp) {res['p_z_gt_rp']:.3f} | cos condmean u {res['cos_condmean']['u']:.3f} c {res['cos_condmean']['c']:.3f} dm {res['cos_condmean']['dm']:.3f} | cos samples u {res['cos_samples']['u']:.3f} c {res['cos_samples']['c']:.3f} | {ntok:.0f} tok", flush=True)
