@@ -128,6 +128,26 @@ J-lens subset = {fl['n_subset']}/{res['n']} prompts where the J-lens flips withi
 <p><b>Matched-KL table</b> (best flip rate / target mention within each KL budget, per family):</p>{table('B')}<details><summary>type A (word swap in the full explanation) and subset figures</summary>{table('A')}
 <figure><img src="unclip_steer_v2_frontier_A.png" alt="type A frontier"></figure><figure><img src="unclip_steer_v2_frontier_B_subset.png" alt="type B, J-lens subset"></figure></details>
 <p>Code: <code>scripts/unclip_steer_v2.py</code> (harness), <code>scripts/unclip_steer_v2_plot.py</code>; raw rows: <code>data/unclip/steer_{a.tag}.json</code>. Earlier animal-swap continuation eval: <code>unclip_steer_dec_main_262M_phone.png</code>, <code>data/unclip/steer_dec_main_262M.json</code>.</p>'''
+    # ---- earlier continuation evals (animal / object swaps): readout-vs-generation gap table
+    prev = ""
+    for tg, cpt in (("dec_main_262M", "animal"), ("dec_main_262M_object", "object")):
+        pth = f"{D}/steer_{tg}.json"
+        if not os.path.exists(pth): continue
+        Sx = json.load(open(pth))["summary"]
+        def row(nm, lb):
+            s_ = Sx.get(nm)
+            if not s_: return ""
+            rb = f"{100 * s_['readback_names_tgt']:.0f}% / {100 * s_['readback_names_src']:.0f}%" if "readback_names_tgt" in s_ else "—"
+            return f"<tr><td>{html.escape(lb)}</td><td class='num'>{100 * s_['tgt_mention']:.0f}%</td><td class='num'>{100 * s_['clean_swap']:.0f}%</td><td class='num'>{s_['tgt_rank_median']:.0f} ({100 * s_['tgt_rank_le10']:.0f}%)</td><td class='num'>{rb}</td><td class='num'>{s_['kl1_median']:.2f}</td><td class='num'>{s_['cos_c_mean']:.2f}</td></tr>"
+        prev += f"<p><b>{cpt} swap, 24 prompts × 4 continuations</b> (<code>unclip_steer_{tg}_phone.png</code>, <code>data/unclip/steer_{tg}.json</code>):</p><table><tr><th>anchor edit</th><th class='num'>target mention</th><th class='num'>clean swap</th><th class='num'>J-rank of target, median (≤10)</th><th class='num'>read-back names target / source</th><th class='num'>KL1 med</th><th class='num'>centred cos</th></tr>"
+        for nm, lb in (("none", "no edit"), ("jadd_b1", "J-lens direction β=1 (control)"), ("jadd_on_b0.25", "J-lens direction, every position β=0.25"), ("tdiff_a2_cfg2", "unCLIP pooled text diff α=2, CFG 2"), ("tdiff_a4_cfg2", "unCLIP pooled text diff α=4, CFG 2"),
+                       ("tdiff_a4_cfg4", "unCLIP pooled text diff α=4, CFG 4"), ("gtext_cfg2", "unCLIP decode under g(z′)"), ("pdiff_a4_cfg2", "unCLIP prior-read diff α=4, CFG 2"), ("prior_inv_cfg2", "unCLIP prior sample e′~p(e|z′), CFG 2"), ("tdirT_b1", "displacement of pooled diff as direction β=1"), ("recon", "round trip (control)"), ("var_1", "variation (control)")):
+            prev += row(nm, lb)
+        prev += "</table>"
+    if prev:
+        frag += ("<details open><summary>Continuation-based swaps on the animal and object sets (same decoder / prior): the readout moves, the generation does not</summary>" + prev +
+                 "<p>On the object set the α=4 pooled text diff makes the edited anchor read as the target by both the J-lens (median rank 6) and the verbalizer (67% name the target), while the 40-token continuation mentions it in 2–4% of samples vs 41% for the J-lens direction. "
+                 "The embedding edit reaches the concept representation the lenses read without changing what the model generates; v2 above measures that gap at the next token directly.</p></details>")
     open(f"{REP}/unclip_steer_section.html", "w").write(frag)
     print(f"[plot] {figs['B'][0]}.png | {figs['A'][0]}.png | embed ratio B/A {ratio}\n[claim] {figs['B'][1]}")
     for lb, m in tab["B"]: print(f"[matched B] {lb:52s} " + " ".join(f"KL<={B}: {100 * m[B]['flip_rate']:.0f}%/{100 * m[B]['tgt_mention']:.0f}%" if m[B] else f"KL<={B}: —" for B in budgets))
