@@ -31,7 +31,7 @@ def main(paths, stem="unclip_decoder"):
         if "fm" not in r: continue
         ts = np.array(r["fm"]["ts"]); y = np.array(r["fm"]["bits_density_per_t"]); s = np.array(r["fm"]["bits_density_per_t_sem"])
         tz = getattr(np, "trapezoid", None) or np.trapz; i0 = ts.tolist().index(0.1) if 0.1 in ts.tolist() else 0; part = float(tz(y[i0:], ts[i0:]))
-        a.plot(ts, y, "-o", ms=3, color=C["cond"] if k == 0 else C["alt"], label=f"gold e: ∫(t ≥ 0.1) = {part:.0f} bits" + (f", exact PMI {r['exact']['pmi_bits']['mean']:.0f}" if "exact" in r else "")); a.fill_between(ts, y - s, y + s, alpha=.2, color=C["cond"] if k == 0 else C["alt"])
+        a.plot(ts, y, "-o", ms=3, color=C["cond"] if k == 0 else C["alt"], label=f"gold e: ∫(t ≥ 0.1) = {part:.0f} bits" + (f", exact PMI vs fixed prior {r['exact']['pmi_vs_ref_prior_bits']['mean']:.0f}" if "exact" in r and "pmi_vs_ref_prior_bits" in r["exact"] else (f", exact PMI {r['exact']['pmi_bits']['mean']:.0f}" if "exact" in r else ""))); a.fill_between(ts, y - s, y + s, alpha=.2, color=C["cond"] if k == 0 else C["alt"])
         data[f"elbo_partial_t_ge_0.1_{nm}"] = part
         ys = np.array(r["fm"]["loss"]["uncond"]) - np.array(r["fm"]["loss"]["shuf"]); a.plot(ts, 5120 * (1 - ts) / ts * ys / np.log(2), "--", color=C["shuf"], label="shuffled e (control)" if k == 0 else None)
         data[f"bits_density_{nm}"] = {"ts": ts.tolist(), "gold": y.tolist(), "sem": s.tolist()}
@@ -63,11 +63,15 @@ def main(paths, stem="unclip_decoder"):
     # (4) exact PMI histogram
     a = ax[1, 1]
     if "exact" in r:
-        pmi = np.array(r["exact"]["per_row_pmi_bits"]); a.hist(pmi, bins=40, color=C["cond"], alpha=.8, label=f"gold e: {pmi.mean():.0f} ± {pmi.std() / np.sqrt(len(pmi)):.0f} bits, {100 * (pmi > 0).mean():.0f}% > 0")
-        a.axvline(r["exact"]["shuf_bits"]["mean"], color=C["shuf"], ls="--", label=f"shuffled e (mean {r['exact']['shuf_bits']['mean']:.0f} bits)"); a.axvline(0, color="k", lw=.5)
-        a.set_xlabel("exact log₂ p(h|e) − log₂ p(h) per activation (bits)"); a.set_ylabel("clean1 activations"); a.legend(loc="upper left")
+        pmi = np.array(r["exact"]["per_row_pmi_bits"]); ref = np.array(r["exact"]["per_row_pmi_vs_ref_bits"]) if "per_row_pmi_vs_ref_bits" in r["exact"] else None
+        if ref is not None:   # HEADLINE: against the FIXED original prior (the co-trained model's own unconditional branch drifts); own-branch PMI secondary
+            a.hist(ref, bins=40, color=C["cond"], alpha=.85, label=f"vs FIXED original prior: {ref.mean():.0f} ± {ref.std() / np.sqrt(len(ref)):.0f} bits [headline]")
+            a.hist(pmi, bins=40, histtype="step", color=C["alt"], lw=1.5, label=f"vs own unconditional branch: {pmi.mean():.0f} ± {pmi.std() / np.sqrt(len(pmi)):.0f} bits")
+        else: a.hist(pmi, bins=40, color=C["cond"], alpha=.8, label=f"gold e: {pmi.mean():.0f} ± {pmi.std() / np.sqrt(len(pmi)):.0f} bits, {100 * (pmi > 0).mean():.0f}% > 0")
+        a.axvline(r["exact"]["shuf_bits"]["mean"], color=C["shuf"], ls="--", label=f"shuffled e (own branch, mean {r['exact']['shuf_bits']['mean']:.0f} bits)"); a.axvline(0, color="k", lw=.5)
+        a.set_xlabel("exact log₂ p(h|e) − log₂ p(h) per activation (bits)"); a.set_ylabel("clean1 activations"); a.legend(loc="upper left", fontsize=10)
         a.set_title(f"How many bits of h does e carry? Exact ODE PMI\n({r['exact']['ode_steps']} Heun steps, {r['n']} held-out activations)")
-        data["exact"] = {"pmi_mean": float(pmi.mean()), "pmi_sem": float(pmi.std() / np.sqrt(len(pmi))), "frac_pos": float((pmi > 0).mean()), "shuf_mean": r["exact"]["shuf_bits"]["mean"], "bpd_uncond": r["exact"]["bits_per_dim_uncond"], "bpd_cond": r["exact"]["bits_per_dim_cond"]}
+        data["exact"] = {"pmi_vs_fixed_prior_mean": (float(ref.mean()) if ref is not None else None), "pmi_vs_fixed_prior_sem": (float(ref.std() / np.sqrt(len(ref))) if ref is not None else None), "pmi_own_uncond_mean": float(pmi.mean()), "pmi_own_uncond_sem": float(pmi.std() / np.sqrt(len(pmi))), "frac_pos": float((pmi > 0).mean()), "shuf_mean": r["exact"]["shuf_bits"]["mean"], "bpd_uncond": r["exact"]["bits_per_dim_uncond"], "bpd_cond": r["exact"]["bits_per_dim_cond"]}
     if has_var:   # (5) do variations keep the semantics? CLIP text-encoder similarity of the verbalizations; (6) their geometry
         v = r["var"]; a = ax[2, 0]; ts_ = v["text_sim"]
         keys = [("verbalized_h_vs_gold", "AV(h) vs gold z"), ("variation_vs_gold", "AV(variation)\nvs gold z"), ("variation_vs_verbalized_h", "AV(variation)\nvs AV(h)"), ("uncond_sample_vs_gold", "AV(uncond.\nsample) vs gold"), ("gold_vs_other_row_gold", "gold z vs\nother row's gold")]

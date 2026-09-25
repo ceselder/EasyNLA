@@ -248,6 +248,11 @@ def main():
     else: rank, world = 0, 1; dev = torch.device("cuda" if torch.cuda.is_available() and not a.cpu_test else "cpu")
     is0 = rank == 0; torch.manual_seed(a.seed); os.makedirs(a.out, exist_ok=True)
     if dev.type == "cuda": torch.backends.cuda.matmul.allow_tf32 = True
+    if a.export_latest and os.path.exists(os.path.join(a.out, "latest", "meta.json")):   # export: take the RUN's coordinate settings from its checkpoint, not from the CLI
+        ma = json.load(open(os.path.join(a.out, "latest", "meta.json"))).get("args", {})
+        for k in ("dir_space", "radial_sigma", "init_from", "stats", "encoder_json", "prior", "prior_weights", "gate_rank", "d_c", "n_slots", "n_heads", "d_head", "p_uncond", "lr", "prior_lr", "freeze_prior", "batch", "grad_accum", "tag"):
+            if k in ma: setattr(a, k, ma[k])
+        if is0: print(f"[dec] export: run settings restored from latest/meta.json (space {'dir' if a.dir_space else 'std'}, tag {a.tag})", flush=True)
     norm = Normalizer.load(a.stats).to(dev)            # the flow prior's standardised space (also the encoder's input space)
     dnorm = DirNormalizer(a.dir_space).to(dev) if a.dir_space else None; err_map = dnorm.W_inv if dnorm is not None else None   # PriorGrad-A: loss = squared error mapped back to h_dir coordinates
     from nla.unclip.encoder import load_encoder, ActEncoder
