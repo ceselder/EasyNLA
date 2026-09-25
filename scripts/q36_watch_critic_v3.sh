@@ -58,7 +58,7 @@ import json; d=json.load(open('$D/$f')); s=d['sets']['craft_full']; tw=d.get('tw
 m=lambda x: x['mean'] if isinstance(x, dict) else x
 print(f\"content {s['content_bits']['mean']:.1f} P {s['p_z_gt_dm']:.3f} rp-content {m(s['content_rp_bits']):.1f} | twin_shift P {tw.get('twin_shift',{}).get('p_true_gt_twin',float('nan')):.3f} twin_new P {tw.get('twin_new',{}).get('p_true_gt_twin',float('nan')):.3f} (FM view {tw.get('twin_shift',{}).get('proxy_p_true_gt_twin',float('nan')):.3f} / {tw.get('twin_new',{}).get('proxy_p_true_gt_twin',float('nan')):.3f}) | neigh m1/m4/m16 dd {' / '.join(f\"{s['neighbours'][k]['double_diff']:.1f}\" for k in ('m1','m4','m16') if k in s.get('neighbours',{}))}\")" 2>&1 | tail -n 1)"
   done
-  if [ $new -eq 1 ]; then systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_critic_curve.py --tag $TAG 2>&1 | grep -iE "error|traceback|PASS|FAIL" | head -3; (cd $REP && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); log "curve replotted + report built"; fi
+  if [ $new -eq 1 ]; then systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_twin_curve.py 2>&1 | grep -E "^saved|Traceback|Error" | head -2; systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_critic_curve.py --tag $TAG 2>&1 | grep -iE "error|traceback|PASS|FAIL" | head -3; (cd $REP && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); log "curve replotted + report built"; fi
   [ -f $D/bits_${TAG}_step003000.json ] || [ -f $D/bits_${TAG}_step004500.json ] && { log "${TAG} GATE EVALS DONE"; break; }
   sleep 300
 done
