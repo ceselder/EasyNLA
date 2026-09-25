@@ -39,6 +39,11 @@ if E and E[-1].get("empty_rate", 0) > 0.5: print(f"STOP empty outputs: {E[-1]['e
 if len(E) >= 4:
     c = [x["cotrained/content_bits"] for x in E[-4:]]; f = [x["frozen/content_bits"] for x in E[-4:]]
     if c[-1] - c[0] > 8 and f[-1] - f[0] <= 1: print(f"STOP collusion: cotrained content {c[0]:.1f}->{c[-1]:.1f} while frozen {f[0]:.1f}->{f[-1]:.1f}")
+# teacher-reference collusion flag (report, not stop): the co-trained critic scores the fixed TEACHER text lower than at step 0 while scoring the policy higher
+if len(E) >= 2 and E[-1].get("cotrained/teacher_content_bits") is not None and E[0].get("cotrained/teacher_content_bits") is not None:
+    dt = E[-1]["cotrained/teacher_content_bits"] - E[0]["cotrained/teacher_content_bits"]; dp = E[-1]["cotrained/content_bits"] - E[0]["cotrained/content_bits"]
+    if dt < -3 and dp > 3: print(f"FLAG collusion-vs-teacher: co-trained critic teacher {E[0]['cotrained/teacher_content_bits']:.1f}->{E[-1]['cotrained/teacher_content_bits']:.1f} while policy {E[0]['cotrained/content_bits']:.1f}->{E[-1]['cotrained/content_bits']:.1f} (frozen judge: teacher {E[-1].get('frozen/teacher_content_bits', float('nan')):.1f}, policy {E[-1]['frozen/content_bits']:.1f})")
+    if dt < -10 and dp > 3 and E[-1]["frozen/content_bits"] - E[0]["frozen/content_bits"] <= 1: print(f"STOP collusion-vs-teacher: co-trained critic drops the teacher by {-dt:.1f} bits while the frozen judge does not move")
 PY
 )
   [ -n "$verdict" ] && echo "$verdict" | sed "s/^/[watchrl] $(date -u +%H:%M) /"
