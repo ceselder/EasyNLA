@@ -12,7 +12,9 @@ for f in $(ls_q | grep -vE "\.running\.|\.done"); do
   timeout 120 modal volume cp nlt $Q/$f $H/$f >/dev/null 2>&1 && timeout 120 modal volume rm nlt $Q/$f >/dev/null 2>&1 && log "held $f" || log "hold of $f FAILED (left in place)"
 done
 # (b) wait for the running jobs to finish (prio-0 RL exact specs may arrive and run meanwhile)
-for i in $(seq 1 90); do r=$(ls_q | grep -c "\.running\." || true); [ "$r" -eq 0 ] && break; [ $((i % 5)) -eq 0 ] && log "waiting: $r job(s) still running"; sleep 60; done
+for i in $(seq 1 90); do
+  for f in $(ls_q | grep -vE "\.running\.|\.done" | grep -vE "^0_"); do timeout 120 modal volume cp nlt $Q/$f $H/$f >/dev/null 2>&1 && timeout 120 modal volume rm nlt $Q/$f >/dev/null 2>&1 && log "held (arrived during the drain) $f"; done   # keep holding what the watchers enqueue meanwhile; prio-0 RL exact specs stay live
+  r=$(ls_q | grep -c "\.running\." || true); [ "$r" -eq 0 ] && break; [ $((i % 5)) -eq 0 ] && log "waiting: $r job(s) still running"; sleep 60; done
 # (c) stop the old workers
 L=$(app_list); [ -z "$L" ] && { sleep 60; L=$(app_list); }
 for a in $(grep -E "^ap-[A-Za-z0-9]+ 1 evalq_w" $LOGD/gpu_ledger.txt | awk '{print $1}'); do
