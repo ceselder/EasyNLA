@@ -36,13 +36,13 @@ def series(runs, f):
 def main():
     R = {r: load(r) for r in ("dec_main", "dec_dir")}; data = {}
     if not R["dec_main"]: print("no dec_main snapshot JSONs"); return
-    fig, ax = plt.subplots(2, 2, figsize=(12, 9.5))
+    fig, ax = plt.subplots(2, 2, figsize=(13, 10))
     def cfg2(d, key): return d["recon"]["cfg2"][key]
     panels = [
-        (ax[0, 0], lambda d: (cfg2(d, "cos_centered")["mean"], cfg2(d, "cos_centered")["sem"]), "centered cos(h'−μ, h−μ), CFG 2 sample", "Reconstruction from e alone: direction-space flow vs\nstandardised-h flow (centered cosine, 50 Heun, CFG 2)", (0, 1)),
-        (ax[0, 1], lambda d: (d["kl"]["kl"]["cfg2"]["median"], 0.0), "next-token KL(base ‖ patched), median nats (h' at ‖h‖)", "Downstream fidelity of the spliced CFG-2 sample:\nnext-token KL to the original (lower is better)", None),
-        (ax[1, 0], lambda d: ((d["exact"]["pmi_vs_ref_prior_bits"]["mean"], d["exact"]["pmi_vs_ref_prior_bits"]["sem"]) if "pmi_vs_ref_prior_bits" in d["exact"] else (d["exact"]["pmi_bits"]["mean"], d["exact"]["pmi_bits"]["sem"])), "exact log₂ p(h|e) − log₂ p(h) (bits)", "Bits of h carried by e (exact ODE PMI): dec_main vs the FIXED\nprior; dec_dir vs its own branch (dir coordinates, not comparable)", None),
-        (ax[1, 1], lambda d: (d["var"]["text_sim"]["variation_vs_gold"]["mean"], d["var"]["text_sim"]["variation_vs_gold"]["sem"]), "CLIP text similarity of AV(variation) to the gold explanation", "Variations read back by the warm-start AV keep the\nexplanation's semantics (higher = closer to the gold text)", (0, 1)),
+        (ax[0, 0], lambda d: (cfg2(d, "cos_centered")["mean"], cfg2(d, "cos_centered")["sem"]), "centered cos(h'−μ, h−μ) of the CFG-2 sample", "Reconstruction from e alone (centered cosine, 50 Heun, CFG 2):\ndirection-space flow vs standardised-h flow", (0, 1)),
+        (ax[0, 1], lambda d: (d["kl"]["kl"]["cfg2"]["median"], 0.0), "median next-token KL, nats (h' spliced at ‖h‖)", "Downstream fidelity of the spliced CFG-2 sample:\nnext-token KL to the original (lower is better)", (0.005, 10)),
+        (ax[1, 0], lambda d: ((d["exact"]["pmi_vs_ref_prior_bits"]["mean"], d["exact"]["pmi_vs_ref_prior_bits"]["sem"]) if "pmi_vs_ref_prior_bits" in d["exact"] else (d["exact"]["pmi_bits"]["mean"], d["exact"]["pmi_bits"]["sem"])), "exact PMI (bits per activation)", "Bits of h carried by e (exact ODE PMI): dec_main vs the FIXED\nprior; dec_dir vs its own branch (dir coordinates, dashed)", (0, None)),
+        (ax[1, 1], lambda d: (d["var"]["text_sim"]["variation_vs_gold"]["mean"], d["var"]["text_sim"]["variation_vs_gold"]["sem"]), "CLIP text-sim: AV(variation) vs gold explanation", "Variations read back by the warm-start AV keep the\nexplanation's semantics (higher = closer to the gold text)", (0, 1)),
     ]
     for a, f, yl, title, ylim in panels:
         for run in ("dec_main", "dec_dir"):
@@ -57,11 +57,14 @@ def main():
         if "similarity" in yl:
             d0 = R["dec_main"][0]
             if "var" in d0: a.axhline(d0["var"]["text_sim"]["verbalized_h_vs_gold"]["mean"], color=C["base"], ls=":", label=f"AV(h itself) vs gold ({d0['var']['text_sim']['verbalized_h_vs_gold']['mean']:.3f})")
-        a.set_xlabel("fresh activations seen within the run (millions)"); a.set_ylabel(yl); a.set_title(title); a.grid(alpha=.3)
-        if ylim: a.set_ylim(*ylim)
+        a.set_xlabel("fresh activations seen within the run (millions)"); a.set_ylabel(yl); a.set_title(title); a.grid(alpha=.3); a.margins(x=0.15)
+        if ylim:
+            lo, hi = ylim
+            if hi is None: hi = max([max(v["y"]) for r_ in data.values() for k_, v in r_.items() if k_ == yl] + [1]) * 1.25
+            a.set_ylim(lo, hi)
         a.legend(loc="best")
     fig.suptitle("unCLIP decoder: standardised-h flow (dec_main) vs direction-space flow (dec_dir) at matched fresh-activation counts", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.965))
+    fig.tight_layout(rect=(0, 0, 1, 0.965)); fig.subplots_adjust(wspace=0.32, hspace=0.42)
     for ext in ("png", "pdf"): fig.savefig(os.path.join(REP, f"unclip_decoder_compare.{ext}"), dpi=150)
     json.dump(data, open(os.path.join(U, "unclip_decoder_compare.json"), "w"), indent=1); print("wrote", os.path.join(REP, "unclip_decoder_compare.png"))
 
