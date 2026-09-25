@@ -43,7 +43,7 @@ if [ "$(nfiles q36/text/$TAG/val 'describer_sonnet5_A__')" -lt 1 ]; then
   TR=$(timeout 120 modal volume ls nlt q36/text/$TAG/train 2>/dev/null | grep describer_inputs__ | sort | head -n $N_DESC_TRAIN)
   for f in $TR; do timeout 300 modal volume get nlt "$f" $DL/in/train__$(basename $f) --force >/dev/null 2>&1; done
   log "describer inputs pulled: $(ls $DL/in | wc -l) files"
-  VIN=$(ls $DL/in/val__*.parquet | head -n 2 | tr '\n' ' '); TIN=$(ls $DL/in/train__*.parquet | tr '\n' ' ')
+  VIN=$(ls $DL/in/val__*.parquet | head -n 1 | tr '\n' ' '); TIN=$(ls $DL/in/train__*.parquet | tr '\n' ' ')
   systemd-run --user --scope -q -p MemoryMax=2G with-local-keys python3 nlt/q36/describe.py sonnet --inputs $VIN --out $DL/out/val/describer_sonnet5_A__val.parquet --variant A --concurrency 48 > $DL/desc_val_A.log 2>&1 &
   P1=$!
   systemd-run --user --scope -q -p MemoryMax=2G with-local-keys python3 nlt/q36/describe.py sonnet --inputs $TIN --out $DL/out/train/describer_sonnet5_A__train.parquet --variant A --concurrency 48 > $DL/desc_train_A.log 2>&1 &
