@@ -55,7 +55,7 @@ def main():
               ("number", "other_doc", "floor", "Numbers vs a number from another document\nabove the floor"),
               ("name", "other_doc", "floor", "Names vs a name from another document\nabove the floor"),
               ("quote", "other_doc", "floor", "Quoted spans vs a span from another document\nabove the floor")]
-    fig, axes = plt.subplots(3, 2, figsize=(12, 13.5)); axes = axes.ravel()
+    fig, axes = plt.subplots(3, 2, figsize=(12, 15)); axes = axes.ravel()
     for i, (typ, task, control, title) in enumerate(panels):
         ax = axes[i]
         if typ not in R: ax.set_visible(False); continue
@@ -70,7 +70,7 @@ def main():
             xs = [c[0] for c in cv]; ys = [c[1] for c in cv]; ns = cv[-1][4]
             ax.plot(xs, ys, marker="o", color=BCOL[b], label=f"k={b} (n_test={ns})")
         ax.set_xscale("log"); ax.axhline(0, color="k", lw=0.8, ls=":"); ax.set_xlabel("training rows (stratified over distances; best capacity per size)"); ax.set_ylabel("accuracy above control")
-        ax.set_title(title); ax.legend(loc="upper left", ncol=2); ax.grid(alpha=0.25, which="both")
+        ax.set_title(title); ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3, frameon=False); ax.grid(alpha=0.25, which="both")
     # panel 6: capacity breakdown for far-back numbers (k >= 2) on the near-miss task
     ax = axes[5]
     if "number" in R and "near" in R["number"]["tasks"]:
@@ -85,9 +85,9 @@ def main():
                 xs.append(byc[c]["real"]["n_train"]); ys.append((num - numf) / den)
             if xs: ax.plot(xs, ys, marker="s", color=CCOL[c], label=CAPL[c]); P[c] = [{"n_train": x, "net": y} for x, y in zip(xs, ys)]
         ax.set_xscale("log"); ax.axhline(0, color="k", lw=0.8, ls=":"); ax.set_xlabel("training rows"); ax.set_ylabel("accuracy above the value-only floor")
-        ax.set_title("Far-back numbers (k = 2–64) vs their near-miss:\nevery capacity, above the floor"); ax.legend(loc="upper left"); ax.grid(alpha=0.25, which="both")
+        ax.set_title("Far-back numbers (k = 2–64) vs their near-miss:\nevery capacity, above the floor"); ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=2, frameon=False); ax.grid(alpha=0.25, which="both")
     fig.suptitle("Does more data or capacity make far-back exact values readable from the layer-42 activation? Held-out documents", fontsize=14)
-    fig.tight_layout(w_pad=2.0, h_pad=2.0); os.makedirs(DD, exist_ok=True); fig.savefig(os.path.join(REP, "decodability_scaling.png")); fig.savefig(os.path.join(REP, "decodability_scaling.pdf")); plt.close(fig)
+    fig.tight_layout(w_pad=2.0, h_pad=3.0); os.makedirs(DD, exist_ok=True); fig.savefig(os.path.join(REP, "decodability_scaling.png")); fig.savefig(os.path.join(REP, "decodability_scaling.pdf")); plt.close(fig)
     # ---- tables
     for typ, task, control, title in panels:
         key = f"{typ}/{task}"
