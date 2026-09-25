@@ -65,6 +65,56 @@ class NLISim:
         return S
 
 
+import re as _re
+_QUOTES = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'", "«": '"', "»": '"'})
+
+
+def _toks(c):
+    return _re.findall(r"[\w']+|[^\w\s]", c.lower().translate(_QUOTES))
+
+
+def lex_sim(a, b, span=4):
+    """1 if the two claims share a verbatim run of >= `span` consecutive words (lowercased, quotes normalised; punctuation tokens do not count
+    toward the run length), else the words in the longest common contiguous run / the shorter claim's word count"""
+    ta, tb = _toks(a), _toks(b)
+    if not ta or not tb: return 0.0
+    best = bw = 0; prev = [0] * (len(tb) + 1); prevw = [0] * (len(tb) + 1)
+    for i in range(1, len(ta) + 1):
+        cur = [0] * (len(tb) + 1); curw = [0] * (len(tb) + 1)
+        for j in range(1, len(tb) + 1):
+            if ta[i - 1] == tb[j - 1]:
+                cur[j] = prev[j - 1] + 1; curw[j] = prevw[j - 1] + (1 if ta[i - 1][0].isalnum() else 0)
+                if cur[j] > best: best = cur[j]
+                if curw[j] > bw: bw = curw[j]
+        prev, prevw = cur, curw
+    na = sum(1 for t in ta if t[0].isalnum()); nb = sum(1 for t in tb if t[0].isalnum())
+    return 1.0 if bw >= span else bw / max(1, min(na, nb))                                # ratio over WORD tokens (punctuation runs do not inflate it)
+
+
+class LexSim:
+    """shared verbatim spans (catches a quote repeated across bullets with different tails, paraphrase- and split-robust above 4 words)"""
+    def __init__(self, span=4): self.span = span
+
+    def matrix(self, claims):
+        m = len(claims); S = torch.eye(m)
+        for i in range(m):
+            for j in range(i + 1, m): S[i, j] = S[j, i] = lex_sim(claims[i], claims[j], self.span)
+        return S
+
+
+class MaxSim:
+    """elementwise max of several similarity models (e.g. NLI entailment for paraphrases + embedding cosine for template-stuffed claims that share
+    a quoted span but differ in their tail, which entail nothing)"""
+    def __init__(self, *sims): self.sims = sims
+
+    def prefetch(self, claim_lists):
+        for s_ in self.sims:
+            if hasattr(s_, "prefetch"): s_.prefetch(claim_lists)
+
+    def matrix(self, claims):
+        return torch.stack([s_.matrix(claims) for s_ in self.sims]).max(0).values
+
+
 def _discounts(claims, sim, floor=None):
     m = len(claims)
     if m <= 1: return [0.0] * m
@@ -105,3 +155,36 @@ def dup_rate(sim, claim_lists, thr=0.9):
         if len(cl) < 2: n += len(cl); continue
         S = sim.matrix(cl); n += len(cl); d += sum(int(float(S[i, :i].max()) > thr) for i in range(1, len(cl)))
     return d / max(n, 1)
+
+
+_QSPAN = _re.compile(r'"([^"]+)"|\'([^\']{8,})\'')
+
+
+def quoted_spans(claim, min_words=4):
+    """quoted spans of >= min_words words (quotes normalised, lowercased, whitespace-collapsed)"""
+    c = claim.translate(_QUOTES)
+    out = []
+    for m in _QSPAN.finditer(c):
+        q = " ".join((m.group(1) or m.group(2) or "").lower().split())
+        if len(q.split()) >= min_words: out.append(q)
+    return out
+
+
+def quote_rep_rate(claim_lists, min_words=4):
+    """share of bullets containing a quoted span (>= min_words words) that also appears in ANOTHER bullet of the same list (exploit monitor)"""
+    n = r = 0
+    for cl in claim_lists:
+        qs = [set(quoted_spans(c, min_words)) for c in cl]; n += len(cl)
+        for i, q in enumerate(qs):
+            if q and any(q & qs[j] for j in range(len(cl)) if j != i): r += 1
+    return r / max(n, 1)
+
+
+def dedup_quotes(claims, min_words=4):
+    """keep the first bullet carrying each repeated quoted span, drop later bullets that re-quote it (regression reference for the exploit)"""
+    seen, out = set(), []
+    for c in claims:
+        q = set(quoted_spans(c, min_words))
+        if q and q & seen: continue
+        seen |= q; out.append(c)
+    return out

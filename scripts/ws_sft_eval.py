@@ -36,6 +36,7 @@ def main():
     p.add_argument("--av-lora", required=True); p.add_argument("--parquet", required=True); p.add_argument("--sidecar", default=None)
     p.add_argument("--base-ckpt", default="Qwen/Qwen3.6-27B"); p.add_argument("--n", type=int, default=96)
     p.add_argument("--temperature", type=float, default=1.0); p.add_argument("--max-new-tokens", type=int, default=200); p.add_argument("--out", required=True)
+    p.add_argument("--greedy-only", action="store_true", help="skip the sampled pass")
     p.add_argument("--save-all", action="store_true", help="keep every generated response (row index, mode, text) in the output json")
     a = p.parse_args(); dev = "cuda"
     tok = AutoTokenizer.from_pretrained(a.base_ckpt); cfg = load_nla_config(a.sidecar or a.parquet, tok)
@@ -47,7 +48,7 @@ def main():
     out = {"adapter": a.av_lora, "parquet": a.parquet, "targets": stats(tgt, tok), "examples": []}
     tgt_exact = [split_claims(extract_explanation(r)) == [l[2:].strip().rstrip(";") for l in extract_explanation(r).splitlines() if l.startswith("• ")] for r in tgt]
     out["targets"]["exact_roundtrip"] = float(np.mean(tgt_exact))
-    for mode, temp in (("greedy", 0.0), (f"sample_t{a.temperature:g}", a.temperature)):
+    for mode, temp in (("greedy", 0.0),) + (() if a.greedy_only else ((f"sample_t{a.temperature:g}", a.temperature),)):
         resps = []
         for r in t:
             ids = tok.encode(build_prompt_text(r["prompt"], cfg.injection_char, tok), add_special_tokens=False); pt = torch.tensor([ids], device=dev)

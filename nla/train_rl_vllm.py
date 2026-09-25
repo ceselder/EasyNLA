@@ -1928,7 +1928,7 @@ def main():
                    help="redundancy rule of singles_red (nla.flow.claim_redundancy, shared with scripts/claims_redundancy_eval.py): lm = sum v_i - alpha*R_LM(C); "
                         "semdup = sum_i v_i * (1 - max_{j<i} sim(c_i, c_j)) (paraphrases ~0, no charge for inconsistency)")
     p.add_argument("--claim-redundancy-alpha", type=float, default=1.0, help="lm: weight of R_LM")
-    p.add_argument("--claim-sim", choices=["emb", "nli"], default="nli", help="semdup similarity: embedding cosine or NLI entailment (max of both directions)")
+    p.add_argument("--claim-sim", choices=["emb", "nli", "max", "max3"], default="nli", help="semdup similarity: embedding cosine or NLI entailment (max of both directions)")
     p.add_argument("--claim-sim-model", default=None, help="default sentence-transformers/all-MiniLM-L6-v2 (emb) / cross-encoder/nli-deberta-v3-base (nli)")
     p.add_argument("--claim-sim-floor", type=float, default=None, help="semdup: similarity rescaled to clip((s - floor)/(1 - floor), 0, 1)")
     p.add_argument("--claim-dup-model", default="sentence-transformers/all-MiniLM-L6-v2", help="monitoring: embedding model of critic/claims_dup_rate (cosine > 0.9 to an earlier claim of the same rollout); '' = off")
@@ -2413,8 +2413,11 @@ def main():
                 from nla.flow.claim_lm import ClaimLM
                 claim_lm = ClaimLM(args.claim_lm, _lm_dev); claim_red = ClaimRedundancy("lm", lm=claim_lm, alpha=args.claim_redundancy_alpha)
             else:
+                from nla.flow.claim_redundancy import MaxSim, LexSim
                 _sim = (EmbSim(args.claim_sim_model or "sentence-transformers/all-MiniLM-L6-v2", _lm_dev) if args.claim_sim == "emb"
-                        else NLISim(args.claim_sim_model or "cross-encoder/nli-deberta-v3-base", _lm_dev))
+                        else NLISim(args.claim_sim_model or "cross-encoder/nli-deberta-v3-base", _lm_dev) if args.claim_sim == "nli"
+                        else MaxSim(NLISim("cross-encoder/nli-deberta-v3-base", _lm_dev), EmbSim("sentence-transformers/all-MiniLM-L6-v2", _lm_dev)) if args.claim_sim == "max"
+                        else MaxSim(NLISim("cross-encoder/nli-deberta-v3-base", _lm_dev), EmbSim("sentence-transformers/all-MiniLM-L6-v2", _lm_dev), LexSim(4)))
                 claim_red = ClaimRedundancy("semdup", sim=_sim, floor=args.claim_sim_floor)
             if args.claim_dup_model:
                 claim_dup = EmbSim(args.claim_dup_model, _lm_dev)
@@ -3345,6 +3348,8 @@ def main():
             if _nc: shape_terms["critic/n_claims_mean"] = float(np.mean(_nc)); shape_terms["critic/n_claims_over_max_frac"] = float(np.mean([c > args.claim_max for c in _nc]))
             shape_terms["critic/claims_fail_frac"] = 1.0 - len(_ok) / max(len(all_explanations), 1)
             shape_terms["critic/claims_parse_rate"] = float(np.mean([claim_res["n_claims"][i] > 0 for i in range(len(all_explanations))])) if all_explanations else 0.0
+            from nla.flow.claim_redundancy import quote_rep_rate as _qrr
+            shape_terms["critic/claims_quote_rep"] = _qrr([claim_res["claims"][i][: args.claim_max] for i in range(len(all_explanations)) if claim_res["claims"][i]])
             if claim_dup is not None:
                 from nla.flow.claim_redundancy import dup_rate as _dup_rate
                 shape_terms["critic/claims_dup_rate"] = _dup_rate(claim_dup, [claim_res["claims"][i][: args.claim_max] for i in range(len(all_explanations)) if claim_res["claims"][i]])
@@ -4035,7 +4040,7 @@ def main():
         if args.reward_mode == "claims":   # compositional reward summary (the same keys go to wandb under critic/*)
             _g = lambda k: shape_terms.get(k, float("nan"))
             print(f"  [claims@{step}] n_claims {_g('critic/n_claims_mean'):.2f} (>{args.claim_max}: {_g('critic/n_claims_over_max_frac'):.2f}) | fail {_g('critic/claims_fail_frac'):.2f} | "
-                  f"parse {_g('critic/claims_parse_rate'):.3f} | dup {_g('critic/claims_dup_rate'):.3f} | "
+                  f"parse {_g('critic/claims_parse_rate'):.3f} | dup {_g('critic/claims_dup_rate'):.3f} | qrep {_g('critic/claims_quote_rep'):.3f} | "
                   f"PMI {_g('critic/claims_pmi_nats_mean'):.1f} nats ({_g('critic/claims_pmi_per_claim_nats'):.1f}/claim) | reward {_g('critic/claim_reward_mean'):.1f} | "
                   f"LOO credit mean {_g('critic/claim_credit_mean'):.1f} p10/p90 {_g('critic/claim_credit_p10'):.1f}/{_g('critic/claim_credit_p90'):.1f} "
                   f"frac<cost {_g('critic/claim_credit_frac_below_cost'):.2f} (n {_g('critic/claim_credit_n'):.0f}) | single PMI median {_g('critic/claim_single_pmi_median'):.1f} "

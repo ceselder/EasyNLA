@@ -22,22 +22,23 @@ def main():
     ap.add_argument("--lm", default="Qwen/Qwen3-8B-Base"); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--emb", default="sentence-transformers/all-MiniLM-L6-v2"); ap.add_argument("--nli", default="cross-encoder/nli-deberta-v3-base")
     ap.add_argument("--floors", default="0.5,0.7")
+    ap.add_argument("--from-json", default="", help="skip the critic pass: re-score the saved per-set singles of a previous run (redundancy_<tag>.json); output redundancy_<tag>_v2.json")
     a = ap.parse_args(); dev = "cuda:0"; rng = np.random.default_rng(a.seed)
     import pyarrow.parquet as pq
     from nla.flow.rl_critic import FlowCritic
     from nla.flow.claims import format_claims
     from nla.flow.claim_lm import ClaimLM
-    from nla.flow.claim_redundancy import EmbSim, NLISim, semdup_score
+    from nla.flow.claim_redundancy import EmbSim, NLISim, LexSim, MaxSim, semdup_score
     C = json.load(open(f"{OUT}/claims.json"))["items"]; PP = {x["row"]: x["paraphrases"] for x in json.load(open(f"{OUT}/paraphrases.json"))["items"]}
     if a.limit: C = C[: a.limit]
     t = pq.read_table("/vol_q36/data/sft/av_sft_val_clean1.parquet", columns=["activation_vector"]); N = t.num_rows
     acts = torch.tensor(np.asarray(t.column("activation_vector").combine_chunks().flatten(), dtype=np.float32).reshape(N, -1))
     aa = torch.load(a.adapter, map_location="cpu")["args"]; pov = os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt"); pov = pov if os.path.exists(pov) else None
-    fc = FlowCritic(aa["prior"], a.adapter, aa["stats"], None, None, torch.device(dev), enc_layer=aa.get("enc_layer", 42), t_grid=TS, eps_per_t=a.D, train_adapter=False,
-                    prior_override=pov, ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"), enc_device=torch.device(dev))
-    lm = ClaimLM(a.lm, dev); emb = EmbSim(a.emb, dev); nli = NLISim(a.nli, dev)
-    rows = []
-    for n, it in enumerate(C):                                                            # ---- critic pass: singles + composed PMI of every variant set
+    lm = ClaimLM(a.lm, dev); emb = EmbSim(a.emb, dev); nli = NLISim(a.nli, dev); lex = LexSim(4)
+    rows = json.load(open(a.from_json))["rows"] if a.from_json else []
+    fc = None if a.from_json else FlowCritic(aa["prior"], a.adapter, aa["stats"], None, None, torch.device(dev), enc_layer=aa.get("enc_layer", 42), t_grid=TS, eps_per_t=a.D, train_adapter=False,
+                                             prior_override=pov, ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"), enc_device=torch.device(dev))
+    for n, it in enumerate([] if a.from_json else C):                                                            # ---- critic pass: singles + composed PMI of every variant set
         row = it["row"]; tc = [c["claim"] for c in it["true_claims"]]; fps = it["false_pairs"]; pp = PP.get(row) or []
         other = C[(n + 1 + int(rng.integers(len(C) - 1))) % len(C)]; oc = [c["claim"] for c in other["true_claims"]][: len(tc)]
         sets = {"T": tc, "O": oc}
@@ -52,7 +53,7 @@ def main():
     def scores(S):
         cl, v = S["claims"], S["singles"]; sv = sum(v); R = lm.redundancy(cl)
         o = {"singles": sv, "neg_lm": -R, "lm": sv - R, "lm1.5": sv - 1.5 * R, "lm2": sv - 2 * R, "lm3": sv - 3 * R, "min_composed": min(sv, S["pmi_composed"])}
-        for nm, sim in (("emb", emb), ("nli", nli)):
+        for nm, sim in (("emb", emb), ("nli", nli), ("lex", lex), ("max", MaxSim(nli, emb)), ("max3", MaxSim(nli, emb, lex))):
             o[f"semdup_{nm}"] = semdup_score(cl, v, sim)
             for s0 in floors: o[f"semdup_{nm}_t{s0:g}"] = semdup_score(cl, v, sim, floor=s0)
         return o
@@ -78,7 +79,7 @@ def main():
     dR = [r["sets"]["T"]["scores"]["neg_lm"] - r["sets"][k]["scores"]["neg_lm"] for r in rows for k in r["sets"] if k.startswith("swap")]
     summ["twin_swap_decomposition"] = {"singles_drop_mean": float(np.mean(dsv)), "singles_drop_median": float(np.median(dsv)), "neg_lm_drop_mean": float(np.mean(dR)), "neg_lm_drop_median": float(np.median(dR)),
                                        "share_R_LM_lower_for_swap": float(np.mean([x < 0 for x in dR]))}
-    os.makedirs(OUT, exist_ok=True); json.dump({"summary": summ, "rows": rows}, open(f"{OUT}/redundancy_{a.tag}.json", "w"), indent=1)
+    os.makedirs(OUT, exist_ok=True); json.dump({"summary": summ, "rows": rows}, open(f"{OUT}/redundancy_{a.tag}{'_v2' if a.from_json else ''}.json", "w"), indent=1)
     print(json.dumps(summ["twin_swap_decomposition"]), flush=True)
 
 
