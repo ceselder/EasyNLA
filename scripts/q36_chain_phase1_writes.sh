@@ -36,6 +36,8 @@ fi
 TX=/vol/q36/text/$TAG; TX1=/vol/q36/text/$V1
 # 4. Sonnet describer WITH writes (variant W): val shard 0 + N_DESC_TRAIN train shards; local box, <= 2 drivers
 DL=/home/celeste/nlt-q36-data/describer_w; mkdir -p $DL/in $DL/out/train $DL/out/val
+# <= 2 local Sonnet drivers at a time: wait for the v1 train-A describer to finish before starting the W drivers
+for i in $(seq 1 200); do [ -f /home/celeste/nlt-q36-data/describer/out/train/describer_sonnet5_A__train_stats.json ] && break; [ $((i % 10)) -eq 0 ] && log "waiting for the train-A describer to finish"; sleep 60; done
 if [ "$(nfiles q36/text/$TAG/val 'describer_sonnet5_W__')" -lt 1 ]; then
   for f in $(timeout 120 modal volume ls nlt q36/text/$TAG/val 2>/dev/null | grep describer_inputs__ | sort | head -n 1); do timeout 300 modal volume get nlt "$f" $DL/in/val__$(basename $f) --force >/dev/null 2>&1; done
   for f in $(timeout 120 modal volume ls nlt q36/text/$TAG/train 2>/dev/null | grep describer_inputs__ | sort | head -n $N_DESC_TRAIN); do timeout 300 modal volume get nlt "$f" $DL/in/train__$(basename $f) --force >/dev/null 2>&1; done
