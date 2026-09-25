@@ -22,6 +22,6 @@ run hf 1 dump_verbalizer.py "--data-dir /vol/q36/data --adapter /vol/q36/verbali
 waitn q36/dumps "verbalizer_v1b.parquet" 1 || exit 1
 GT=H100 wait_gpu 1 || exit 1
 run hf 1 eval_bits.py "--data-dir /vol/q36/data --ckpt $CK --out /vol/q36/results/bits_v1b_verbalizer.json --sets 'teacher:$TX/val/craft_full__*.parquet,verbalizer_v1b:/vol/q36/dumps/verbalizer_v1b.parquet,verbalizer:/vol/q36/dumps/verbalizer_${TAG}.parquet,base_control:/vol/q36/dumps/base_control_${TAG}.parquet' --n 512 --ode-steps 64" bits_verb_v1b 1
-waitn q36/results "bits_v1b_verbalizer.json" 1 || exit 1
+wait_bits bits_v1b_verbalizer || exit 1
 timeout 300 modal volume get nlt q36/results/bits_v1b_verbalizer.json /home/celeste/shared/reports/nlt-27b-olens/data/bits_v1b_verbalizer.json --force >/dev/null 2>&1
 cd /home/celeste/nlt && systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_phase1.py --tag v1 2>&1 | tail -3; cd /home/celeste/shared/reports/nlt-27b-olens && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1; log "RELAUNCH2 DONE"
