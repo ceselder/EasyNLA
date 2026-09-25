@@ -5,7 +5,7 @@ Inputs: data/bits_<tag>_main.json, bits_<tag>_components.json, bits_<tag>_verbal
 Outputs: fig_phase1_critic.{png,pdf}, fig_phase1_components.{png,pdf}, fig_phase1_verbalizer.{png,pdf}, data/phase1_table.json.
 """
 from __future__ import annotations
-import argparse, json, os
+import argparse, glob, json, os
 import numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -14,7 +14,10 @@ REP = os.path.expanduser("~/shared/reports/nlt-27b-olens")
 C1, C2, C3, C4, CG = "#2a78d6", "#eb6834", "#1baf7a", "#8a5cd6", "#8a8987"
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "axes.labelsize": 12, "legend.fontsize": 11, "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True, "grid.color": "#e6e4df", "grid.linewidth": 0.6, "axes.axisbelow": True})
 NICE = {"craft_full": "crafted change text (all lines)", "craft_nojl": "crafted, no J-lens line", "craft_delta": "Shift line only (olens of Δ)", "craft_newfaded": "Now present / Faded only", "jlens": "J-lens leaning line only",
-        "olens_j": "olens bullets of the later state", "olens_i": "olens bullets of the earlier state (control)", "teacher": "crafted teacher text", "verbalizer": "distilled two-state verbalizer", "base_control": "base model, same prompt (control)"}
+        "olens_j": "olens bullets of the later state", "olens_i": "olens bullets of the earlier state (control)", "teacher": "crafted teacher text", "verbalizer": "distilled two-state verbalizer", "base_control": "base model, same prompt (control)",
+        "describer": "LLM trace (Sonnet 5, readouts only)", "describer_A": "LLM trace (Sonnet 5, readouts only)", "describer_W": "LLM trace (Sonnet 5, + attention/MLP write readouts)", "describer_sonnet_A": "LLM trace Sonnet 5 (A)", "describer_sonnet_B": "LLM trace Sonnet 5 (+ passage tail)", "describer_qwen32b": "LLM trace Qwen3-32B (A)", "craft_full_same": "crafted change text (same rows)",
+        "raw_all": "raw readouts, all sources concatenated", "raw_all_w": "raw readouts + attention/MLP write readouts", "writes_only": "attention/MLP write readouts only", "raw_no_i": "raw, without the earlier-state read", "raw_no_j": "raw, without the later-state read", "raw_no_delta": "raw, without the Δ read", "raw_no_jl": "raw, without the J-lens rising/falling words",
+        "raw_w_no_attn": "raw + writes, without the attention write read", "raw_w_no_mlp": "raw + writes, without the MLP write read", "skiplens_jd": "skip-lens of the J-transported Δ"}
 
 
 def savefig(fig, stem):
@@ -40,9 +43,9 @@ def bars(ax, labels, vals, errs, color, title, ylabel, hline=None, fmt="{:.1f}")
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--tag", default="v1"); ap.add_argument("--data", default=f"{REP}/data"); a = ap.parse_args()
-    M = load(f"{a.data}/bits_{a.tag}_main.json"); C = load(f"{a.data}/bits_{a.tag}_components.json"); V = load(f"{a.data}/bits_{a.tag}_verbalizer.json")
-    T = {"tag": a.tag, "sets": {}, "twins": {}, "ckpt": (M or C or V or {}).get("ckpt"), "step": (M or C or V or {}).get("step"), "ode_steps": (M or C or V or {}).get("ode_steps")}
-    for R in (M, C, V):
+    files = sorted(glob.glob(f"{a.data}/bits_{a.tag}_*.json")); Rs = [load(f) for f in files]; R0 = next((r for r in Rs if r), {})
+    T = {"tag": a.tag, "sets": {}, "twins": {}, "ckpt": R0.get("ckpt"), "step": R0.get("step"), "ode_steps": R0.get("ode_steps"), "files": [os.path.basename(f) for f in files]}
+    for R in Rs:
         if not R: continue
         for k, s in R["sets"].items(): T["sets"][k] = row(s)
         for k, tw in R.get("twins", {}).items(): T["twins"][k] = tw
@@ -72,6 +75,17 @@ def main():
         ax.bar(x, [S[k]["cos_condmean"]["c"] for k in vk], w, color=C1, label="true text"); ax.bar(x + w, [S[k]["cos_condmean"]["dm"] for k in vk], w, color=C2, label="depth-matched wrong text")
         ax.set_xticks(x); ax.set_xticklabels([NICE.get(k, k) for k in vk], rotation=20, ha="right", fontsize=10); ax.set_title("Centred cos of the critic's conditional mean with the true u_j", fontsize=13); ax.set_ylabel("cos(E[u_j | u_i, z], u_j)"); ax.legend(frameon=False, fontsize=9)
         fig.tight_layout(); savefig(fig, "fig_phase1_verbalizer")
+    # ---- fig 4: the text-source search (one judge, identical rows): sources + leave-one-source-out
+    src_keys = [k for k in ("raw_all", "raw_all_w", "craft_full", "describer_A", "describer", "describer_W", "describer_qwen32b", "skiplens_jd") if k in S]
+    loo_keys = [k for k in ("raw_all", "raw_no_i", "raw_no_j", "raw_no_delta", "raw_no_jl", "raw_all_w", "raw_w_no_attn", "raw_w_no_mlp", "writes_only") if k in S]
+    if len(src_keys) >= 2 or len(loo_keys) >= 3:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.2))
+        if src_keys: bars(axes[0], [NICE.get(k, k) for k in src_keys], [S[k]["content"] for k in src_keys], [S[k]["content_sem"] for k in src_keys], C1, "Which trace carries the most bits about the later state?", "content bits (PMI(z) − PMI(z_dm))", 0)
+        if loo_keys:
+            ref = S["raw_all"]["content"] if "raw_all" in S else 0.0
+            bars(axes[1], [NICE.get(k, k) for k in loo_keys], [S[k]["content"] for k in loo_keys], [S[k]["content_sem"] for k in loo_keys], C4, "Leave one readout source out: which source buys the bits?", "content bits", 0)
+            axes[1].axhline(ref, color=C1, ls="--", lw=1)
+        fig.suptitle(f"Text-source search on the single direction critic (held-out pairs, Heun {T['ode_steps']})", fontsize=14, y=1.02); fig.tight_layout(); savefig(fig, "fig_phase1_sources")
     print(json.dumps({k: {"content": round(v["content"], 2), "P": round(v["p_z_gt_dm"], 3), "rp": round(v["rp"], 2), "cos_c": round(v["cos_condmean"]["c"], 3), "cos_u": round(v["cos_condmean"]["u"], 3)} for k, v in S.items()}, indent=1))
 
 
