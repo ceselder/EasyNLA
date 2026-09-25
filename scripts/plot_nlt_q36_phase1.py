@@ -82,13 +82,20 @@ def main():
     src_keys = [k for k in ("raw_all", "raw_all_w", "craft_full", "describer_A", "describer", "describer_W", "describer_qwen32b", "skiplens_jd") if k in S]
     loo_keys = [k for k in ("raw_all", "raw_no_i", "raw_no_j", "raw_no_delta", "raw_no_jl", "raw_all_w", "raw_w_no_attn", "raw_w_no_mlp", "writes_only") if k in S]
     if len(src_keys) >= 2 or len(loo_keys) >= 3:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5.2))
-        if src_keys: bars(axes[0], [NICE.get(k, k) for k in src_keys], [S[k]["content"] for k in src_keys], [S[k]["content_sem"] for k in src_keys], C1, "Which trace carries the most bits about the later state?", "content bits (PMI(z) − PMI(z_dm))", 0)
-        if loo_keys:
+        two = len(loo_keys) >= 3                                   # the leave-one-source-out panel only exists once the write-readout (v2) sets are in
+        fig, axes = plt.subplots(1, 2 if two else 1, figsize=(12 if two else 7.5, 5.2)); axes = list(np.atleast_1d(axes))
+        off = [k for k in src_keys if k.startswith("describer") and a.tag == "v1"]   # critic v1's pool was mechanical text only: LLM-written traces are off-register for it
+        if src_keys:
+            bars(axes[0], [NICE.get(k, k) + ("\n(judge never trained on this register)" if k in off else "") for k in src_keys], [S[k]["content"] for k in src_keys], [S[k]["content_sem"] for k in src_keys], C1,
+                 "Crafted text beats the LLM traces under this judge (register caveat)" if off else "Which trace carries the most bits about the later state?", "content bits (PMI(z) − PMI(z_dm))", 0)
+            for xi, k in enumerate(src_keys):
+                if k in off: axes[0].patches[xi].set_hatch("//"); axes[0].patches[xi].set_alpha(0.55)
+        if two:
             ref = S["raw_all"]["content"] if "raw_all" in S else 0.0
             bars(axes[1], [NICE.get(k, k) for k in loo_keys], [S[k]["content"] for k in loo_keys], [S[k]["content_sem"] for k in loo_keys], C4, "Leave one readout source out: which source buys the bits?", "content bits", 0)
             axes[1].axhline(ref, color=C1, ls="--", lw=1)
-        fig.suptitle(f"Text-source search on the single direction critic (held-out pairs, Heun {T['ode_steps']})", fontsize=14, y=1.02); fig.tight_layout(); savefig(fig, f"fig_phase1_sources_{a.tag}")
+        fig.suptitle((f"Crafted change text carries ~2x the bits of an LLM-written trace, but the judge (critic {a.tag}) saw only crafted text (held-out pairs, Heun {T['ode_steps']})" if off else
+                      f"Text-source search on critic {a.tag} (held-out pairs, Heun {T['ode_steps']})"), fontsize=13, y=1.02); fig.tight_layout(); savefig(fig, f"fig_phase1_sources_{a.tag}")
     print(json.dumps({k: {"content": round(v["content"], 2), "P": round(v["p_z_gt_dm"], 3), "rp": round(v["rp"], 2), "cos_c": round(v["cos_condmean"]["c"], 3), "cos_u": round(v["cos_condmean"]["u"], 3)} for k, v in S.items()}, indent=1))
 
 
