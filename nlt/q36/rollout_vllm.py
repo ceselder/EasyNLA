@@ -26,6 +26,8 @@ ap.add_argument("--temperature", type=float, default=1.0); ap.add_argument("--to
 ap.add_argument("--coeff", type=float, default=1.0); ap.add_argument("--layer", type=int, default=1)
 ap.add_argument("--max-num-seqs", type=int, default=512); ap.add_argument("--gpu-mem", type=float, default=0.90); ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--model", default=os.environ.get("OLENS_MODEL", "Qwen/Qwen3.6-27B")); ap.add_argument("--hf-extra", default="/vol/q36/hf_extra")
+ap.add_argument("--grammar", action="store_true", help="regex-constrained decoding: exactly --k ASCII bullets of --bullet-chars chars max (the RL sampled under an ascii + bullet-grammar + 16-token cap mask; plain decoding lets the lens run on)")
+ap.add_argument("--bullet-chars", type=int, default=70)
 args = ap.parse_args()
 D_MODEL = 5120
 
@@ -120,6 +122,14 @@ def main():
         if has_ref: kw["norm_match_ref"] = "residual_stream"
         return SteeringVector(**kw)
     ban = {int(tok.eos_token_id): -100.0} if args.prompt == "av" else {}       # the AV prompt writes a continuation: never stop early (bullets: EOS ends the list)
+    SO = {}
+    if args.grammar:
+        ch = r"""[A-Za-z0-9 ,.'\-:;()&/"!?%$#]"""; rx = r"\* " + ch + "{2," + str(args.bullet_chars) + "}" + r"(\n\* " + ch + "{2," + str(args.bullet_chars) + "})" + "{" + str(args.k - 1) + "}"
+        try:
+            from vllm.sampling_params import StructuredOutputsParams; SO = {"structured_outputs": StructuredOutputsParams(regex=rx)}
+        except Exception:
+            from vllm.sampling_params import GuidedDecodingParams; SO = {"guided_decoding": GuidedDecodingParams(regex=rx)}
+        print(f"[rollout] grammar-constrained decoding: {rx}", flush=True)
     total = 0
     for ji, (lab, od, ld) in enumerate(todo):
         COL, n, pair_ids = ld(); os.makedirs(od, exist_ok=True); print(f"[rollout] job {ji + 1}/{len(todo)} {lab}: {n} rows", flush=True)
@@ -132,9 +142,9 @@ def main():
             prompts, params = [], []
             for i in range(n):
                 if not args.no_greedy:
-                    prompts.append({"prompt_token_ids": PROMPT}); params.append(SamplingParams(n=1, temperature=0.0, max_tokens=args.max_tokens, extra_args={"apply_steering_vectors": [sv(V[i])]}, seed=args.seed, logit_bias=ban or None))
+                    prompts.append({"prompt_token_ids": PROMPT}); params.append(SamplingParams(n=1, temperature=0.0, max_tokens=args.max_tokens, extra_args={"apply_steering_vectors": [sv(V[i])]}, seed=args.seed, logit_bias=ban or None, **SO))
                 if args.n_samples > 0:
-                    prompts.append({"prompt_token_ids": PROMPT}); params.append(SamplingParams(n=args.n_samples, temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens, extra_args={"apply_steering_vectors": [sv(V[i])]}, seed=args.seed + i, logit_bias=ban or None))
+                    prompts.append({"prompt_token_ids": PROMPT}); params.append(SamplingParams(n=args.n_samples, temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens, extra_args={"apply_steering_vectors": [sv(V[i])]}, seed=args.seed + i, logit_bias=ban or None, **SO))
             t1 = time.time(); outs = llm.generate(prompts, params, use_tqdm=False); t2 = time.time()
             rows, samples, ids_col, texts = [], [], [], []; q = 0
             for i in range(n):
