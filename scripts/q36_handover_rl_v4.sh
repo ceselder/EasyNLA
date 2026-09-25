@@ -19,12 +19,16 @@ for l in open("/tmp/q36_v1b_evals.txt"):
     C = [float(f[f"{s}/exact_content_bits"]) for s in sets if f"{s}/exact_content_bits" in f]
     rows.append({"step": st, "P_exact_mean": sum(P_exact) / len(P_exact), "P_proxy_mean": sum(P_proxy) / len(P_proxy), "content_mean": sum(C) / len(C), "craft_P": float(f.get("craft_full/exact_p_z_gt_dm", "nan")), "craft_content": float(f.get("craft_full/exact_content_bits", "nan")), "craft_pmi": float(f.get("craft_full/exact_pmi_bits", "nan"))})
 rows = sorted({r["step"]: r for r in rows}.values(), key=lambda r: r["step"])
-cmax = max(r["content_mean"] for r in rows)
-# rule: among checkpoints whose mean exact content is within 20% of the best, take the highest mean exact P(z > z_dm); proxy P (n 256) breaks ties
-ok = [r for r in rows if r["content_mean"] >= 0.8 * cmax] or rows
-best = max(ok, key=lambda r: (round(r["P_exact_mean"], 3), r["P_proxy_mean"]))
-json.dump({"rows": rows, "rule": "max mean exact P(z>z_dm) over val sets among checkpoints with mean exact content >= 80% of the best; proxy P breaks ties", "chosen_step": best["step"]}, open("/home/celeste/shared/reports/nlt-27b-olens/data/critic_v1b_judge_choice.json", "w"), indent=1)
-for r in rows: print(f"  step {r['step']:5d}: mean exact P {r['P_exact_mean']:.3f} (proxy {r['P_proxy_mean']:.3f}) content {r['content_mean']:.1f} | craft P {r['craft_P']:.3f} content {r['craft_content']:.1f} PMI {r['craft_pmi']:+.1f}" + ("   <- JUDGE" if r is best else ""))
+# rule (fixed 07:35 before the later evals existed): 'content' inflates as the depth-matched text collapses with the drift (v1b @1500: content 140 with PMI -129), so content is a FLOOR (>= 25 bits,
+# the pre-registered floor), not a score. Judge = the save with the highest mean exact P(z > z_dm) over the val sets; ties within 0.01 broken by P(z > no text) (calibration), then proxy P.
+for r in rows:
+    f_ = dict(re.findall(r"([a-z_A-Z0-9]+/[a-z_]+)=([-0-9.]+)", [l for l in open("/tmp/q36_v1b_evals.txt") if re.match(rf"\[eval@{r['step']} rows", l)][-1]))
+    pn = [float(f_[k]) for k in f_ if k.endswith("/exact_p_z_gt_null")]; r["P_null_mean"] = sum(pn) / len(pn) if pn else 0.0
+ok = [r for r in rows if r["content_mean"] >= 25] or rows
+top = max(r["P_exact_mean"] for r in ok); cand = [r for r in ok if r["P_exact_mean"] >= top - 0.01]
+best = max(cand, key=lambda r: (round(r["P_null_mean"], 3), r["P_proxy_mean"]))
+json.dump({"rows": rows, "rule": "max mean exact P(z>z_dm) over val sets among 500-step saves with mean exact content >= 25 bits; ties within 0.01 broken by P(z>no text), then proxy P", "chosen_step": best["step"]}, open("/home/celeste/shared/reports/nlt-27b-olens/data/critic_v1b_judge_choice.json", "w"), indent=1)
+for r in rows: print(f"  step {r['step']:5d}: mean exact P {r['P_exact_mean']:.3f} (proxy {r['P_proxy_mean']:.3f}) P_null {r['P_null_mean']:.3f} content {r['content_mean']:.1f} | craft P {r['craft_P']:.3f} content {r['craft_content']:.1f} PMI {r['craft_pmi']:+.1f}" + ("   <- JUDGE" if r is best else ""))
 print(f"CHOSEN {best['step']}")
 PY
 cat /tmp/q36_v1b_judge.txt; STEP=$(grep -oE "^CHOSEN [0-9]+" /tmp/q36_v1b_judge.txt | awk '{print $2}')
@@ -60,3 +64,5 @@ timeout 120 modal app stop -y $A3 >/dev/null 2>&1; sed -i "s/^$A3 /# $A3 (stoppe
 CRITIC_CK=$CKPATH FROZEN_CK=$CKPATH bash $LOGD/launch_rl_v4.sh 2>&1 | sed "s/^/[handover] /"
 (RL_TAG=rl_v4 APPFILE=$LOGD/rl_app_rl_v4.txt systemd-run --user --scope -q -p MemoryMax=1G --setenv=RL_TAG=rl_v4 --setenv=APPFILE=$LOGD/rl_app_rl_v4.txt bash $LOGD/watch_rl_v3.sh >> $LOGD/watch_rl_v4.out 2>&1 &)
 (cd $REP && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); log "HANDOVER DONE: RL v4 app $(cat $LOGD/rl_app_rl_v4.txt 2>/dev/null)"
+# ---- 6. cross-judge table for RL v3 (orchestrator 07:33): step-0 and last-saved-policy dumps + teacher under critics of OTHER lineages (v2 step 3000, v1b's judge) and the frozen v1 judge
+(JUDGE_V1B=$CKPATH systemd-run --user --scope -q -p MemoryMax=1G --setenv=JUDGE_V1B=$CKPATH bash $LOGD/crossjudge_rl_v3.sh >> $LOGD/crossjudge_rl_v3.out 2>&1 &)

@@ -222,6 +222,10 @@ def critic_step(src, u_j, texts, G):
 @torch.no_grad()
 def evaluate(step):
     policy.eval(); vecs, src, u_j = vecs_for(store_val, Vh_rows, Vh_i, Vh_j); y_j = y_of(u_j, 4321); g = gen(vecs, 0.0); texts = decode(g); N = len(texts)
+    if is_main:                                                                                     # keep the held-out greedy dumps (cross-judge scoring by critics of other lineages later)
+        try:
+            import pyarrow as pa; pq.write_table(pa.table({"pair_id": vp["pair_id"].tolist()[:N], "text": texts, "source": [f"rl_step{step:04d}"] * N, "sample": pa.array([0] * N, pa.int32())}), f"{args.out}/dumps_{step:04d}.parquet")
+        except Exception as e_: P(f"[rl] dump save failed: {e_}")
     eps_bank = eps_for(N, D_MODEL, 4321); dmp = dm_partner(Vh_i, Vh_j); dm_texts = [texts[q] for q in dmp]; rp_texts = [texts[(q + N // 2) % N] for q in range(N)]
     out = {"step": step, "tokens": float(np.mean([len(tok(t, add_special_tokens=False).input_ids) for t in texts])), "depth_hit_rate": float(np.mean([depth_hit(t) for t in texts])), "empty_rate": float(np.mean([not t.strip() for t in texts]))}
     for name, model in (("cotrained", critic.eval()), ("frozen", frozen)):
