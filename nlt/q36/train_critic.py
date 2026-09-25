@@ -79,6 +79,8 @@ def main():
     p.add_argument("--null-dm", type=float, default=0.0, help="8B v1.16 regulariser: at the same (x_t, t, eps) pull the velocity under a depth-matched WRONG text (another micro-batch row, same (i,j) else same j else rolled) toward the no-text velocity (detached), so a wrong text earns no bits and the text path stays calibrated to the null path")
     p.add_argument("--max-passes", type=float, default=1.0, help="ONE-PASS RULE (orchestrator 07:45): stop (save ckpt_final) as soon as the most-sampled text pool has been drawn more than this many times over its distinct (pair, text) rows; <= 0 disables. Passes per pool are logged every 25 steps.")
     p.add_argument("--anchor", type=float, default=0.0, help="ACTIVATION-ANCHORED contrast weight (critic v3): text fixed, activation varied - the text-conditioned gain over the unconditional velocity error must be larger on the text's own (u_i, u_j) than on a depth-matched OTHER pair's (same (i, j), same eps and t); logistic loss softplus((gain_other - gain_own) / tau). Never a text-edit negative.")
+    p.add_argument("--anchor-mode", default="gain", choices=["gain", "capped"], help="gain (v3b): softplus((gain_other - gain_own)/tau) - satisfiable by WRECKING the mismatched-text prediction (FM_other -> inf), which is what v3b did. capped: relu(FM_own - min(FM_other, FM_own + margin) + margin): the own-target loss must beat the other-target loss by a margin, and once FM_other exceeds FM_own + margin the term is exactly 0 with NO gradient, so inflating FM_other buys nothing")
+    p.add_argument("--anchor-margin", type=float, default=0.05, help="capped mode: margin in inner per-dim MSE units")
     p.add_argument("--anchor-tau", type=float, default=0.05, help="temperature of the anchored contrast in inner per-dim MSE units"); p.add_argument("--anchor-frac", type=float, default=1.0, help="fraction of each text micro-batch that gets the anchored contrast (compute: 2 extra forwards per anchored row)")
     p.add_argument("--sigma-r", type=float, default=0.1); p.add_argument("--radial", default="lognormal", choices=["lognormal", "fixed"], help="fixed: s = 1 + isotropic dequantisation noise --sigma-iso (radial density shared by the text and null paths)"); p.add_argument("--sigma-iso", type=float, default=0.05); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=256); p.add_argument("--eval-offset", type=int, default=2048, help="val pairs before this index are the FIXED test set (eval_bits.py); monitoring uses pairs after it"); p.add_argument("--spot-exact-n", type=int, default=64); p.add_argument("--spot-ode-steps", type=int, default=16)
@@ -155,7 +157,11 @@ def main():
                 l = ((r_own.float() - v_in) ** 2).mean(-1); v_mse = l.detach()
                 e_unc = ((r_unc.float() - v_in) ** 2).mean(-1).detach(); g_own = e_unc[:na] - l[:na]; g_oth = e_unc[perm][:na] - ((r_sw.float() - v_in[perm][:na]) ** 2).mean(-1)
                 valid = (perm[:na] != torch.arange(na, device=dev)) & keep[sl][:na]                                            # rows whose partner is a different row and whose text was kept
-                anc = torch.nn.functional.softplus((g_oth - g_own) / a.anchor_tau); anc = anc[valid].mean() if valid.any() else anc.sum() * 0
+                if a.anchor_mode == "gain": anc = torch.nn.functional.softplus((g_oth - g_own) / a.anchor_tau)
+                else:
+                    l_oth = ((r_sw.float() - v_in[perm][:na]) ** 2).mean(-1); cap = (l[:na] + a.anchor_margin).detach()
+                    anc = torch.relu(l[:na] - torch.minimum(l_oth, cap) + a.anchor_margin)                  # zero, with zero gradient, once FM_other >= FM_own + margin
+                anc = anc[valid].mean() if valid.any() else anc.sum() * 0
                 step_loss = l.mean() + a.anchor * anc
                 if valid.any(): ANC.append((float(g_own[valid].mean()), float(g_oth[valid].mean()), float((g_own[valid] > g_oth[valid]).float().mean()), float(anc)))
             else:
