@@ -1988,6 +1988,14 @@ def main():
     p.add_argument("--zero-var-filter", action="store_true", default=False,
                    help="ScaleRL: groups whose rewards are identical (std<=1e-6) leave the effective batch (weight 0, out "
                         "of the loss denominators)")
+    p.add_argument("--adv-fail-mode", choices=["include", "pin"], default=None,
+                   help="--adv-mode batch only. include (legacy): failed rollouts (no reward: extraction/truncation "
+                        "failure -> fail floor) are centred and normalised with the rest, so a single -2 (or -480-nat claims) "
+                        "failure inflates the batch std and shrinks every other advantage. pin: failures are excluded from the "
+                        "group centring and the batch std, and their normalised advantage is set to --adv-fail-value. "
+                        "Default: pin for --reward-mode claims, include otherwise (in-flight arms resume bit-identical).")
+    p.add_argument("--adv-fail-value", type=float, default=-3.0,
+                   help="normalised advantage of a failed rollout under --adv-fail-mode pin")
     p.add_argument("--loss-agg", choices=["seq", "prompt"], default="seq",
                    help="seq (DEFAULT): each rollout weighs 1/n_total, its tokens 1/|y| (Dr.GRPO: 1/max_new_tokens); "
                         "prompt (ScaleRL): each GROUP weighs 1/G_kept, its tokens 1/sum_g|y|")
@@ -3291,6 +3299,7 @@ def main():
                      (args.claim_fail_reward if args.claim_fail_reward is not None else -args.claim_cost * args.claim_max))
             rewards_filled = [_fail if r is None else r for r in actor_rewards]
         rewards_t = torch.tensor(rewards_filled, dtype=torch.float32, device=device)
+        fail_t = torch.tensor([r is None for r in actor_rewards], dtype=torch.bool, device=device)   # got the fail floor
 
         # ---- reward shaping (length penalty) ----
         # Subtracted from the GRPO signal (rewards_t) only, so FVE stays a pure
@@ -3376,14 +3385,17 @@ def main():
                 if args.zero_var_filter and _gsd[gi] <= 1e-6:
                     _zv_groups.add(gi)
             if _adv_mode == "batch":
-                # centre per group (already done above when dr_grpo; redo from rewards to be explicit)
+                # centre per group (already done above when dr_grpo; redo from rewards to be explicit).
+                # --adv-fail-mode pin: failed rollouts leave the centring and the std, then get a fixed advantage.
+                _pin = (args.adv_fail_mode or ("pin" if args.reward_mode == "claims" else "include")) == "pin"
+                _ok = (inject_ok_t & ~fail_t) if _pin else inject_ok_t
                 adv = torch.zeros_like(rewards_t)
                 for gi in range(args.batch_prompts):
-                    mask = (group_t == gi) & inject_ok_t
+                    mask = (group_t == gi) & _ok
                     if mask.sum() == 0 or gi in _zv_groups:
                         continue
                     adv[mask] = rewards_t[mask] - rewards_t[mask].mean()
-                _live = inject_ok_t.clone()
+                _live = _ok.clone()
                 for gi in _zv_groups:
                     _live &= ~(group_t == gi)
                 _stats = torch.tensor([float(adv[_live].double().pow(2).sum()), float(adv[_live].double().sum()),
@@ -3394,6 +3406,12 @@ def main():
                 _std = math.sqrt(max(_stats[0].item() / _n - (_stats[1].item() / _n) ** 2, 0.0)) if _n > 1 else 1.0
                 adv = adv / (_std + 1e-6)
                 shape_terms["scalerl/batch_adv_std"] = _std
+                shape_terms["scalerl/n_fail"] = float((inject_ok_t & fail_t).sum())
+                if _pin:
+                    _pf = inject_ok_t & fail_t                  # zero-variance groups (e.g. all 8 failed) stay zeroed below
+                    for gi in _zv_groups:
+                        _pf &= ~(group_t == gi)
+                    adv[_pf] = args.adv_fail_value
             if _zv_groups:
                 for gi in _zv_groups:
                     adv[group_t == gi] = 0.0
