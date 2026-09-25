@@ -107,7 +107,11 @@ def run_evalq(idle_min: int = 20, worker: str = "w0"):
         except Exception as e: print(f"[evalq] claim of {os.path.basename(spec)} failed ({e}); retrying", flush=True); _t.sleep(5); continue
         job = json.load(open(claimed)); idle = 0.0; n += 1
         print(f"[evalq] {worker} job {n}: {job['label']} :: {job['args'][:160]}", flush=True)
-        rc = _run(f"python {Q36}/{job.get('script', 'eval_bits.py')} {job['args']}", f"evalq_{job['label']}")
+        import re as _re; m_out = _re.search(r"--out (\S+)", job["args"]); outp = m_out.group(1) if m_out else None
+        if outp and outp.endswith(".json") and os.path.exists(outp) and '"elapsed_min"' in open(outp).read():          # idempotent: a complete result already exists (duplicate spec) -> skip
+            print(f"[evalq] {job['label']}: result {outp} already complete -> skipped", flush=True); rc = 0
+        else:
+            rc = _run(f"python {Q36}/{job.get('script', 'eval_bits.py')} {job['args']}", f"evalq_{job['label']}")
         try: os.rename(claimed, spec[:-5] + f".done{rc}.json"); vol.commit()
         except Exception as e: print(f"[evalq] done-mark failed: {e}", flush=True)
         print(f"[evalq] {worker} finished {job['label']} rc {rc}", flush=True)
