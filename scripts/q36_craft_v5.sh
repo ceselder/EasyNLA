@@ -19,7 +19,7 @@ for i in $(seq 1 400); do
     prev=$(grep -E "^\[${PFX}_${sp}_${si}\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+"); if [ -n "$prev" ] && app_live "$prev"; then LAUNCHED[$tok]=1; log "craft of $tok already running ($prev) from an earlier chain"; continue; fi
     n=$(timeout 120 modal volume ls nlt ${LAYER_OUT#/vol/}/$sp/$f 2>/dev/null | grep -c "h_L.*\.parquet$"); m=$(timeout 120 modal volume ls nlt ${DELTA_OUT#/vol/}/$sp/$f 2>/dev/null | grep -c "v_delta.parquet")
     [ "$n" -ge 16 ] && [ "$m" -ge 1 ] || continue
-    PRIO=1 wait_gpu 1 || exit 1                                                   # crafting feeds critic v4 (the main next judge): same priority as its gate evals
+    PRIO=${CRAFT_PRIO:-2} wait_gpu 1 || exit 1                                                   # crafting feeds critic v4 (the main next judge): same priority as its gate evals
     TW=""
     run "--data-dir $DATA_DIR --split $sp --shards $si --rollouts-root /vol/q36/rollouts/$sp --layer-root $LAYER_OUT --delta-root $DELTA_OUT --extra-pairs $DATA_DIR/pairs_all_x4.parquet --m-extra $M_EXTRA --out-dir /vol/${TEXT_OUT#/vol/}/$sp --greedy-only $TW" craft3_${sp}_$si
     if grep -q "${PFX}_${sp}_${si}\] SPAWNED" $LOGD/apps.txt; then LAUNCHED[$tok]=1; log "craft launched for $tok ($(shard_name $sp $si): $n layer files, delta ok)"; else log "craft launch for $tok FAILED (will retry next round)"; fi

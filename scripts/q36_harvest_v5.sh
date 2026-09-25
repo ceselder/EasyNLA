@@ -31,7 +31,7 @@ for i in $(seq 1 400); do
     if [ -n "$a" ] && echo "$live" | grep -q "$a"; then alldone=0; continue; fi                       # running
     if done_p $p; then continue; fi                                                                    # finished
     alldone=0; [ -f $LOGD/${PFX}_pause_$p ] && { log "engine $p paused ($LOGD/${PFX}_pause_$p exists)"; continue; }   # orchestrator 07:57: one engine paused for the eval queue
-    PRIO=0 wait_gpu 1 || exit 1; launch $p
+    PRIO=${ENGINE_PRIO:-2} wait_gpu 1 || exit 1; launch $p
   done
   [ $alldone -eq 1 ] && { log "$PFX HARVEST DONE"; touch $LOGD/.${PFX}_done; break; }
   sleep 600
