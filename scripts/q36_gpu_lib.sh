@@ -26,7 +26,7 @@ wait_bits(){ # wait_bits name1 name2 ... -> returns when every result is complet
   for i in $(seq 1 600); do ok=0; for n in "$@"; do bits_complete "$n" && ok=$((ok + 1)); done; [ "$ok" -ge $# ] && return 0; [ $((i % 5)) -eq 0 ] && echo "[bits-wait] $(date -u +%H:%M) complete: $ok/$#"; sleep 180; done; return 1; }
 
 # spawn_retry env VAR=.. timeout 900 modal run --detach ... : retries while Modal refuses the launch ("reached limit of 100 ephemeral apps", transient errors); releases the launch lock while sleeping
-spawn_retry(){ local i out; for i in $(seq 1 24); do out=$("$@" 2>&1 9>&- | grep -E "SPAWNED|modal.com/apps|rror|limit"); if echo "$out" | grep -q SPAWNED; then echo "$out"; return 0; fi
+spawn_retry(){ local i out full; for i in $(seq 1 24); do full=$("$@" 2>&1 9>&-); printf '%s\n' "$full" > /tmp/q36_spawn_last.txt; out=$(printf '%s\n' "$full" | grep -E "SPAWNED|modal.com/apps|rror|limit"); if echo "$out" | grep -q SPAWNED; then echo "$out"; return 0; fi; echo "[spawn] $(date -u +%H:%M) error body: $(printf '%s\n' "$full" | grep -vE "^\s*$|^[╭╰│┃━─]+\s*$" | grep -A2 -iE "error" | tr -s ' ' | tr '\n' ' ' | cut -c1-300)"
   echo "[spawn] $(date -u +%H:%M) launch refused ($(echo "$out" | grep -oE 'reached limit[^│]*|rror[^│]*' | head -1 | cut -c1-80)); retry $i/24 in 5 min" >&2; flock -u 9 2>/dev/null; sleep 300 9>&-; flock 9 2>/dev/null; done; echo "$out"; return 1; }
 
 # EVAL QUEUE (orchestrator 09:12): enqueue_eval "<eval_bits args>" <label> [prio] [script] -> one spec file on the volume; eval_workers.sh keeps <= EVAL_WORKERS long-lived worker apps (task evalq) draining it in priority order.
