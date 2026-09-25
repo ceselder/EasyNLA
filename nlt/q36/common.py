@@ -265,8 +265,14 @@ BULLET_RE = re.compile(r"^\*\s+(.+?)\s*$")
 
 
 def parse_bullets(text: str, k: int = 4):
-    """-> the first k '* ' bullets of a readout (stripped), total bullet count."""
-    bs = [b for b in (m.group(1) for m in (BULLET_RE.match(l.strip()) for l in text.split("\n")) if m) if b]
+    """-> the first k bullets of a readout (stripped), total bullet count. Lenient: one bullet per line; a leading '* ' / '- ' is stripped
+    (plain vLLM decoding sometimes drops the first '* ' that the RL grammar forced), lines that are only punctuation are dropped."""
+    bs = []
+    for l in text.split("\n"):
+        l = l.strip()
+        if l.startswith("* ") or l.startswith("- "): l = l[2:].strip()
+        elif l.startswith("*"): l = l[1:].strip()
+        if l and re.search(r"[A-Za-z0-9一-鿿]", l): bs.append(l)
     return bs[:k], len(bs)
 
 
