@@ -25,8 +25,24 @@ def test_exact_logp_matches_gaussian():
     assert torch.allclose(lp_q, ref, atol=0.15)
 
 
-def tiny(use_g=True, use_tokens=True, d_enc=24):
-    return EPrior(d_e=32, n_tok=4, d_model=32, n_layers=2, n_heads=4, d_enc=d_enc, d_g=8, use_tokens=use_tokens, use_g=use_g)
+def tiny(use_g=True, use_tokens=True, d_enc=24, norm="pre"):
+    return EPrior(d_e=32, n_tok=4, d_model=32, n_layers=2, n_heads=4, d_enc=d_enc, d_g=8, use_tokens=use_tokens, use_g=use_g, norm=norm)
+
+
+@pytest.mark.parametrize("norm", ["pre", "post", "peri"])
+def test_norm_modes_consistency(norm):
+    torch.manual_seed(7); m = tiny(norm=norm)
+    x = torch.randn(3, 32); t = torch.rand(3)
+    assert torch.allclose(m(x, t), torch.zeros(3, 32))                                 # zero-init output projection -> zero velocity in every mode
+    for p in m.parameters(): p.data.normal_(0, 0.05)
+    x = torch.randn(4, 32); t = torch.rand(4); enc = torch.randn(4, 6, 24); mk = torch.ones(4, 6, dtype=torch.bool); g = torch.randn(4, 8)
+    mk[1] = False; g_has = torch.tensor([True, False, True, True])
+    vc = m(x, t, enc, mk, g, g_has); vu = m(x, t)
+    assert torch.allclose(vc[1], vu[1], atol=1e-5), norm                               # text-dropped row == enc-less unconditional call (also for post-norm's extra LN step)
+    assert not torch.allclose(vc[0], vu[0], atol=1e-3)
+    enc2 = torch.cat([enc, torch.randn(4, 3, 24)], 1); mk2 = torch.cat([mk, torch.zeros(4, 3, dtype=torch.bool)], 1)
+    assert torch.allclose(m(x, t, enc2, mk2, g, g_has), vc, atol=1e-5)               # padding invariance
+    assert m.arch()["norm"] == norm and EPrior(**m.arch()).norm == norm
 
 
 def test_zero_init_is_identity_velocity_zero():

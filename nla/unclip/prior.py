@@ -123,43 +123,59 @@ def _attn(q, k, v, mask=None):
 
 
 class Block(nn.Module):
-    """pre-norm: adaLN(self-attn over e-tokens) -> adaLN(cross-attn over text tokens) -> adaLN(MLP); the 9 modulation vectors come from the
-    shared adaLN-single MLP (PixArt-alpha) plus this block's learned table. Cross-attention output is zero for rows with an all-False mask."""
-    def __init__(self, d, n_heads, d_enc_proj, mlp_ratio=4, use_tokens=True):
+    """adaLN-modulated transformer block: self-attn over the e-tokens -> cross-attn over the text tokens -> MLP. The 9 modulation vectors come from the
+    shared adaLN-single MLP (PixArt-alpha) plus this block's learned table. norm placement:
+      pre  : h = LN(x)(1+sc)+sh ; x = x + g * f(h)                      (default; identity at init through the zero-init output projections)
+      post : y = x + g * f(x)   ; x = LN(y)(1+sc)+sh                    (original-transformer post-norm, modulated after the norm)
+      peri : h = LN(x)(1+sc)+sh ; x = x + g * LN_out(f(h))              (Peri-LN / sandwich: sublayer input AND output normalised)
+    Cross-attention output is zero for rows with an all-False mask; with enc=None the cross sublayer contributes 0 but its norm step (post mode)
+    is still applied, so text-dropped rows and enc-less unconditional calls follow the identical computation."""
+    def __init__(self, d, n_heads, d_enc_proj, mlp_ratio=4, use_tokens=True, norm="pre"):
         super().__init__()
-        self.d, self.h = d, n_heads; self.use_tokens = use_tokens
+        assert norm in ("pre", "post", "peri"), norm
+        self.d, self.h = d, n_heads; self.use_tokens = use_tokens; self.norm = norm
         self.ln1 = nn.LayerNorm(d, elementwise_affine=False); self.qkv = nn.Linear(d, 3 * d); self.o1 = _zero(nn.Linear(d, d))
-        if use_tokens:
-            self.ln2 = nn.LayerNorm(d, elementwise_affine=False); self.q2 = nn.Linear(d, d); self.kv2 = nn.Linear(d_enc_proj, 2 * d); self.o2 = _zero(nn.Linear(d, d))
+        self.ln2 = nn.LayerNorm(d, elementwise_affine=False)
+        if use_tokens: self.q2 = nn.Linear(d, d); self.kv2 = nn.Linear(d_enc_proj, 2 * d); self.o2 = _zero(nn.Linear(d, d))
         self.ln3 = nn.LayerNorm(d, elementwise_affine=False); self.mlp = nn.Sequential(nn.Linear(d, mlp_ratio * d), nn.GELU(approximate="tanh"), _zero(nn.Linear(mlp_ratio * d, d)))
+        if norm == "peri": self.lno1 = nn.LayerNorm(d); self.lno2 = nn.LayerNorm(d); self.lno3 = nn.LayerNorm(d)
         self.table = nn.Parameter(torch.zeros(9 * d))   # per-block offsets to the shared modulation (shift, scale, gate) x 3
+
+    def _sub(self, x, ln, lno, f, sh, sc, g, has=None):
+        """has [B] bool (cross sublayer only): rows without a condition get EXACTLY zero contribution, applied after any output norm"""
+        hm = (lambda y: y * has[:, None, None].to(y.dtype)) if has is not None else (lambda y: y)
+        if self.norm == "pre": return x + g * hm(f(ln(x) * (1 + sc) + sh))
+        if self.norm == "peri": return x + g * hm(lno(f(ln(x) * (1 + sc) + sh)))
+        return ln(x + g * hm(f(x))) * (1 + sc) + sh                                          # post
 
     def forward(self, x, mod, enc=None, enc_mask=None):
         """x [B, S, d]; mod [B, 9d] (shared adaLN-single output); enc [B, T, d_enc_proj]; enc_mask [B, T] bool"""
         B, S, d = x.shape
         m = (mod + self.table[None]).view(B, 9, 1, d); sh1, sc1, g1, sh2, sc2, g2, sh3, sc3, g3 = m.unbind(1)
-        h = self.ln1(x) * (1 + sc1) + sh1
-        q, k, v = self.qkv(h).view(B, S, 3, self.h, d // self.h).permute(2, 0, 3, 1, 4)
-        a = _attn(q, k, v).transpose(1, 2).reshape(B, S, d)
-        x = x + g1 * self.o1(a)
-        if self.use_tokens and enc is not None:
-            has = enc_mask.any(-1); safe = enc_mask | (~has)[:, None]
-            h = self.ln2(x) * (1 + sc2) + sh2
-            q = self.q2(h).view(B, S, self.h, d // self.h).transpose(1, 2)
-            k, v = self.kv2(enc).view(B, -1, 2, self.h, d // self.h).permute(2, 0, 3, 1, 4)
-            a = _attn(q, k, v, safe[:, None, None, :]).transpose(1, 2).reshape(B, S, d)
-            x = x + g2 * self.o2(a) * has[:, None, None].to(x.dtype)
-        h = self.ln3(x) * (1 + sc3) + sh3
-        return x + g3 * self.mlp(h)
+        def f_self(h):
+            q, k, v = self.qkv(h).view(B, S, 3, self.h, d // self.h).permute(2, 0, 3, 1, 4)
+            return self.o1(_attn(q, k, v).transpose(1, 2).reshape(B, S, d))
+        x = self._sub(x, self.ln1, getattr(self, "lno1", None), f_self, sh1, sc1, g1)
+        if self.use_tokens:
+            if enc is not None:
+                has = enc_mask.any(-1); safe = enc_mask | (~has)[:, None]
+                def f_cross(h):
+                    q = self.q2(h).view(B, S, self.h, d // self.h).transpose(1, 2)
+                    k, v = self.kv2(enc).view(B, -1, 2, self.h, d // self.h).permute(2, 0, 3, 1, 4)
+                    return self.o2(_attn(q, k, v, safe[:, None, None, :]).transpose(1, 2).reshape(B, S, d))
+            else: has = None; f_cross = lambda h: torch.zeros_like(h)                         # unconditional: zero contribution, same norm step
+            if enc is not None or self.norm == "post": x = self._sub(x, self.ln2, getattr(self, "lno2", None), f_cross, sh2, sc2, g2, has)
+        x = self._sub(x, self.ln3, getattr(self, "lno3", None), self.mlp, sh3, sc3, g3)
+        return x
 
 
 class EPrior(nn.Module):
     """velocity network v(x_t, t | z). forward(x_t [B, d_e], t [B], enc=None, enc_mask=None, g=None, g_has=None) -> [B, d_e].
     enc=None: the unconditional prior (no cross-attention, g = null). Per-sample dropout: all-False mask row + g_has False."""
-    def __init__(self, d_e=1024, n_tok=16, d_model=1024, n_layers=12, n_heads=16, d_enc=5120, d_g=1024, use_tokens=True, use_g=True, mlp_ratio=4):
+    def __init__(self, d_e=1024, n_tok=16, d_model=1024, n_layers=12, n_heads=16, d_enc=5120, d_g=1024, use_tokens=True, use_g=True, mlp_ratio=4, norm="pre"):
         super().__init__()
         assert d_e % n_tok == 0; self.d_e, self.n_tok, self.d_model, self.d_tok = d_e, n_tok, d_model, d_e // n_tok
-        self.use_tokens, self.use_g, self.d_enc, self.d_g = use_tokens, use_g, d_enc, d_g
+        self.use_tokens, self.use_g, self.d_enc, self.d_g, self.norm = use_tokens, use_g, d_enc, d_g, norm
         self.inp = nn.Linear(self.d_tok, d_model); self.pos = nn.Parameter(torch.randn(n_tok, d_model) * 0.02)
         self.t_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
         if use_g:
@@ -168,14 +184,14 @@ class EPrior(nn.Module):
         if use_tokens:
             self.enc_ln = nn.LayerNorm(d_enc); self.enc_proj = nn.Linear(d_enc, d_model)   # shared projection of the trunk states (5120 -> d_model)
         self.mod = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 9 * d_model))  # adaLN-single: one modulation MLP for all blocks
-        self.blocks = nn.ModuleList([Block(d_model, n_heads, d_model, mlp_ratio, use_tokens) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, d_model, mlp_ratio, use_tokens, norm) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model, elementwise_affine=False); self.mod_f = _zero(nn.Linear(d_model, 2 * d_model)); self.out = _zero(nn.Linear(d_model, self.d_tok))
         # zero-init the final modulation layer of the shared MLP so every block starts as identity apart from the (also zero) output projections
         nn.init.zeros_(self.mod[1].weight); nn.init.zeros_(self.mod[1].bias)
 
     def arch(self):
         return dict(d_e=self.d_e, n_tok=self.n_tok, d_model=self.d_model, n_layers=len(self.blocks), n_heads=self.blocks[0].h, d_enc=self.d_enc, d_g=self.d_g,
-                    use_tokens=self.use_tokens, use_g=self.use_g, mlp_ratio=self.blocks[0].mlp[0].out_features // self.d_model)
+                    use_tokens=self.use_tokens, use_g=self.use_g, mlp_ratio=self.blocks[0].mlp[0].out_features // self.d_model, norm=self.norm)
 
     def cond_vector(self, t, g=None, g_has=None):
         c = self.t_embed(timestep_embedding(t * 1000.0, self.d_model).to(self.inp.weight.dtype))

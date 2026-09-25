@@ -137,6 +137,7 @@ def main():
     p.add_argument("--train-globs", default="/vol_q36/data/acts_qwen36_L42/shard_*.parquet"); p.add_argument("--max-rows", type=int, default=0, help="per rank (0 = all)"); p.add_argument("--render-pick", default="random", choices=["random", "canonical", "all"], help="g2 shards with several renderings per activation: one random QC-passing rendering, the canonical column, or ALL QC-passing renderings as separate pairs")
     p.add_argument("--val-parquet", default="/vol_q36/data/sft/av_sft_val_clean1.parquet"); p.add_argument("--eval-n", type=int, default=736); p.add_argument("--ret-n", type=int, default=256); p.add_argument("--exact-n", type=int, default=64); p.add_argument("--exact-steps", type=int, default=24)
     p.add_argument("--n-tok", type=int, default=16); p.add_argument("--d-model", type=int, default=1024); p.add_argument("--n-layers", type=int, default=16); p.add_argument("--n-heads", type=int, default=16); p.add_argument("--mlp-ratio", type=int, default=4)
+    p.add_argument("--norm", default="pre", choices=["pre", "post", "peri"], help="norm placement in the denoiser blocks: pre (adaLN-Zero), post (LN after the residual add), peri (sandwich: sublayer input and output normalised)")
     p.add_argument("--no-tokens", action="store_true", help="no cross-attention over the explanation tokens (g-only ablation)"); p.add_argument("--no-g", action="store_true", help="no CLIP text-embedding vector condition (tokens only)")
     p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--e-noise", type=float, default=0.05, help="isotropic noise added to the standardised e during training when e is unit-normalised (proper density off the shell); 0 with unnormalised e")
     p.add_argument("--max-len", type=int, default=224); p.add_argument("--enorm-n", type=int, default=65536)
@@ -204,7 +205,7 @@ def main():
     d_enc = 5120 if arvec.crit is not None else arvec.owner.config.hidden_size
 
     # ---------------- denoiser
-    model = EPrior(d_e=act_enc.d_e, n_tok=a.n_tok, d_model=a.d_model, n_layers=a.n_layers, n_heads=a.n_heads, d_enc=d_enc, d_g=act_enc.d_e, use_tokens=use_tokens, use_g=use_g, mlp_ratio=a.mlp_ratio).to(dev)
+    model = EPrior(d_e=act_enc.d_e, n_tok=a.n_tok, d_model=a.d_model, n_layers=a.n_layers, n_heads=a.n_heads, d_enc=d_enc, d_g=act_enc.d_e, use_tokens=use_tokens, use_g=use_g, mlp_ratio=a.mlp_ratio, norm=a.norm).to(dev)
     start_step = 0; start_pairs = 0; enorm = None
     if a.resume_from:
         ck = torch.load(os.path.join(a.resume_from, "prior.pt"), map_location="cpu", weights_only=False)
@@ -226,7 +227,7 @@ def main():
     if a.resume_from and a.resume_opt and os.path.exists(os.path.join(a.resume_from, "opt.pt")):
         opt.load_state_dict(torch.load(os.path.join(a.resume_from, "opt.pt"), map_location="cpu", weights_only=False)); log("[prior] AdamW state restored")
     trainable = list(model.parameters()) + lora
-    log(f"[prior] world {world}; denoiser {model.n_params()/1e6:.0f}M params ({a.n_layers} blocks x d {a.d_model}, {a.n_tok} e-tokens, tokens={use_tokens}, g={use_g}); trunk LoRA {sum(p_.numel() for p_ in lora)/1e6:.0f}M at lr {a.lr_lora}; denoiser lr {a.lr}")
+    log(f"[prior] world {world}; denoiser {model.n_params()/1e6:.0f}M params ({a.n_layers} blocks x d {a.d_model}, {a.n_tok} e-tokens, tokens={use_tokens}, g={use_g}, norm={a.norm}); trunk LoRA {sum(p_.numel() for p_ in lora)/1e6:.0f}M at lr {a.lr_lora}; denoiser lr {a.lr}")
 
     # ---------------- data
     t0 = time.time(); A, Z, AIDX, LAD = load_pairs_all(a.train_globs, rank, world, a.max_rows, a.seed, a.render_pick, para_col=a.para_col, with_ladders=a.neg_frac > 0)
