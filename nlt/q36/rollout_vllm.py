@@ -105,9 +105,9 @@ def main():
     else:
         files = sorted(sum((glob.glob(x.strip()) for x in args.data.split(",")), [])); assert files, f"no files match {args.data}"
         def loader():
-            need_cols = sorted({c for s in specs for c in s.split("-")})
-            tb = pa.concat_tables([pq.ParquetFile(f).read(columns=need_cols) for f in files]).slice(args.skip_rows, args.n_rows if args.n_rows else None)
-            return {c: torch.tensor(fsl(tb, c, D_MODEL, np.float32)) for c in need_cols}, tb.num_rows, None
+            need_cols = sorted({c for s in specs for c in s.split("-")}); has_pid = all("pair_id" in pq.ParquetFile(f).schema_arrow.names for f in files)
+            tb = pa.concat_tables([pq.ParquetFile(f).read(columns=need_cols + (["pair_id"] if has_pid else [])) for f in files]).slice(args.skip_rows, args.n_rows if args.n_rows else None)
+            return {c: torch.tensor(fsl(tb, c, D_MODEL, np.float32)) for c in need_cols}, tb.num_rows, (tb.column("pair_id").to_pylist() if has_pid else None)
         jobs.append(("columns", args.out_dir, loader))
     todo = [(lab, od, ld) for lab, od, ld in jobs if any(not os.path.exists(os.path.join(od, spec_name(s) + ".parquet")) for s in specs)]
     print(f"[rollout] {len(todo)}/{len(jobs)} jobs to do", flush=True)
