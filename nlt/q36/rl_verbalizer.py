@@ -67,7 +67,9 @@ if args.critic != "none":
 else:
     cargs = {"enc_model": "Qwen/Qwen3-0.6B", "enc_layer": 20, "enc_max_len": 192}; critic = DiffusionPrior(D_MODEL, 512, 4, 8, 8, 1024, 192, "v", 0.02, 0, 4, math.sqrt(D_MODEL))
 critic.to(dev).float(); frozen = copy.deepcopy(critic).eval().requires_grad_(False); critic.train()
-encoder = TextEncoder(cargs.get("enc_model", "Qwen/Qwen3-0.6B"), int(cargs.get("enc_layer", 20)), dev, int(cargs.get("enc_max_len", 192)))
+from huggingface_hub import snapshot_download
+ENC_DIR = snapshot_download(cargs.get("enc_model", "Qwen/Qwen3-0.6B"), cache_dir="/vol/hf_cache/enc", token=os.environ.get("HF_TOKEN"))      # explicit cache_dir: HF_HOME points at the read-only 27B cache
+encoder = TextEncoder(ENC_DIR, int(cargs.get("enc_layer", 20)), dev, int(cargs.get("enc_max_len", 192)))
 c_opt = torch.optim.AdamW(critic.parameters(), lr=args.critic_lr, betas=(0.9, 0.999), weight_decay=0.01)
 P(f"[rl] critic {args.critic} ({critic.n_params() / 1e6:.0f}M) co-train {not args.no_cotrain} lr {args.critic_lr} | frozen copy kept for the guard")
 
