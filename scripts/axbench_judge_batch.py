@@ -166,11 +166,35 @@ def collect(a):
     for m, v in summ["per_method"].items(): print(f"   {m:22s} overall {v['selected_overall']:.3f} (factor {v['selected_factor_mean']:.2f}) | plain best {v['best_plain_overall']:.3f} @ {v['best_plain_factor']:g} | axes {({k: round(x, 2) for k, x in v['selected_axes'].items()})}", flush=True)
 
 
+def retry(a):
+    """re-ask (direct Messages calls, same verbatim templates) every axis still missing a rating (refusals / unparsed), up to a.attempts times."""
+    import concurrent.futures as cf
+    d = json.load(open(a.out)); recs = d["records"]; cl = client()
+    todo = [(i, ax) for i, r in enumerate(recs) for ax in AXES if r.get(SK[ax]) is None]
+    print(f"[axbench-judge] retry: {len(todo)} missing ratings", flush=True)
+    def one(i, ax):
+        for att in range(a.attempts):
+            try:
+                msg = cl.messages.create(model=MODEL, max_tokens=a.max_tokens, messages=[{"role": "user", "content": prompt_for(ax, recs[i])}])
+                v = parse_rating("".join(b.text for b in msg.content if getattr(b, "type", None) == "text"))
+                if v is not None: return i, ax, v, msg.stop_reason
+            except Exception as e: time.sleep(min(60, 2 ** att + random.random()))
+        return i, ax, None, "failed"
+    stops = {}
+    with cf.ThreadPoolExecutor(a.workers) as ex:
+        for i, ax, v, sr in ex.map(lambda t: one(*t), todo):
+            stops[sr] = stops.get(sr, 0) + 1
+            if v is not None: recs[i][SK[ax]] = v
+    d["summary"] = aggregate(recs); d["retry_stop_reasons"] = stops; json.dump(d, open(a.out, "w"))
+    print(f"[axbench-judge] retry done: {stops}; judged {d['summary']['n_judged']}/{d['summary']['n_records']}", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="cmd", required=True)
+    rt = sub.add_parser("retry"); rt.add_argument("--out", required=True); rt.add_argument("--attempts", type=int, default=3); rt.add_argument("--workers", type=int, default=8); rt.add_argument("--max-tokens", type=int, default=1000)
     s = sub.add_parser("submit"); s.add_argument("--gen", required=True); s.add_argument("--out", required=True); s.add_argument("--chunk", type=int, default=2000); s.add_argument("--max-tokens", type=int, default=1000)   # the templates ask for an explanation BEFORE the rating; 400 truncated ~13 % of answers
     c = sub.add_parser("collect"); c.add_argument("--out", required=True); c.add_argument("--wait", action="store_true"); c.add_argument("--poll", type=int, default=120); c.add_argument("--reparse", action="store_true", help="re-fetch results of batches already marked done")
-    a = p.parse_args(); (submit if a.cmd == "submit" else collect)(a)
+    a = p.parse_args(); {"submit": submit, "collect": collect, "retry": retry}[a.cmd](a)
 
 
 if __name__ == "__main__": main()
