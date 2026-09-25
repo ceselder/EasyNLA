@@ -22,9 +22,11 @@ from critic_data import Store, Directions, load_text_pairs, dm_partner
 T_GRID = (0.1, 0.3, 0.5, 0.7, 0.9)
 
 
-def load_critic(path, dev):
+def load_critic(path, dev, raw=False):
     from nlt.prior.model import build_prior
-    ck = torch.load(path, map_location="cpu"); m = build_prior(ck["config"]); m.load_state_dict(ck["model"]); m.to(dev).eval().requires_grad_(False)
+    ck = torch.load(path, map_location="cpu"); m = build_prior(ck["config"])
+    if raw: assert "model_raw" in ck, f"{path} has no raw weights (only ckpt_latest.pt, saved with the optimizer, carries model_raw)"
+    m.load_state_dict(ck["model_raw"] if raw else ck["model"]); m.to(dev).eval().requires_grad_(False)
     return m, ck["args"], ck.get("step")
 
 
@@ -59,6 +61,7 @@ def main():
     p.add_argument("--n", type=int, default=512); p.add_argument("--n-fixed", type=int, default=2048); p.add_argument("--batch", type=int, default=32); p.add_argument("--ode-steps", type=int, default=64); p.add_argument("--probes", type=int, default=1)
     p.add_argument("--n-samples", type=int, default=4); p.add_argument("--sample-steps", type=int, default=32); p.add_argument("--skip-samples", action="store_true"); p.add_argument("--skip-sw", action="store_true")
     p.add_argument("--fixed-from-texts", action="store_true", help="build the fixed test set from the FIRST --sets glob's own rows (seeded shuffle, then --n-fixed) instead of pairs_<split>.parquet: needed for harvested text/v3 rows whose pair ids (split:pos_idx:i:j) are not in the pairs file (train-row memorisation probe for the one-pass critics)")
+    p.add_argument("--raw-weights", action="store_true", help="orchestrator 15:12: score with the RAW (non-EMA) weights of a ckpt_latest.pt (EMA vs raw diagnostic)")
     p.add_argument("--fixed-from-twins", action="store_true", help="orchestrator 13:50: build the fixed set from the --twins manifests with <= 1 pair per POSITION (pairs carrying every variant first), seeded; use with --twins-n = --n-fixed >= 1024")
     p.add_argument("--twins-n", type=int, default=0, help="pairs scored in the twins block (0 = --n)"); p.add_argument("--boot", type=int, default=2000, help="bootstrap resamples, clustered by position, for the twin CIs")
     p.add_argument("--pair-ids-file", default=None, help="with --fixed-from-texts: restrict the probe to these pair ids (one per line) = the slice a pair-capped critic trained on (train_critic writes <out>/pair_slice_<s>.txt)")
@@ -68,7 +71,7 @@ def main():
     a = p.parse_args(); dev = "cuda"; torch.manual_seed(a.seed); t_all = time.time()
     from nlt.eval_bits.exact import exact_logp, make_probe_bank
     from nlt.critic.text_encoder import TextEncoder
-    model, aa, step = load_critic(a.ckpt, dev); sigma_r = float(aa.get("sigma_r", 0.1))
+    model, aa, step = load_critic(a.ckpt, dev, raw=a.raw_weights); sigma_r = float(aa.get("sigma_r", 0.1))
     dirs = Directions(a.stats or aa.get("stats_path") or os.path.join(a.data_dir, "layer_stats.pt"), sigma_r, dev, radial=aa.get("radial", "lognormal"), sigma_iso=float(aa.get("sigma_iso", 0.0)))
     store = Store(a.data_dir, a.split, device=a.data_device); d = store.d
     NB = None                                                     # neighbour activations: {(shard, row) -> index}, tensors per (L, k)
@@ -223,19 +226,21 @@ def main():
         T_PROXY = [0.1, 0.3, 0.5, 0.7, 0.9]
         def proxy_fm(kk, texts):
             # the RL reward's view: flow-matching loss on a fixed t grid with the pair's fixed eps (common random numbers across the variants of one pair)
-            x0, src, _, _ = inputs(kk); e = eps_all[kk].to(dev); out = torch.zeros(len(kk), device=dev)
+            x0, src, _, _ = inputs(kk); e = eps_all[kk].to(dev); per_t = []
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 enc, mask = encoder(texts)
                 for tv in T_PROXY:
                     tt = torch.full((len(kk),), tv, device=dev); x_t = (1 - tt)[:, None] * x0 + tt[:, None] * e
-                    v = model(x_t, tt, src, enc=enc, enc_mask=mask); out = out + ((v.float() - (e - x0)) ** 2).mean(-1)
-            return (out / len(T_PROXY)).cpu()
+                    v = model(x_t, tt, src, enc=enc, enc_mask=mask); per_t.append(((v.float() - (e - x0)) ** 2).mean(-1))
+            PT = torch.stack(per_t, 1).cpu(); return PT.mean(1), PT     # mean over the grid (the RL reward's view) and the per-t losses (orchestrator 15:12: t-band diagnostic)
+        fmt = np.zeros((n, len(T_PROXY)))
         for s0 in range(0, n, a.batch):
             sub = tw.iloc[s0:s0 + a.batch]; kk = sub["k"].tolist(); texts = sub["text"].astype(str).tolist()
-            lp[s0:s0 + len(kk)] = lp_batch(kk, texts)[0].numpy(); fm[s0:s0 + len(kk)] = proxy_fm(kk, texts).numpy()
+            lp[s0:s0 + len(kk)] = lp_batch(kk, texts)[0].numpy(); fm_mean, fm_pt = proxy_fm(kk, texts); fm[s0:s0 + len(kk)] = fm_mean.numpy(); fmt[s0:s0 + len(kk)] = fm_pt.numpy()
             if (s0 // a.batch) % 10 == 0: print(f"[twins] {label}: {min(n, s0 + a.batch)}/{n} rows, {time.time() - t0:.0f}s", flush=True)
-        tw["logp"] = lp; tw["fm"] = fm; res = {"n_pairs": len(pids), "variants": {}}
-        tru = tw[tw["variant"] == "true"].set_index("pair_id")["logp"]; tru_fm = tw[tw["variant"] == "true"].set_index("pair_id")["fm"]
+        tw["logp"] = lp; tw["fm"] = fm; res = {"n_pairs": len(pids), "variants": {}, "t_grid": T_PROXY, "t_bands": ["[0.05,0.2)", "[0.2,0.4)", "[0.4,0.6)", "[0.6,0.8)", "[0.8,0.95]"], "raw_weights": bool(a.raw_weights)}
+        for ti, tv in enumerate(T_PROXY): tw[f"fm_t{ti}"] = fmt[:, ti]
+        tru = tw[tw["variant"] == "true"].set_index("pair_id")["logp"]; tru_fm = tw[tw["variant"] == "true"].set_index("pair_id")["fm"]; tru_row = tw[tw["variant"] == "true"].set_index("pair_id")
         for var in sorted(set(tw["variant"]) - {"true"}):
             sub = tw[tw["variant"] == var].set_index("pair_id"); com = [pid for pid in sub.index if pid in tru.index]
             dlt = (tru.loc[com].values - sub.loc[com, "logp"].values) / math.log(2); dfm = sub.loc[com, "fm"].values - tru_fm.loc[com].values      # dfm > 0: the true text has the LOWER FM loss (= higher RL reward)
@@ -243,6 +248,12 @@ def main():
                                     "proxy_p_true_gt_twin": float((dfm > 0).mean()), "proxy_fm_twin_minus_true": float(dfm.mean()), "proxy_sem": float(dfm.std() / math.sqrt(max(1, len(dfm))))}
             cl = [pos_of[pid] for pid in com]; bx = boot_ci(dlt, cl); bf = boot_ci(dfm, cl)
             res["variants"][var].update({"ci95_p": bx["ci95_p"], "ci95_bits": bx["ci95_bits"], "proxy_ci95_p": bf["ci95_p"], "proxy_ci95_fm": bf["ci95_bits"], "n_positions": bx["n_positions"], "boot": a.boot})
+            by_t = {}
+            for ti, tv in enumerate(T_PROXY):
+                d_t = sub.loc[com, f"fm_t{ti}"].values - tru_row.loc[com, f"fm_t{ti}"].values; b_t = boot_ci(d_t, cl, B=max(200, a.boot // 4))
+                by_t[str(tv)] = {"p_true_better": float((d_t > 0).mean()), "ci95_p": b_t["ci95_p"], "mean_fm_twin_minus_true": float(d_t.mean()), "band": res["t_bands"][ti]}
+            res["variants"][var]["fm_by_t"] = by_t
+            print(f"[twins] {label}/{var}: FM-view P(true better) per t: " + ", ".join(f"t={tv} {by_t[str(tv)]['p_true_better']:.3f} [{by_t[str(tv)]['ci95_p'][0]:.3f},{by_t[str(tv)]['ci95_p'][1]:.3f}]" for tv in T_PROXY), flush=True)
             print(f"[twins] {label}/{var}: CI95(P) exact {res['variants'][var]['ci95_p']} FM {res['variants'][var]['proxy_ci95_p']} over {res['variants'][var]['n_positions']} positions", flush=True)
             print(f"[twins] {label}/{var}: P(true > twin) {res['variants'][var]['p_true_gt_twin']:.3f} | true - twin {dlt.mean():.2f} +- {res['variants'][var]['sem']:.2f} bits (n {len(com)}) | FM-loss (RL reward) view: P(true better) {res['variants'][var]['proxy_p_true_gt_twin']:.3f}, twin - true {dfm.mean():.4f} +- {res['variants'][var]['proxy_sem']:.4f}", flush=True)
         results["twins"][label] = res; json.dump(results, open(a.out, "w"), indent=1)
