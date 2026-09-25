@@ -94,7 +94,7 @@ def main():
             ref = S["raw_all"]["content"] if "raw_all" in S else 0.0
             bars(axes[1], [NICE.get(k, k) for k in loo_keys], [S[k]["content"] for k in loo_keys], [S[k]["content_sem"] for k in loo_keys], C4, "Leave one readout source out: which source buys the bits?", "content bits", 0)
             axes[1].axhline(ref, color=C1, ls="--", lw=1)
-        fig.suptitle((f"Crafted change text carries ~2x the bits of an LLM-written trace, but the judge (critic {a.tag}) saw only crafted text (held-out pairs, Heun {T['ode_steps']})" if off else
+        fig.suptitle((f"Crafted change text carries ~2x the bits of an LLM-written trace,\nbut the judge (critic {a.tag}) trained on crafted text only (held-out pairs, Heun {T['ode_steps']})" if off else
                       f"Text-source search on critic {a.tag} (held-out pairs, Heun {T['ode_steps']})"), fontsize=13, y=1.02); fig.tight_layout(); savefig(fig, f"fig_phase1_sources_{a.tag}")
     print(json.dumps({k: {"content": round(v["content"], 2), "P": round(v["p_z_gt_dm"], 3), "rp": round(v["rp"], 2), "cos_c": round(v["cos_condmean"]["c"], 3), "cos_u": round(v["cos_condmean"]["u"], 3)} for k, v in S.items()}, indent=1))
 
