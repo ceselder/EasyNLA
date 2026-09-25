@@ -52,7 +52,7 @@ trainable = [q for n_, q in policy.named_parameters() if q.requires_grad and ".d
 for q in trainable: q.data = q.data.float()
 for n_, q in policy.named_parameters():
     if ".ref." in n_: q.requires_grad_(False)
-INJ = InjectMarkers(policy)
+MPOS = [k for k, t in enumerate(PROMPT) if t == MARKER_ID]; INJ = InjectMarkers(policy, positions=MPOS)
 P(f"[rl] policy {args.policy} ({sum(q.numel() for q in trainable) / 1e6:.0f}M trainable) | prompt {PLEN} tok | world {WORLD} x {args.batch} prompts x {args.group}")
 
 # ---- critic (co-trained) + frozen copy + text encoder ----
@@ -126,7 +126,7 @@ def gen(vecs, temperature):
         vb = vecs[a:a + args.gen_chunk]; ids = PROMPT_T.repeat(vb.shape[0], 1); INJ.set(vb, ids)
         try:
             kw = dict(do_sample=temperature > 0, temperature=temperature if temperature > 0 else None, top_p=1.0 if temperature > 0 else None, top_k=0 if temperature > 0 else None)
-            g = policy.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=args.n_tok, pad_token_id=PAD, eos_token_id=[EOT, PAD], **kw)
+            g = policy.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=args.n_tok, pad_token_id=PAD, eos_token_id=[EOT, PAD], suppress_tokens=[MARKER_ID], **kw)
         finally: INJ.off()
         s = g[:, PLEN:]; s = F.pad(s, (0, args.n_tok - s.shape[1]), value=PAD) if s.shape[1] < args.n_tok else s; outs.append(s)
     return torch.cat(outs)

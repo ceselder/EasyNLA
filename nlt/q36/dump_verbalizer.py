@@ -8,7 +8,7 @@ format, so eval_bits.py scores the verbalizer next to the crafted teacher text o
 import argparse, glob, json, os, time
 import numpy as np, pyarrow as pa, pyarrow.parquet as pq, torch
 from peft import PeftModel
-from common import InjectMarkers, change_prompt, load_base, load_tokenizer
+from common import InjectMarkers, MARKER_ID, change_prompt, load_base, load_tokenizer
 from critic_data import Store, Directions, load_text_pairs
 
 ap = argparse.ArgumentParser()
@@ -19,7 +19,7 @@ args = ap.parse_args(); dev = "cuda"; t0 = time.time(); tok = load_tokenizer(); 
 PROMPT = change_prompt(tok); PLEN = len(PROMPT); PROMPT_T = torch.tensor(PROMPT, dtype=torch.long, device=dev)
 model = load_base(dev)
 if not args.base_only: model = PeftModel.from_pretrained(model, args.adapter); model.eval()
-inj = InjectMarkers(model); dirs = Directions(os.path.join(args.data_dir, "layer_stats.pt"), device=dev); store = Store(args.data_dir, args.split, device=dev, layers=[int(x) for x in args.band.split(",")] if args.band else None)
+inj = InjectMarkers(model, positions=[k for k, t in enumerate(PROMPT) if t == MARKER_ID]); dirs = Directions(os.path.join(args.data_dir, "layer_stats.pt"), device=dev); store = Store(args.data_dir, args.split, device=dev, layers=[int(x) for x in args.band.split(",")] if args.band else None)
 vp = pq.read_table(os.path.join(args.data_dir, f"pairs_{args.split}.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)]
 if args.pairs_text:
     have = set(load_text_pairs(sorted(sum((glob.glob(g) for g in args.pairs_text.split(",")), [])), os.path.join(args.data_dir, f"pairs_{args.split}.parquet"))["pair_id"]); vp = vp[vp["pair_id"].isin(have)]
@@ -29,7 +29,7 @@ for s in range(0, n, args.batch):
     sub = vp.iloc[s:s + args.batch]; B = len(sub); rows = store.rows_for(sub["pos_idx"].values); i = torch.tensor(sub["i"].values.astype(np.int64)); j = torch.tensor(sub["j"].values.astype(np.int64))
     vec = torch.stack([dirs.unit(store.gather(rows, i, dev), i), dirs.unit(store.gather(rows, j, dev), j)], 1); ids = PROMPT_T[None].repeat(B, 1); inj.set(vec, ids)
     with torch.no_grad():
-        try: g = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=args.max_new, do_sample=args.sample, temperature=args.temperature if args.sample else None, top_p=1.0 if args.sample else None, top_k=0 if args.sample else None, pad_token_id=pad_id)
+        try: g = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=args.max_new, do_sample=args.sample, temperature=args.temperature if args.sample else None, top_p=1.0 if args.sample else None, top_k=0 if args.sample else None, pad_token_id=pad_id, suppress_tokens=[MARKER_ID])
         finally: inj.off()
     texts += [tok.decode(g[q, PLEN:], skip_special_tokens=True).strip() for q in range(B)]
     if (s // args.batch) % 8 == 0: print(f"[dump] {min(n, s + B)}/{n} | {(time.time() - t0) / 60:.1f} min | e.g. {texts[-1][:160]!r}", flush=True)

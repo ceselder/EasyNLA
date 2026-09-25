@@ -197,8 +197,10 @@ class InjectMarkers:
     block INJECT_LAYER (prefill only). The marker positions are read from the input_ids passed to set(); the prompt is constant so they are the
     same for every row. Computed in fp32 (the 8B TwoMarkerInjector convention)."""
 
-    def __init__(self, model, layer: int = INJECT_LAYER, marker_id: int = MARKER_ID, coeff: float = 1.0):
-        self.vecs = None; self.ids = None; self.marker = marker_id; self.coeff = coeff; self.n_writes = 0
+    def __init__(self, model, layer: int = INJECT_LAYER, marker_id: int = MARKER_ID, coeff: float = 1.0, positions=None):
+        """positions: the fixed marker positions in the (constant) prompt. With positions, the hook injects EXACTLY there (after checking the token is the
+        marker) and ignores any marker the model emits later in its response; without them it scans the whole row (training code should pass positions)."""
+        self.vecs = None; self.ids = None; self.marker = marker_id; self.coeff = coeff; self.n_writes = 0; self.positions = tuple(int(p) for p in positions) if positions is not None else None
         self._handle = backbone(model).layers[layer].register_forward_hook(self)
 
     def set(self, vecs, input_ids):
@@ -214,13 +216,19 @@ class InjectMarkers:
         if h.shape[1] <= 1:
             return out
         B, N = self.vecs.shape[0], self.vecs.shape[1]
-        mask = (self.ids == self.marker)
         bidx, pidx, kidx = [], [], []
-        for b in range(B):
-            pos = mask[b].nonzero(as_tuple=False).flatten().tolist()
-            assert len(pos) == N, f"row {b}: expected {N} markers, found {len(pos)}"
-            for k, p in enumerate(pos):
-                bidx.append(b); pidx.append(p); kidx.append(k)
+        if self.positions is not None:
+            pos = list(self.positions); assert len(pos) == N, (pos, N)
+            for p in pos: assert bool((self.ids[:, p] == self.marker).all()), f"marker token not at the fixed prompt position {p}"
+            for b in range(B):
+                for k, p in enumerate(pos): bidx.append(b); pidx.append(p); kidx.append(k)
+        else:
+            mask = (self.ids == self.marker)
+            for b in range(B):
+                pos = mask[b].nonzero(as_tuple=False).flatten().tolist()
+                assert len(pos) == N, f"row {b}: expected {N} markers, found {len(pos)}"
+                for k, p in enumerate(pos):
+                    bidx.append(b); pidx.append(p); kidx.append(k)
         bt = torch.tensor(bidx, device=h.device); pt = torch.tensor(pidx, device=h.device); kt = torch.tensor(kidx, device=h.device)
         base = h[bt, pt].float()
         v = F.normalize(self.vecs[bt, kt].to(h.device).float(), dim=-1)

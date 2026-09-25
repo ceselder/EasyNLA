@@ -34,7 +34,7 @@ model = load_base(dev)
 if args.init_adapter: model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
 else: model = get_peft_model(model, LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, use_rslora=True, lora_dropout=0.0, bias="none", target_modules=lora_target_re(None), task_type="CAUSAL_LM"))
 if is_main: model.print_trainable_parameters()
-inj = InjectMarkers(model)
+inj = InjectMarkers(model, positions=[k for k, t in enumerate(PROMPT) if t == MARKER_ID])
 
 # ---- data: text rows joined to pairs; activations from the store (CPU) ----
 dirs = Directions(os.path.join(args.data_dir, "layer_stats.pt"), device=dev)
