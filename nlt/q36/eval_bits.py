@@ -107,6 +107,7 @@ def main():
         parts = cand["pair_id"].str.split(":", expand=True); cand["pos_idx"] = parts[1].astype("int64"); cand["i"] = parts[2].astype("int32"); cand["j"] = parts[3].astype("int32")
         cand = cand[cand["pos_idx"].isin(store.row_of)].sample(frac=1.0, random_state=a.seed).sort_values(["full", "nvar"], ascending=False, kind="stable")
         vp = cand.drop_duplicates("pos_idx").sample(frac=1.0, random_state=a.seed + 1).iloc[: a.n_fixed].reset_index(drop=True)[["pair_id", "pos_idx", "i", "j"]]; NF = len(vp)
+        open(a.out.replace(".json", "") + ".pairs.txt", "w").write("\n".join(vp["pair_id"].tolist()) + "\n")
         print(f"[bits] fixed set from twins: {NF} pairs over {vp['pos_idx'].nunique()} distinct positions ({int(cand.drop_duplicates('pos_idx')['full'].sum())} positions carry every variant; {len(twf)} manifests)", flush=True)
     elif a.fixed_from_texts:
         first = [s_ for s_ in a.sets.split(",") if s_.strip()][0].split(":", 1)[1]

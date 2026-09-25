@@ -13,7 +13,7 @@ from critic_data import Store, Directions, load_text_pairs
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--data-dir", required=True); ap.add_argument("--adapter", required=True); ap.add_argument("--out", required=True); ap.add_argument("--split", default="val")
-ap.add_argument("--pairs-text", default=None); ap.add_argument("--n", type=int, default=1024); ap.add_argument("--batch", type=int, default=16); ap.add_argument("--max-new", type=int, default=176)
+ap.add_argument("--pairs-text", default=None); ap.add_argument("--pair-ids-file", default=None, help="one pair_id per line (split:pos_idx:i:j; e.g. the twinsL fixed set) -> dump exactly these pairs, in this order"); ap.add_argument("--n", type=int, default=1024); ap.add_argument("--batch", type=int, default=16); ap.add_argument("--max-new", type=int, default=176)
 ap.add_argument("--band", default=None); ap.add_argument("--sample", action="store_true"); ap.add_argument("--temperature", type=float, default=1.0); ap.add_argument("--source", default="verbalizer"); ap.add_argument("--base-only", action="store_true", help="no adapter: the base model with the injected markers (control)")
 args = ap.parse_args(); dev = "cuda"; t0 = time.time(); tok = load_tokenizer(); pad_id = tok.eos_token_id
 PROMPT = change_prompt(tok); PLEN = len(PROMPT); PROMPT_T = torch.tensor(PROMPT, dtype=torch.long, device=dev)
@@ -23,6 +23,10 @@ inj = InjectMarkers(model, positions=[k for k, t in enumerate(PROMPT) if t == MA
 vp = pq.read_table(os.path.join(args.data_dir, f"pairs_{args.split}.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)]
 if args.pairs_text:
     have = set(load_text_pairs(sorted(sum((glob.glob(g) for g in args.pairs_text.split(",")), [])), os.path.join(args.data_dir, f"pairs_{args.split}.parquet"))["pair_id"]); vp = vp[vp["pair_id"].isin(have)]
+if args.pair_ids_file:
+    import pandas as pd
+    ids = [l.strip() for l in open(args.pair_ids_file) if l.strip()]; parts = [x.split(":") for x in ids]
+    vp = pd.DataFrame({"pair_id": ids, "pos_idx": [int(x[1]) for x in parts], "i": [int(x[2]) for x in parts], "j": [int(x[3]) for x in parts]}); vp = vp[vp["pos_idx"].isin(store.row_of)].reset_index(drop=True)
 vp = vp.iloc[: args.n].reset_index(drop=True); n = len(vp); print(f"[dump] {n} pairs, adapter {args.adapter if not args.base_only else 'NONE (base)'}", flush=True)
 texts = []
 for s in range(0, n, args.batch):

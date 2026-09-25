@@ -5,7 +5,7 @@
 # RL v3 = rl_v2 (auto lambda) + the target-scale fix (reward / eval on sqrt(d) u_j s, as the critic was trained) + teacher reference in the eval,
 # starting from the FULL-LENGTH SFT policy v1b (256-token targets: the v1 policy never saw the Shift line) with a 208-token budget (teacher p50).
 set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt; source /home/celeste/nlt-q36-logs/gpu_lib.sh
-BAND=12,16,20,24,28,30,32,36,40,42,44,48,52,54,56,60; TAG=v1; TX=/vol/q36/text/$TAG; CK=${CRITIC_CK:-/vol/q36/critic/v5/ckpt_step000849.pt}; GATE_DIR=${GATE_DIR:-q36/critic/v5}; LOGD=/home/celeste/nlt-q36-logs; RL_TAG=${RL_TAG:-rl_v5}
+BAND=12,16,20,24,28,30,32,36,40,42,44,48,52,54,56,60; TAG=v1; TX=/vol/q36/text/$TAG; CK=${CRITIC_CK:-/vol/q36/critic/v5/ckpt_step000500.pt}; GATE_DIR=${GATE_DIR:-q36/critic/v5}; LOGD=/home/celeste/nlt-q36-logs; RL_TAG=${RL_TAG:-rl_v5}
 log(){ echo "[rl5] $(date -u +%H:%M) $*"; }
 for i in $(seq 1 900); do [ "$(timeout 120 modal volume ls nlt $GATE_DIR 2>/dev/null | grep -c ckpt_final.pt)" -ge 1 ] && break; [ $((i % 10)) -eq 0 ] && log "waiting for $GATE_DIR/ckpt_final.pt (then ckpt_best is the final best)"; sleep 120; done; log "judge critic trained: $CK"
 others_pending(){ echo 0; }   # RL has priority over the v1b ablation; v1b waits with its own ledger-aware guard
