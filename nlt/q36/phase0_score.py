@@ -93,8 +93,10 @@ EMB = None
 if not args.no_embed:
     import huggingface_hub.constants as _hfc; _hfc.HF_HUB_OFFLINE = False; os.environ["HF_HUB_OFFLINE"] = "0"
     from transformers import AutoModel, AutoTokenizer
-    etok = AutoTokenizer.from_pretrained(args.embed_model, cache_dir="/root/hf_dl", token=os.environ.get("HF_TOKEN")); etok.padding_side = "left"
-    emod = AutoModel.from_pretrained(args.embed_model, cache_dir="/root/hf_dl", token=os.environ.get("HF_TOKEN"), dtype=torch.bfloat16).to(dev).eval()
+    from huggingface_hub import snapshot_download
+    EDIR = snapshot_download(args.embed_model, cache_dir="/root/hf_dl", token=os.environ.get("HF_TOKEN"))          # local snapshot: no hub lookups against the read-only HF_HOME
+    etok = AutoTokenizer.from_pretrained(EDIR); etok.padding_side = "left"
+    emod = AutoModel.from_pretrained(EDIR, dtype=torch.bfloat16).to(dev).eval()
     @torch.no_grad()
     def EMB(texts):
         out = []

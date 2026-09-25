@@ -30,8 +30,10 @@ WORD_RE = re.compile(r"^[A-Za-z][A-Za-z'\-]{1,}$")
 SPLITS = json.load(open(os.path.join(args.data_dir, "splits.json")))[args.split]; PAIRS_ALL = pq.read_table(os.path.join(args.data_dir, f"pairs_{args.split}.parquet")).to_pandas()
 JL = JLens(args.jlens, args.frozen, dev)
 from transformers import AutoModel, AutoTokenizer
-etok = AutoTokenizer.from_pretrained(args.embed_model, cache_dir="/root/hf_dl", token=os.environ.get("HF_TOKEN")); etok.padding_side = "left"
-emod = AutoModel.from_pretrained(args.embed_model, cache_dir="/root/hf_dl", token=os.environ.get("HF_TOKEN"), dtype=torch.bfloat16).to(dev).eval()
+from huggingface_hub import snapshot_download
+EDIR = snapshot_download(args.embed_model, cache_dir="/root/hf_dl", token=os.environ.get("HF_TOKEN"))          # local snapshot: no hub lookups against the read-only HF_HOME
+etok = AutoTokenizer.from_pretrained(EDIR); etok.padding_side = "left"
+emod = AutoModel.from_pretrained(EDIR, dtype=torch.bfloat16).to(dev).eval()
 
 
 @torch.no_grad()
