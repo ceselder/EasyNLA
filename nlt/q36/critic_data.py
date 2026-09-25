@@ -76,11 +76,15 @@ class Directions(torch.nn.Module):
     """u = unit(h - mu_layer); source = sqrt(d) u_i; target y = sqrt(d) u_j s with s = exp(sigma_r eps_r). log-density bookkeeping: the change of
     variables from (u_j, s) to y is the same for every conditioning variant of a row, so PMI needs none of it; absolute numbers are 'in y-space'."""
 
-    def __init__(self, stats_path, sigma_r=0.1, device="cuda"):
+    def __init__(self, stats_path, sigma_r=0.1, device="cuda", radial="lognormal", sigma_iso=0.0):
+        """radial='lognormal': y = sqrt(d) u s, s ~ lognormal(0, sigma_r) (the original dequantisation).
+        radial='fixed': s = 1 and isotropic noise N(0, sigma_iso^2 I) is added to y instead (the radial density is then shared trivially between the text and
+        null paths: orchestrator's fix for the radial-mismatch anomaly). The same eps_iso is used for every conditioning variant of a row (paired)."""
         super().__init__()
         st = torch.load(stats_path, map_location="cpu"); self.layers = [int(l) for l in st["layers"]]
         mu = torch.stack([torch.as_tensor(st["mean"][l] if l in st["mean"] else st["mean"][str(l)]).float() for l in self.layers])
         self.register_buffer("mu", mu.to(device)); self.lidx = {l: k for k, l in enumerate(self.layers)}; self.sigma_r = float(sigma_r); self.d = mu.shape[1]; self.sqrt_d = math.sqrt(self.d)
+        self.radial = radial; self.sigma_iso = float(sigma_iso)
 
     def unit(self, h, layer):
         """h [B, d] raw, layer [B] long (block indices) -> unit(h - mu_layer) [B, d] float32"""
@@ -91,9 +95,16 @@ class Directions(torch.nn.Module):
     def source(self, h_i, i):
         return self.sqrt_d * self.unit(h_i, i)
 
-    def target(self, h_j, j, s=None, gen=None):
-        """-> (y [B, d], s [B]); s drawn fresh unless given (eval: fixed per row so every conditioning variant sees the SAME y)"""
+    def target(self, h_j, j, s=None, gen=None, eps_iso=None):
+        """-> (y [B, d], s [B]); s drawn fresh unless given (eval: fixed per row so every conditioning variant sees the SAME y).
+        radial='fixed': s = 1 and y += sigma_iso * eps_iso (eps_iso [B, d], drawn fresh unless given; pass a fixed one at eval for paired variants)."""
         u = self.unit(h_j, j)
+        if self.radial == "fixed":
+            y = self.sqrt_d * u
+            if self.sigma_iso > 0:
+                if eps_iso is None: eps_iso = torch.randn(u.shape, generator=gen, device=("cpu" if gen is not None else u.device)).to(u.device)
+                y = y + self.sigma_iso * eps_iso.to(u.device)
+            return y, torch.ones(u.shape[0], device=u.device)
         if s is None:
             eps = torch.randn(u.shape[0], generator=gen, device=("cpu" if gen is not None else u.device)).to(u.device); s = torch.exp(self.sigma_r * eps)
         return self.sqrt_d * u * s[:, None], s

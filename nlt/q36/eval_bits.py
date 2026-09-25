@@ -65,7 +65,7 @@ def main():
     from nlt.eval_bits.exact import exact_logp, make_probe_bank
     from nlt.critic.text_encoder import TextEncoder
     model, aa, step = load_critic(a.ckpt, dev); sigma_r = float(aa.get("sigma_r", 0.1))
-    dirs = Directions(a.stats or aa.get("stats_path") or os.path.join(a.data_dir, "layer_stats.pt"), sigma_r, dev)
+    dirs = Directions(a.stats or aa.get("stats_path") or os.path.join(a.data_dir, "layer_stats.pt"), sigma_r, dev, radial=aa.get("radial", "lognormal"), sigma_iso=float(aa.get("sigma_iso", 0.0)))
     store = Store(a.data_dir, "val", device=a.data_device); d = store.d
     NB = None                                                     # neighbour activations: {(shard, row) -> index}, tensors per (L, k)
     if a.neighbors:
@@ -96,7 +96,7 @@ def main():
     encoder = TextEncoder(aa.get("enc_model", "Qwen/Qwen3-0.6B"), int(aa.get("enc_layer", 20)), dev, int(aa.get("enc_max_len", 192)))
     vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet"), columns=["pair_id", "pos_idx", "i", "j", "shard"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)].iloc[: a.n_fixed].reset_index(drop=True); NF = len(vp)
     rows_all = store.rows_for(vp["pos_idx"].values); I_all = torch.tensor(vp["i"].values.astype(np.int64)); J_all = torch.tensor(vp["j"].values.astype(np.int64)); pid_all = vp["pair_id"].tolist()
-    g = torch.Generator().manual_seed(a.seed + 1); s_all = torch.exp(sigma_r * torch.randn(NF, generator=g)); eps_all = torch.randn(NF, d, generator=g); eps_samp = torch.randn(a.n_samples, NF, d, generator=g)
+    g = torch.Generator().manual_seed(a.seed + 1); s_all = torch.exp(sigma_r * torch.randn(NF, generator=g)); eps_all = torch.randn(NF, d, generator=g); eps_samp = torch.randn(a.n_samples, NF, d, generator=g); iso_all = torch.randn(NF, d, generator=g)
     probe_bank = make_probe_bank(a.ode_steps, a.probes, d, torch.Generator().manual_seed(a.seed + 2)); rng_sw = np.random.default_rng(a.seed + 7)
     sets = {}
     for item in [s for s in a.sets.split(",") if s.strip()]:
@@ -108,7 +108,7 @@ def main():
         own = [k for k, pid in enumerate(pid_all) if pid in tm]; cs = set(common); return (common[: a.n] + [k for k in own if k not in cs])[: a.n]
     UNC = {}          # k -> (lp_u, cos_u, cos_samples_u...)
     def inputs(kk):
-        r = rows_all[kk]; i = I_all[kk]; j = J_all[kk]; h_i = store.gather(r, i, dev); h_j = store.gather(r, j, dev); src = dirs.source(h_i, i); x0, _ = dirs.target(h_j, j, s=s_all[kk].to(dev))
+        r = rows_all[kk]; i = I_all[kk]; j = J_all[kk]; h_i = store.gather(r, i, dev); h_j = store.gather(r, j, dev); src = dirs.source(h_i, i); x0, _ = dirs.target(h_j, j, s=s_all[kk].to(dev), eps_iso=iso_all[kk].to(dev))
         return x0, src, h_j, j
     def lp_only(kk, texts):
         x0, src, _, _ = inputs(kk)
@@ -156,7 +156,7 @@ def main():
                     kk = sub[s0:s0 + a.batch]; B = len(kk); i = I_all[kk]; j = J_all[kk]
                     hi_nb, ok_i = nb_gather(kk, i, k); hj_nb, ok_j = nb_gather(kk, j, k); ok = ok_i & ok_j; okall[s0:s0 + B] = ok
                     if not ok.any(): continue
-                    src_nb = dirs.source(hi_nb.to(dev), i); y_nb, _ = dirs.target(hj_nb.to(dev), j, s=s_all[kk].to(dev))
+                    src_nb = dirs.source(hi_nb.to(dev), i); y_nb, _ = dirs.target(hj_nb.to(dev), j, s=s_all[kk].to(dev), eps_iso=iso_all[kk].to(dev))
                     lp_u[s0:s0 + B] = exact_logp(model, y_nb, src_nb, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank).cpu()
                     with torch.autocast("cuda", dtype=torch.bfloat16): e_c, m_c = encoder(sub_texts[s0:s0 + B]); e_d, m_d = encoder(sub_dm[s0:s0 + B])
                     lp_c[s0:s0 + B] = exact_logp(model, y_nb, src_nb, enc=e_c, enc_mask=m_c, n_steps=a.ode_steps, probes=a.probes, probe_bank=probe_bank).cpu()

@@ -36,7 +36,7 @@ def proxy_losses(model, x0, src, eps_bank, enc, mask):
     return out
 
 
-def evaluate(model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a, probe_bank):
+def evaluate(model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a, probe_bank, iso_bank=None):
     from nlt.eval_bits.exact import exact_logp
     model.eval(); d = dirs.d; out = {}; B = 64
     for label, (rows, ii, jj, texts, _) in val_sets.items():
@@ -45,7 +45,7 @@ def evaluate(model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a
         ne = min(a.spot_exact_n, n); lp = {k: torch.zeros(ne) for k in ("c", "u", "dm", "rp")}; cosm = {k: torch.zeros(n) for k in ("c", "u", "dm")}
         for s0 in range(0, n, B):
             r, i, j = rows[s0:s0 + B], ii[s0:s0 + B], jj[s0:s0 + B]; nb = len(r)
-            h_i = store_val.gather(r, i, dev); h_j = store_val.gather(r, j, dev); src = dirs.source(h_i, i); x0, _ = dirs.target(h_j, j, s=s_bank[s0:s0 + nb].to(dev))
+            h_i = store_val.gather(r, i, dev); h_j = store_val.gather(r, j, dev); src = dirs.source(h_i, i); x0, _ = dirs.target(h_j, j, s=s_bank[s0:s0 + nb].to(dev), eps_iso=(iso_bank[s0:s0 + nb].to(dev) if iso_bank is not None else None))
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 enc, mask = encoder(texts[s0:s0 + nb]); enc_d, mask_d = encoder(dm_texts[s0:s0 + nb]); enc_r, mask_r = encoder(rp_texts[s0:s0 + nb])
             eb = [e[s0:s0 + nb].to(dev) for e in eps_bank]
@@ -76,7 +76,7 @@ def main():
     p.add_argument("--param", default="v", choices=["x0", "v", "x0res"]); p.add_argument("--t-min", type=float, default=0.02); p.add_argument("--x0-scale", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=1024); p.add_argument("--micro-batch", type=int, default=128); p.add_argument("--lr", type=float, default=1.2e-4); p.add_argument("--warmup", type=int, default=300); p.add_argument("--wd", type=float, default=0.01)
     p.add_argument("--uncond-steps", type=int, default=0, help="PRETRAIN p(u_j | u_i) with NO text on random band pairs from the whole store for this many steps (unlabelled pairs are free), then switch to the text pools (tip from the NLA flow-critic session: freeze-then-condition worked best there)"); p.add_argument("--beta2", type=float, default=0.999); p.add_argument("--ema", type=float, default=0.999); p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--uncond-frac", type=float, default=0.15); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-floor", type=float, default=0.05)
-    p.add_argument("--sigma-r", type=float, default=0.1); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
+    p.add_argument("--sigma-r", type=float, default=0.1); p.add_argument("--radial", default="lognormal", choices=["lognormal", "fixed"], help="fixed: s = 1 + isotropic dequantisation noise --sigma-iso (radial density shared by the text and null paths)"); p.add_argument("--sigma-iso", type=float, default=0.05); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=256); p.add_argument("--eval-offset", type=int, default=2048, help="val pairs before this index are the FIXED test set (eval_bits.py); monitoring uses pairs after it"); p.add_argument("--spot-exact-n", type=int, default=64); p.add_argument("--spot-ode-steps", type=int, default=16)
     p.add_argument("--save-every", type=int, default=1000); p.add_argument("--keep-every", type=int, default=0); p.add_argument("--max-hours", type=float, default=20.0); p.add_argument("--max-train-pos", type=int, default=None); p.add_argument("--data-device", default="cuda"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--wandb", default="nlt-qwen36-27b"); p.add_argument("--wandb-entity", default="octahedral-systems"); p.add_argument("--no-wandb", action="store_true"); p.add_argument("--resume", default=None)
@@ -85,13 +85,13 @@ def main():
     from nlt.prior.model import DiffusionPrior
     from nlt.critic.text_encoder import TextEncoder
     from nlt.eval_bits.exact import make_probe_bank
-    stats_path = a.stats or os.path.join(a.data_dir, "layer_stats.pt"); dirs = Directions(stats_path, a.sigma_r, dev)
+    stats_path = a.stats or os.path.join(a.data_dir, "layer_stats.pt"); dirs = Directions(stats_path, a.sigma_r, dev, radial=a.radial, sigma_iso=a.sigma_iso)
     store = Store(a.data_dir, "train", device=a.data_device, max_pos=a.max_train_pos); store_val = Store(a.data_dir, "val", device=a.data_device); d = store.d
     band = [int(x) for x in a.band.split(",")] if a.band else store.layers
     encoder = TextEncoder(a.enc_model, a.enc_layer, dev, a.enc_max_len)
     pools = TextPools(a.pools, os.path.join(a.data_dir, "pairs_train.parquet"), store)
     val_sets = load_val_sets(a.val_sets, os.path.join(a.data_dir, "pairs_val.parquet"), store_val, a.eval_n, offset=a.eval_offset)
-    g_eval = torch.Generator().manual_seed(1234); eps_bank = [torch.randn(a.eval_n, d, generator=g_eval) for _ in T_GRID]; s_bank = torch.exp(a.sigma_r * torch.randn(a.eval_n, generator=g_eval))
+    g_eval = torch.Generator().manual_seed(1234); eps_bank = [torch.randn(a.eval_n, d, generator=g_eval) for _ in T_GRID]; s_bank = torch.exp(a.sigma_r * torch.randn(a.eval_n, generator=g_eval)); iso_bank = torch.randn(a.eval_n, d, generator=g_eval)
     probe_bank = make_probe_bank(a.spot_ode_steps, 1, d, torch.Generator().manual_seed(4321))
     gen = torch.Generator().manual_seed(a.seed)
     if a.x0_scale <= 0:
@@ -105,9 +105,9 @@ def main():
     def lr_at(s):
         if s < a.warmup: return a.lr * (s + 1) / a.warmup
         pr = (s - a.warmup) / max(1, a.steps - a.warmup); return a.lr * (a.lr_floor + (1 - a.lr_floor) * 0.5 * (1 + math.cos(math.pi * min(1.0, pr))))
-    args_save = vars(a) | {"norm": "directions", "stats_path": stats_path, "cond": "text", "target": "u_j", "layers": store.layers, "band": band}
+    args_save = vars(a) | {"norm": "directions", "stats_path": stats_path, "cond": "text", "target": "u_j", "layers": store.layers, "band": band, "radial": a.radial, "sigma_iso": a.sigma_iso}
     def save(step, name="ckpt_latest.pt", with_opt=True):
-        d_ = {"model": ema_model.state_dict(), "step": step, "args": args_save, "config": model.config() | {"norm": "directions", "sigma_r": a.sigma_r}, "d_enc": encoder.d_enc}
+        d_ = {"model": ema_model.state_dict(), "step": step, "args": args_save, "config": model.config() | {"norm": "directions", "sigma_r": a.sigma_r, "radial": a.radial, "sigma_iso": a.sigma_iso}, "d_enc": encoder.d_enc}
         if with_opt: d_["model_raw"] = model.state_dict(); d_["opt"] = opt.state_dict()
         torch.save(d_, os.path.join(a.out, name))
     wb = None
@@ -150,7 +150,7 @@ def main():
             if wb: wb.log(log, step=step)
             if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} text {log['train/loss_text']:.4f} notext {log['train/loss_notext']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']} pool={pname}", flush=True)
         if ((step + 1) % a.eval_every == 0 and step + 1 >= a.uncond_steps) or step + 1 == a.steps:
-            te = time.time(); out = evaluate(ema_model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a, probe_bank); out["eval/seconds"] = time.time() - te; out["eval/rows_seen"] = rows_seen
+            te = time.time(); out = evaluate(ema_model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a, probe_bank, iso_bank); out["eval/seconds"] = time.time() - te; out["eval/rows_seen"] = rows_seen
             if wb: wb.log(out, step=step)
             json.dump({"step": step + 1, "rows_seen": rows_seen, "scalars": out}, open(os.path.join(a.out, "eval_latest.json"), "w"), indent=1)
             print(f"[eval@{step+1} rows {rows_seen}] " + " | ".join(f"{k}={v:.3f}" for k, v in out.items() if ("exact" in k or "content" in k or "p_z" in k or "cos_mean" in k)), flush=True)

@@ -64,12 +64,13 @@ from nlt.critic.text_encoder import TextEncoder
 from nlt.evals.regex_tags import hard_hits
 EXTRA_HARD = [re.compile(p_, re.I) for p_ in (r"\b(?:layer|block|stage|step)s?\s*#?\s*\d{1,2}\b", r"\b\d{1,2}\s*(?:->|→|to)\s*\d{1,2}\b", r"\bL\d{1,2}\b", r"\bresidual stream\b", r"\bhidden states?\b", r"\bactivations?\b")]
 def depth_hit(t): return bool(hard_hits(t)) or any(r_.search(t or "") for r_ in EXTRA_HARD)
-dirs = Directions(args.stats or os.path.join(args.data_dir, "layer_stats.pt"), device=dev)
+dirs = Directions(args.stats or os.path.join(args.data_dir, "layer_stats.pt"), device=dev)          # radial settings are read from the critic checkpoint below
 if args.critic != "none":
     ck = torch.load(args.critic, map_location="cpu"); critic = build_prior(ck["config"]); critic.load_state_dict(ck["model"]); cargs = ck["args"]
 else:
     cargs = {"enc_model": "Qwen/Qwen3-0.6B", "enc_layer": 20, "enc_max_len": 192}; critic = DiffusionPrior(D_MODEL, 512, 4, 8, 8, 1024, 192, "v", 0.02, 0, 4, math.sqrt(D_MODEL))
 critic.to(dev).float(); frozen = copy.deepcopy(critic).eval().requires_grad_(False); critic.train()
+dirs.radial = cargs.get("radial", "lognormal"); dirs.sigma_iso = float(cargs.get("sigma_iso", 0.0)); dirs.sigma_r = float(cargs.get("sigma_r", dirs.sigma_r)); P(f"[rl] target convention: radial {dirs.radial} sigma_r {dirs.sigma_r} sigma_iso {dirs.sigma_iso}")
 from huggingface_hub import snapshot_download
 ENC_DIR = snapshot_download(cargs.get("enc_model", "Qwen/Qwen3-0.6B"), cache_dir="/vol/hf_cache/enc", token=os.environ.get("HF_TOKEN"))      # explicit cache_dir: HF_HOME points at the read-only 27B cache
 encoder = TextEncoder(ENC_DIR, int(cargs.get("enc_layer", 20)), dev, int(cargs.get("enc_max_len", 192)))
@@ -181,7 +182,7 @@ def critic_step(src, u_j, texts, G):
     S, Y, T = [src], [u_j], list(texts)
     if n_rep:
         idx = torch.randint(0, len(REPLAY["text"]), (n_rep,), generator=gen_t); _, s_r, y_r = vecs_for(store, REPLAY["rows"][idx], REPLAY["i"][idx], REPLAY["j"][idx]); S.append(s_r); Y.append(y_r); T += [REPLAY["text"][k] for k in idx.tolist()]
-    S = torch.cat(S); Y = torch.cat(Y); y = dirs.sqrt_d * Y * torch.exp(dirs.sigma_r * torch.randn(Y.shape[0], device=dev))[:, None]
+    S = torch.cat(S); Y = torch.cat(Y); y = dirs.sqrt_d * Y * torch.exp(dirs.sigma_r * torch.randn(Y.shape[0], device=dev))[:, None] if dirs.radial != "fixed" else dirs.sqrt_d * Y + dirs.sigma_iso * torch.randn_like(Y)
     keep = torch.rand(len(T), device=dev) >= 0.1; tot = 0.0; c_opt.zero_grad(set_to_none=True); n_all = len(T)
     for s0 in range(0, n_all, args.critic_micro):
         sl = slice(s0, min(n_all, s0 + args.critic_micro)); nb = sl.stop - sl.start

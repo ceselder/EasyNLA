@@ -24,7 +24,7 @@ from nlt.critic.text_encoder import TextEncoder
 from nlt.eval_bits.exact import exact_logp, make_probe_bank
 from eval_bits import ode_sample
 ck = torch.load(a.ckpt, map_location="cpu"); model = build_prior(ck["config"]); model.load_state_dict(ck["model"]); model.to(dev).eval().requires_grad_(False); aa = ck["args"]; sigma_r = float(aa.get("sigma_r", 0.1))
-dirs = Directions(aa.get("stats_path") or os.path.join(a.data_dir, "layer_stats.pt"), sigma_r, dev); store = Store(a.data_dir, "val", device="cuda"); d = store.d
+dirs = Directions(aa.get("stats_path") or os.path.join(a.data_dir, "layer_stats.pt"), sigma_r, dev, radial=aa.get("radial", "lognormal"), sigma_iso=float(aa.get("sigma_iso", 0.0))); store = Store(a.data_dir, "val", device="cuda"); d = store.d
 from huggingface_hub import snapshot_download
 enc_dir = snapshot_download(aa.get("enc_model", "Qwen/Qwen3-0.6B"), cache_dir="/vol/hf_cache/enc", token=os.environ.get("HF_TOKEN")); encoder = TextEncoder(enc_dir, int(aa.get("enc_layer", 20)), dev, int(aa.get("enc_max_len", 192)))
 vp = pq.read_table(os.path.join(a.data_dir, "pairs_val.parquet"), columns=["pair_id", "pos_idx", "i", "j"]).to_pandas(); vp = vp[vp["pos_idx"].isin(store.row_of)].iloc[:2048].reset_index(drop=True)
