@@ -31,7 +31,8 @@ def load(path):
 def row(s):
     return {"n": s["n"], "content": s["content_bits"]["mean"], "content_sem": s["content_bits"]["sem"], "pmi": s["pmi_bits"]["mean"], "dm": s["dm_bits"]["mean"], "rp": s["rp_bits"]["mean"], "sw": (s["sw_bits"] or {}).get("mean"),
             "p_z_gt_dm": s["p_z_gt_dm"], "p_z_gt_rp": s["p_z_gt_rp"], "p_z_gt_sw": s.get("p_z_gt_sw"), "p_z_gt_null": s["p_z_gt_null"], "n_tokens": s["n_tokens_mean"], "content_per_token": s["content_per_token"],
-            "cos_condmean": s["cos_condmean"], "cos_samples": s["cos_samples"], "cos_sample_mean": s.get("cos_sample_mean"), "p_cos_c_gt_u": s.get("p_cos_c_gt_u"), "content_by_gap": {k: v["mean"] for k, v in s["content_bits"]["by_gap"].items()}, "content_by_j": {k: v["mean"] for k, v in s["content_bits"]["by_j"].items()}}
+            "cos_condmean": s["cos_condmean"], "cos_samples": s["cos_samples"], "cos_sample_mean": s.get("cos_sample_mean"), "p_cos_c_gt_u": s.get("p_cos_c_gt_u"), "content_by_gap": {k: v["mean"] for k, v in s["content_bits"]["by_gap"].items()}, "content_by_j": {k: v["mean"] for k, v in s["content_bits"]["by_j"].items()},
+            "neighbours": s.get("neighbours", {})}
 
 
 def bars(ax, labels, vals, errs, color, title, ylabel, hline=None, fmt="{:.1f}"):
