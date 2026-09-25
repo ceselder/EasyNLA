@@ -45,7 +45,7 @@ def frontier_fig(res, T, subset=False, stem="unclip_steer_v2_frontier"):
     S = res["summary_subset" if subset else "summary"]; ser = series(S, res["families"], T); n = res["fluency"]["n_subset"] if subset else res["n"]
     fig, axes = plt.subplots(2, 2, figsize=(12, 10)); base_nll = S["none"]["nll_median"]
     panels = [(axes[0, 0], 1, 3, "median KL at the next token (nats, log)", "next-token flip rate: p(target) > p(source)"), (axes[0, 1], 1, 4, "median KL at the next token (nats, log)", "continuations mentioning the target (fraction)"),
-              (axes[1, 0], 2, 3, "median NLL/token of the continuation under the unedited model", "next-token flip rate"), (axes[1, 1], 2, 4, "median NLL/token of the continuation under the unedited model", "continuations mentioning the target (fraction)")]
+              (axes[1, 0], 2, 3, "median NLL/token of the continuation under the unedited model", "next-token flip rate"), (axes[1, 1], 2, 4, "median NLL/token of the continuation under the unedited model", "target mention in continuations")]
     for ax, xi, yi, xl, yl in panels:
         for k, pts in ser.items():
             lb, col, ls, mk = STYLE[k]; xs = [max(p[xi], 1e-3) if xi == 1 else p[xi] for p in pts]; ys = [p[yi] for p in pts]
@@ -57,12 +57,12 @@ def frontier_fig(res, T, subset=False, stem="unclip_steer_v2_frontier"):
     j = ser.get("jlens_add", []); tau = res["fluency"]["tau_kl1"]
     best_u = max([p for k, pts in ser.items() if k.startswith("unclip") for p in pts if p[1] <= tau], key=lambda p: p[3], default=None)
     bj = max([p for p in j if p[1] <= tau], key=lambda p: p[3], default=None)
-    claim = (f"At the J-lens fluency budget (KL ≤ {tau:.1f} nats) unCLIP edits flip the next token in {100 * best_u[3]:.0f}% of prompts vs {100 * bj[3]:.0f}% for the J-lens direction"
+    claim = (f"At the J-lens fluency budget (KL ≤ {tau:.1f} nats) unCLIP edits flip the next token in {100 * best_u[3]:.0f}% of prompts\nvs {100 * bj[3]:.0f}% for the J-lens direction"
              if best_u and bj else "unCLIP edits vs the J-lens direction: next-token flips along the strength sweeps")
-    fig.suptitle(f"{claim}\nnext-token concept swap, {n} prompts{' (J-lens fluency subset)' if subset else ''}, text-edit type {T} ({'word swap in the full explanation' if T == 'A' else 'concept-centred explanation pair'}); every edit rescaled to ||h||",
+    fig.suptitle(f"{claim}\nnext-token concept swap, {n} prompts{' (J-lens fluency subset)' if subset else ''}, text type {T} ({'word swap in the full explanation' if T == 'A' else 'concept-centred pair'}); edits rescaled to ||h||",
                  fontsize=14, x=0.02, ha="left")
     handles = [Line2D([], [], color=STYLE[k][1], ls=STYLE[k][2] if STYLE[k][2] else "none", marker=STYLE[k][3], ms=8, label=STYLE[k][0]) for k in ser]
-    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 0.0)); fig.tight_layout(rect=(0, 0.13, 1, 0.92))
+    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 0.0)); fig.tight_layout(rect=(0, 0.13, 1, 0.9))
     out = f"{REP}/{stem}_{T}{'_subset' if subset else ''}"
     for ext in ("png", "pdf"): fig.savefig(f"{out}.{ext}", dpi=150)
     plt.close(fig); return out, claim, ser
