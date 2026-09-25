@@ -23,7 +23,14 @@ for i in $(seq 1 400); do
 import json; d=json.load(open('$D/$f')); s=d['sets']; t=s.get('teacher',{}); p=s.get('policy',{})
 print(f\"teacher {t['content_bits']['mean']:.1f}±{t['content_bits']['sem']:.1f} (P {t['p_z_gt_dm']:.2f}) | policy {p['content_bits']['mean']:.1f}±{p['content_bits']['sem']:.1f} (P {p['p_z_gt_dm']:.2f}) | policy PMI {p['pmi_bits']['mean'] if isinstance(p['pmi_bits'],dict) else p['pmi_bits']:+.1f} tok {p['n_tokens_mean']:.0f}\")" 2>&1 | tail -n 1)"
   done
-  if [ $new -eq 1 ]; then systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_rl_exact.py --tag $RL_TAG 2>&1 | grep -E "VERDICT|error|Traceback" | head -3; (cd /home/celeste/shared/reports/nlt-27b-olens && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); fi
+  if [ $new -eq 1 ]; then V=$(systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_rl_exact.py --tag $RL_TAG 2>&1 | grep -E "VERDICT|error|Traceback" | head -3); echo "$V"
+    # pre-registered stop (orchestrator 10:10 + 11:05): at >= STOP_STEP steps, "STOP" under BOTH judges -> stop the RL app, ledger, summary line, Discord ping; the FM-view watcher keeps its own rules
+    last=$(python3 -c "import json; d=json.load(open('$D/rl_${RL_TAG}_exact.json')); print(d['gains_at_last']['step'] if d.get('gains_at_last') else 0)" 2>/dev/null || echo 0)
+    if echo "$V" | grep -q "VERDICT STOP" && [ "${last:-0}" -ge "${STOP_STEP:-40}" ] && [ ! -f $LOGD/.rl_${RL_TAG}_stopped ]; then
+      A=$(grep -oE "ap-[A-Za-z0-9]+" $APPFILE 2>/dev/null | head -1); timeout 120 modal app stop -y $A >/dev/null 2>&1; touch $LOGD/.rl_${RL_TAG}_stopped
+      sed -i -E "s|^($A 4 $RL_TAG [0-9:]+)|# \1 (stopped $(date -u +%H:%M) by the exact-view rule at step $last)|" $LOGD/gpu_ledger.txt
+      log "STOPPED $A at step $last by the pre-registered exact-view rule: $(echo "$V" | grep VERDICT | cut -c1-400)"; notify-discord "nlt-q36 RL $RL_TAG stopped at step $last: FM-reward RL does not move exact content (both judges within 1 sem)" 2>/dev/null || true
+    fi; (cd /home/celeste/shared/reports/nlt-27b-olens && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); fi
   A=$(grep -oE "ap-[A-Za-z0-9]+" $APPFILE 2>/dev/null | head -1); L=$(app_list)
   if [ -n "$A" ] && [ -n "$L" ]; then if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); fi; fi     # an empty list is a transient read, not an absence
   [ ${miss:-0} -ge 3 ] && { log "RL app $A absent from 3 consecutive app lists; final pass done"; break; }
