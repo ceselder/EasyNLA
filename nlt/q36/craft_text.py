@@ -24,11 +24,14 @@ ap.add_argument("--writes-dir", default=None, help="A_L*/M_L* prefix-sum store (
 ap.add_argument("--tau", type=float, default=0.8, help="embedding cos threshold for 'same bullet'"); ap.add_argument("--k", type=int, default=4); ap.add_argument("--max-bullet-tok", type=int, default=16)
 ap.add_argument("--jl-k", type=int, default=6, help="J-lens words per direction in the Leaning line"); ap.add_argument("--jl-pool", type=int, default=40, help="top-k pool filtered down to clean words")
 ap.add_argument("--jlens", default="/vol_ol1/jlens/qwen36_27b_jlens.pt"); ap.add_argument("--frozen", default="/vol_ol1/frozen/qwen36_27b_embed_head.pt")
+ap.add_argument("--pairs-file", default=None, help="pairs parquet (default pairs_<split>.parquet); one row per position is what harvest mode needs")
+ap.add_argument("--layer-root", default=None, help="HARVEST MODE: root of per-position olens reads at every stored layer (rollout_vllm --layer-specs): <root>/<split>/<shard>/h_L<L>.parquet. Pairs are then built from --extra-pairs (K delta pairs per position, with v_delta reads under --delta-root) plus --m-extra random (i<j) pairs per position WITHOUT a delta read (-> pool craft_nodelta); the legacy v_i/v_j/v_delta parquets are not used")
+ap.add_argument("--delta-root", default=None, help="HARVEST MODE: <root>/<split>/<shard>/v_delta.parquet with pair_id (rollout_vllm --delta-pairs)"); ap.add_argument("--extra-pairs", default=None, help="HARVEST MODE: pairs parquet with the delta pairs (pairs_all_x4.parquet)"); ap.add_argument("--m-extra", type=int, default=12, help="HARVEST MODE: random extra (i<j) pairs per position without a delta read")
 ap.add_argument("--embed-model", default="Qwen/Qwen3-Embedding-0.6B"); ap.add_argument("--twins", action="store_true"); ap.add_argument("--force", action="store_true", help="redo shards whose stats file exists"); ap.add_argument("--greedy-only", action="store_true"); ap.add_argument("--seed", type=int, default=0)
 args = ap.parse_args(); dev = "cuda"; T_ALL = time.time(); tok = load_tokenizer(); os.makedirs(args.out_dir, exist_ok=True)
 JUNK = ("</s>", "<s>", "<|", "##", "</p>", "</div", "�")
 WORD_RE = re.compile(r"^[A-Za-z][A-Za-z'\-]{1,}$")
-SPLITS = json.load(open(os.path.join(args.data_dir, "splits.json")))[args.split]; PAIRS_ALL = pq.read_table(os.path.join(args.data_dir, f"pairs_{args.split}.parquet")).to_pandas()
+SPLITS = json.load(open(os.path.join(args.data_dir, "splits.json")))[args.split]; PAIRS_ALL = pq.read_table(args.pairs_file or os.path.join(args.data_dir, f"pairs_{args.split}.parquet")).to_pandas()
 JL = JLens(args.jlens, args.frozen, dev)
 from transformers import AutoModel, AutoTokenizer
 from huggingface_hub import snapshot_download
@@ -90,10 +93,45 @@ def craft_shard(shard_index):
     rollouts_dir = os.path.join(args.rollouts_root, tag)
     pairs = PAIRS_ALL[PAIRS_ALL["shard"] == shard_index].reset_index(drop=True); n = len(pairs)
     RO = {}; WSPECS = ["v_attn", "v_mlp"] if args.writes_dir else []
-    for v in ["v_i", "v_j", "v_delta"] + WSPECS:
-        t = pq.read_table(os.path.join(rollouts_dir, v + ".parquet")).to_pandas(); RO[v] = {}
-        for r, s, txt in zip(t["row"], t["sample"], t["text"]): RO[v].setdefault(int(r), {})[int(s)] = clean_bullets(parse_bullets(txt, args.k)[0])
-    n_samp = 1 if args.greedy_only else max(len(v) for v in RO["v_i"].values())
+    if args.layer_root:
+        # ---- HARVEST MODE: per-position reads at every layer + delta reads for the K extra pairs; M more random pairs per position without a delta read
+        ldir = os.path.join(args.layer_root, args.split, tag); ddir = os.path.join(args.delta_root or (args.layer_root.rstrip("/") + "_delta"), args.split, tag)
+        BAND_ALL = sorted(int(f_[3:-8]) for f_ in os.listdir(ldir) if f_.startswith("h_L") and f_.endswith(".parquet")); assert len(BAND_ALL) >= 2, (ldir, BAND_ALL)
+        HB = {}
+        for L in BAND_ALL:
+            t = pq.read_table(os.path.join(ldir, f"h_L{L}.parquet"), columns=["row", "sample", "text"]).to_pandas(); t = t[t["sample"] == 0]
+            HB[L] = {int(r): clean_bullets(parse_bullets(txt, args.k)[0]) for r, txt in zip(t["row"], t["text"])}          # row here = position row within the shard parquet
+        DB = {}
+        if os.path.exists(os.path.join(ddir, "v_delta.parquet")):
+            t = pq.read_table(os.path.join(ddir, "v_delta.parquet"), columns=["pair_id", "sample", "text"]).to_pandas(); t = t[t["sample"] == 0]
+            DB = {pid: clean_bullets(parse_bullets(txt, args.k)[0]) for pid, txt in zip(t["pair_id"], t["text"])}
+        X = pq.read_table(args.extra_pairs).to_pandas(); X = X[(X["shard"] == shard_index) & (X["split"] == args.split)].reset_index(drop=True)
+        have = set(zip(X["pos_idx"].tolist(), X["i"].tolist(), X["j"].tolist())) | set(zip(pairs["pos_idx"].tolist(), pairs["i"].tolist(), pairs["j"].tolist()))
+        rows_x = []
+        for pos, row_ in zip(pairs["pos_idx"].tolist(), pairs["row"].tolist()):                       # one entry per position in the original list
+            got, tries = set(), 0
+            while len(got) < args.m_extra and tries < 200:
+                a_, b_ = rng.integers(0, len(BAND_ALL), 2); tries += 1
+                if a_ == b_: continue
+                i_, j_ = BAND_ALL[min(a_, b_)], BAND_ALL[max(a_, b_)]
+                if (pos, i_, j_) in have or (i_, j_) in got: continue
+                got.add((i_, j_))
+            for i_, j_ in sorted(got): rows_x.append((f"{args.split}:{pos}:{i_}:{j_}", args.split, int(pos), int(i_), int(j_), int(shard_index), int(row_)))
+        import pandas as _pd
+        EXTRA = _pd.DataFrame(rows_x, columns=["pair_id", "split", "pos_idx", "i", "j", "shard", "row"])
+        pairs = _pd.concat([X[["pair_id", "split", "pos_idx", "i", "j", "shard", "row"]], EXTRA], ignore_index=True); n = len(pairs)
+        for v in ("v_i", "v_j", "v_delta"): RO[v] = {}
+        n_delta = 0
+        for r in range(n):
+            row_ = int(pairs["row"][r]); i_ = int(pairs["i"][r]); j_ = int(pairs["j"][r]); pid = pairs["pair_id"][r]
+            RO["v_i"][r] = {0: HB.get(i_, {}).get(row_, [])}; RO["v_j"][r] = {0: HB.get(j_, {}).get(row_, [])}; RO["v_delta"][r] = {0: DB.get(pid, [])}; n_delta += bool(DB.get(pid))
+        print(f"[craft] HARVEST MODE {tag}: {len(X)} delta pairs + {len(EXTRA)} extra pairs = {n} pairs over {pairs['pos_idx'].nunique()} positions; layers {BAND_ALL}; {n_delta} with a delta read", flush=True)
+        n_samp = 1
+    else:
+        for v in ["v_i", "v_j", "v_delta"] + WSPECS:
+            t = pq.read_table(os.path.join(rollouts_dir, v + ".parquet")).to_pandas(); RO[v] = {}
+            for r, s, txt in zip(t["row"], t["sample"], t["text"]): RO[v].setdefault(int(r), {})[int(s)] = clean_bullets(parse_bullets(txt, args.k)[0])
+        n_samp = 1 if args.greedy_only else max(len(v) for v in RO["v_i"].values())
     print(f"[craft] shard {shard_index} ({tag}): {n} pairs, {n_samp} readouts per vector", flush=True)
     # ---- J-lens rising / falling per pair ----
     layers = sorted(set(pairs["i"].tolist()) | set(pairs["j"].tolist())); tb = pq.read_table(acts_file, columns=[f"h_L{L}" for L in layers] + ["row"])
@@ -141,7 +179,7 @@ def craft_shard(shard_index):
         if not bi or not bj: return list(bj), list(bi)
         Si = torch.stack([E[b] for b in bi]); Sj = torch.stack([E[b] for b in bj]); M = Sj @ Si.T
         return [b for b, m in zip(bj, M.max(1).values.tolist()) if m < args.tau], [b for b, m in zip(bi, M.max(0).values.tolist()) if m < args.tau]
-    POOLS = {k: [] for k in ("craft_full", "craft_nojl", "craft_delta", "craft_newfaded", "jlens", "olens_j", "olens_i", "raw_all", "raw_no_i", "raw_no_j", "raw_no_delta", "raw_no_jl") + (("raw_all_w", "writes_only", "raw_w_no_attn", "raw_w_no_mlp") if WSPECS else ())}
+    POOLS = {k: [] for k in ("craft_full", "craft_nodelta", "craft_nojl", "craft_delta", "craft_newfaded", "jlens", "olens_j", "olens_i", "raw_all", "raw_nodelta", "raw_no_i", "raw_no_j", "raw_no_delta", "raw_no_jl") + (("raw_all_w", "writes_only", "raw_w_no_attn", "raw_w_no_mlp") if WSPECS else ())}
     def write_lines(r_, drop=None):
         """the pooled attention / MLP write readouts as plain lines (no layer words): 'Attention wrote: ...' / 'MLP wrote: ...' + the share sentence"""
         out = []; ba = RO["v_attn"].get(r_, {}).get(0, []); bm = RO["v_mlp"].get(r_, {}).get(0, [])
@@ -191,8 +229,9 @@ def craft_shard(shard_index):
             if s == 0: stats["new_mean"] += len(new) / n; stats["faded_mean"] += len(faded) / n; stats["shift_mean"] += len(bd) / n
             full = lines(new, faded, bd, lean); nojl = lines(new, faded, bd, lean, jl=False); delta = lines([], [], bd, None, jl=False); nf = lines(new, faded, [], None, jl=False); jlt = lines([], [], [], lean)
             if s == 0 and not full: stats["empty_full"] += 1
-            for k_, t_ in (("craft_full", full), ("craft_nojl", nojl), ("craft_delta", delta), ("craft_newfaded", nf), ("jlens", jlt), ("olens_j", "Present: " + "; ".join(bj) + "." if bj else ""), ("olens_i", "Present: " + "; ".join(bi) + "." if bi else ""),
-                          ("raw_all", raw_lines(bi, bj, bd, lean)), ("raw_no_i", raw_lines(bi, bj, bd, lean, "i")), ("raw_no_j", raw_lines(bi, bj, bd, lean, "j")), ("raw_no_delta", raw_lines(bi, bj, bd, lean, "delta")), ("raw_no_jl", raw_lines(bi, bj, bd, lean, "jl"))):
+            k_full, k_raw = ("craft_full", "raw_all") if (bd or not args.layer_root) else ("craft_nodelta", "raw_nodelta")          # harvest mode: a pair without a delta read is a different pool
+            for k_, t_ in ((k_full, full), ("craft_nojl", nojl if bd else ""), ("craft_delta", delta), ("craft_newfaded", nf), ("jlens", jlt), ("olens_j", "Present: " + "; ".join(bj) + "." if bj else ""), ("olens_i", "Present: " + "; ".join(bi) + "." if bi else ""),
+                          (k_raw, raw_lines(bi, bj, bd, lean)), ("raw_no_i", raw_lines(bi, bj, bd, lean, "i") if bd else ""), ("raw_no_j", raw_lines(bi, bj, bd, lean, "j") if bd else ""), ("raw_no_delta", raw_lines(bi, bj, bd, lean, "delta") if bd else ""), ("raw_no_jl", raw_lines(bi, bj, bd, lean, "jl") if bd else "")):
                 if t_: POOLS[k_].append((pid, t_, k_, s))
             if WSPECS and s == 0:
                 wl = write_lines(r); base = raw_lines(bi, bj, bd, lean)
@@ -217,7 +256,8 @@ def craft_shard(shard_index):
     if TW: pq.write_table(pa.table({"pair_id": [x[0] for x in TW], "variant": [x[1] for x in TW], "text": [x[2] for x in TW]}), os.path.join(args.out_dir, f"twins__{tag}.parquet"))
     stats["pool_rows"] = {k_: len(v) for k_, v in POOLS.items()}; stats["twins"] = len(TW); stats["elapsed_min"] = (time.time() - t0) / 60
     json.dump(stats, open(os.path.join(args.out_dir, f"stats__{tag}.json"), "w"), indent=1)
-    for r in range(min(2, len(POOLS["craft_full"]))): print(f"--- {POOLS['craft_full'][r][0]}\n{POOLS['craft_full'][r][1]}", flush=True)
+    for k_show in ("craft_full", "craft_nodelta"):
+        for r in range(min(1, len(POOLS[k_show]))): print(f"--- {k_show} {POOLS[k_show][r][0]}\n{POOLS[k_show][r][1]}", flush=True)
     print(f"[craft] done {tag} {json.dumps(stats)}", flush=True)
 
 
