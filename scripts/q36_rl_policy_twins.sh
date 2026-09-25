@@ -24,7 +24,7 @@ for it in $(seq 1 600); do
 import json; v=json.load(open('$D/$out.json'))['twins']['policy_twins']['variants']
 print(' | '.join(f\"{k}: P {x['p_true_gt_twin']:.3f} [{x['ci95_p'][0]:.3f},{x['ci95_p'][1]:.3f}] FM {x['proxy_p_true_gt_twin']:.3f} [{x['proxy_ci95_p'][0]:.3f},{x['proxy_ci95_p'][1]:.3f}] n {x['n_positions']}\" for k, x in v.items() if k in ('twin_shift', 'twin_new', 'dm_full')))" 2>/dev/null)"; systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_policy_twins.py --tag $RL_TAG 2>&1 | grep -E "^saved|Traceback" | head -2; (cd /home/celeste/shared/reports/nlt-27b-olens && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); }; continue; fi
       [ -n "${Q[$out]:-}" ] && continue; CK=$FROZEN; [ $J = other ] && CK=$OTHER
-      enqueue_eval "--data-dir /vol/q36/data --ckpt $CK --out /vol/q36/results/$out.json --sets '' --twins 'policy_twins:$RLD/twinsL_$st.parquet' --fixed-from-twins --n-fixed 1024 --twins-n 1024 --ode-steps 32 --skip-samples --skip-sw" $out 1 && Q[$out]=1
+      enqueue_eval "--data-dir /vol/q36/data --ckpt $CK --out /vol/q36/results/$out.json --sets '' --twins 'policy_twins:$RLD/twinsL_$st.parquet' --fixed-from-twins --n-fixed 1024 --twins-n 1024 --ode-steps 32 --skip-samples --skip-sw" $out 0 && Q[$out]=1
     done
   done
   A=$(grep -oE "ap-[A-Za-z0-9]+" $APPFILE 2>/dev/null | head -1); if [ -n "$A" ]; then app_live "$A"; r=$?; [ $r -eq 0 ] && miss=0; [ $r -eq 1 ] && miss=$((miss + 1)); fi
