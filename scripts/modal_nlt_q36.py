@@ -109,6 +109,15 @@ def run_evalq(idle_min: int = 20, worker: str = "w0"):
         spec = specs[0]; claimed = spec[:-5] + f".running.{worker}.json"
         try: os.rename(spec, claimed); vol.commit()
         except Exception as e: print(f"[evalq] claim of {os.path.basename(spec)} failed ({e}); retrying", flush=True); _t.sleep(5); continue
+        # CLAIM RACE (12:20: two workers renamed the same spec inside their own volume views and both ran it): after the commit, reload and let the lexicographically first claimant keep it
+        try: vol.reload()
+        except Exception: pass
+        others = sorted(glob.glob(spec[:-5] + ".running.*.json"))
+        if len(others) > 1 and others[0] != claimed:
+            print(f"[evalq] {worker} lost the claim race for {os.path.basename(spec)} to {os.path.basename(others[0])}; releasing mine", flush=True)
+            try: os.remove(claimed); vol.commit()
+            except Exception as e: print(f"[evalq] release failed: {e}", flush=True)
+            _t.sleep(3); continue
         job = json.load(open(claimed)); idle = 0.0; n += 1
         print(f"[evalq] {worker} job {n}: {job['label']} :: {job['args'][:160]}", flush=True)
         import re as _re; m_out = _re.search(r"--out (\S+)", job["args"]); outp = m_out.group(1) if m_out else None
