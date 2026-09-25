@@ -8,7 +8,7 @@ set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt;
 RL_TAG=${RL_TAG:-rl_v5}; FROZEN=${FROZEN:-/vol/q36/critic/v5/ckpt_step000500.pt}; OTHER=${OTHER:-/vol/q36/critic/v2/ckpt_step3000.pt}; EVERY=${EVERY:-20}; SFT=${SFT:-/vol/q36/verbalizer/v1b/final}
 PAIRS=${PAIRS:-/vol/q36/twinsL/pairs.txt}; LOGD=/home/celeste/nlt-q36-logs; D=/home/celeste/shared/reports/nlt-27b-olens/data; RLD=/vol/q36/rl/$RL_TAG; APPFILE=${APPFILE:-$LOGD/rl_app_$RL_TAG.txt}
 log(){ echo "[ptwins] $(date -u +%H:%M) $*"; }
-for i in $(seq 1 200); do [ "$(timeout 120 modal volume ls nlt ${PAIRS%/*} 2>/dev/null | grep -c pairs.txt)" -ge 1 ] && break; [ $((i % 5)) -eq 0 ] && log "waiting for $PAIRS"; sleep 60; done
+for i in $(seq 1 200); do [ "$(timeout 120 modal volume ls nlt $(dirname ${PAIRS#/vol/}) 2>/dev/null | grep -c pairs.txt)" -ge 1 ] && break; [ $((i % 5)) -eq 0 ] && log "waiting for $PAIRS"; sleep 60; done
 declare -A Q; miss=0
 for it in $(seq 1 600); do
   RLS=$(timeout 120 modal volume ls nlt ${RLD#/vol/} 2>/dev/null); RES=$(timeout 120 modal volume ls nlt q36/results 2>/dev/null)
