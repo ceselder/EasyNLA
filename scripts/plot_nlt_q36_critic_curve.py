@@ -86,7 +86,7 @@ def main():
         if any(y is not None for y in ys): ax.plot(st, ys, "o-", color=c, lw=2, label=lab)
     ax.axhline(0.5, color="k", lw=0.8); ax.axhline(PASS_TWIN, color=C3, ls="--", lw=1.2, label=f"pass bar {PASS_TWIN}")
     if ref and ref.get("twin_shift") is not None: ax.axhline(ref["twin_shift"], color=C1, ls=":", lw=1, label="reference judge, Shift twin")
-    ax.set_ylim(0, 1); ax.set_xlabel("training step (500-step saves)"); ax.set_ylabel("P(true text > twin), exact bits"); ax.set_title("Does the anchored critic see ONE swapped claim?", fontsize=13); ax.legend(frameon=False, fontsize=8)
+    ax.set_ylim(0, 1); ax.set_xlabel("training step (500-step saves)"); ax.set_ylabel("P(true text > twin), exact bits"); ax.set_title("Does the critic see ONE swapped claim?", fontsize=13); ax.legend(frameon=False, fontsize=8)
     ax = axes[0, 1]; ax.errorbar(st, [r["content"] for r in R], yerr=[r["content_sem"] for r in R], fmt="o-", color=C1, lw=2, capsize=3, label="crafted change text")
     dc = [r["describer_content"] for r in R]
     if any(v is not None for v in dc): ax.plot(st, dc, "s-", color=C2, lw=1.5, label="Sonnet trace (A)")
@@ -103,7 +103,8 @@ def main():
         ys = [r["neigh"].get(k, {}).get("double_diff") for r in R]; es = [r["neigh"].get(k, {}).get("sem", 0) for r in R]
         if any(y is not None for y in ys): ax.errorbar(st, ys, yerr=es, fmt="o-", color=c, lw=1.5, capsize=3, label=f"same-document neighbour {lab}")
     ax.axhline(0, color="k", lw=0.8); ax.set_xlabel("training step"); ax.set_ylabel("content(own) − content(neighbour), bits"); ax.set_title("Position specificity: own state vs a neighbour's", fontsize=13); ax.legend(frameon=False, fontsize=8)
-    fig.suptitle(f"Critic {a.tag} (activation-anchored contrast) over its saved checkpoints - verdict so far: {out['verdict']}", fontsize=14, y=1.0); fig.tight_layout()
+    DESC = {"v3": "activation-anchored gain contrast", "v3b": "anchored gain hinge, v1b recipe", "v3c": "margin-hinge anchor w 0.1 + guard, one pass over harvested pools", "v4": "plain one-pass critic on 16x harvested pools, no anchor"}
+    fig.suptitle(f"Critic {a.tag} ({DESC.get(a.tag, 'critic')}) over its saved checkpoints - verdict so far: {out['verdict']}", fontsize=14, y=1.0); fig.tight_layout()
     fig.savefig(f"{REP}/fig_critic_{a.tag}_curve.png", dpi=150, bbox_inches="tight"); fig.savefig(f"{REP}/fig_critic_{a.tag}_curve.pdf", bbox_inches="tight"); print("saved", f"fig_critic_{a.tag}_curve", "|", out["verdict"])
     for r in R: print(f"step {r['step']}: content {r['content']:.1f} P {r['p_dm']:.3f} P_null {r.get('p_null')} twin_shift {r['twins'].get('twin_shift', {}).get('p')}/{r['twins'].get('twin_shift', {}).get('proxy_p')} twin_new {r['twins'].get('twin_new', {}).get('p')}/{r['twins'].get('twin_new', {}).get('proxy_p')} | cos_c {r.get('cos_c')} (v1b {r.get('v1b_ref_cos_c')}) | passes {r.get('passes_max')} | PMI train {r.get('pmi_train')} gap {r.get('pmi_gap')} -> {'PASS' if r['pass'] else ('contrast-only' if r.get('contrast_learned_reconstruction_lost') else 'no: ' + ', '.join(r['fail_reasons']))}")
 
