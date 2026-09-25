@@ -75,7 +75,7 @@ def main():
     p.add_argument("--width", type=int, default=1536); p.add_argument("--depth", type=int, default=16); p.add_argument("--heads", type=int, default=16); p.add_argument("--k-chunks", type=int, default=8); p.add_argument("--mlp-ratio", type=int, default=4)
     p.add_argument("--param", default="v", choices=["x0", "v", "x0res"]); p.add_argument("--t-min", type=float, default=0.02); p.add_argument("--x0-scale", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=1024); p.add_argument("--micro-batch", type=int, default=128); p.add_argument("--lr", type=float, default=1.2e-4); p.add_argument("--warmup", type=int, default=300); p.add_argument("--wd", type=float, default=0.01)
-    p.add_argument("--beta2", type=float, default=0.999); p.add_argument("--ema", type=float, default=0.999); p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--uncond-frac", type=float, default=0.15); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-floor", type=float, default=0.05)
+    p.add_argument("--uncond-steps", type=int, default=0, help="PRETRAIN p(u_j | u_i) with NO text on random band pairs from the whole store for this many steps (unlabelled pairs are free), then switch to the text pools (tip from the NLA flow-critic session: freeze-then-condition worked best there)"); p.add_argument("--beta2", type=float, default=0.999); p.add_argument("--ema", type=float, default=0.999); p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--uncond-frac", type=float, default=0.15); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-floor", type=float, default=0.05)
     p.add_argument("--sigma-r", type=float, default=0.1); p.add_argument("--enc-model", default="Qwen/Qwen3-0.6B"); p.add_argument("--enc-layer", type=int, default=20); p.add_argument("--enc-max-len", type=int, default=192)
     p.add_argument("--eval-every", type=int, default=500); p.add_argument("--eval-n", type=int, default=256); p.add_argument("--eval-offset", type=int, default=2048, help="val pairs before this index are the FIXED test set (eval_bits.py); monitoring uses pairs after it"); p.add_argument("--spot-exact-n", type=int, default=64); p.add_argument("--spot-ode-steps", type=int, default=16)
     p.add_argument("--save-every", type=int, default=1000); p.add_argument("--keep-every", type=int, default=0); p.add_argument("--max-hours", type=float, default=20.0); p.add_argument("--max-train-pos", type=int, default=None); p.add_argument("--data-device", default="cuda"); p.add_argument("--seed", type=int, default=0)
@@ -117,9 +117,13 @@ def main():
     ema_p = list(ema_model.parameters()); raw_p = list(model.parameters()); t0 = time.time(); ema_loss = None; best = None; rows_seen = step0 * a.batch
     n_unc = int(round(a.batch * a.uncond_frac)); n_txt = a.batch - n_unc
     for step in range(step0, a.steps):
-        rows, i, j, texts, pname = pools.sample(n_txt, gen)
-        if n_unc:
-            ru, iu, ju = store.sample_pairs(n_unc, gen, band); rows = torch.cat([rows, ru]); i = torch.cat([i, iu]); j = torch.cat([j, ju]); texts = texts + [""] * n_unc
+        if step < a.uncond_steps:                                                      # unconditional pretraining phase: every row text-free, pairs from the whole store
+            rows, i, j = store.sample_pairs(a.batch, gen, band); texts = [""] * a.batch; pname = "uncond"
+        else:
+            rows, i, j, texts, pname = pools.sample(n_txt, gen)
+            if n_unc:
+                ru, iu, ju = store.sample_pairs(n_unc, gen, band); rows = torch.cat([rows, ru]); i = torch.cat([i, iu]); j = torch.cat([j, ju]); texts = texts + [""] * n_unc
+        if step == a.uncond_steps and a.uncond_steps > 0: print(f"[train] unconditional pretraining done ({a.uncond_steps} steps x {a.batch}); switching to the text pools", flush=True); save(step, "ckpt_uncond.pt", with_opt=False)
         for g_ in opt.param_groups: g_["lr"] = lr_at(step)
         opt.zero_grad(set_to_none=True); keep = torch.rand(a.batch, device=dev) >= a.p_uncond
         order = sorted(range(a.batch), key=lambda q: len(texts[q])); rows, i, j = rows[order], i[order], j[order]; texts = [texts[q] for q in order]; keep = keep[torch.tensor(order, device=dev)]
@@ -142,7 +146,7 @@ def main():
                    "train/lr": lr_at(step), "train/grad_norm": float(gn), "train/rows_per_s": (step - step0 + 1) * a.batch / max(1e-6, el), "train/rows_seen": rows_seen, "train/seq_len": mask_T + 3 * a.k_chunks + 2}
             if wb: wb.log(log, step=step)
             if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} text {log['train/loss_text']:.4f} notext {log['train/loss_notext']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']} pool={pname}", flush=True)
-        if (step + 1) % a.eval_every == 0 or step + 1 == a.steps:
+        if ((step + 1) % a.eval_every == 0 and step + 1 >= a.uncond_steps) or step + 1 == a.steps:
             te = time.time(); out = evaluate(ema_model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a, probe_bank); out["eval/seconds"] = time.time() - te; out["eval/rows_seen"] = rows_seen
             if wb: wb.log(out, step=step)
             json.dump({"step": step + 1, "rows_seen": rows_seen, "scalars": out}, open(os.path.join(a.out, "eval_latest.json"), "w"), indent=1)
