@@ -51,7 +51,7 @@ PY
   VALS="craft_full:$TX1/val/craft_full__*.parquet,describer:$TX1/val/describer_sonnet5_A__*.parquet,raw_all:$TX1/val/raw_all__*.parquet,craft_delta:$TX1/val/craft_delta__*.parquet,craft_newfaded:$TX1/val/craft_newfaded__*.parquet,craft_nojl:$TX1/val/craft_nojl__*.parquet,jlens:$TX1/val/jlens__*.parquet,olens_j:$TX1/val/olens_j__*.parquet"
   [ "$(nfiles q36/text/v3/val 'craft_full__')" -ge 1 ] && VALS="$VALS,craft_full_v3:$TX3/val/craft_full__*.parquet,craft_nodelta_v3:$TX3/val/craft_nodelta__*.parquet"
   log "stage $stage: $(cat /tmp/q36_v5_stage.json | cut -c1-260) -> steps $STEP0 + $ONE (x1.15) = $STEPS (the one-pass rule over the slice stops it)"
-  PRIO=1 wait_gpu 1 || exit 1
+  PRIO=${CRITIC_PRIO:-2} wait_gpu 1 || exit 1
   run train_critic.py "--data-dir /vol/q36/data --out /vol/q36/critic/$TAG --tag critic_${TAG}_s$stage --pools '$SPEC' --val-sets '$VALS' --band $BAND --width 1536 --depth 16 --heads 16 --param v --uncond-steps 0 --uncond-frac 0.10 --steps $STEPS --keep-every 500 --max-passes 1 --max-pairs-per-pos $CAP --pair-slice $SLICE --batch 1024 --micro-batch 128 --eval-every 500 --eval-n 256 --spot-exact-n 64 --spot-ode-steps 16 --max-hours 8.0 $RESUME $EXTRA" critic_${TAG}_s$stage
   grep -q "critic_${TAG}_s$stage\] SPAWNED" $LOGD/apps.txt || { log "stage $stage launch FAILED; retrying in 5 min"; sleep 300; continue; }
   cp /tmp/q36_v5_stage.json $D/critic_${TAG}_stage$stage.json; echo "stage $stage slice $SLICE $(date -u +%H:%M)" >> $USED; for f in $SH; do echo "slice$SLICE $f" >> $USED; done

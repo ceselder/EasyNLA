@@ -245,13 +245,14 @@ def bullet_credit(samp, texts_raw, src, y, eps_bank, r_full):
             if t in (PAD, EOT): break
             ids.append(t)
         sp = bullet_spans(raw); tsp = token_spans(ids, sp) if sp else []
-        for (s, e, lab), (a, b, _) in zip(sp, tsp): jobs.append((n, without_span(raw, s, e).strip() or " ")); meta.append((n, a, b))
-    if not jobs: return [[] for _ in texts_raw], 0.0, 0.0
+        for (s, e, lab), (a, b, _) in zip(sp, tsp): jobs.append((n, without_span(raw, s, e).strip() or " ")); meta.append((n, a, b, lab))
+    if not jobs: return [[] for _ in texts_raw], 0.0, 0.0, {}
     idx = torch.tensor([n for n, _ in jobs], device=dev); fm = torch.cat([fm_loss_text(critic.eval(), src[idx[a:a + 128]], y[idx[a:a + 128]], [j[1] for j in jobs[a:a + 128]], [e[idx[a:a + 128]] for e in eps_bank]) for a in range(0, len(jobs), 128)]); critic.train()
     gains = (r_full[idx] - (-fm)).tolist()                 # r_full excludes the lam/depth terms' change (a removed bullet also shortens the text; we credit the FM part only)
-    out = [[] for _ in texts_raw]
-    for (n, a, b), g_ in zip(meta, gains): out[n].append((a, b, g_))
-    return out, float(np.mean(gains)), float(np.mean([g_ > 0 for g_ in gains]))
+    out = [[] for _ in texts_raw]; per_line = {}
+    for (n, a, b, lab), g_ in zip(meta, gains): out[n].append((a, b, g_)); per_line.setdefault(lab, []).append(g_)
+    stats = {f"bullets/{lab.replace(' ', '_')}_gain_mean": float(np.mean(v)) for lab, v in per_line.items()} | {f"bullets/{lab.replace(' ', '_')}_frac_pos": float(np.mean([g_ > 0 for g_ in v])) for lab, v in per_line.items()} | {f"bullets/{lab.replace(' ', '_')}_n": len(v) for lab, v in per_line.items()}
+    return out, float(np.mean(gains)), float(np.mean([g_ > 0 for g_ in gains])), stats
 LAM = [args.lam]                                            # calibrated at step 1 when --lam < 0: 20% of the group std at the median length
 def rewards_for(src, u_j, texts, G, seed):
     """texts grouped by prompt (B*G, prompt-major); the SAME (t grid, eps) for every rollout of a prompt (common random numbers) -> reward = -FM loss - lam*tokens - depth penalty.
@@ -333,9 +334,9 @@ for step in range(1, args.steps + 1):
         stats = torch.tensor([advf[keep].double().pow(2).sum().item(), advf[keep].double().sum().item(), float(keep.sum())], dtype=torch.float64, device=dev)
         if is_dist: dist.all_reduce(stats)
         n_all = stats[2].item(); std = math.sqrt(max(stats[0].item() / n_all - (stats[1].item() / n_all) ** 2, 0.0)) if n_all > 1 else 1.0; adv = (advf / (std + 1e-6)).view(-1)
-        A_tok = adv[:, None].expand(B * G, samp.shape[1]).clone(); b_gain = float("nan"); b_pos = float("nan"); b_n = 0
+        A_tok = adv[:, None].expand(B * G, samp.shape[1]).clone(); b_gain = float("nan"); b_pos = float("nan"); b_n = 0; b_stats = {}
         if args.bullet_beta > 0:                                                     # RL v6 per-bullet credit: + beta * z(leave-one-out gain) on the bullet's tokens (z over the prompt's group)
-            credits, b_gain, b_pos = bullet_credit(samp, decode(samp, strip=False), sG, yG, rewards_for.last_eps, rewards_for.last_negfm)
+            credits, b_gain, b_pos, b_stats = bullet_credit(samp, decode(samp, strip=False), sG, yG, rewards_for.last_eps, rewards_for.last_negfm)
             for bq in range(B):
                 gs = [g_ for n in range(bq * G, (bq + 1) * G) for (_, _, g_) in credits[n]]
                 if len(gs) < 2 or not keep[bq * G]: continue
@@ -361,8 +362,8 @@ for step in range(1, args.steps + 1):
     gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); optim.step()
     c_loss = critic_step(sG, uG, texts, G)
     if is_main:
-        log = {"step": step, "reward": rew.mean().item(), "neg_fm_loss": pmi.mean().item(), "lam": LAM[0], "tokens": ntok.mean().item(), "depth_hit_rate": hits.mean().item(), "groups_kept": int(nz.sum()), "kl_k3": kl_tot / max(1, (B * G) // args.bwd_chunk), "grad_norm": float(gn), "critic_loss": c_loss, "bullet_gain_mean": b_gain, "bullet_gain_frac_pos": b_pos, "bullets_credited": b_n, "min": (time.time() - t0) / 60}
-        print(f"step {step:04d} | reward {log['reward']:.4f} | -fm {log['neg_fm_loss']:.4f} | tokens {log['tokens']:.0f} | depth-hits {log['depth_hit_rate']:.1%} | groups {log['groups_kept']}/{B} | kl {log['kl_k3']:.4f} | critic {c_loss:.4f} | gn {float(gn):.2f} | {log['min']:.1f} min", flush=True)
+        log = {"step": step, "reward": rew.mean().item(), "neg_fm_loss": pmi.mean().item(), "lam": LAM[0], "tokens": ntok.mean().item(), "depth_hit_rate": hits.mean().item(), "groups_kept": int(nz.sum()), "kl_k3": kl_tot / max(1, (B * G) // args.bwd_chunk), "grad_norm": float(gn), "critic_loss": c_loss, "bullet_gain_mean": b_gain, "bullet_gain_frac_pos": b_pos, "bullets_credited": b_n, **b_stats, "min": (time.time() - t0) / 60}
+        print(f"step {step:04d} | reward {log['reward']:.4f} | -fm {log['neg_fm_loss']:.4f} | tokens {log['tokens']:.0f} | depth-hits {log['depth_hit_rate']:.1%} | groups {log['groups_kept']}/{B} | kl {log['kl_k3']:.4f} | critic {c_loss:.4f} | gn {float(gn):.2f} | {log['min']:.1f} min" + (" | bullets " + " ".join(f"{k.split('/')[1].replace('_gain_mean', '')} {log[k]:+.1e}({log[k.replace('_gain_mean', '_frac_pos')]:.2f})" for k in sorted(log) if k.startswith("bullets/") and k.endswith("_gain_mean")) if b_stats else ""), flush=True)
         if wb: wb.log(log)
         if step % args.eval_every == 0:
             ev = evaluate(step); json.dump(ev, open(f"{args.out}/eval_{step:04d}.json", "w"), indent=1)
