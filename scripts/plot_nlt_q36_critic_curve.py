@@ -43,6 +43,7 @@ def main():
             r["v1b_ref_cos_c"] = v1b_ref["by_step"][k]["cos_c"]; r["v1b_ref_step"] = int(k)
         elif v1b_ref: r["v1b_ref_cos_c"] = v1b_ref.get("cos_c")
     PASSES = json.load(open(f"{REP}/data/critic_{a.tag}_passes.json")) if os.path.exists(f"{REP}/data/critic_{a.tag}_passes.json") else {}
+    EXPOS = json.load(open(f"{REP}/data/critic_{a.tag}_exposures.json")) if os.path.exists(f"{REP}/data/critic_{a.tag}_exposures.json") else {}   # orchestrator 11:05: exposures per position are first-class
     for r in R:
         # AMENDED CRITERION (orchestrator 2026-09-25 09:25 UTC, before any v4 / v3c number): ALL of (a) a one-claim twin >= 0.60 in BOTH views, (b) held-out P(z > no text) >= 0.80, (c) content >= 25,
         # (d) passes over every pool <= 1 at the checkpoint, (e) train - held-out PMI gap < 20 bits (small train-row eval bits_<tag>_stepNNNNNN_train.json)
@@ -51,6 +52,7 @@ def main():
         r["b_calibrated"] = bool(r.get("p_null") is not None and r["p_null"] >= 0.80)
         r["c_content"] = bool(r["content"] >= PASS_CONTENT)
         ps = [v for k, v in PASSES.items() if int(k) <= r["step"]]; r["passes_max"] = max(ps) if ps else None; r["d_one_pass"] = bool(r["passes_max"] is not None and r["passes_max"] <= 1.0)
+        ex = [(int(k), v) for k, v in EXPOS.items() if int(k) <= r["step"]]; r["exposures"] = max(ex, key=lambda kv: kv[0])[1] if ex else None
         pf = f"{REP}/data/bits_{a.tag}_step{r['step']:06d}_pools.json"
         r["per_pool"] = {k: {"content": v["content_bits"]["mean"], "p_dm": v["p_z_gt_dm"], "p_null": v.get("p_z_gt_null")} for k, v in json.load(open(pf))["sets"].items()} if os.path.exists(pf) else {}
         tf = f"{REP}/data/bits_{a.tag}_step{r['step']:06d}_train.json"
