@@ -30,7 +30,7 @@ ap.add_argument("--steps", type=int, default=200); ap.add_argument("--batch", ty
 ap.add_argument("--lr", type=float, default=1e-5); ap.add_argument("--critic-lr", type=float, default=3e-5); ap.add_argument("--kl", type=float, default=0.02); ap.add_argument("--lam", type=float, default=-1.0, help="per-token cost in FM-loss units; < 0 = calibrate at step 1 (20% of the group std at the median length)"); ap.add_argument("--depth-penalty", type=float, default=0.05, help="FM-loss units subtracted per text with a depth word / empty text (the FM loss is O(1) per dim; group stds are ~1e-3..1e-2)")
 ap.add_argument("--cispo-eps-max", type=float, default=5.0); ap.add_argument("--no-cotrain", action="store_true"); ap.add_argument("--replay-frac", type=float, default=0.5); ap.add_argument("--critic-micro", type=int, default=64)
 ap.add_argument("--t-grid", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9"); ap.add_argument("--eval-every", type=int, default=10); ap.add_argument("--heldout", type=int, default=128); ap.add_argument("--save-every", type=int, default=50)
-ap.add_argument("--gen-chunk", type=int, default=32); ap.add_argument("--bwd-chunk", type=int, default=8); ap.add_argument("--max-train-pos", type=int, default=None); ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--gen-chunk", type=int, default=32); ap.add_argument("--bwd-chunk", type=int, default=8); ap.add_argument("--no-grad-ckpt", action="store_true", help="disable gradient checkpointing on the policy (on by default: a 27B backward over 8 x 170 tokens OOMs a 140 GB H200 without it)"); ap.add_argument("--max-train-pos", type=int, default=None); ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--wandb-project", default="nlt-qwen36-27b"); ap.add_argument("--wandb-entity", default="octahedral-systems"); ap.add_argument("--wandb-name", default=None); ap.add_argument("--no-wandb", action="store_true")
 args = ap.parse_args()
 RANK, WORLD, LRANK = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1)), int(os.environ.get("LOCAL_RANK", 0)); is_dist, is_main = WORLD > 1, RANK == 0
@@ -52,6 +52,8 @@ trainable = [q for n_, q in policy.named_parameters() if q.requires_grad and ".d
 for q in trainable: q.data = q.data.float()
 for n_, q in policy.named_parameters():
     if ".ref." in n_: q.requires_grad_(False)
+if not args.no_grad_ckpt:
+    policy.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False}); policy.enable_input_require_grads(); P("[rl] gradient checkpointing ON (policy)")
 MPOS = [k for k, t in enumerate(PROMPT) if t == MARKER_ID]; INJ = InjectMarkers(policy, positions=MPOS)
 P(f"[rl] policy {args.policy} ({sum(q.numel() for q in trainable) / 1e6:.0f}M trainable) | prompt {PLEN} tok | world {WORLD} x {args.batch} prompts x {args.group}")
 
@@ -126,7 +128,7 @@ def gen(vecs, temperature):
         vb = vecs[a:a + args.gen_chunk]; ids = PROMPT_T.repeat(vb.shape[0], 1); INJ.set(vb, ids)
         try:
             kw = dict(do_sample=temperature > 0, temperature=temperature if temperature > 0 else None, top_p=1.0 if temperature > 0 else None, top_k=0 if temperature > 0 else None)
-            g = policy.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=args.n_tok, pad_token_id=PAD, eos_token_id=[EOT, PAD], suppress_tokens=[MARKER_ID], **kw)
+            g = policy.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=args.n_tok, pad_token_id=PAD, eos_token_id=[EOT, PAD], suppress_tokens=[MARKER_ID], use_cache=True, **kw)
         finally: INJ.off()
         s = g[:, PLEN:]; s = F.pad(s, (0, args.n_tok - s.shape[1]), value=PAD) if s.shape[1] < args.n_tok else s; outs.append(s)
     return torch.cat(outs)

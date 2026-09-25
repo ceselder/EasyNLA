@@ -125,7 +125,7 @@ def main():
                       max_num_seqs=mns, enforce_eager=False, enable_prefix_caching=False, disable_log_stats=True, seed=args.seed, **extra)
         except Exception as e:
             msg = str(e)
-            if ("Mamba cache blocks" in msg or "max_num_seqs" in msg) and mns > 32:
+            if ("Mamba cache blocks" in msg or "max_num_seqs" in msg or "Engine core initialization failed" in msg) and mns > 32:     # the engine-core wrapper hides the Mamba-block message
                 mns //= 2; print(f"[rollout] engine init failed ({msg[:120]}...) -> retry with max_num_seqs {mns}", flush=True); import gc; gc.collect(); torch.cuda.empty_cache()
             else: raise
     print(f"[rollout] engine up with max_num_seqs {mns}", flush=True)
