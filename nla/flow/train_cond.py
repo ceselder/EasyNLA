@@ -375,6 +375,9 @@ def main():
     p.add_argument("--ctr-k", type=int, default=32, help="negatives per activation (group size K+1)"); p.add_argument("--ctr-weight", type=float, default=1.0)
     p.add_argument("--ctr-tau-init", type=float, default=20.0, help="InfoNCE temperature in nats of FM-proxy PMI"); p.add_argument("--ctr-fixed-tau", action="store_true")
     p.add_argument("--ctr-tau-lr", type=float, default=1e-3, help="learning rate of log tau"); p.add_argument("--ctr-tau-max", type=float, default=100.0, help="tau clamp (nats)")
+    p.add_argument("--health-every", type=int, default=0, help="density health every N steps (and before training): median / mean single-claim PMI of held-out true claims on their own activation + mean cond / uncond FM loss (fixed noise)")
+    p.add_argument("--health-n", type=int, default=256)
+    p.add_argument("--ctr-gradcap", action="store_true", help="replicated DDP: scale the contrastive gradient so its norm <= the FM gradient norm of the same step")
     p.add_argument("--unit-norm", action="store_true", help="direction-only critic: rescale every activation to the RMS training norm before the normaliser (stored in the adapter args; FlowBundle / FlowCritic apply it automatically)")
     p.add_argument("--rewarm", type=int, default=0, help="continuation runs: linear lr re-warm-up over this many steps after --start-step (AdamW state is not restored under FSDP)")
     p.add_argument("--ctr-global", type=int, default=0, help="N > 0: ONE same-template group of N distinct-answer activations spread over all ranks (N/world rows each), full N x N "
@@ -867,6 +870,31 @@ def main():
             for _ in range(a.start_step * a.grad_accum): next_ctr_batch(a.batch)
             if is0: print(f"[cond] same-template sampler replayed {a.start_step} steps; {sum(len(v) for v in pools.values())} fresh activations left on rank 0", flush=True)
     ctr_stats = {}
+    @torch.no_grad()
+    def health_eval():
+        """density health on fixed held-out anchors (same noise every call): single-claim PMI proxy (d/2)(L_uncond - L_cond) of the anchor's own
+        true claim, 5 t, 1 eps; every rank runs the same calls (FSDP-safe)"""
+        if sv_acts is None or not len(sv_z): return {}
+        n_ = min(a.health_n, len(sv_z)); X = norm.normalize(sv_acts[:n_].to(dev)).float(); d_ = X.shape[1]
+        tt5 = torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device=dev); E = torch.randn(n_, d_, device=dev, generator=torch.Generator(device=dev).manual_seed(4321))
+        Lc, Lu = torch.empty(n_, device=dev), torch.empty(n_, device=dev); bs = 64
+        for b0 in range(0, n_, bs):
+            xb, eb = X[b0: b0 + bs], E[b0: b0 + bs]; m_ = len(xb); e_, mk_, cv_ = enc_batch(sv_z[b0: b0 + m_], grad=False)
+            xt = ((1 - tt5)[None, :, None] * xb[:, None] + tt5[None, :, None] * eb[:, None]).reshape(-1, d_); tg = (eb - xb)[:, None].expand(m_, 5, d_).reshape(-1, d_)
+            sel = torch.arange(m_, device=dev).repeat_interleave(5); tv = tt5.repeat(m_)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                vc = model(xt, tv, e_[sel] if e_ is not None else None, mk_[sel] if mk_ is not None else None, cv_[sel] if cv_ is not None else None).float(); vu = model(xt, tv).float()
+            Lc[b0: b0 + m_] = ((vc - tg) ** 2).mean(-1).view(m_, 5).mean(-1); Lu[b0: b0 + m_] = ((vu - tg) ** 2).mean(-1).view(m_, 5).mean(-1)
+        pm = (d_ / 2) * (Lu - Lc)
+        return {"health/pmi_median": float(pm.median()), "health/pmi_mean": float(pm.mean()), "health/pmi_pos_share": float((pm > 0).float().mean()),
+                "health/fm_cond": float(Lc.mean()), "health/fm_uncond": float(Lu.mean()), "health/n": n_}
+    def _log_health(step_):
+        hs = health_eval()
+        if hs and is0:
+            print(f"  [health] step {step_}: single-claim PMI of held-out true claims median {hs['health/pmi_median']:+.1f} mean {hs['health/pmi_mean']:+.1f} nats "
+                  f"(> 0: {100*hs['health/pmi_pos_share']:.0f}%), FM cond {hs['health/fm_cond']:.4f} uncond {hs['health/fm_uncond']:.4f} (n {hs['health/n']})", flush=True)
+            if use_wandb: wandb.log(hs, step=step_)
+    if a.health_every: _log_health(a.start_step)
     for step in range(a.start_step + 1, a.steps + 1):
         _decay = ((1.0 - (1.0 - a.lr_linear_to) * min(1.0, step / a.steps)) if a.lr_linear_to is not None     # anneal: linear decay to lr_linear_to x lr
                   else (1.0 if a.lr_const else (0.5 * (1 + math.cos(math.pi * min(1.0, step / a.steps))) * 0.9 + 0.1)))
@@ -923,6 +951,11 @@ def main():
                 neg_stats = {"train/contrast_loss": closs.item(), "train/neg_gap": gap.mean().item(), "train/neg_win": (gap > 0).float().mean().item(), "train/neg_n": n2,
                              "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2, "train/neg_frac_quote": sum(1 for k in keep_i if negs[k][1] == "quote") / n2,
                              "train/neg_frac_twin": sum(1 for k in keep_i if negs[k][1] == "twin") / n2, "train/neg_rel_gap": float((gap / lpos.clamp_min(1e-6)).mean())}
+        if a.ctr_template and a.ctr_gradcap:   # keep the FM gradient aside; the contrastive gradient is scaled to <= its norm below
+            assert not a.unfreeze_prior, "--ctr-gradcap is implemented for replicated (non-FSDP) runs"
+            _cap_p = [p_ for g_ in opt.param_groups for p_ in g_["params"] if p_.grad is not None and p_ is not log_tau]
+            _cap_g = [p_.grad.detach().clone() for p_ in _cap_p]; _fm_n = float(torch.sqrt(sum((g_.float() ** 2).sum() for g_ in _cap_g)))
+            for p_ in _cap_p: p_.grad = None
         if a.ctr_template and a.ctr_global:   # ONE same-template group of N activations across all ranks, full N x N InfoNCE (rows sharded over ranks)
             t_c = time.time(); Ng = a.ctr_global; M = Ng // world; assert M * world == Ng, "--ctr-global must be divisible by the world size"
             assert not a.ctr_enc_grad, "--ctr-global keeps the claim encodings detached"
@@ -1026,6 +1059,11 @@ def main():
             if ddp and log_tau.requires_grad:                                     # every rank issues it (a rank with no group this step has no grad yet)
                 if log_tau.grad is None: log_tau.grad = torch.zeros_like(log_tau)
                 dist.all_reduce(log_tau.grad, op=dist.ReduceOp.AVG)
+        if a.ctr_template and a.ctr_gradcap:
+            _c_n = float(torch.sqrt(sum((p_.grad.float() ** 2).sum() for p_ in _cap_p if p_.grad is not None))) if _cap_p else 0.0
+            _sc = min(1.0, _fm_n / max(_c_n, 1e-12))
+            for p_, g_ in zip(_cap_p, _cap_g): p_.grad = g_ + (p_.grad * _sc if p_.grad is not None else 0.0)
+            ctr_stats.update({"train/ctr_gradscale": _sc, "train/fm_gradnorm": _fm_n, "train/ctr_gradnorm": _c_n})
         if ddp and arvec is not None and arvec.trainable:   # the encoder LoRA lives outside FSDP (one copy per rank): average its grads across ranks
             for p_ in arvec.trainable_parameters():
                 if p_.grad is None: p_.grad = torch.zeros_like(p_)
@@ -1059,6 +1097,8 @@ def main():
             if grp:
                 g_ = torch.nn.utils.clip_grad_norm_(grp, 1.0); g_ = g_.full_tensor() if hasattr(g_, "full_tensor") else g_; gn2 += float(g_) ** 2
         gn = torch.tensor(gn2 ** 0.5); opt.step()
+        if a.health_every and step % a.health_every == 0: _log_health(step)
+        if a.ctr_template and step % 50 == 0: torch.cuda.empty_cache()   # the chunked contrastive recompute fragments the allocator (c1_ctr crept 144 -> 160 GiB and OOM'd at step ~2750)
         if (step % 50 == 0 or step <= a.start_step + 3) and is0:
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step | peak mem {torch.cuda.max_memory_allocated()/2**30:.0f} GiB", flush=True)
             cfm_st = {f"train/cfm_{k}": float(v) for k, v in getattr(cond_fm_loss, "last", {}).items()} if a.cfm_lambda > 0 else {}
@@ -1067,7 +1107,7 @@ def main():
             if ctr_stats and is0 and a.ctr_global: print(f"  [ctr] InfoNCE row {ctr_stats['train/ctr_ce_row']:.3f} col {ctr_stats['train/ctr_ce_col']:.3f} (row chance {math.log(max(ctr_stats['train/ctr_answers'], 1)):.2f}) "
                                         f"acc row {100*ctr_stats['train/ctr_acc_row']:.1f}% col {100*ctr_stats['train/ctr_acc_col']:.1f}% (row chance {100*ctr_stats['train/ctr_chance']:.1f}%) | "
                                         f"{ctr_stats['train/ctr_groups']} global group(s) of {a.ctr_global}: {ctr_stats['train/ctr_unique']:.0f} activations, {ctr_stats['train/ctr_answers']:.0f} distinct answers | "
-                                        f"tau {ctr_stats['train/ctr_tau']:.1f} nats | {ctr_stats['train/ctr_seconds']:.2f}s", flush=True)
+                                        f"tau {ctr_stats['train/ctr_tau']:.1f} nats | {ctr_stats['train/ctr_seconds']:.2f}s" + (f" | grad cap x{ctr_stats['train/ctr_gradscale']:.3f} (FM {ctr_stats['train/fm_gradnorm']:.3g}, ctr {ctr_stats['train/ctr_gradnorm']:.3g})" if "train/ctr_gradscale" in ctr_stats else ""), flush=True)
             elif ctr_stats and is0: print(f"  [ctr] InfoNCE {ctr_stats['train/ctr_ce']:.3f} (chance {math.log(a.ctr_k + 1):.2f}) acc row {100*ctr_stats['train/ctr_acc_row']:.0f}% col {100*ctr_stats['train/ctr_acc_col']:.0f}% "
                                         f"(chance {100/(a.ctr_k + 1):.0f}%) | {ctr_stats['train/ctr_groups']} groups of <= {a.ctr_k + 1}, {ctr_stats['train/ctr_unique']} distinct answers, {ctr_stats['train/ctr_templates']} template chunks | "
                                         f"tau {ctr_stats['train/ctr_tau']:.1f} nats | {ctr_stats['train/ctr_seconds']:.2f}s", flush=True)

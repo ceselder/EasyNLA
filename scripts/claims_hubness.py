@@ -44,10 +44,11 @@ def main():
         if len(tmpls) >= a.templates: break
     res = {"adapter": a.adapter, "tag": a.tag, "D": a.D, "norm_all_val": {"n": len(norms), "mean": float(norms.mean()), "cv": float(norms.std() / norms.mean()),
            **{f"p{q}": float(np.percentile(norms, q)) for q in (1, 10, 50, 90, 99)}}, "templates": {}}
-    mats = {}
+    mats = {}; diag_all = []
     for k, lst in tmpls:
         ii = [i for i, _ in lst]; cl = [c for _, c in lst]
         M = sc.pmi_matrix(Xv[ii], cl, [3_000_003 + i for i in ii]).numpy(); n = len(ii); nm = norms[ii]; mats[k] = M
+        diag_all += list(np.diag(M))
         top = M.argmax(0); hub = np.bincount(top, minlength=n).astype(float)                     # claim j -> its top activation
         colmean = M.mean(1)                                                                       # activation i: mean PMI over all claims
         order = np.argsort(-hub); top5 = order[: max(1, n // 20)]
@@ -58,6 +59,8 @@ def main():
                                "top_hubs_norm_percentile_mean": float(pct[top5].mean()), "top_hubs_norm_mean": float(nm[top5].mean()), "template_norm_mean": float(nm.mean())}
         print(f"[hubness {a.tag}] {k}: c->a {res['templates'][k]['claim_to_act_acc']:.3f}, max hub {int(hub.max())}/{n}, top-5% hubs take {100*res['templates'][k]['share_claims_to_top5pct_hubs']:.0f}% of claims, "
               f"rho(hub,|h|) {res['templates'][k]['spearman_hub_norm']:+.2f}, rho(mean PMI,|h|) {res['templates'][k]['spearman_meanpmi_norm']:+.2f}, top hubs at norm pct {res['templates'][k]['top_hubs_norm_percentile_mean']:.2f}", flush=True)
+    dg = np.array(diag_all); res["health"] = {"pmi_own_median": float(np.median(dg)), "pmi_own_mean": float(dg.mean()), "pmi_own_pos_share": float((dg > 0).mean()), "n": len(dg)}
+    print(f"[hubness {a.tag}] density health: single-claim PMI of true claims on their own activation median {np.median(dg):+.1f} mean {dg.mean():+.1f} nats (> 0: {100*(dg > 0).mean():.0f}%)", flush=True)
     T = res["templates"].values()
     res["mean"] = {k: float(np.mean([t[k] for t in T])) for k in ("spearman_hub_norm", "spearman_meanpmi_norm", "top_hubs_norm_percentile_mean", "share_claims_to_top5pct_hubs", "claim_to_act_acc")}
     os.makedirs(OUT, exist_ok=True); json.dump(res, open(f"{OUT}/hubness_{a.tag}.json", "w"), indent=1)

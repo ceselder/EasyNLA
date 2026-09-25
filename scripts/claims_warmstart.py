@@ -287,16 +287,47 @@ def cmd_margin_stats(a):
                                                   f"share margin>0 {v['share_margin_lse_gt']['0']:.2f}, pmi>20 {v['share_pmi_gt']['20']:.2f}", flush=True)
 
 
+_NUM = re.compile(r"\d(?:[\d,.:/]*\d)?")
+
+
+def _prefix_texts(part_file):
+    """id -> document prefix up to the activation (gold: extraction shard `text`; synthetic: anchors_<name>.parquet `prefix_text`)"""
+    import pyarrow.parquet as pq
+    base = os.path.basename(part_file)[:-8]
+    if base.startswith("gold:"):
+        name = base[5:]; t = pq.read_table(f"/vol_q36/data/acts_qwen36_L42/{name}.parquet", columns=["text"]).column(0).to_pylist()
+        return lambda id_: t[int(id_.rsplit(":", 1)[1])]
+    name = base[4:]; f = f"/vol_glp/claims/anchors/anchors_{name}.parquet"
+    if not os.path.exists(f): return lambda id_: None
+    t = pq.read_table(f, columns=["anchor_id", "prefix_text"]).to_pydict(); m = dict(zip(t["anchor_id"], t["prefix_text"]))
+    return m.get
+
+
+def _number_ok(claim, type_, prefix, window):
+    """decodability (diffusion-AR-nla probes): exact numbers are linearly readable from h42 only <= 1 token back. A claim quoting a number that
+    occurs in the document prefix is kept only if that number sits in the last `window` characters; position claims and numbers that do not
+    occur in the prefix (buckets, hedges) are exempt"""
+    if window <= 0 or prefix is None or type_ == "text:position": return True
+    tail = prefix[-window:]
+    for n in _NUM.findall(claim):
+        if n in prefix and n not in tail: return False
+    return True
+
+
 def cmd_build(a):
     """critic-filtered SFT sets: bullets with PMI > lambda, best-first, <= cap per activation, in the verbalizer's SFT schema"""
     import pyarrow as pa, pyarrow.parquet as pq
     prompt = pq.read_table("/vol_q36/data/sft/av_sft_train.parquet", columns=["prompt"]).slice(0, 1).column(0).to_pylist()[0]
     rows = {"train": [], "val": []}; st = {"activations": 0, "kept": 0, "bullets_in": 0, "bullets_kept": 0, "by_source": {}}
+    st["number_dropped"] = 0
     for f in sorted(glob.glob(f"{WS}/{'scores_margin_' if a.margin is not None else 'scores_'}{a.critic_tag}/*.parquet")):
+        pfx = _prefix_texts(f) if a.number_window > 0 else (lambda id_: None)
         for r in pq.read_table(f).to_pylist():
             st["activations"] += 1; st["bullets_in"] += len(r["claims"])
             if a.margin is not None:   # v2: contrastive margin over same-template activations of other documents, best-first; true-future types never become targets
                 keep = sorted([(m_, c, t_) for m_, c, t_ in zip(r[a.margin_key], r["claims"], r["types"]) if m_ is not None and m_ > a.margin and t_ not in FUTURE_TYPES], key=lambda x: -x[0])
+                if a.number_window > 0:
+                    px = pfx(r["id"]); k0 = len(keep); keep = [x for x in keep if _number_ok(x[1], x[2], px, a.number_window)]; st["number_dropped"] += k0 - len(keep)
             else: keep = sorted([(p, c, t_) for p, c, t_ in zip(r["pmi"], r["claims"], r["types"]) if p is not None and p > a.lam], key=lambda x: -x[0])
             seen, sel = set(), []
             for p, c, t_ in keep:
@@ -311,7 +342,7 @@ def cmd_build(a):
     out = f"{WS}/sft_{a.critic_tag}" + (f"_margin{a.margin:g}" if a.margin is not None else ""); os.makedirs(out, exist_ok=True)
     for k, v in rows.items():
         if v: pq.write_table(pa.Table.from_pylist(v), f"{out}/{k}.parquet", compression="zstd")
-    st.update(train=len(rows["train"]), val=len(rows["val"]), lam=a.lam, margin=a.margin, margin_key=a.margin_key, cap=a.cap, critic=a.critic_tag, bullets_per_kept=st["bullets_kept"] / max(st["kept"], 1))
+    st.update(train=len(rows["train"]), val=len(rows["val"]), lam=a.lam, margin=a.margin, margin_key=a.margin_key, number_window=a.number_window, cap=a.cap, critic=a.critic_tag, bullets_per_kept=st["bullets_kept"] / max(st["kept"], 1))
     json.dump(st, open(f"{out}/stats.json", "w"), indent=1)
     ex = random.Random(0).sample(rows["train"], min(12, len(rows["train"])))
     json.dump([{k: v for k, v in e.items() if k not in ("activation_vector", "prompt")} for e in ex], open(f"{out}/examples.json", "w"), indent=1)
@@ -322,6 +353,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("score"); s.add_argument("--adapter", required=True); s.add_argument("--critic-tag", required=True); s.add_argument("--parts", required=True); s.add_argument("--D", type=int, default=1)
     b = sub.add_parser("build"); b.add_argument("--critic-tag", required=True); b.add_argument("--lam", type=float, default=20.0); b.add_argument("--cap", type=int, default=6)
+    b.add_argument("--number-window", type=int, default=0, help="drop bullets quoting a document number that is not within the last N characters of the prefix (0 = off; v2: 12)")
     b.add_argument("--margin", type=float, default=None, help="v2: keep bullets with contrastive margin > this (reads scores_margin_<critic>)"); b.add_argument("--margin-key", default="margin_lse", choices=["margin_lse", "margin_mean"])
     m = sub.add_parser("score_margin"); m.add_argument("--adapter", required=True); m.add_argument("--critic-tag", required=True); m.add_argument("--parts", required=True)
     m.add_argument("--K", type=int, default=64); m.add_argument("--seed", type=int, default=0); m.add_argument("--rows-per-fwd", type=int, default=8192)
