@@ -15,7 +15,7 @@ C1, C2, C3, C4, CG = "#2a78d6", "#eb6834", "#1baf7a", "#8a5cd6", "#8a8987"
 plt.rcParams.update({"font.size": 12, "axes.titlesize": 14, "axes.labelsize": 12, "legend.fontsize": 11, "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True, "grid.color": "#e6e4df", "grid.linewidth": 0.6, "axes.axisbelow": True})
 NICE = {"craft_full": "crafted change text (all lines)", "craft_nojl": "crafted, no J-lens line", "craft_delta": "Shift line only (olens of Δ)", "craft_newfaded": "Now present / Faded only", "jlens": "J-lens leaning line only",
         "olens_j": "olens bullets of the later state", "olens_i": "olens bullets of the earlier state (control)", "teacher": "crafted teacher text", "verbalizer": "distilled two-state verbalizer", "base_control": "base model, same prompt (control)",
-        "describer": "LLM trace (Sonnet 5, readouts only)", "describer_A": "LLM trace (Sonnet 5, readouts only)", "describer_W": "LLM trace (Sonnet 5, + attention/MLP write readouts)", "describer_sonnet_A": "LLM trace Sonnet 5 (A)", "describer_sonnet_B": "LLM trace Sonnet 5 (+ passage tail)", "describer_qwen32b": "LLM trace Qwen3-32B (A)", "craft_full_same": "crafted change text (same rows)", "teacher_trunc96": "crafted teacher cut at 96 tokens (RL v1 budget)", "teacher_trunc176": "crafted teacher cut at 176 tokens",
+        "describer": "LLM trace (Sonnet 5, readouts only)", "describer_A": "LLM trace (Sonnet 5, readouts only)", "describer_W": "LLM trace (Sonnet 5, + attention/MLP write readouts)", "describer_sonnet_A": "LLM trace Sonnet 5 (A)", "describer_sonnet_B": "LLM trace Sonnet 5 (+ passage tail)", "describer_qwen32b": "LLM trace Qwen3-32B (A)", "craft_full_same": "crafted change text (same rows)", "teacher_trunc96": "crafted teacher cut at 96 tokens (RL v1 budget)", "verbalizer_v1b": "distilled verbalizer, full-length SFT (v1b)", "teacher_trunc176": "crafted teacher cut at 176 tokens",
         "raw_all": "raw readouts, all sources concatenated", "raw_all_w": "raw readouts + attention/MLP write readouts", "writes_only": "attention/MLP write readouts only", "raw_no_i": "raw, without the earlier-state read", "raw_no_j": "raw, without the later-state read", "raw_no_delta": "raw, without the Δ read", "raw_no_jl": "raw, without the J-lens rising/falling words",
         "raw_w_no_attn": "raw + writes, without the attention write read", "raw_w_no_mlp": "raw + writes, without the MLP write read", "skiplens_jd": "skip-lens of the J-transported Δ"}
 
@@ -44,7 +44,9 @@ def bars(ax, labels, vals, errs, color, title, ylabel, hline=None, fmt="{:.1f}")
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--tag", default="v1"); ap.add_argument("--data", default=f"{REP}/data"); a = ap.parse_args()
-    files = sorted(glob.glob(f"{a.data}/bits_{a.tag}_*.json")); Rs = [load(f) for f in files]; R0 = next((r for r in Rs if r), {})
+    files = sorted(glob.glob(f"{a.data}/bits_{a.tag}_*.json")) + sorted(glob.glob(f"{a.data}/bits_{a.tag}b_verbalizer.json")); Rs = [load(f) for f in files]; R0 = next((r for r in Rs if r), {})
+    for R, f in zip(Rs, files):                                   # the full-length-SFT rerun (v1b) contributes only its own new set; duplicated names keep the main job's numbers
+        if R and os.path.basename(f).startswith(f"bits_{a.tag}b_"): R["sets"] = {k: v for k, v in R["sets"].items() if k.endswith("_" + a.tag + "b")}; R["twins"] = {}
     T = {"tag": a.tag, "sets": {}, "twins": {}, "ckpt": R0.get("ckpt"), "step": R0.get("step"), "ode_steps": R0.get("ode_steps"), "files": [os.path.basename(f) for f in files]}
     for R in Rs:
         if not R: continue
@@ -67,7 +69,7 @@ def main():
         fig, ax = plt.subplots(figsize=(7, 4.4)); bars(ax, lab, val, None, C3, "Does the critic notice one swapped claim? P(true text > twin)", "P(true > twin)", 0.5, "{:.2f}"); ax.axhline(0.65, color=CG, ls="--", lw=1); ax.set_ylim(0.3, 1.0)
         fig.tight_layout(); savefig(fig, f"fig_phase1_twins_{a.tag}")
     # ---- fig 3: verbalizer vs teacher on the same rows
-    vk = [k for k in ("teacher", "verbalizer", "base_control") if k in S]
+    vk = [k for k in ("teacher", "teacher_trunc176", "teacher_trunc96", "verbalizer", f"verbalizer_{a.tag}b", "base_control") if k in S]
     if vk:
         fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
         bars(axes[0], [NICE.get(k, k) for k in vk], [S[k]["content"] for k in vk], [S[k]["content_sem"] for k in vk], C1, "Content bits: distilled verbalizer vs its crafted teacher (same pairs)", "content bits", 0)
