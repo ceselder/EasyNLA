@@ -86,9 +86,11 @@ class Decoder:
         return torch.cat(out)
 
     @torch.no_grad()
-    def v(self, x, t, c, cfg=1.0):
-        """velocity at (x [B, d], scalar t) under condition c [B, d_cond] (None = unconditional prior) with CFG scale cfg."""
+    def v(self, x, t, c, cfg=1.0, win=None):
+        """velocity at (x [B, d], scalar t) under condition c [B, d_cond] (None = unconditional prior) with classifier-free guidance scale
+        cfg, applied only for t inside `win` = (t_lo, t_hi) (None = the whole trajectory)."""
         tt = torch.full((x.shape[0],), float(t), device=x.device)
+        if win is not None and not (win[0] <= float(t) <= win[1]): cfg = 1.0
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if c is None or cfg == 0: return self.model(x, tt).float()
             has = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
@@ -98,23 +100,28 @@ class Decoder:
             return vu + cfg * (vc - vu)
 
     @torch.no_grad()
-    def ode(self, x, c, t0, t1, steps, cfg=1.0):
+    def ode(self, x, c, t0, t1, steps, cfg=1.0, win=None):
         """Heun probability-flow ODE from t0 to t1 (batched)."""
         ts = torch.linspace(t0, t1, steps + 1, device=x.device)
         for i in range(steps):
-            h = ts[i + 1] - ts[i]; v0 = self.v(x, ts[i], c, cfg); xp = x + h * v0; v1 = self.v(xp, ts[i + 1], c, cfg); x = x + h * 0.5 * (v0 + v1)
+            h = ts[i + 1] - ts[i]; v0 = self.v(x, ts[i], c, cfg, win); xp = x + h * v0; v1 = self.v(xp, ts[i + 1], c, cfg, win); x = x + h * 0.5 * (v0 + v1)
         return x
 
     def invert(self, h_raw, c, steps):
-        """h -> its noise under condition c (ODE 0 -> 1, plain conditional model, as DDIM inversion)."""
+        """h -> its noise under condition c (ODE 0 -> 1, plain conditional model, no guidance, as DDIM inversion)."""
         return self.ode(self.norm.normalize(h_raw.to(self.dev)).float(), c, 0.0, 1.0, steps, 1.0)
 
-    def decode(self, eps, c, steps, cfg=1.0):
-        return self.norm.denormalize(self.ode(eps, c, 1.0, 0.0, steps, cfg))
+    def decode(self, eps, c, steps, cfg=1.0, win=None):
+        return self.norm.denormalize(self.ode(eps, c, 1.0, 0.0, steps, cfg, win))
 
-    def sdedit(self, h_raw, c, tau, steps, cfg, eps):
+    def sdedit(self, h_raw, c, tau, steps, cfg, eps, win=None):
         x0 = self.norm.normalize(h_raw.to(self.dev)).float(); xt = (1 - tau) * x0 + tau * eps
-        return self.norm.denormalize(self.ode(xt, c, tau, 0.0, max(3, int(steps * tau)), cfg))
+        return self.norm.denormalize(self.ode(xt, c, tau, 0.0, max(3, int(steps * tau)), cfg, win))
+
+    @property
+    def mu(self):
+        """the dataset mean activation (raw units) for centred cosines"""
+        n = self.norm; return (n.mean if hasattr(n, "mean") else n.base.mean).float()
 
 
 def load_prior(prior_dir, encoder_json, dev):
@@ -130,16 +137,16 @@ def load_prior(prior_dir, encoder_json, dev):
 
 
 @torch.no_grad()
-def prior_sample(prior, texts, seed, cfg=None):
-    """-> [N, d_e] one sample of e per text (the prior's own units; the caller re-projects with Encoder.project), trying the plausible signatures."""
-    texts = list(texts); tries = [{"texts": texts, "seed": seed}, {"texts": texts, "n": 1, "seed": seed}, {"texts": texts}]
-    if cfg is not None: tries = [{**kw, "cfg_scale": cfg} for kw in tries] + [{**kw, "cfg": cfg} for kw in tries] + tries
-    for kw in tries:
-        try: out = prior.sample(**kw)
-        except TypeError: continue
-        if isinstance(out, dict): out = out.get("e", out.get("samples", next(iter(out.values()))))
-        out = torch.as_tensor(out).float()
-        if out.dim() == 3: out = out[:, 0] if out.shape[0] == len(texts) else out[0]
-        assert out.shape[0] == len(texts), out.shape
-        return out
-    raise RuntimeError("prior.sample() signature not understood")
+def prior_sample(prior, texts, n=1, seed=0, cfg=1.0, n_steps=50):
+    """e' ~ p(e | z): UnclipCritic.sample(texts, n, seed, cfg_scale, n_steps) -> [N, n, d_e] in encoder units (agent B's API), with a
+    fallback for looser signatures. Always returns [N, n, d_e]."""
+    texts = list(texts)
+    try: out = prior.sample(texts, n=n, seed=seed, cfg_scale=cfg, n_steps=n_steps)
+    except TypeError:
+        try: out = prior.sample(texts, n=n, seed=seed)
+        except TypeError: out = prior.sample(texts)
+    if isinstance(out, dict): out = out.get("e", out.get("samples", next(iter(out.values()))))
+    out = torch.as_tensor(out).float()
+    if out.dim() == 2: out = out[:, None]
+    assert out.shape[0] == len(texts), out.shape
+    return out

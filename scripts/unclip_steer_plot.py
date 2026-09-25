@@ -20,15 +20,24 @@ PRETTY = {"none": "no edit", "jadd_b1": "J-lens direction, β=1 (control)", "jad
 
 def pretty(nm):
     if nm in PRETTY: return PRETTY[nm]
-    m = re.fullmatch(r"tdiff_a([\d.]+)_cfg([\d.]+)", nm)
-    if m: return f"text diff α={m.group(1)}, CFG {m.group(2)}"
-    m = re.fullmatch(r"sde_t([\d.]+)_cfg([\d.]+)", nm)
-    if m: return f"SDEdit τ={m.group(1)}, CFG {m.group(2)}"
-    m = re.fullmatch(r"tdir(\d)_b([\d.]+)", nm)
-    if m: return f"text-diff displacement as direction (α={m.group(1)}), β={m.group(2)}"
-    m = re.fullmatch(r"tdir(\d)_on_b([\d.]+)", nm)
-    if m: return f"text-diff displacement, every position (α={m.group(1)}), β={m.group(2)}"
-    m = re.fullmatch(r"var_(\d)", nm)
+    full = nm.endswith("full"); core = nm[:-4] if full else nm; sfx = " (CFG on the whole trajectory)" if full else ""
+    m = re.fullmatch(r"tdiff_a([\d.]+)_cfg([\d.]+)", core)
+    if m: return f"pooled text diff α={m.group(1)}, CFG {m.group(2)}{sfx}"
+    m = re.fullmatch(r"pdiff_a([\d.]+)_cfg([\d.]+)", core)
+    if m: return f"prior-read text diff α={m.group(1)}, CFG {m.group(2)}{sfx}"
+    m = re.fullmatch(r"prior_inv_cfg([\d.]+)", core)
+    if m: return f"e′ ~ prior(z′), h's noise, CFG {m.group(1)}{sfx}"
+    m = re.fullmatch(r"prior_fresh_cfg([\d.]+)", core)
+    if m: return f"e′ ~ prior(z′), fresh noise, CFG {m.group(1)}{sfx}"
+    m = re.fullmatch(r"gtext_cfg([\d.]+)", core)
+    if m: return f"decode under g(z′) itself, CFG {m.group(1)}{sfx}"
+    m = re.fullmatch(r"sde(T?)_t([\d.]+)_cfg([\d.]+)", core)
+    if m: return f"SDEdit τ={m.group(2)} under {'pooled text-diff' if m.group(1) else 'prior'} e′, CFG {m.group(3)}{sfx}"
+    m = re.fullmatch(r"tdir([TPM])_b([\d.]+)", core)
+    if m: return f"displacement of {dict(T='pooled text diff', P='prior sample', M='prior-read diff')[m.group(1)]} as direction, β={m.group(2)}"
+    m = re.fullmatch(r"tdir([TPM])_on_b([\d.]+)", core)
+    if m: return f"displacement of {dict(T='pooled text diff', P='prior sample', M='prior-read diff')[m.group(1)]}, every position β={m.group(2)}"
+    m = re.fullmatch(r"var_(\d)", core)
     if m: return f"variation {m.group(1)} (same e, new noise)"
     return nm
 
@@ -60,13 +69,13 @@ def fig_methods(tag, res, base, label):
         vals = [100 * s[key] for _, s, _, _ in rows]
         ax.barh(y, vals, color=[c for _, _, c, _ in rows], hatch=[h or "" for _, _, _, h in rows], edgecolor="white", linewidth=0.8, height=0.72)
         for yi, v in zip(y, vals): ax.text(v + 0.8, yi, f"{v:.0f}", va="center", ha="left", fontsize=10, color=INK2)
-        ax.set_xlabel(xl); ax.set_xlim(0, max(vals + [35]) * 1.18); ax.grid(axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
+        ax.set_xlabel(xl.replace("TARGET animal", "TARGET concept")); ax.set_xlim(0, max(vals + [35]) * 1.18); ax.grid(axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
         for sp in ("top", "right"): ax.spines[sp].set_visible(False)
     axes[0].set_yticks(y); axes[0].set_yticklabels([lb for lb, _, _, _ in rows], fontsize=10)
     best_e = max((S[k]["tgt_mention"] for k in edits), default=0.0); j = S.get("jadd_b1", {}).get("tgt_mention", 0.31); bb = max((s["tgt_mention"] for _, s in base_rows(base)), default=0.05)
     verdict = ("matches the J-lens direction" if best_e >= 0.9 * j else "beats the earlier critics but stays below the J-lens direction" if best_e > 1.5 * bb else "steers no better than the earlier critics")
     fig.suptitle(f"unCLIP embedding edits of the anchor activation: best {100 * best_e:.0f}% target mention {verdict} ({100 * j:.0f}%)\n"
-                 f"animal swap, {res['n']} prompts × {1 + res['k']} continuations of 40 tokens; decoder: {label}", fontsize=14, x=0.02, ha="left")
+                 f"{res.get('concept', 'animal')} swap, {res['n']} prompts × {1 + res['k']} continuations of 40 tokens; decoder: {label}", fontsize=14, x=0.02, ha="left")
     from matplotlib.patches import Patch
     axes[1].legend(handles=[Patch(color=C_REF, label="references (no edit, J-lens direction)"), Patch(color=C_BASE, label="earlier critics, best row per method (steer_base)"),
                             Patch(color=C_UNCLIP, label="unCLIP decoder edits"), Patch(facecolor=C_UNCLIP, hatch="///", edgecolor="white", label="unCLIP controls (round trip, variations)")],
@@ -83,8 +92,9 @@ def fig_methods(tag, res, base, label):
 
 def fig_train(tags, steps, results, base):
     """steering vs decoder training: best text-diff row, the α=1/CFG=1 row, SDEdit, direction; J-lens and earlier-critic references as lines."""
-    keys = {"best text diff (any α, CFG)": lambda S: max(v["tgt_mention"] for k, v in S.items() if k.startswith("tdiff_")),
-            "text diff α=1, CFG 1": lambda S: S["tdiff_a1_cfg1"]["tgt_mention"], "best SDEdit": lambda S: max((v["tgt_mention"] for k, v in S.items() if k.startswith("sde_")), default=np.nan),
+    keys = {"best pooled text diff (any α, CFG)": lambda S: max(v["tgt_mention"] for k, v in S.items() if k.startswith("tdiff_")),
+            "best prior target (sample / prior-read diff)": lambda S: max((v["tgt_mention"] for k, v in S.items() if k.startswith("prior_") or k.startswith("pdiff_")), default=np.nan),
+            "best SDEdit": lambda S: max((v["tgt_mention"] for k, v in S.items() if k.startswith("sde")), default=np.nan),
             "best displacement direction": lambda S: max((v["tgt_mention"] for k, v in S.items() if k.startswith("tdir")), default=np.nan),
             "round trip (control)": lambda S: S["recon"]["tgt_mention"]}
     cols = [C_UNCLIP, "#2a78d6", "#eda100", "#4a3aa7", "#52514e"]; mk = ["o", "s", "D", "^", "x"]
@@ -99,7 +109,7 @@ def fig_train(tags, steps, results, base):
     ax.set_xlabel("decoder training (activations seen, millions)"); ax.set_ylabel("target-animal mention in continuations (%)"); ax.set_ylim(0, max(j, max(max(v) for v in out["series"].values())) * 1.15)
     ax.grid(color=GRID, lw=0.8); ax.set_axisbelow(True)
     for sp in ("top", "right"): ax.spines[sp].set_visible(False)
-    trend = np.array(out["series"]["best text diff (any α, CFG)"]); claim = "rises with decoder training" if len(trend) > 1 and trend[-1] > trend[0] + 2 else "does not improve with decoder training so far"
+    trend = np.nanmax(np.array([out["series"]["best pooled text diff (any α, CFG)"], out["series"]["best prior target (sample / prior-read diff)"]], dtype=float), axis=0); claim = "rises with decoder training" if len(trend) > 1 and trend[-1] > trend[0] + 2 else "does not improve with decoder training so far"
     ax.set_title(f"unCLIP text-diff steering {claim}\n(animal swap, best target-mention rate per decoder snapshot)", loc="left"); ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(0.0, 0.85))
     fig.tight_layout()
     for ext in ("png", "pdf"): fig.savefig(f"{REP}/unclip_steer_train.{ext}", dpi=150)
