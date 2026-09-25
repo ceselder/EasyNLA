@@ -44,7 +44,7 @@ def load_rows(paths, split, store):
     if args.samples and "sample" in df: df = df[df["sample"].isin([int(x) for x in args.samples.split(",")])].reset_index(drop=True)
     return df
 BAND = [int(x) for x in args.band.split(",")] if args.band else None
-store = Store(args.data_dir, "train", device=dev, layers=BAND, verbose=is_main)          # on the GPU: 16 layers x 100k positions = 17 GB per rank, too much for CPU RAM x 4 ranks; df = load_rows(args.text, "train", store); df = df.iloc[RANK::WORLD].reset_index(drop=True)
+store = Store(args.data_dir, "train", device=dev, layers=BAND, verbose=is_main); df = load_rows(args.text, "train", store); df = df.iloc[RANK::WORLD].reset_index(drop=True)   # store on the GPU: 16 layers x 100k positions = 17 GB per rank (too much for CPU RAM x 4 ranks)
 P(f"[sft] {len(df)} train text rows per rank (sources {df['source'].value_counts().to_dict()}); eff batch {args.batch * args.grad_accum * WORLD}")
 store_val = dfv = None
 if args.val_text and is_main:
