@@ -17,7 +17,7 @@ eval "$(cat $LOGD/critic_v4_s1.launch)"
 log "v3c = v4 stage-1 pools ($(echo "$SPEC" | tr ',' '\n' | wc -l) pools), steps $STEPS, + hinge anchor w 0.1 m 0.02 warm-up 300, guard 5% vs v1b"
 # orchestrator 09:00: v3c alongside v4 in the FIRST free slot; if the cap makes that impossible, pause one more harvest engine (highest running slot) rather than delay v3c
 if [ $(( $(gpus_in_use) + 1 )) -gt $(cap_now) ]; then
-  for p_ in 4 3 2 1 0; do a_=$(cat $LOGD/harvest_app_$p_.txt 2>/dev/null || true); [ -n "$a_" ] || continue; timeout 90 modal app list 2>/dev/null | grep -vE "stopped|stopping" | grep -q "$a_" || continue
+  for p_ in 4 3 2 1 0; do a_=$(cat $LOGD/harvest_app_$p_.txt 2>/dev/null || true); [ -n "$a_" ] || continue; app_list | grep -vE "stopped|stopping" | grep -q "$a_" || continue
     touch $LOGD/harvest_pause_$p_; timeout 120 modal app stop -y $a_ >/dev/null 2>&1; sed -i "s/^$a_ /# $a_ (paused $(date -u +%H:%M) for critic v3c) /" $LOGD/gpu_ledger.txt; log "paused harvest engine $p_ ($a_) for v3c"; PAUSED=$p_; sleep 20; break; done
 fi
 PRIO=1 wait_gpu 1 || exit 1

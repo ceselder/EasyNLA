@@ -38,7 +38,7 @@ PY
   ONE=$(python3 -c "import json; print(json.load(open('/tmp/q36_v4_stage.json'))['one_pass_steps'])"); STEP0=0; RESUME=""
   if [ $stage -gt 1 ]; then
     PREV=$(grep -E "^\[critic_${TAG}_s$((stage - 1))\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+")
-    for i in $(seq 1 600); do L=$(timeout 90 modal app list 2>/dev/null); [ -n "$L" ] && ! echo "$L" | grep -vE "stopped|stopping" | grep -q "$PREV" && break; [ $((i % 6)) -eq 0 ] && log "stage $stage: previous stage $PREV still running"; sleep 300; done
+    for i in $(seq 1 600); do L=$(app_list); [ -n "$L" ] && ! echo "$L" | grep -vE "stopped|stopping" | grep -q "$PREV" && break; [ $((i % 6)) -eq 0 ] && log "stage $stage: previous stage $PREV still running"; sleep 300; done
     for i in $(seq 1 60); do [ "$(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null | grep -c one_pass_stop.json)" -ge 1 ] && break; sleep 60; done
   fi
   if [ $stage -gt 1 ]; then STEP0=$(timeout 60 modal volume get nlt q36/critic/$TAG/one_pass_stop.json /tmp/q36_v4_stop.json --force >/dev/null 2>&1 && python3 -c "import json; print(json.load(open('/tmp/q36_v4_stop.json'))['stopped_at_step'])" || echo 0); RESUME="--resume /vol/q36/critic/$TAG/ckpt_latest.pt"; fi
@@ -52,6 +52,6 @@ PY
   cp /tmp/q36_v4_stage.json $D/critic_${TAG}_stage$stage.json; echo "stage $stage $(date -u +%H:%M)" >> $USED; for f in $new; do echo $f >> $USED; done
   printf 'SPEC=%q\nVALS=%q\nSTEPS=%q\n' "$SPEC" "$VALS" "$STEPS" > $LOGD/critic_${TAG}_s${stage}.launch          # exact launch config for sibling runs (v3c mirrors stage 1)
   A=$(grep -E "^\[critic_${TAG}_s$stage\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+"); log "stage $stage launched: $A"
-  miss=0; for i in $(seq 1 600); do L=$(timeout 90 modal app list 2>/dev/null); if [ -z "$L" ]; then sleep 60; continue; fi; if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); [ $miss -ge 3 ] && break; fi; sleep 300; done; log "stage $stage app ended (3 consecutive absences)"
+  miss=0; for i in $(seq 1 600); do L=$(app_list); if [ -z "$L" ]; then sleep 60; continue; fi; if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); [ $miss -ge 3 ] && break; fi; sleep 300; done; log "stage $stage app ended (3 consecutive absences)"
   stage=$((stage + 1))
 done

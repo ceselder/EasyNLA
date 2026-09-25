@@ -8,7 +8,7 @@ LOGD=/home/celeste/nlt-q36-logs; D=/home/celeste/shared/reports/nlt-27b-olens/da
 WAIT_LABEL=${WAIT_LABEL:-v4eval_step000500}
 for i in $(seq 1 90); do ls_=$(timeout 120 modal volume ls nlt q36/evalq 2>/dev/null); [ -n "$ls_" ] && ! echo "$ls_" | grep -q "_${WAIT_LABEL}\.running\." && break; [ $((i % 5)) -eq 0 ] && log "waiting for $WAIT_LABEL to finish"; sleep 60; done
 log "$WAIT_LABEL no longer running -> recycling workers"
-L=$(timeout 90 modal app list 2>/dev/null); [ -z "$L" ] && { sleep 60; L=$(timeout 90 modal app list 2>/dev/null); }
+L=$(app_list); [ -z "$L" ] && { sleep 60; L=$(app_list); }
 for a in $(grep -E "^ap-[A-Za-z0-9]+ 1 evalq_w" $LOGD/gpu_ledger.txt | awk '{print $1}'); do
   echo "$L" | grep -vE "stopped|stopping" | grep -q "$a" || continue
   timeout 120 modal app stop -y "$a" >/dev/null 2>&1 && log "stopped worker $a" || log "stop of $a failed"

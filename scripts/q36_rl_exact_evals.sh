@@ -24,7 +24,7 @@ import json; d=json.load(open('$D/$f')); s=d['sets']; t=s.get('teacher',{}); p=s
 print(f\"teacher {t['content_bits']['mean']:.1f}±{t['content_bits']['sem']:.1f} (P {t['p_z_gt_dm']:.2f}) | policy {p['content_bits']['mean']:.1f}±{p['content_bits']['sem']:.1f} (P {p['p_z_gt_dm']:.2f}) | policy PMI {p['pmi_bits']['mean'] if isinstance(p['pmi_bits'],dict) else p['pmi_bits']:+.1f} tok {p['n_tokens_mean']:.0f}\")" 2>&1 | tail -n 1)"
   done
   if [ $new -eq 1 ]; then systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_rl_exact.py --tag $RL_TAG 2>&1 | grep -E "VERDICT|error|Traceback" | head -3; (cd /home/celeste/shared/reports/nlt-27b-olens && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); fi
-  A=$(grep -oE "ap-[A-Za-z0-9]+" $APPFILE 2>/dev/null | head -1); L=$(timeout 90 modal app list 2>/dev/null)
+  A=$(grep -oE "ap-[A-Za-z0-9]+" $APPFILE 2>/dev/null | head -1); L=$(app_list)
   if [ -n "$A" ] && [ -n "$L" ]; then if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); fi; fi     # an empty list is a transient read, not an absence
   [ ${miss:-0} -ge 3 ] && { log "RL app $A absent from 3 consecutive app lists; final pass done"; break; }
   sleep 300

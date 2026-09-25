@@ -77,6 +77,8 @@ def main():
     p.add_argument("--steps", type=int, default=3000); p.add_argument("--batch", type=int, default=1024); p.add_argument("--micro-batch", type=int, default=128); p.add_argument("--lr", type=float, default=1.2e-4); p.add_argument("--warmup", type=int, default=300); p.add_argument("--wd", type=float, default=0.01)
     p.add_argument("--uncond-steps", type=int, default=0, help="PRETRAIN p(u_j | u_i) with NO text on random band pairs from the whole store for this many steps (unlabelled pairs are free), then switch to the text pools (tip from the NLA flow-critic session: freeze-then-condition worked best there)"); p.add_argument("--beta2", type=float, default=0.999); p.add_argument("--ema", type=float, default=0.999); p.add_argument("--p-uncond", type=float, default=0.1); p.add_argument("--uncond-frac", type=float, default=0.15); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--lr-floor", type=float, default=0.05)
     p.add_argument("--null-dm", type=float, default=0.0, help="8B v1.16 regulariser: at the same (x_t, t, eps) pull the velocity under a depth-matched WRONG text (another micro-batch row, same (i,j) else same j else rolled) toward the no-text velocity (detached), so a wrong text earns no bits and the text path stays calibrated to the null path")
+    p.add_argument("--max-pairs-per-pos", type=int, default=0, help="cap: a pass exposes each position through <= K of its rows per pool (rows permuted once, seeded); 0 = all rows (orchestrator 11:05)")
+    p.add_argument("--pair-slice", type=int, default=0, help="which K-row slice of every position to train on (0 = first); later slices are later passes' data on the same shards")
     p.add_argument("--max-passes", type=float, default=1.0, help="ONE-PASS RULE (orchestrator 07:45): stop (save ckpt_final) as soon as the most-sampled text pool has been drawn more than this many times over its distinct (pair, text) rows; <= 0 disables. Passes per pool are logged every 25 steps.")
     p.add_argument("--anchor", type=float, default=0.0, help="ACTIVATION-ANCHORED contrast weight (critic v3): text fixed, activation varied - the text-conditioned gain over the unconditional velocity error must be larger on the text's own (u_i, u_j) than on a depth-matched OTHER pair's (same (i, j), same eps and t); logistic loss softplus((gain_other - gain_own) / tau). Never a text-edit negative.")
     p.add_argument("--anchor-mode", default="gain", choices=["gain", "hinge", "capped"], help="gain (v3b): softplus((gain_other - gain_own)/tau) with gain = FM_uncond - FM_text - the shared unconditional term let v3b inflate the contrast by wrecking the mismatched-text prediction. hinge (= 'capped', same function: relu(FM_own - FM_other + m) is 0 with zero gradient once FM_other >= FM_own + m): the own-target FM loss must beat the other-target FM loss by a margin m. What bounds the shortcut is NOT the form but (a) m small vs the natural own-vs-dm gap, (b) a small weight with --anchor-warmup, (c) the reconstruction GUARD (--guard-ref)")
@@ -98,7 +100,9 @@ def main():
     store = Store(a.data_dir, "train", device=a.data_device, max_pos=a.max_train_pos); store_val = Store(a.data_dir, "val", device=a.data_device); d = store.d
     band = [int(x) for x in a.band.split(",")] if a.band else store.layers
     encoder = TextEncoder(a.enc_model, a.enc_layer, dev, a.enc_max_len)
-    pools = TextPools(a.pools, os.path.join(a.data_dir, "pairs_train.parquet"), store)
+    pools = TextPools(a.pools, os.path.join(a.data_dir, "pairs_train.parquet"), store, max_pairs_per_pos=a.max_pairs_per_pos, pair_slice=a.pair_slice, slice_seed=a.seed)
+    if pools.slice_pair_ids is not None:
+        os.makedirs(a.out, exist_ok=True); open(os.path.join(a.out, f"pair_slice_{a.pair_slice}_{a.tag}.txt"), "w").write("\n".join(sorted(pools.slice_pair_ids)) + "\n"); print(f"[pools] slice pair ids -> {a.out}/pair_slice_{a.pair_slice}_{a.tag}.txt", flush=True)
     val_sets = load_val_sets(a.val_sets, os.path.join(a.data_dir, "pairs_val.parquet"), store_val, a.eval_n, offset=a.eval_offset)
     g_eval = torch.Generator().manual_seed(1234); eps_bank = [torch.randn(a.eval_n, d, generator=g_eval) for _ in T_GRID]; s_bank = torch.exp(a.sigma_r * torch.randn(a.eval_n, generator=g_eval)); iso_bank = torch.randn(a.eval_n, d, generator=g_eval)
     probe_bank = make_probe_bank(a.spot_ode_steps, 1, d, torch.Generator().manual_seed(4321))
@@ -125,15 +129,22 @@ def main():
         wb = wandb.init(project=a.wandb, entity=a.wandb_entity, name=a.tag, config=vars(a) | {"n_params": model.n_params(), "n_train_pos": store.N, "n_text_rows": pools.n_rows}, resume="allow")
     ema_p = list(ema_model.parameters()); raw_p = list(model.parameters()); t0 = time.time(); ema_loss = None; best = None; rows_seen = step0 * a.batch
     n_unc = int(round(a.batch * a.uncond_frac)); n_txt = a.batch - n_unc
-    DRAWN = {nm: 0 for nm in pools.names}; POOL_ROWS = {nm: len(pl["text"]) for nm, pl in zip(pools.names, pools.pools)}   # passes over each pool's distinct (pair, text) rows
+    EXPO = {}; DRAWN = {nm: 0 for nm in pools.names}; POOL_ROWS = {nm: len(pl["text"]) for nm, pl in zip(pools.names, pools.pools)}   # passes over each pool's distinct (pair, text) rows
+    EXP_POS = torch.zeros(store.N, dtype=torch.int64); EXP_POSJ = torch.zeros(store.N * 1000, dtype=torch.int64)          # exposures per position / per (position, j) (orchestrator 11:05); resumed runs restart the counters (fresh pools)
+    def exposures():
+        seen = EXP_POS[EXP_POS > 0]; ex = {"exposures/per_position_mean": float(EXP_POS.sum()) / max(1, pools.n_positions), "exposures/per_position_seen_mean": float(seen.float().mean()) if len(seen) else 0.0,
+                                           "exposures/per_position_max": float(EXP_POS.max()) if store.N else 0.0, "exposures/frac_positions_seen": float((EXP_POS > 0).sum()) / max(1, pools.n_positions),
+                                           "exposures/per_pos_j_mean": float(EXP_POSJ.sum()) / max(1, pools.n_pos_j), "exposures/per_pos_j_max": float(EXP_POSJ.max())}
+        return ex
     for step in range(step0, a.steps):
         if step < a.uncond_steps:                                                      # unconditional pretraining phase: every row text-free, pairs from the whole store
             rows, i, j = store.sample_pairs(a.batch, gen, band); texts = [""] * a.batch; pname = "uncond"
         else:
             rows, i, j, texts, pname = pools.sample(n_txt, gen); DRAWN[pname] += n_txt
+            EXP_POS.index_add_(0, rows.cpu(), torch.ones(len(rows), dtype=torch.int64)); EXP_POSJ.index_add_(0, (rows.cpu() * 1000 + j.cpu()), torch.ones(len(rows), dtype=torch.int64))
             if a.max_passes > 0 and DRAWN[pname] / POOL_ROWS[pname] > a.max_passes:
                 print(f"[train] ONE-PASS RULE: pool {pname} has been drawn {DRAWN[pname] / POOL_ROWS[pname]:.2f} times over its {POOL_ROWS[pname]} rows (> {a.max_passes}); stopping at step {step} and saving ckpt_final (passes: " + ", ".join(f"{k} {DRAWN[k] / POOL_ROWS[k]:.2f}" for k in DRAWN) + ")", flush=True)
-                save(step, "ckpt_final.pt", with_opt=False); save(step, "ckpt_latest.pt", with_opt=True); json.dump({"stopped_at_step": step, "passes": {k: DRAWN[k] / POOL_ROWS[k] for k in DRAWN}}, open(os.path.join(a.out, "one_pass_stop.json"), "w")); break
+                save(step, "ckpt_final.pt", with_opt=False); save(step, "ckpt_latest.pt", with_opt=True); json.dump({"stopped_at_step": step, "passes": {k: DRAWN[k] / POOL_ROWS[k] for k in DRAWN}, "exposures": exposures(), "pair_cap": a.max_pairs_per_pos, "pair_slice": a.pair_slice, "rows_per_position": pools.rows_per_position}, open(os.path.join(a.out, "one_pass_stop.json"), "w")); print("[train] exposures at stop: " + json.dumps(exposures()), flush=True); break
             if n_unc:
                 ru, iu, ju = store.sample_pairs(n_unc, gen, band); rows = torch.cat([rows, ru]); i = torch.cat([i, iu]); j = torch.cat([j, ju]); texts = texts + [""] * n_unc
         if step == a.uncond_steps and a.uncond_steps > 0: print(f"[train] unconditional pretraining done ({a.uncond_steps} steps x {a.batch}); switching to the text pools", flush=True); save(step, "ckpt_uncond.pt", with_opt=False)
@@ -189,8 +200,9 @@ def main():
             if ANC: log.update({"anchor/gain_own": sum(x[0] for x in ANC) / len(ANC), "anchor/gain_other": sum(x[1] for x in ANC) / len(ANC), "anchor/p_own_gt_other": sum(x[2] for x in ANC) / len(ANC), "anchor/loss": sum(x[3] for x in ANC) / len(ANC),
                                  "anchor/fm_own": sum(x[4] for x in ANC) / len(ANC), "anchor/fm_other": sum(x[5] for x in ANC) / len(ANC), "anchor/weight": ANC[-1][6]})
             log.update({f"passes/{k}": DRAWN[k] / POOL_ROWS[k] for k in DRAWN}); log["passes/max"] = max((DRAWN[k] / POOL_ROWS[k] for k in DRAWN), default=0.0)
+            if step % 25 == 0: EXPO = exposures(); log.update(EXPO)
             if wb: wb.log(log, step=step)
-            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} text {log['train/loss_text']:.4f} notext {log['train/loss_notext']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']} pool={pname}" + (f" | anchor gain own {log['anchor/gain_own']:.4f} other {log['anchor/gain_other']:.4f} P(own>other) {log['anchor/p_own_gt_other']:.3f} loss {log['anchor/loss']:.3f} FM own {log['anchor/fm_own']:.4f} FM_other {log['anchor/fm_other']:.4f} w {log['anchor/weight']:.3f}" if ANC else "") + f" | passes max {log['passes/max']:.2f}", flush=True)
+            if step % 100 == 0: print(f"[train] step {step} loss {loss.item():.4f} ema {ema_loss:.4f} text {log['train/loss_text']:.4f} notext {log['train/loss_notext']:.4f} lr {lr_at(step):.2e} gn {float(gn):.2f} {log['train/rows_per_s']:.0f} rows/s S={log['train/seq_len']} pool={pname}" + (f" | anchor gain own {log['anchor/gain_own']:.4f} other {log['anchor/gain_other']:.4f} P(own>other) {log['anchor/p_own_gt_other']:.3f} loss {log['anchor/loss']:.3f} FM own {log['anchor/fm_own']:.4f} FM_other {log['anchor/fm_other']:.4f} w {log['anchor/weight']:.3f}" if ANC else "") + f" | passes max {log['passes/max']:.2f}", + (f" | expo pos {EXPO['exposures/per_position_mean']:.1f} (seen {EXPO['exposures/per_position_seen_mean']:.1f}, max {EXPO['exposures/per_position_max']:.0f}) posj {EXPO['exposures/per_pos_j_mean']:.2f}" if step >= a.uncond_steps else ""), flush=True)
         if ((step + 1) % a.eval_every == 0 and step + 1 >= a.uncond_steps) or step + 1 == a.steps:
             te = time.time(); out = evaluate(ema_model, store_val, dirs, encoder, val_sets, dev, eps_bank, s_bank, a, probe_bank, iso_bank); out["eval/seconds"] = time.time() - te; out["eval/rows_seen"] = rows_seen
             if wb: wb.log(out, step=step)

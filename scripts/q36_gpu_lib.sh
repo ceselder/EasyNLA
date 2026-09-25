@@ -1,17 +1,18 @@
 # shared GPU accounting for the nlt-q36 chains: a ledger (app id -> GPUs PER TASK; hf-many = 1, torchrun RL/SFT = nproc) x live task count.
 # A failed / empty `modal app list` (transient) returns 99 so callers keep waiting instead of launching into an unknown state.
 LEDGER=/home/celeste/nlt-q36-logs/gpu_ledger.txt; touch $LEDGER
-live_apps(){ timeout 90 modal app list 2>/dev/null | grep "nlt-q36" | grep -vE "stopped|stopping" | awk -F'│' '{gsub(/ /,"",$2); gsub(/ /,"",$5); print $2, $5}'; }
-gpus_in_use(){ raw=$(timeout 90 modal app list 2>/dev/null); [ -z "$raw" ] && { echo 99; return; }; echo "$raw" | grep "nlt-q36" | grep -vE "stopped|stopping" | awk -F'│' '{gsub(/ /,"",$2); gsub(/ /,"",$5); print $2, $5}' | while read -r id tasks; do g=$(awk -v a="$id" '$1==a {print $2; exit}' $LEDGER); echo $(( tasks * ${g:-1} )); done | awk '{s+=$1} END {print s+0}'; }
-ledger_add(){ id=$(echo "$1" | grep -oE "ap-[A-Za-z0-9]+" | head -1); [ -n "$id" ] && echo "$id $2 $3 $(date -u +%H:%M)" >> $LEDGER; [ -n "$id" ] && for i in 1 2 3 4 5 6 7 8 9 10 11 12; do timeout 60 modal app list 9>&- 2>/dev/null | grep -q "$id" && break; sleep 5 9>&-; done; release_gpu_lock; }   # hold the lock until the new app is listed (a spawned app takes seconds to appear; without this two waiters over-launch)
+app_list(){ local o; o=$(timeout 90 modal app list 2>/dev/null) || return 1; echo "$o" | grep -q "└" || return 1; echo "$o"; }   # complete listing or nothing: 10:59-11:09 three consecutive truncated/failed reads made two chains declare live apps "ended"
+live_apps(){ app_list | grep "nlt-q36" | grep -vE "stopped|stopping" | awk -F'│' '{gsub(/ /,"",$2); gsub(/ /,"",$5); print $2, $5}'; }
+gpus_in_use(){ raw=$(app_list); [ -z "$raw" ] && { echo 99; return; }; echo "$raw" | grep "nlt-q36" | grep -vE "stopped|stopping" | awk -F'│' '{gsub(/ /,"",$2); gsub(/ /,"",$5); print $2, $5}' | while read -r id tasks; do g=$(awk -v a="$id" '$1==a {print $2; exit}' $LEDGER); echo $(( tasks * ${g:-1} )); done | awk '{s+=$1} END {print s+0}'; }
+ledger_add(){ id=$(echo "$1" | grep -oE "ap-[A-Za-z0-9]+" | head -1); [ -n "$id" ] && echo "$id $2 $3 $(date -u +%H:%M)" >> $LEDGER; [ -n "$id" ] && for i in 1 2 3 4 5 6 7 8 9 10 11 12; do app_list 9>&- | grep -q "$id" && break; sleep 5 9>&-; done; release_gpu_lock; }   # hold the lock until the new app is listed (a spawned app takes seconds to appear; without this two waiters over-launch)
 LOCK=/home/celeste/nlt-q36-logs/gpu_launch.lock
-harvest_active(){ for p_ in 0 1 2 3 4 5; do a_=$(cat /home/celeste/nlt-q36-logs/harvest_app_$p_.txt 2>/dev/null || true); [ -n "$a_" ] && timeout 90 modal app list 2>/dev/null | grep -vE "stopped|stopping" | grep -q "$a_" && return 0; done; pgrep -f "bash .*harvest\.sh" >/dev/null 2>&1 && [ ! -f /home/celeste/nlt-q36-logs/.harvest_done ]; }
+harvest_active(){ for p_ in 0 1 2 3 4 5; do a_=$(cat /home/celeste/nlt-q36-logs/harvest_app_$p_.txt 2>/dev/null || true); [ -n "$a_" ] && app_list | grep -vE "stopped|stopping" | grep -q "$a_" && return 0; done; pgrep -f "bash .*harvest\.sh" >/dev/null 2>&1 && [ ! -f /home/celeste/nlt-q36-logs/.harvest_done ]; }
 cap_now(){ if harvest_active; then echo 12; else echo 8; fi; }   # orchestrator 08:05: cap 12 until the HARVEST is done (6 engines also during RL v4); 8 after
 # PRIORITY (orchestrator 07:57): a waiter with a lower PRIO number goes first. While waiting, each chain advertises $LOGD/gpu_want_<PRIO>_<pid>; a waiter yields whenever a LIVE higher-priority waiter exists.
 #   PRIO 0 harvest engines | 1 v3b gate evals | 2 v1b twins+neighbours (RL v4 judge) | 3 v1b train-vs-val | 4 fair describers | 5 v2 LOO/singles | 9 default
 PRIO=${PRIO:-9}; WANTDIR=/home/celeste/nlt-q36-logs/gpu_want; mkdir -p $WANTDIR
 higher_waiting(){ local f b pr pid; for f in $WANTDIR/want_*; do [ -e "$f" ] || continue; b=$(basename $f); pr=${b#want_}; pr=${pr%%_*}; pid=${b##*_}; kill -0 $pid 2>/dev/null || { rm -f $f; continue; }; [ "$pr" -lt "$PRIO" ] && return 0; done; return 1; }
-APPCAP=${APPCAP:-12}; nlt_apps_live(){ timeout 90 modal app list 2>/dev/null | grep -E "nlt-" | grep -vE "stopped|stopping" | wc -l; }   # orchestrator 09:12: <= 12 live nlt-* apps (workspace limit is 100 ephemeral apps, shared)
+APPCAP=${APPCAP:-12}; nlt_apps_live(){ app_list | grep -E "nlt-" | grep -vE "stopped|stopping" | wc -l; }   # orchestrator 09:12: <= 12 live nlt-* apps (workspace limit is 100 ephemeral apps, shared)
 wait_gpu(){ [ "${QUEUE_MODE:-0}" = 1 ] && return 0; need=${1:-1}; cap=${2:-$(cap_now)}; touch $WANTDIR/want_${PRIO}_$$; trap 'rm -f $WANTDIR/want_${PRIO}_$$' EXIT
   exec 9>$LOCK; flock 9; for i in $(seq 1 900); do g=$(gpus_in_use); cap=${2:-$(cap_now)}
     na=$(nlt_apps_live)

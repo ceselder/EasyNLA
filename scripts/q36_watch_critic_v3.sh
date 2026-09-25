@@ -26,7 +26,9 @@ for i in $(seq 1 400); do
     # the one-pass critics (v4 stages, v3c = v4 stage 1) train on harvested text/v3 shards whose pair ids are NOT in pairs_train -> the fixed set is built from the shard files themselves (--fixed-from-texts);
     # the glob = exactly the shards the run has trained on (stage files), so the probe never scores rows the critic has not seen at all. At 0.x passes only that fraction of the probe rows has been seen -> gap diluted; the definitive (e) test is the one-pass end.
     STG=$D/critic_v4_stage*.json; [ "$TAG" = v3c ] && STG=$D/critic_v4_stage1.json
-    if [ "$TAG" = v4 ] || [ "$TAG" = v3c ]; then TRAIN_GLOB=$(python3 -c "import json,glob; sh=sorted({s for f in glob.glob('$STG') for s in json.load(open(f))['shards']}); print(';'.join(f'/vol/q36/text/v3/train/craft_full__{s}.parquet' for s in sh))"); FFT="--fixed-from-texts"; else TRAIN_GLOB=${TRAIN_GLOB:-$TX1/train/craft_full__*.parquet}; FFT=""; fi
+    [ "$TAG" = v5 ] && STG=$D/critic_v5_stage*.json
+    if [ "$TAG" = v4 ] || [ "$TAG" = v3c ] || [ "$TAG" = v5 ]; then TRAIN_GLOB=$(python3 -c "import json,glob; sh=sorted({s for f in glob.glob('$STG') for s in json.load(open(f))['shards']}); print(';'.join(f'/vol/q36/text/v3/train/craft_full__{s}.parquet' for s in sh))"); FFT="--fixed-from-texts"; else TRAIN_GLOB=${TRAIN_GLOB:-$TX1/train/craft_full__*.parquet}; FFT=""; fi
+    [ "$TAG" = v5 ] && FFT="$FFT --pair-ids-file /vol/q36/critic/$TAG/pair_ids_trained.txt"     # pair-capped critic: probe only the pairs it trained on (chain merges every stage's slice file)
     run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --split train --out /vol/q36/results/bits_${TAG}_${st}_train.json --sets 'craft_full:$TRAIN_GLOB' --n 128 --n-fixed 512 --ode-steps 64 --skip-samples --skip-sw $FFT" ${TAG}eval_${st}_train
     if grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt || grep -q "\[${TAG}eval_$st\] QUEUED" $LOGD/evalq.txt; then launched[$st]=1; log "gate eval launched/queued for $st"; else log "gate eval launch for $st FAILED (retry next round)"; fi
   done
@@ -35,11 +37,13 @@ for i in $(seq 1 400); do
   TAS=$(grep -E "^\[critic_${TAG}(_s[0-9]+)?\] https" $LOGD/apps.txt | grep -oE "ap-[A-Za-z0-9]+" | awk '!seen[$0]++')
   [ -n "$TAS" ] && for TA in $TAS; do timeout 120 modal app logs $TA 2>/dev/null | grep -E "^\[train\] step [0-9]+ .*passes max"; done | python3 -c "
 import sys, re, json
-d = {}
+d = {}; e = {}
 for l in sys.stdin:
     m = re.search(r'step (\d+) .*passes max ([0-9.]+)', l)
     if m: d[int(m.group(1))] = float(m.group(2))
-json.dump(d, open('$D/critic_${TAG}_passes.json', 'w'))" 2>/dev/null
+    x = re.search(r'expo pos ([0-9.]+) \(seen ([0-9.]+), max ([0-9.]+)\) posj ([0-9.]+)', l)
+    if m and x: e[int(m.group(1))] = {'per_position_mean': float(x.group(1)), 'per_position_seen_mean': float(x.group(2)), 'per_position_max': float(x.group(3)), 'per_pos_j_mean': float(x.group(4))}
+json.dump(d, open('$D/critic_${TAG}_passes.json', 'w')); json.dump(e, open('$D/critic_${TAG}_exposures.json', 'w'))" 2>/dev/null
   new=0
   for f in $(timeout 120 modal volume ls nlt q36/results 2>/dev/null | grep -oE "bits_${TAG}_step[0-9]+(_train|_pools)?\.json" | sort -u); do
     [ -f $D/$f ] && continue; timeout 180 modal volume get nlt q36/results/$f /tmp/q36_$f --force >/dev/null 2>&1; grep -q '"elapsed_min"' /tmp/q36_$f 2>/dev/null || continue; cp /tmp/q36_$f $D/$f; new=1

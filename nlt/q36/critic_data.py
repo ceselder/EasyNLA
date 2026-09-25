@@ -137,19 +137,45 @@ def load_text_pairs(paths, pairs_parquet, pools_verbose=True):
     return tx.merge(pairs, on="pair_id", how="inner")
 
 
+def pair_slice_ids(dfs, cap, slice_idx, seed=0):
+    """PAIR cap (orchestrator 11:05: <= K (i, j) pairs per position per pass, the rest are a later pass's data): over the UNION of the pools' rows, every position's distinct pair_ids are
+    permuted once (seeded) and slice s keeps ranks [sK, (s+1)K). Returns the set of kept pair_ids (all pools' rows of a kept pair stay: the same activation pair under its text variants)."""
+    import pandas as pd
+    u = pd.concat([d[["pos_idx", "pair_id"]] for d in dfs if len(d)], ignore_index=True).drop_duplicates()
+    if cap <= 0 or len(u) == 0: return None
+    rng = np.random.default_rng(int(seed) * 1000003 + 17); u = u.iloc[rng.permutation(len(u))].reset_index(drop=True)
+    rank = u.groupby("pos_idx").cumcount().values; keep = (rank >= slice_idx * cap) & (rank < (slice_idx + 1) * cap)
+    return set(u["pair_id"][keep].tolist())
+
+
 class TextPools:
     """name=weight:glob[;glob],...  -> sample(B): one pool per step (drawn by weight), rows (store rows), i, j, texts, names"""
 
-    def __init__(self, spec, pairs_parquet, store, verbose=True):
-        self.names, self.weights, self.pools = [], [], []
+    def __init__(self, spec, pairs_parquet, store, verbose=True, max_pairs_per_pos=0, pair_slice=0, slice_seed=0):
+        """max_pairs_per_pos K > 0 (orchestrator 11:05): a pass exposes every position through at most K of its (i, j) PAIRS (all pools' text variants of those pairs); the other pairs are a LATER
+        slice's data (--pair-slice s+1 on the same shards), never the same pass. Distinct rows != distinct activations: critic v4 stage 1 had 89 rows per position (16 pairs x ~5.6 text variants), so
+        0.61 row-passes were ~54 exposures of every position and the train - held-out PMI gap went 2.6 -> 21.5 -> ~51 bits at 0.24 / 0.49 / 0.73 row-passes. Pool weights are re-set ∝ kept rows."""
+        self.names, self.weights, self.pools = [], [], []; self.cap = int(max_pairs_per_pos); self.slice = int(pair_slice); self.slice_pair_ids = None
+        loaded = []
         for item in [s for s in spec.split(",") if s.strip()]:
             name, rest = item.split("=", 1); w, paths = rest.split(":", 1)
-            df = load_text_pairs(paths.split(";"), pairs_parquet); df = df[df["pos_idx"].isin(store.row_of)].reset_index(drop=True)
+            df = load_text_pairs(paths.split(";"), pairs_parquet); df = df[df["pos_idx"].isin(store.row_of)].reset_index(drop=True); loaded.append((name, float(w), paths, df))
+        if self.cap > 0:
+            self.slice_pair_ids = pair_slice_ids([d for _, _, _, d in loaded], self.cap, self.slice, slice_seed) or set()
+            if verbose: print(f"[pools] PAIR CAP {self.cap} pairs/position, slice {self.slice}: {len(self.slice_pair_ids)} pairs kept of {len(set().union(*[set(d['pair_id']) for _, _, _, d in loaded]))} in the union", flush=True)
+        for name, w, paths, df in loaded:
+            if self.cap > 0:
+                n_all = len(df); df = df[df["pair_id"].isin(self.slice_pair_ids)].reset_index(drop=True); w = float(len(df))
+                if verbose: print(f"[pools] {name}: {len(df)} of {n_all} rows in slice {self.slice} ({df['pos_idx'].nunique() if len(df) else 0} positions, max rows/position {df.groupby('pos_idx').size().max() if len(df) else 0}); weight ∝ rows", flush=True)
             if len(df) == 0: print(f"[pools] WARNING pool {name} has no rows ({paths})", flush=True); continue
             self.names.append(name); self.weights.append(float(w))
             self.pools.append({"rows": store.rows_for(df["pos_idx"].values), "i": torch.tensor(df["i"].values.astype(np.int64)), "j": torch.tensor(df["j"].values.astype(np.int64)), "text": df["text"].astype(str).tolist(), "pair_id": df["pair_id"].tolist()})
             if verbose: print(f"[pools] {name}: {len(df)} rows ({df['pair_id'].nunique()} pairs), weight {w}, ~{np.mean([len(t.split()) for t in self.pools[-1]['text'][:3000]]):.0f} words; e.g. {self.pools[-1]['text'][0][:140]!r}", flush=True)
         w = np.asarray(self.weights, dtype=np.float64); self.p = w / w.sum(); self.n_rows = sum(len(p["text"]) for p in self.pools)
+        # exposure denominators (orchestrator 11:05: exposures per POSITION and per (position, j) are first-class metrics next to passes over rows)
+        allrows = torch.cat([p["rows"] for p in self.pools]) if self.pools else torch.zeros(0, dtype=torch.long); allj = torch.cat([p["j"] for p in self.pools]) if self.pools else torch.zeros(0, dtype=torch.long)
+        self.n_positions = int(torch.unique(allrows).numel()); self.n_pos_j = int(torch.unique(allrows * 1000 + allj).numel()); self.rows_per_position = self.n_rows / max(1, self.n_positions)
+        if verbose: print(f"[pools] union: {self.n_rows} rows over {self.n_positions} positions ({self.rows_per_position:.1f} rows/position) and {self.n_pos_j} distinct (position, j) -> one row-pass = {self.rows_per_position:.1f} exposures per position", flush=True)
 
     def sample(self, B, gen=None):
         rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,), generator=gen))); k = rng.choice(len(self.p), p=self.p); pool = self.pools[k]
