@@ -6,7 +6,7 @@ set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt;
 TX=/vol/q36/text/v1; TX2=/vol/q36/text/v2; LOGD=/home/celeste/nlt-q36-logs; D=/home/celeste/shared/reports/nlt-27b-olens/data
 log(){ echo "[fair] $(date -u +%H:%M) $*"; }
 nfiles(){ timeout 120 modal volume ls nlt "$1" 2>/dev/null | grep -cE "$2" || true; }
-run(){ out=$(NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script eval_bits.py --args "$1" 2>&1 | grep -E "SPAWNED|modal.com/apps|rror"); echo "$out" | sed "s/^/[$2] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$2"; }
+run(){ out=$(spawn_retry env NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script eval_bits.py --args "$1"); echo "$out" | sed "s/^/[$2] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$2"; }
 SAME="describer_sonnet_A:$TX/val/describer_sonnet5_A__*.parquet,describer_sonnet_B:$TX/val/describer_sonnet5_B__*.parquet,describer_qwen32b:$TX/val/describer_qwen3-32b__*.parquet,craft_full_same:$TX/val/craft_full__*.parquet"
 WITHW="describer_sonnet_A:$TX/val/describer_sonnet5_A__*.parquet,describer_sonnet_W:$TX2/val/describer_sonnet5_W__*.parquet,craft_full_same:$TX/val/craft_full__*.parquet,raw_all_same:$TX/val/raw_all__*.parquet"
 # judge checkpoints (orchestrator 06:15): the best-CALIBRATED checkpoint, not the lowest-FM-loss final. v1: ckpt_best = step 3500 (no 2500/3000 saved). v2: ckpt_step3000.pt if captured, else ckpt_best. v1b: ckpt_best.

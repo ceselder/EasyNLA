@@ -5,7 +5,7 @@
 set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt; source /home/celeste/nlt-q36-logs/gpu_lib.sh
 TAG=${TAG:-v3b}; MINSTEP=${MINSTEP:-500}; TX=/vol/q36/text/v1; TX1=/vol/q36/text/v1; LOGD=/home/celeste/nlt-q36-logs; D=/home/celeste/shared/reports/nlt-27b-olens/data; REP=/home/celeste/shared/reports/nlt-27b-olens
 log(){ echo "[${TAG}eval] $(date -u +%H:%M) $*"; }
-run(){ out=$(NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script eval_bits.py --args "$1" 2>&1 | grep -E "SPAWNED|modal.com/apps|rror"); echo "$out" | sed "s/^/[$2] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$2"; }
+run(){ out=$(spawn_retry env NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script eval_bits.py --args "$1"); echo "$out" | sed "s/^/[$2] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$2"; }
 declare -A launched
 for i in $(seq 1 400); do
   for ck in $(timeout 120 modal volume ls nlt q36/critic/$TAG 2>/dev/null | grep -oE "ckpt_step[0-9]+\.pt" | sort -u); do
@@ -14,7 +14,7 @@ for i in $(seq 1 400); do
     grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt && { launched[$st]=1; continue; }        # already launched by an earlier incarnation of this watcher
     PRIO=1 wait_gpu 1 || exit 1
     run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --out /vol/q36/results/bits_${TAG}_$st.json --sets 'craft_full:$TX/val/craft_full__*.parquet,describer_A:$TX1/val/describer_sonnet5_A__*.parquet' --twins 'craft_twins:$TX/val/twins__*.parquet' --neighbors /vol/q36/data/neigh --neighbor-n 256 --n 256 --ode-steps 64 --skip-samples" ${TAG}eval_$st
-    launched[$st]=1; log "gate eval launched for $st"
+    if grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt; then launched[$st]=1; log "gate eval launched for $st"; else log "gate eval launch for $st FAILED (retry next round)"; fi
   done
   new=0
   for f in $(timeout 120 modal volume ls nlt q36/results 2>/dev/null | grep -oE "bits_${TAG}_step[0-9]+\.json" | sort -u); do

@@ -4,8 +4,9 @@
 set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt; source /home/celeste/nlt-q36-logs/gpu_lib.sh
 TX=/vol/q36/text/v1; LOGD=/home/celeste/nlt-q36-logs; D=/home/celeste/shared/reports/nlt-27b-olens/data
 log(){ echo "[trainval] $(date -u +%H:%M) $*"; }
-run(){ out=$(NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script eval_bits.py --args "$1" 2>&1 | grep -E "SPAWNED|modal.com/apps|rror"); echo "$out" | sed "s/^/[$2] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$2"; }
+run(){ out=$(spawn_retry env NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script eval_bits.py --args "$1"); echo "$out" | sed "s/^/[$2] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$2"; }
 for ST in 000500 001500; do for SP in train val; do
+  bits_complete bits_v1b_${SP}_$ST && { log "bits_v1b_${SP}_$ST already complete"; continue; }
   PRIO=3 wait_gpu 1 || exit 1
   run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/v1b/ckpt_step$ST.pt --split $SP --out /vol/q36/results/bits_v1b_${SP}_$ST.json --sets 'craft_full:$TX/$SP/craft_full__*.parquet' --n 256 --n-fixed 1024 --ode-steps 64 --skip-samples --skip-sw" v1b_${SP}_$ST
 done; done

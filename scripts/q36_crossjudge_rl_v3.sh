@@ -7,7 +7,7 @@ TX=/vol/q36/text/v1; LOGD=/home/celeste/nlt-q36-logs; D=/home/celeste/shared/rep
 JUDGE_V1B=${JUDGE_V1B:-/vol/q36/critic/v1b/ckpt_best.pt}
 log(){ echo "[crossjudge] $(date -u +%H:%M) $*"; }
 nfiles(){ timeout 120 modal volume ls nlt "$1" 2>/dev/null | grep -cE "$2" || true; }
-run(){ out=$(NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script "$1" --args "$2" 2>&1 | grep -E "SPAWNED|modal.com/apps|rror"); echo "$out" | sed "s/^/[$3] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$3"; }
+run(){ out=$(spawn_retry env NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script "$1" --args "$2"); echo "$out" | sed "s/^/[$3] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$3"; }
 LAST=$(timeout 120 modal volume ls nlt q36/rl/rl_v3 2>/dev/null | grep -oE "step_[0-9]+" | sort -u | tail -n 1); [ -z "$LAST" ] && { log "no saved RL v3 policy step -> nothing to score"; exit 0; }
 log "last saved RL v3 policy: $LAST"
 DUMP=/vol/q36/dumps/rl_v3_$LAST.parquet

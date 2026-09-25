@@ -6,7 +6,7 @@
 set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt; source /home/celeste/nlt-q36-logs/gpu_lib.sh
 BAND=12,16,20,24,28,30,32,36,40,42,44,48,52,54,56,60; LOGD=/home/celeste/nlt-q36-logs; D=/home/celeste/shared/reports/nlt-27b-olens/data
 log(){ echo "[v3c] $(date -u +%H:%M) $*"; }
-run(){ out=$(NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script "$1" --args "$2" 2>&1 | grep -E "SPAWNED|modal.com/apps|Error|rror:"); echo "$out" | sed "s/^/[$3] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$3"; }
+run(){ out=$(spawn_retry env NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script "$1" --args "$2"); echo "$out" | sed "s/^/[$3] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$3"; }
 for i in $(seq 1 600); do grep -q "^\[critic_v4_s1\] SPAWNED" $LOGD/apps.txt && [ -f $D/critic_v4_stage1.json ] && break; [ $((i % 6)) -eq 0 ] && log "waiting for critic v4 stage 1 to launch"; sleep 300; done
 A4=$(grep -E "^\[critic_v4_s1\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+")
 # same pools / val sets as v4 stage 1 (read back from its launch line)

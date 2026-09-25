@@ -21,3 +21,7 @@ release_gpu_lock(){ flock -u 9 2>/dev/null || true; }
 bits_complete(){ timeout 180 modal volume get nlt "q36/results/$1.json" "/tmp/q36_chk_$1.json" --force >/dev/null 2>&1 && grep -q '"elapsed_min"' "/tmp/q36_chk_$1.json"; }
 wait_bits(){ # wait_bits name1 name2 ... -> returns when every result is complete
   for i in $(seq 1 600); do ok=0; for n in "$@"; do bits_complete "$n" && ok=$((ok + 1)); done; [ "$ok" -ge $# ] && return 0; [ $((i % 5)) -eq 0 ] && echo "[bits-wait] $(date -u +%H:%M) complete: $ok/$#"; sleep 180; done; return 1; }
+
+# spawn_retry env VAR=.. timeout 900 modal run --detach ... : retries while Modal refuses the launch ("reached limit of 100 ephemeral apps", transient errors); releases the launch lock while sleeping
+spawn_retry(){ local i out; for i in $(seq 1 60); do out=$("$@" 2>&1 9>&- | grep -E "SPAWNED|modal.com/apps|rror|limit"); if echo "$out" | grep -q SPAWNED; then echo "$out"; return 0; fi
+  echo "[spawn] $(date -u +%H:%M) launch refused ($(echo "$out" | grep -oE 'reached limit[^│]*|rror[^│]*' | head -1 | cut -c1-80)); retry $i/60 in 120 s" >&2; flock -u 9 2>/dev/null; sleep 120 9>&-; flock 9 2>/dev/null; done; echo "$out"; return 1; }

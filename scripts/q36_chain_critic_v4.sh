@@ -7,7 +7,7 @@ BAND=12,16,20,24,28,30,32,36,40,42,44,48,52,54,56,60; TX3=/vol/q36/text/v3; TX1=
 MIN_NEW=${MIN_NEW:-8}; MIN_NEW_LATER=${MIN_NEW_LATER:-4}; TAG=${TAG:-v4}; EXTRA=${EXTRA:-}
 log(){ echo "[v4] $(date -u +%H:%M) $*"; }
 nfiles(){ timeout 120 modal volume ls nlt "$1" 2>/dev/null | grep -cE "$2" || true; }
-run(){ out=$(NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script "$1" --args "$2" 2>&1 | grep -E "SPAWNED|modal.com/apps|Error|rror:"); echo "$out" | sed "s/^/[$3] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$3"; }
+run(){ out=$(spawn_retry env NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script "$1" --args "$2"); echo "$out" | sed "s/^/[$3] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$3"; }
 USED=$LOGD/critic_${TAG}_used_shards.txt; touch $USED; stage=$(( $(grep -c "^stage" $USED) + 1 ))
 mkdir -p /tmp/q36_v3stats
 while true; do
@@ -43,6 +43,7 @@ PY
   log "stage $stage: rows $(cat /tmp/q36_v4_stage.json | cut -c1-300) -> steps $STEP0 + $ONE (x1.15) = $STEPS"
   PRIO=1 wait_gpu 1 || exit 1
   run train_critic.py "--data-dir /vol/q36/data --out /vol/q36/critic/$TAG --tag critic_${TAG}_s$stage --pools '$SPEC' --val-sets '$VALS' --band $BAND --width 1536 --depth 16 --heads 16 --param v --uncond-steps 0 --uncond-frac 0.10 --steps $STEPS --keep-every 500 --max-passes 1 --batch 1024 --micro-batch 128 --eval-every 500 --eval-n 256 --spot-exact-n 64 --spot-ode-steps 16 --max-hours 8.0 $RESUME $EXTRA" critic_${TAG}_s$stage
+  grep -q "critic_${TAG}_s$stage\] SPAWNED" $LOGD/apps.txt || { log "stage $stage launch FAILED; retrying in 5 min"; sleep 300; continue; }
   cp /tmp/q36_v4_stage.json $D/critic_${TAG}_stage$stage.json; echo "stage $stage $(date -u +%H:%M)" >> $USED; for f in $new; do echo $f >> $USED; done
   A=$(grep -E "^\[critic_${TAG}_s$stage\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+"); log "stage $stage launched: $A"
   for i in $(seq 1 600); do timeout 90 modal app list 2>/dev/null | grep -vE "stopped|stopping" | grep -q "$A" || break; sleep 300; done; log "stage $stage app ended"

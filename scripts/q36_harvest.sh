@@ -18,7 +18,7 @@ args_for(){ echo "--data-dir /vol/q36/data --pairs-shards '$1' --layer-specs '$L
 declare -A APP
 launch(){ p=$1; L=${LIST[$p]}
   # the delta pairs file depends on the split of each shard token; the loader picks by 'split' column, so pass BOTH files' union: use the train file for train tokens and val for val tokens -> two invocations would reload the model; instead give ONE combined parquet
-  out=$(NLT_Q36_GPU=B200 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task vllm --gpus 1 --script rollout_vllm.py --args "$(args_for "$L" | sed 's#pairs_SPLIT_x4#pairs_all_x4#')" 2>&1 | grep -E "SPAWNED|modal.com/apps|rror"); echo "$out" | sed "s/^/[harvest_$p] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 harvest_$p
+  out=$(spawn_retry env NLT_Q36_GPU=B200 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task vllm --gpus 1 --script rollout_vllm.py --args "$(args_for "$L" | sed 's#pairs_SPLIT_x4#pairs_all_x4#')"); echo "$out" | sed "s/^/[harvest_$p] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 harvest_$p
   APP[$p]=$(echo "$out" | grep -oE "ap-[A-Za-z0-9]+" | head -1); echo "${APP[$p]}" > $LOGD/harvest_app_$p.txt; log "engine $p launched: ${APP[$p]}"; }
 done_p(){ for tok in $(echo "${LIST[$1]}" | tr ',' ' '); do sp=${tok%%:*}; si=${tok##*:}; f=$(python3 -c "import json; print(json.load(open('/tmp/q36_splits.json'))['$sp'][$si].split('/')[-1].replace('.parquet',''))"); n=$(timeout 120 modal volume ls nlt q36/rollouts_layers/$sp/$f 2>/dev/null | grep -c "h_L"); m=$(timeout 120 modal volume ls nlt q36/rollouts_delta/$sp/$f 2>/dev/null | grep -c "v_delta.parquet"); [ "$n" -ge 16 ] && [ "$m" -ge 1 ] || return 1; done; return 0; }
 for i in $(seq 1 400); do
