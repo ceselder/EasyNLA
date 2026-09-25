@@ -31,7 +31,7 @@ try:
 except Exception: print('0.28,0.37,0.36')")
 log "t weights for 0.5,0.7,0.9: $W"
 rm -f $LOGD/rl_app_rl_v6.txt $LOGD/.rl_rl_v6_stopped
-systemd-run --user --scope -q -p MemoryMax=1G --setenv=RL_TAG=rl_v6 --setenv=CRITIC_CK=$JUDGE --setenv=FROZEN_CK=$JUDGE --setenv=GATE_DIR=q36/critic/v5 --setenv=PRIO=1 --setenv=EXTRA_RL_ARGS="--group 16 --batch 8 --t-grid 0.5,0.7,0.9 --t-weights $W --eps-draws 4 --bullet-beta 1.0 --save-every 20" bash $LOGD/launch_rl_v5.sh >> $LOGD/launch_rl_v6.out 2>&1 &
+systemd-run --user --scope -q -p MemoryMax=1G --setenv=RL_TAG=rl_v6 --setenv=CRITIC_CK=$JUDGE --setenv=FROZEN_CK=$JUDGE --setenv=GATE_DIR=q36/critic/v5 --setenv=PRIO=1 --setenv=EXTRA_RL_ARGS="--group 16 --batch 8 --t-grid 0.5,0.7,0.9 --t-weights $W --eps-draws 4 --bullet-beta 1.0 --bullet-lines \"Now present,Shift\" --save-every 20" bash $LOGD/launch_rl_v5.sh >> $LOGD/launch_rl_v6.out 2>&1 &
 log "RL v6 launcher started (waits for 4 GPUs; RL v5 keeps running under its own rules)"
 for i in $(seq 1 720); do [ -s $LOGD/rl_app_rl_v6.txt ] && break; sleep 30; done; [ -s $LOGD/rl_app_rl_v6.txt ] || { log "no RL v6 app after 6 h"; exit 1; }
 A=$(cat $LOGD/rl_app_rl_v6.txt); log "RL v6 app $A"
