@@ -93,8 +93,6 @@ REPLAY = None
 if args.replay_text and not args.no_cotrain:
     files = sorted(sum((glob.glob(g) for g in args.replay_text.split(",")), [])); df = load_text_pairs(files, os.path.join(args.data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of) & df["i"].isin(band) & df["j"].isin(band)].reset_index(drop=True)
     REPLAY = {"rows": store.rows_for(df["pos_idx"].values), "i": torch.tensor(df["i"].values.astype(np.int64)), "j": torch.tensor(df["j"].values.astype(np.int64)), "text": df["text"].astype(str).tolist()}; P(f"[rl] replay pool {len(df)} rows from {len(files)} files")
-with torch.no_grad():
-    _y = y_of(dirs.unit(store_val.gather(Vh_rows[:64], Vh_j[:64], dev), Vh_j[:64]), 1); P(f"[rl] target rms over 64 held-out pairs = {float(_y.pow(2).mean().sqrt()):.2f} (critic trained at ~sqrt(d) = {dirs.sqrt_d:.2f})")
 REF = None
 if args.ref_text:
     dfr = load_text_pairs(sorted(sum((glob.glob(g) for g in args.ref_text.split(",")), [])), os.path.join(args.data_dir, "pairs_val.parquet"), pools_verbose=False)
@@ -124,6 +122,9 @@ def y_of(u, seed):
     g = torch.Generator(device=dev).manual_seed(int(seed))
     if getattr(dirs, "radial", "lognormal") == "fixed": return dirs.sqrt_d * u + float(getattr(dirs, "sigma_iso", 0.0)) * torch.randn(u.shape, generator=g, device=dev)
     return dirs.sqrt_d * u * torch.exp(dirs.sigma_r * torch.randn(u.shape[0], generator=g, device=dev))[:, None]
+
+with torch.no_grad():
+    _y = y_of(dirs.unit(store_val.gather(Vh_rows[:64], Vh_j[:64], dev), Vh_j[:64]), 1); P(f"[rl] target rms over 64 held-out pairs = {float(_y.pow(2).mean().sqrt()):.2f} (critic trained at ~sqrt(d) = {dirs.sqrt_d:.2f})")
 
 # ---- critic scoring: proxy bits with shared (t, eps) ----
 @torch.no_grad()
