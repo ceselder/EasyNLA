@@ -13,7 +13,7 @@ for i in $(seq 1 400); do
     for J in frozen other; do
       out=rl_${RL_TAG}_exact_${J}_$st; [ -n "${Q[$out]:-}" ] && continue; [ -f $D/$out.json ] && { Q[$out]=1; continue; }
       CK=$FROZEN; [ $J = other ] && CK=$OTHER
-      enqueue_eval "--data-dir /vol/q36/data --ckpt $CK --out /vol/q36/results/$out.json --sets 'teacher:$TX/val/craft_full__*.parquet,policy:/vol/q36/rl/$RL_TAG/$d_' --n 128 --n-fixed 128 --ode-steps 32 --skip-samples --skip-sw" $out 1 && Q[$out]=1
+      enqueue_eval "--data-dir /vol/q36/data --ckpt $CK --out /vol/q36/results/$out.json --sets 'teacher:$TX/val/craft_full__*.parquet,policy:/vol/q36/rl/$RL_TAG/$d_' --n 128 --n-fixed 128 --ode-steps 32 --skip-samples --skip-sw" $out 0 && Q[$out]=1
     done
   done
   new=0
