@@ -50,7 +50,7 @@ def main():
         if not R: continue
         for k, s in R["sets"].items(): T["sets"][k] = row(s)
         for k, tw in R.get("twins", {}).items(): T["twins"][k] = tw
-    os.makedirs(a.data, exist_ok=True); json.dump(T, open(f"{a.data}/phase1_table.json", "w"), indent=1)
+    os.makedirs(a.data, exist_ok=True); json.dump(T, open(f"{a.data}/phase1_table_{a.tag}.json", "w"), indent=1)
     S = T["sets"]
     # ---- fig 1: headline critic content per text source + P(z > dm)
     keys = [k for k in ("craft_full", "jlens", "craft_delta", "craft_newfaded", "craft_nojl", "olens_j", "olens_i") if k in S]
@@ -58,14 +58,14 @@ def main():
         fig, axes = plt.subplots(1, 2, figsize=(11, 4.8))
         bars(axes[0], [NICE.get(k, k) for k in keys], [S[k]["content"] for k in keys], [S[k]["content_sem"] for k in keys], C1, "Exact bits the text adds beyond a depth-matched wrong text", "content = PMI(z) − PMI(z_dm), bits", 0)
         bars(axes[1], [NICE.get(k, k) for k in keys], [S[k]["p_z_gt_dm"] for k in keys], None, C2, "Win rate of the true text over the depth-matched wrong text", "P(z > z_dm)", 0.5, "{:.2f}"); axes[1].set_ylim(0.3, 1.0)
-        fig.suptitle(f"Which text source carries information about u_j given u_i (held-out pairs, Heun {T['ode_steps']})", fontsize=14, y=1.02); fig.tight_layout(); savefig(fig, "fig_phase1_critic")
+        fig.suptitle(f"Which text source carries information about u_j given u_i (held-out pairs, Heun {T['ode_steps']})", fontsize=14, y=1.02); fig.tight_layout(); savefig(fig, f"fig_phase1_critic_{a.tag}")
     # ---- fig 2: twins
     if T["twins"]:
         lab, val, err = [], [], []
         for tl, tw in T["twins"].items():
             for var, r in tw["variants"].items(): lab.append(f"{var}"); val.append(r["p_true_gt_twin"]); err.append(None)
         fig, ax = plt.subplots(figsize=(7, 4.4)); bars(ax, lab, val, None, C3, "Does the critic notice one swapped claim? P(true text > twin)", "P(true > twin)", 0.5, "{:.2f}"); ax.axhline(0.65, color=CG, ls="--", lw=1); ax.set_ylim(0.3, 1.0)
-        fig.tight_layout(); savefig(fig, "fig_phase1_twins")
+        fig.tight_layout(); savefig(fig, f"fig_phase1_twins_{a.tag}")
     # ---- fig 3: verbalizer vs teacher on the same rows
     vk = [k for k in ("teacher", "verbalizer", "base_control") if k in S]
     if vk:
@@ -75,7 +75,7 @@ def main():
         ax.bar(x - w, [S[k]["cos_condmean"]["u"] for k in vk], w, color=CG, label="no text")
         ax.bar(x, [S[k]["cos_condmean"]["c"] for k in vk], w, color=C1, label="true text"); ax.bar(x + w, [S[k]["cos_condmean"]["dm"] for k in vk], w, color=C2, label="depth-matched wrong text")
         ax.set_xticks(x); ax.set_xticklabels([NICE.get(k, k) for k in vk], rotation=20, ha="right", fontsize=10); ax.set_title("Centred cos of the critic's conditional mean with the true u_j", fontsize=13); ax.set_ylabel("cos(E[u_j | u_i, z], u_j)"); ax.legend(frameon=False, fontsize=9)
-        fig.tight_layout(); savefig(fig, "fig_phase1_verbalizer")
+        fig.tight_layout(); savefig(fig, f"fig_phase1_verbalizer_{a.tag}")
     # ---- fig 4: the text-source search (one judge, identical rows): sources + leave-one-source-out
     src_keys = [k for k in ("raw_all", "raw_all_w", "craft_full", "describer_A", "describer", "describer_W", "describer_qwen32b", "skiplens_jd") if k in S]
     loo_keys = [k for k in ("raw_all", "raw_no_i", "raw_no_j", "raw_no_delta", "raw_no_jl", "raw_all_w", "raw_w_no_attn", "raw_w_no_mlp", "writes_only") if k in S]
@@ -86,7 +86,7 @@ def main():
             ref = S["raw_all"]["content"] if "raw_all" in S else 0.0
             bars(axes[1], [NICE.get(k, k) for k in loo_keys], [S[k]["content"] for k in loo_keys], [S[k]["content_sem"] for k in loo_keys], C4, "Leave one readout source out: which source buys the bits?", "content bits", 0)
             axes[1].axhline(ref, color=C1, ls="--", lw=1)
-        fig.suptitle(f"Text-source search on the single direction critic (held-out pairs, Heun {T['ode_steps']})", fontsize=14, y=1.02); fig.tight_layout(); savefig(fig, "fig_phase1_sources")
+        fig.suptitle(f"Text-source search on the single direction critic (held-out pairs, Heun {T['ode_steps']})", fontsize=14, y=1.02); fig.tight_layout(); savefig(fig, f"fig_phase1_sources_{a.tag}")
     print(json.dumps({k: {"content": round(v["content"], 2), "P": round(v["p_z_gt_dm"], 3), "rp": round(v["rp"], 2), "cos_c": round(v["cos_condmean"]["c"], 3), "cos_u": round(v["cos_condmean"]["u"], 3)} for k, v in S.items()}, indent=1))
 
 
