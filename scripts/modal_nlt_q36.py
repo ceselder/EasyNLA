@@ -18,7 +18,10 @@ import subprocess
 import modal
 
 APP_NAME = os.environ.get("NLT_Q36_APP", "nlt-q36")
-GPU_TYPE = os.environ.get("NLT_Q36_GPU", "B200")
+GPU_TYPE = os.environ.get("NLT_Q36_GPU", "B200")                  # ONE type per launch (Modal 1.5.4 rejects fallback lists); e.g. NLT_Q36_GPU=H100 to route around a B200 queue
+GPU_LIST = [g.strip() for g in GPU_TYPE.split(",") if g.strip()]
+def gpu_spec(n: int):
+    return [f"{g}:{n}" for g in GPU_LIST] if len(GPU_LIST) > 1 else f"{GPU_LIST[0]}:{n}"
 REPO_LOCAL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_REMOTE = "/root/easyNLA"
 Q36 = f"{REPO_REMOTE}/nlt/q36"
@@ -73,19 +76,19 @@ def _run(cmd, tag):
     return p.returncode
 
 
-@app.function(image=image_hf, gpu=GPU_TYPE, volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS, cpu=16, memory=128 * 1024)
+@app.function(image=image_hf, gpu=gpu_spec(1), volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS, cpu=16, memory=128 * 1024)
 def run_hf(script: str, args: str = "", nproc: int = 1):
     cmd = (f"torchrun --nproc_per_node {nproc} {Q36}/{script} {args}" if nproc > 1 else f"python {Q36}/{script} {args}")
     return _run(cmd, script.replace(".py", ""))
 
 
-@app.function(image=image_hf, gpu=GPU_TYPE, volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS, cpu=16, memory=200 * 1024)
+@app.function(image=image_hf, gpu=gpu_spec(1), volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS, cpu=16, memory=200 * 1024)
 def run_mod(module: str, args: str = ""):
     """python -m <module> from the repo root (critic trainer / bits runner)"""
     return _run(f"cd {REPO_REMOTE} && python -m {module} {args}", module.split(".")[-1])
 
 
-@app.function(image=image_vllm, gpu=GPU_TYPE, volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS, cpu=16, memory=128 * 1024)
+@app.function(image=image_vllm, gpu=gpu_spec(1), volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS, cpu=16, memory=128 * 1024)
 def run_vllm(script: str, args: str = ""):
     return _run(f"python {Q36}/{script} {args}", script.replace(".py", ""))
 
@@ -105,15 +108,15 @@ def pyrun(code: str):
 @app.local_entrypoint()
 def main(task: str, script: str = "", args: str = "", code: str = "", gpus: int = 1, nproc: int = 0, module: str = ""):
     if task in ("hf", "hf-many"):
-        fn = run_hf.with_options(gpu=f"{GPU_TYPE}:{gpus}")
+        fn = run_hf.with_options(gpu=gpu_spec(gpus))
         for a in ([args] if task == "hf" else [x.strip() for x in args.split(";;") if x.strip()]):
             h = fn.spawn(script, a, nproc or gpus); print(f"SPAWNED {h.object_id} :: {a[:90]}", flush=True)
     elif task in ("vllm", "vllm-many"):
-        fn = run_vllm.with_options(gpu=f"{GPU_TYPE}:{gpus}")
+        fn = run_vllm.with_options(gpu=gpu_spec(gpus))
         for a in ([args] if task == "vllm" else [x.strip() for x in args.split(";;") if x.strip()]):
             h = fn.spawn(script, a); print(f"SPAWNED {h.object_id} :: {a[:90]}", flush=True)
     elif task in ("mod", "mod-many"):
-        fn = run_mod.with_options(gpu=f"{GPU_TYPE}:{gpus}")
+        fn = run_mod.with_options(gpu=gpu_spec(gpus))
         for a in ([args] if task == "mod" else [x.strip() for x in args.split(";;") if x.strip()]):
             h = fn.spawn(module, a); print(f"SPAWNED {h.object_id} :: {a[:90]}", flush=True)
     elif task == "cpu":

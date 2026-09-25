@@ -6,12 +6,13 @@
 set -uo pipefail; unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET; cd /home/celeste/nlt
 BAND=${BAND:?set BAND}; N_TRAIN=${N_TRAIN:-12}; N_VAL=${N_VAL:-3}; TAG=${TAG:-v2}; V1=${V1:-v1}; NSAMP=${NSAMP:-1}; MAXTOK=${MAXTOK:-80}; N_DESC_TRAIN=${N_DESC_TRAIN:-4}
 CRITIC_STEPS=${CRITIC_STEPS:-4500}; UNCOND_STEPS=${UNCOND_STEPS:-1500}; ENGINES=${ENGINES:-4}
+GPUS_HF=${GPUS_HF:-"H100"}; GPUS_VLLM=${GPUS_VLLM:-"H100"}; GPUS_BIG=${GPUS_BIG:-"H200"}   # Modal 1.5.4 takes ONE gpu type per function (no fallback lists): route around the B200 queue explicitly
 log(){ echo "[chain2] $(date -u +%H:%M) $*"; }
 nfiles(){ timeout 120 modal volume ls nlt "$1" 2>/dev/null | grep -cE "$2" || true; }
 waitn(){ for i in $(seq 1 400); do n=$(nfiles "$1" "$2"); [ "$n" -ge "$3" ] && { log "ready: $1 ($n >= $3)"; return 0; }; [ $((i % 5)) -eq 0 ] && log "waiting $1: $n/$3"; sleep 120; done; log "TIMEOUT waiting $1"; return 1; }
 gpus_in_use(){ timeout 90 modal app list 2>/dev/null | grep "nlt-q36" | grep -vE "stopped" | awk -F'│' '{gsub(/ /,"",$5); s+=$5} END {print s+0}'; }
-wait_gpu(){ need=${1:-1}; for i in $(seq 1 600); do g=$(gpus_in_use); [ $((g + need)) -le ${MAXG:-8} ] && { log "GPU headroom: $g in use, launching $need"; return 0; }; [ $((i % 5)) -eq 0 ] && log "waiting for GPU headroom ($g in use, need $need)"; sleep 120; done; return 1; }
-run(){ timeout 900 modal run --detach scripts/modal_nlt_q36.py --task "$1" --gpus "$2" ${6:+--nproc $6} --script "$3" --args "$4" 2>&1 | grep -E "SPAWNED|modal.com/apps|Error|rror:" | sed "s/^/[$5] /" | tee -a /home/celeste/nlt-q36-logs/apps.txt; }
+wait_gpu(){ need=${1:-1}; for i in $(seq 1 600); do g=$(gpus_in_use); [ $((g + need)) -le ${MAXG:-8} ] && { log "GPU headroom: $g in use, launching $need (types ${GT:-$GPUS_HF})"; return 0; }; [ $((i % 5)) -eq 0 ] && log "waiting for GPU headroom ($g in use, need $need)"; sleep 120; done; return 1; }
+run(){ NLT_Q36_GPU="${GT:-$GPUS_HF}" timeout 900 modal run --detach scripts/modal_nlt_q36.py --task "$1" --gpus "$2" ${6:+--nproc $6} --script "$3" --args "$4" 2>&1 | grep -E "SPAWNED|modal.com/apps|Error|rror:" | sed "s/^/[$5] /" | tee -a /home/celeste/nlt-q36-logs/apps.txt; }
 count_rollouts(){ n=0; for d in $(timeout 120 modal volume ls nlt q36/rollouts/$1 2>/dev/null); do c=$(nfiles "$d" "$2"); n=$((n + c)); sleep 2; done; echo $n; }
 
 # 1. writes store complete (30 parts) + v1 rollouts complete (the v_i/v_j/v_delta files of all 15 shards)
@@ -22,7 +23,7 @@ MARK=/home/celeste/nlt-q36-logs/.rollouts_writes_launched_$TAG
 if [ ! -f "$MARK" ]; then
   touch "$MARK"; JOBS=(); for v in $(seq 0 $((N_VAL - 1))); do JOBS+=("val:$v"); done; for t in $(seq 0 $((N_TRAIN - 1))); do JOBS+=("train:$t"); done
   ARGS=""; for p in $(seq 0 $((ENGINES - 1))); do L=""; for k in "${!JOBS[@]}"; do [ $((k % ENGINES)) -eq $p ] && L+="${JOBS[$k]},"; done; L=${L%,}; [ -n "$L" ] && ARGS+="--data-dir /vol/q36/data --pairs-shards '$L' --specs 'v_attn;v_mlp' --adapter /vol_go/ckpt/ar_ivrl/final --prompt bullets --n-samples $NSAMP --max-tokens $MAXTOK --grammar --out-dir /vol/q36/rollouts ;; "; done
-  wait_gpu $(( 1 * $(( $(grep -o ';;' <<< "$ARGS" | wc -l) + 1 )) )) || exit 1; run vllm-many 1 rollout_vllm.py "${ARGS% ;; }" rollouts_w
+  wait_gpu $(( 1 * $(( $(grep -o ';;' <<< "$ARGS" | wc -l) + 1 )) )) || exit 1; GT="$GPUS_VLLM" run vllm-many 1 rollout_vllm.py "${ARGS% ;; }" rollouts_w
 fi
 for i in $(seq 1 400); do nt=$(count_rollouts train "v_(attn|mlp).parquet$"); nv=$(count_rollouts val "v_(attn|mlp).parquet$"); log "writes rollouts: train $nt/$((2 * N_TRAIN)) val $nv/$((2 * N_VAL))"; [ "$nt" -ge $((2 * N_TRAIN)) ] && [ "$nv" -ge $((2 * N_VAL)) ] && break; sleep 150; done
 # 3. craft v2 (with writes), twins on val
