@@ -170,6 +170,30 @@ for s in specs:
     results["specs"][s] = res
     print(f"[score] {s}: " + " | ".join(f"{tk}: greedy P(own>other) {v['greedy']['p_own_gt_other']:.3f} cfve {v['greedy']['cfve']:.3f}" for tk, v in res["targets"].items()) + f" | uniq {res['degeneracy']['unique_bullet_share']:.2f} top-bullet share {res['degeneracy']['top_bullet_row_share']:.2f}", flush=True)
 
+# ---- (ii-b) Δ controls: does reading Δ explain Δ better than reading h_j (or h_i) does? and does adding the Δ read to the h_j read add explained variance? ----
+for s in specs:
+    if results["specs"][s]["kind"] != "delta" or s not in ROWS: continue
+    j, i = [int(x[3:]) for x in s.split("-")]; tk = f"delta_{i}_{j}"
+    Dc = (H[j] - H[i]); Dc = Dc - Dc.mean(0, keepdim=True); Hjc = H[j] - MU[j]; MU42 = MU[args.ref_layer].cpu().numpy()[0]
+    def recon_from(bl_by_row, target_c):
+        gc_all = target_c.cpu().numpy(); R = np.zeros((n, D_MODEL), np.float32); fve = np.full(n, np.nan); idx = []
+        for r_, bs in bl_by_row.items():
+            if r_ >= n: continue
+            atoms = np.stack([CACHE[bullet_ids(b)].numpy() for b in bs if b and bullet_ids(b) in CACHE]) - MU42[None] if bs else np.zeros((0, D_MODEL), np.float32)
+            rec, f_ = nnls_recon(atoms, gc_all[r_]); R[r_] = rec; fve[r_] = f_; idx.append(r_)
+        idx = np.array(sorted(idx)); return torch.tensor(R, device=dev), fve, idx
+    ctrl = {}
+    for name, src in ((f"read_h{j}", f"h_L{j}"), (f"read_h{i}", f"h_L{i}")):
+        if src not in ROWS: continue
+        R, fve, idx = recon_from(ROWS[src], Dc); sp = specificity(R[idx], Dc[idx]); sp["cfve"] = float(np.nanmean(fve[idx])); ctrl[name + "_vs_delta"] = sp
+    if f"h_L{j}" in ROWS:
+        union = {r_: list(ROWS[f"h_L{j}"].get(r_, [])) + list(ROWS[s].get(r_, [])) for r_ in range(n) if ROWS[f"h_L{j}"].get(r_) or ROWS[s].get(r_)}
+        for name, tgt in (("vs_delta", Dc), (f"vs_h{j}", Hjc)):
+            R, fve, idx = recon_from(union, tgt); sp = specificity(R[idx], tgt[idx]); sp["cfve"] = float(np.nanmean(fve[idx])); ctrl[f"union_hj_plus_delta_{name}"] = sp
+            R, fve, idx = recon_from(ROWS[f"h_L{j}"], tgt); sp = specificity(R[idx], tgt[idx]); sp["cfve"] = float(np.nanmean(fve[idx])); ctrl[f"read_h{j}_{name}_4atoms"] = sp
+    results["specs"][s]["delta_controls"] = ctrl
+    print(f"[score] {s} controls: " + " | ".join(f"{k}: P {v['p_own_gt_other']:.3f} cfve {v['cfve']:.3f}" for k, v in ctrl.items()), flush=True)
+
 # ---- (iii) bullet agreement with layer 42, (v) J-lens agreement ----
 ref = f"h_L{args.ref_layer}"
 def agree(Ea, Eb):
