@@ -61,6 +61,14 @@ USER_TMPL_B = """The passage the model was reading ends with (the states were ta
 
 """ + USER_TMPL_A
 
+WRITES_TMPL = """
+Between the two states the model's attention/mixing steps and its MLP steps each wrote into the state. Readouts of those writes:
+What the attention/mixing steps wrote: {ba}; leaning toward {jla}
+What the MLP steps wrote: {bm}; leaning toward {jlm}
+Share of the change: attention/mixing {sa}%, MLPs {sm}%; the attention write is {ratio} times the MLP write in size.
+"""
+SYSTEM_WRITES = SYSTEM.replace("3. \"Vocabulary leanings\"", "3. \"What the attention/mixing steps wrote\" and \"What the MLP steps wrote\": the same lens and the same vocabulary readout applied to the part of the change that the model's attention (mixing across words) steps wrote and to the part its MLP (per-word processing) steps wrote, with their shares of the change. Use them to say WHICH KIND of computation produced each change (mixing in context vs per-word processing) when the readouts support it.\n4. \"Vocabulary leanings\"")
+
 
 def _lst(xs):
     if xs is None: return []
@@ -79,9 +87,21 @@ def fmt_samples(xs):
 
 
 def build_messages(row, variant="A"):
+    """variants: A = readouts only; B = + passage tail; W = readouts + attention/MLP write readouts (needs the writes columns); BW = both"""
     kw = dict(bi=fmt_list(row["bullets_i"]), bis=fmt_samples(row.get("bullets_i_s")), bj=fmt_list(row["bullets_j"]), bjs=fmt_samples(row.get("bullets_j_s")), bd=fmt_list(row["bullets_delta"]), bds=fmt_samples(row.get("bullets_delta_s")),
               jli=fmt_list(row["jl_i"]), jlj=fmt_list(row["jl_j"]), rise=fmt_list(row["rise"]), fall=fmt_list(row["fall"]), tail=str(row.get("passage_tail", "")).strip())
-    return [{"role": "user", "content": (USER_TMPL_B if variant == "B" else USER_TMPL_A).format(**kw)}]
+    body = (USER_TMPL_B if "B" in variant else USER_TMPL_A).format(**kw)
+    if "W" in variant:
+        import math
+        sa = row.get("attn_share"); sm = row.get("mlp_share"); ra = row.get("attn_over_mlp_norm")
+        fmtp = lambda x: str(int(round(100 * float(x)))) if x is not None and math.isfinite(float(x)) else "?"
+        w = WRITES_TMPL.format(ba=fmt_list(row.get("bullets_attn")), jla=fmt_list(row.get("jl_attn")), bm=fmt_list(row.get("bullets_mlp")), jlm=fmt_list(row.get("jl_mlp")), sa=fmtp(sa), sm=fmtp(sm), ratio=(f"{float(ra):.1f}" if ra is not None and math.isfinite(float(ra)) else "?"))
+        body = body.replace("\nJSON only.", w + "\nJSON only.")
+    return [{"role": "user", "content": body}]
+
+
+def system_for(variant="A"):
+    return SYSTEM_WRITES if "W" in variant else SYSTEM
 
 
 def parse_bullets(text):
@@ -127,8 +147,8 @@ def client_kwargs():
     return dict(api_key=os.environ["ANTHROPIC_API_KEY"], default_headers=hdr)
 
 
-def params(messages):
-    return dict(model=MODEL, max_tokens=MAX_TOKENS, system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}], messages=messages)
+def params(messages, variant="A"):
+    return dict(model=MODEL, max_tokens=MAX_TOKENS, system=[{"type": "text", "text": system_for(variant), "cache_control": {"type": "ephemeral"}}], messages=messages)
 
 
 async def _one(client, sem, key, prm, out, usage, retries=8):
@@ -163,7 +183,7 @@ def run_sync(items, concurrency=48):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["sonnet"]); ap.add_argument("--inputs", required=True, nargs="+"); ap.add_argument("--out", required=True)
-    ap.add_argument("--variant", default="A", choices=["A", "B"]); ap.add_argument("--limit", type=int, default=0); ap.add_argument("--offset", type=int, default=0); ap.add_argument("--concurrency", type=int, default=48)
+    ap.add_argument("--variant", default="A", choices=["A", "B", "W", "BW"]); ap.add_argument("--limit", type=int, default=0); ap.add_argument("--offset", type=int, default=0); ap.add_argument("--concurrency", type=int, default=48)
     ap.add_argument("--source", default=None)
     a = ap.parse_args(); source = a.source or f"describer-sonnet5-{a.variant}"
     files = sorted(sum((glob.glob(x) for x in a.inputs), [])); assert files, a.inputs
@@ -171,7 +191,7 @@ def main():
     if a.offset: df = df.iloc[a.offset:]
     if a.limit: df = df.iloc[: a.limit]
     df = df.reset_index(drop=True); rows = df.to_dict("records")
-    items = [(r["pair_id"], params(build_messages(r, a.variant))) for r in rows]
+    items = [(r["pair_id"], params(build_messages(r, a.variant), a.variant)) for r in rows]
     print(f"[describe] {len(items)} pairs, variant {a.variant}, model {MODEL}; e.g. prompt:\n{items[0][1]['messages'][0]['content'][:700]}", flush=True)
     t0 = time.time(); answers, usage = run_sync(items, a.concurrency)
     stats = {"n_pairs": len(items), "no_answer": 0, "bad_json": 0, "too_few": 0, "hard_regex": 0, "kept": 0, "bullets_kept": 0}

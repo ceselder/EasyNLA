@@ -55,7 +55,7 @@ def gen_files(files: list[str], out_dir: str, variant: str = "A", limit: int = 0
         df = pq.read_table(f).to_pandas()
         if limit: df = df.iloc[:limit]
         rows = df.to_dict("records"); t1 = time.time()
-        prompts = [tok.apply_chat_template([{"role": "system", "content": D.SYSTEM}] + D.build_messages(r, variant), tokenize=False, add_generation_prompt=True, enable_thinking=False) for r in rows]
+        prompts = [tok.apply_chat_template([{"role": "system", "content": D.system_for(variant)}] + D.build_messages(r, variant), tokenize=False, add_generation_prompt=True, enable_thinking=False) for r in rows]
         outs = llm.generate(prompts, sp, use_tqdm=False)
         stats = {"n_pairs": len(rows), "no_answer": 0, "bad_json": 0, "too_few": 0, "hard_regex": 0, "kept": 0, "bullets_kept": 0}; keep = []
         for r, o in zip(rows, outs):

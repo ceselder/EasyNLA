@@ -20,6 +20,7 @@ from common import D_MODEL, JLens, load_tokenizer, parse_bullets
 ap = argparse.ArgumentParser()
 ap.add_argument("--data-dir", required=True); ap.add_argument("--split", default="train"); ap.add_argument("--shards", required=True, help="comma list of shard indices of the split")
 ap.add_argument("--rollouts-root", required=True); ap.add_argument("--out-dir", required=True)
+ap.add_argument("--writes-dir", default=None, help="A_L*/M_L* prefix-sum store (extract_writes.py): adds the pooled attention / MLP write readouts (rollout specs v_attn, v_mlp + J-lens + share scalars) to the describer inputs and the raw_all_w pool")
 ap.add_argument("--tau", type=float, default=0.8, help="embedding cos threshold for 'same bullet'"); ap.add_argument("--k", type=int, default=4); ap.add_argument("--max-bullet-tok", type=int, default=16)
 ap.add_argument("--jl-k", type=int, default=6, help="J-lens words per direction in the Leaning line"); ap.add_argument("--jl-pool", type=int, default=40, help="top-k pool filtered down to clean words")
 ap.add_argument("--jlens", default="/vol_ol1/jlens/qwen36_27b_jlens.pt"); ap.add_argument("--frozen", default="/vol_ol1/frozen/qwen36_27b_embed_head.pt")
@@ -83,8 +84,8 @@ def craft_shard(shard_index):
     if os.path.exists(os.path.join(args.out_dir, f"stats__{tag}.json")): print(f"[craft] skip existing {tag}", flush=True); return
     rollouts_dir = os.path.join(args.rollouts_root, tag)
     pairs = PAIRS_ALL[PAIRS_ALL["shard"] == shard_index].reset_index(drop=True); n = len(pairs)
-    RO = {}
-    for v in ("v_i", "v_j", "v_delta"):
+    RO = {}; WSPECS = ["v_attn", "v_mlp"] if args.writes_dir else []
+    for v in ["v_i", "v_j", "v_delta"] + WSPECS:
         t = pq.read_table(os.path.join(rollouts_dir, v + ".parquet")).to_pandas(); RO[v] = {}
         for r, s, txt in zip(t["row"], t["sample"], t["text"]): RO[v].setdefault(int(r), {})[int(s)] = clean_bullets(parse_bullets(txt, args.k)[0])
     n_samp = 1 if args.greedy_only else max(len(v) for v in RO["v_i"].values())
@@ -105,6 +106,29 @@ def craft_shard(shard_index):
                 up = dlp.topk(args.jl_pool, -1).indices.cpu().numpy(); dn = (-dlp).topk(args.jl_pool, -1).indices.cpu().numpy()
                 for a_, r_ in enumerate(q): LEAN[r_] = (words(up[a_]), words(dn[a_]))
     del HC; torch.cuda.empty_cache()
+    # ---- pooled attention / MLP writes between i and j: J-lens words at layer j + share scalars ----
+    JLW = {"attn": [None] * n, "mlp": [None] * n}; SHARE = {"attn_share": [np.nan] * n, "mlp_share": [np.nan] * n, "attn_over_mlp_norm": [np.nan] * n, "cos_attn_delta": [np.nan] * n, "cos_mlp_delta": [np.nan] * n}
+    if args.writes_dir:
+        wf = os.path.join(args.writes_dir, os.path.basename(acts_file)); tw = pq.read_table(wf, columns=[f"{p_}_L{L}" for p_ in ("A", "M") for L in layers] + ["row"])
+        wrowpos = {int(r): k for k, r in enumerate(tw.column("row").to_numpy())}; wrows = np.array([wrowpos[int(r)] for r in pairs["row"]]); WC = {}
+        def wcol(name, idx):
+            if name not in WC: WC[name] = torch.tensor(tw.column(name).combine_chunks().flatten().to_numpy(zero_copy_only=False).reshape(tw.num_rows, D_MODEL).astype(np.float32), device=dev)
+            return WC[name][torch.as_tensor(idx, device=dev)]
+        HC2 = {}
+        def hcol2(L, idx):
+            if L not in HC2: HC2[L] = torch.tensor(tb.column(f"h_L{L}").combine_chunks().flatten().to_numpy(zero_copy_only=False).reshape(tb.num_rows, D_MODEL).astype(np.float32), device=dev)
+            return HC2[L][torch.as_tensor(idx, device=dev)]
+        for L_i in sorted(set(pairs["i"])):
+            for L_j in sorted(set(pairs[pairs["i"] == L_i]["j"])):
+                sel = np.where((pairs["i"].values == L_i) & (pairs["j"].values == L_j))[0]
+                for s0 in range(0, len(sel), 256):
+                    q = sel[s0:s0 + 256]; A_ = wcol(f"A_L{L_j}", wrows[q]) - wcol(f"A_L{L_i}", wrows[q]); M_ = wcol(f"M_L{L_j}", wrows[q]) - wcol(f"M_L{L_i}", wrows[q]); D_ = hcol2(int(L_j), rows[q]) - hcol2(int(L_i), rows[q])
+                    ja = JL.logprobs(A_, int(L_j)).topk(args.jl_pool, -1).indices.cpu().numpy(); jm = JL.logprobs(M_, int(L_j)).topk(args.jl_pool, -1).indices.cpu().numpy()
+                    dn2 = (D_ * D_).sum(-1).clamp_min(1e-6); sa = ((A_ * D_).sum(-1) / dn2).cpu().numpy(); sm = ((M_ * D_).sum(-1) / dn2).cpu().numpy()      # projection shares of the change (sum ~ 1 up to the embedding term)
+                    ra = (A_.norm(dim=-1) / M_.norm(dim=-1).clamp_min(1e-6)).cpu().numpy(); ca = F.cosine_similarity(A_, D_).cpu().numpy(); cm = F.cosine_similarity(M_, D_).cpu().numpy()
+                    for a_, r_ in enumerate(q):
+                        JLW["attn"][r_] = words(ja[a_]); JLW["mlp"][r_] = words(jm[a_]); SHARE["attn_share"][r_] = float(sa[a_]); SHARE["mlp_share"][r_] = float(sm[a_]); SHARE["attn_over_mlp_norm"][r_] = float(ra[a_]); SHARE["cos_attn_delta"][r_] = float(ca[a_]); SHARE["cos_mlp_delta"][r_] = float(cm[a_])
+        del WC, HC2; torch.cuda.empty_cache()
     # ---- embeddings for new / faded ----
     uniq = sorted({b for v in RO.values() for d_ in v.values() for bs in d_.values() for b in bs}); E = dict(zip(uniq, embed(uniq))) if uniq else {}
     print(f"[craft] {len(uniq)} unique bullets embedded | {(time.time() - t0) / 60:.1f} min", flush=True)
@@ -112,7 +136,15 @@ def craft_shard(shard_index):
         if not bi or not bj: return list(bj), list(bi)
         Si = torch.stack([E[b] for b in bi]); Sj = torch.stack([E[b] for b in bj]); M = Sj @ Si.T
         return [b for b, m in zip(bj, M.max(1).values.tolist()) if m < args.tau], [b for b, m in zip(bi, M.max(0).values.tolist()) if m < args.tau]
-    POOLS = {k: [] for k in ("craft_full", "craft_nojl", "craft_delta", "craft_newfaded", "jlens", "olens_j", "olens_i", "raw_all", "raw_no_i", "raw_no_j", "raw_no_delta", "raw_no_jl")}
+    POOLS = {k: [] for k in ("craft_full", "craft_nojl", "craft_delta", "craft_newfaded", "jlens", "olens_j", "olens_i", "raw_all", "raw_no_i", "raw_no_j", "raw_no_delta", "raw_no_jl") + (("raw_all_w", "writes_only", "raw_w_no_attn", "raw_w_no_mlp") if WSPECS else ())}
+    def write_lines(r_, drop=None):
+        """the pooled attention / MLP write readouts as plain lines (no layer words): 'Attention wrote: ...' / 'MLP wrote: ...' + the share sentence"""
+        out = []; ba = RO["v_attn"].get(r_, {}).get(0, []); bm = RO["v_mlp"].get(r_, {}).get(0, [])
+        if drop != "attn" and (ba or JLW["attn"][r_]): out.append("Attention wrote: " + "; ".join(ba) + (". Leaning: " + ", ".join(JLW["attn"][r_]) if JLW["attn"][r_] else "") + ".")
+        if drop != "mlp" and (bm or JLW["mlp"][r_]): out.append("MLP wrote: " + "; ".join(bm) + (". Leaning: " + ", ".join(JLW["mlp"][r_]) if JLW["mlp"][r_] else "") + ".")
+        sa, sm = SHARE["attn_share"][r_], SHARE["mlp_share"][r_]
+        if np.isfinite(sa) and np.isfinite(sm) and drop is None: out.append(f"Attention accounts for {int(round(100 * sa))}% of the change and the MLPs for {int(round(100 * sm))}%.")
+        return "\n".join(out)
     def raw_lines(bi, bj, bd, lean, drop=None):
         """plain concatenation of the readouts with plain labels (no filtering): the 'raw readouts' text-source arm; drop = one source left out"""
         out = []
@@ -133,7 +165,8 @@ def craft_shard(shard_index):
             if w and w.lower() not in seen and not any(c in w for c in "�"): seen.add(w.lower()); out.append(w)
             if len(out) >= k: break
         return out
-    DI = {"pair_id": [], "i": [], "j": [], "bullets_i": [], "bullets_j": [], "bullets_delta": [], "bullets_i_s": [], "bullets_j_s": [], "bullets_delta_s": [], "jl_i": [], "jl_j": [], "rise": [], "fall": [], "passage_tail": []}
+    DI = {"pair_id": [], "i": [], "j": [], "bullets_i": [], "bullets_j": [], "bullets_delta": [], "bullets_i_s": [], "bullets_j_s": [], "bullets_delta_s": [], "jl_i": [], "jl_j": [], "rise": [], "fall": [], "passage_tail": [],
+          "bullets_attn": [], "bullets_mlp": [], "jl_attn": [], "jl_mlp": [], **{k: [] for k in SHARE}}
     for r in range(n):
         pid = pairs["pair_id"][r]; lean = LEAN[r]
         DI["pair_id"].append(pid); DI["i"].append(int(pairs["i"][r])); DI["j"].append(int(pairs["j"][r]))
@@ -141,6 +174,9 @@ def craft_shard(shard_index):
         DI["bullets_i_s"].append([b for s_ in range(1, n_samp) for b in RO["v_i"].get(r, {}).get(s_, [])]); DI["bullets_j_s"].append([b for s_ in range(1, n_samp) for b in RO["v_j"].get(r, {}).get(s_, [])]); DI["bullets_delta_s"].append([b for s_ in range(1, n_samp) for b in RO["v_delta"].get(r, {}).get(s_, [])])
         DI["jl_i"].append(jl_words(jl_top[int(pairs["i"][r])][rows[r]])); DI["jl_j"].append(jl_words(jl_top[int(pairs["j"][r])][rows[r]])); DI["rise"].append(list(lean[0]) if lean else []); DI["fall"].append(list(lean[1]) if lean else [])
         DI["passage_tail"].append(tok.decode(tails[rows[r]][-40:]))
+        DI["bullets_attn"].append(RO["v_attn"].get(r, {}).get(0, []) if WSPECS else []); DI["bullets_mlp"].append(RO["v_mlp"].get(r, {}).get(0, []) if WSPECS else [])
+        DI["jl_attn"].append(list(JLW["attn"][r] or [])); DI["jl_mlp"].append(list(JLW["mlp"][r] or []))
+        for k in SHARE: DI[k].append(float(SHARE[k][r]))
     pq.write_table(pa.table(DI), os.path.join(args.out_dir, f"describer_inputs__{tag}.parquet"))
     for r in range(n):
         pid = pairs["pair_id"][r]; lean = LEAN[r]
@@ -153,6 +189,10 @@ def craft_shard(shard_index):
             for k_, t_ in (("craft_full", full), ("craft_nojl", nojl), ("craft_delta", delta), ("craft_newfaded", nf), ("jlens", jlt), ("olens_j", "Present: " + "; ".join(bj) + "." if bj else ""), ("olens_i", "Present: " + "; ".join(bi) + "." if bi else ""),
                           ("raw_all", raw_lines(bi, bj, bd, lean)), ("raw_no_i", raw_lines(bi, bj, bd, lean, "i")), ("raw_no_j", raw_lines(bi, bj, bd, lean, "j")), ("raw_no_delta", raw_lines(bi, bj, bd, lean, "delta")), ("raw_no_jl", raw_lines(bi, bj, bd, lean, "jl"))):
                 if t_: POOLS[k_].append((pid, t_, k_, s))
+            if WSPECS and s == 0:
+                wl = write_lines(r); base = raw_lines(bi, bj, bd, lean)
+                for k_, t_ in (("raw_all_w", (base + "\n" + wl).strip()), ("writes_only", wl), ("raw_w_no_attn", (base + "\n" + write_lines(r, "attn")).strip()), ("raw_w_no_mlp", (base + "\n" + write_lines(r, "mlp")).strip())):
+                    if t_: POOLS[k_].append((pid, t_, k_, 0))
             if args.twins and s == 0 and full:
                 TW.append((pid, "true", full))
                 same = np.where((pairs["i"].values == pairs["i"][r]) & (pairs["j"].values == pairs["j"][r]))[0]; same = same[same != r]
