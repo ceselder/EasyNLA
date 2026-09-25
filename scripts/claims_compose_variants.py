@@ -55,6 +55,8 @@ def main():
     ap.add_argument("--lm", default="Qwen/Qwen3-8B-Base"); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--bank", type=int, default=0, help="N > 0: also a BANK-NORMALISED single value per claim, PMI1(h; c) - logmeanexp_b PMI1(h_b; c) over N activations of other rows "
                     "(one fixed noise draw x 5 t for own and bank alike; bounded by log N, immune to an absolute shift) -> variants singles_bank / singles_red_bank")
+    ap.add_argument("--bank-shared", action="store_true", help="with --bank: bank PMIs with the SAME noise draws (the row's --D eps x t grid) as the own score, so the noise component is "
+                    "shared; normalisers lse (tau 1), t100, med (own - bank median), pct (log-odds of the bank percentile) -> variants S:<norm> and SR:<norm> (minus the LM redundancy)")
     a = ap.parse_args(); dev = "cuda:0"; rng = np.random.default_rng(a.seed)
     import pyarrow.parquet as pq
     from nla.flow.scoring import FlowBundle
@@ -67,7 +69,10 @@ def main():
     fb = FlowBundle(aa["prior"], a.adapter, aa["stats"], dev, base="Qwen/Qwen3.6-27B", enc_layer=aa.get("enc_layer", 42), ar_ckpt=aa.get("ar_ckpt", "/vol/ckpts/qwen36_27b/ar_sft_merged"), prior_override=(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt") if os.path.exists(os.path.join(os.path.dirname(a.adapter), "prior_cotrained_latest.pt")) else None))
     fb.model.eval(); lm = LM(a.lm, dev); d = acts.shape[1]; T = len(TS); tt = torch.tensor(TS, device=dev)
     bullet = aa.get("claim_subsets", 0) > 0
-    variants = list(VEL) + ["singles_red"] + (["singles_bank", "singles_red_bank"] if a.bank else []); rows = []; t0 = time.time()
+    variants = list(VEL) + ["singles_red"] + (["singles_bank", "singles_red_bank", "singles_bank100", "singles_red_bank100", "singles_pct"] if a.bank else [])
+    NORMS = ("lse", "t100", "med", "pct")
+    if a.bank and a.bank_shared: variants += [f"S:{n_}" for n_ in NORMS] + [f"SR:{n_}" for n_ in NORMS]
+    rows = []; t0 = time.time()
     if a.bank:   # fixed bank of other rows of the same val parquet (N + 1 so every row can drop itself), one noise draw each
         brow = [int(x) for x in np.random.default_rng(12345).permutation(N)[: a.bank + 1]]
         XB = fb.norm.normalize(acts[brow].to(dev)).float(); EB = torch.stack([torch.randn(d, device=dev, generator=torch.Generator(device=dev).manual_seed(7_000_003 + r)) for r in brow])
@@ -107,8 +112,32 @@ def main():
                         vb = fb.model(xs_b.repeat(G, 1), tv_b.repeat(G), enc.repeat_interleave(R_, 0), mk.repeat_interleave(R_, 0), cv.repeat_interleave(R_, 0) if cv is not None else None).float()
                     Lb = ((vb - tg_b.repeat(G, 1)) ** 2).mean(-1).view(G, nb, T); PB.append((d / 2) * (lu_b[None] - Lb).mean(-1))
             PB = torch.cat(PB)                                                                                # [pool, nb] PMI1 on the bank
-            lme = torch.logsumexp(PB.double(), 1) - math.log(nb)
+            lme = torch.logsumexp(PB.double(), 1) - math.log(nb); lme100 = 100.0 * (torch.logsumexp(PB.double() / 100.0, 1) - math.log(nb))   # tau = 1 (InfoNCE) and tau = 100 nats
             bankv = [float(x) for x in (own1.double() - lme)]; wrong1 = [float(x) for x in (PB[:, 0].double() - lme)]   # a fixed wrong activation (bank row 0)
+            bank100 = [float(x) for x in (own1.double() - lme100)]; wrong100 = [float(x) for x in (PB[:, 0].double() - lme100)]
+            pct = [float(x) for x in (PB < own1[:, None]).double().mean(1)]; wpct = [float(x) for x in (PB < PB[:, :1]).double().mean(1)]   # own's percentile among the bank
+            if a.bank_shared:   # the row's own D noise draws x t grid for every bank activation: x_t^b = (1 - t) x_b + t eps_k
+                XBr = XB[kb]; Dn = a.D
+                xsb = ((1 - tt)[None, None, :, None] * XBr[:, None, None, :] + tt[None, None, :, None] * E[None, :, None, :]).reshape(-1, d)
+                tgb = (E[None, :, None, :] - XBr[:, None, None, :]).expand(nb, Dn, T, d).reshape(-1, d); tvb = tt.repeat(nb * Dn); Rb = xsb.shape[0]
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16): L0b = ((fb.model(xsb, tvb).float() - tgb) ** 2).mean(-1).view(nb, Dn * T)
+                own8 = ((d / 2) * (Lu[None] - ((v0[None] + Dl.float() - tgt[None]) ** 2).mean(-1)).mean(-1)).double()   # = single[j] (D draws x T, "mean" with m = 1)
+                PBS = torch.empty(len(pool), nb, device=dev, dtype=torch.float64)
+                with torch.no_grad():
+                    for j0 in range(0, len(pool), 8):
+                        cc = pool[j0:j0 + 8]; enc, mk, cv = fb.cond([format_claims([c]) if bullet else c for c in cc])
+                        for q in range(len(cc)):
+                            Lj = torch.empty(Rb, device=dev)
+                            for r0 in range(0, Rb, 5120):
+                                m_ = min(5120, Rb - r0)
+                                with torch.autocast("cuda", dtype=torch.bfloat16):
+                                    v_ = fb.model(xsb[r0:r0 + m_], tvb[r0:r0 + m_], enc[q:q + 1].expand(m_, -1, -1), mk[q:q + 1].expand(m_, -1), cv[q:q + 1].expand(m_, -1) if cv is not None else None).float()
+                                Lj[r0:r0 + m_] = ((v_ - tgb[r0:r0 + m_]) ** 2).mean(-1)
+                            PBS[j0 + q] = ((d / 2) * (L0b - Lj.view(nb, Dn * T))).mean(-1).double()
+                nrm = {"lse": torch.logsumexp(PBS, 1) - math.log(nb), "t100": 100.0 * (torch.logsumexp(PBS / 100.0, 1) - math.log(nb)), "med": PBS.median(1).values}
+                bs = {k_: [float(x) for x in own8 - v_] for k_, v_ in nrm.items()}; bsw = {k_: [float(x) for x in PBS[:, 0] - v_] for k_, v_ in nrm.items()}
+                lo = lambda x: math.log(max(x, 0.5 / nb) / max(1 - x, 0.5 / nb))
+                bs["pct"] = [lo(float(x)) for x in (PBS < own8[:, None]).double().mean(1)]; bsw["pct"] = [lo(float(x)) for x in (PBS < PBS[:, :1]).double().mean(1)]
         def vel(idx, var):
             if not idx: return 0.0
             S = Dl[idx].float().sum(0); m = len(idx); w = torch.tensor([VEL[var](float(x), m) for x in tv.tolist()], device=dev)
@@ -123,11 +152,22 @@ def main():
             if var == "singles_red": return sum(single[j] for j in idx) - red(idx)
             if var == "singles_bank": return sum(bankv[j] for j in idx)
             if var == "singles_red_bank": return sum(bankv[j] for j in idx) - red(idx)
+            if var == "singles_bank100": return sum(bank100[j] for j in idx)
+            if var == "singles_red_bank100": return sum(bank100[j] for j in idx) - red(idx)
+            if var == "singles_pct": return sum(math.log(max(pct[j], 0.5 / 256) / max(1 - pct[j], 0.5 / 256)) for j in idx)   # log-odds of the bank percentile
+            if var.startswith("S:"): return sum(bs[var[2:]][j] for j in idx)
+            if var.startswith("SR:"): return sum(bs[var[3:]][j] for j in idx) - red(idx)
             return vel(idx, var)
         best = max(single[j] for j in I_T); rec = {"row": row, "n_true": nt, "single_true": [single[j] for j in I_T], "best_single": best, "by": {}}
         if a.bank:
             rec["bank"] = {"true_own": [bankv[j] for j in I_T], "twin_own": [bankv[j] for j in I_F], "true_wrong": [wrong1[j] for j in I_T], "twin_true_own": [bankv[p["true_index"]] for p in fps],
-                           "own1_true": [float(own1[j]) for j in I_T], "best_single_bank": max(bankv[j] for j in I_T)}
+                           "own1_true": [float(own1[j]) for j in I_T], "best_single_bank": max(bankv[j] for j in I_T),
+                           "true_own100": [bank100[j] for j in I_T], "twin_own100": [bank100[j] for j in I_F], "true_wrong100": [wrong100[j] for j in I_T], "twin_true_own100": [bank100[p["true_index"]] for p in fps],
+                           "true_pct": [pct[j] for j in I_T], "twin_pct": [pct[j] for j in I_F], "true_wrong_pct": [wpct[j] for j in I_T], "twin_true_pct": [pct[p["true_index"]] for p in fps],
+                           "best_single_bank100": max(bank100[j] for j in I_T), "best_single_pct": max(math.log(max(pct[j], 0.5 / 256) / max(1 - pct[j], 0.5 / 256)) for j in I_T)}
+            if a.bank_shared:
+                rec["bank_shared"] = {k_: {"true_own": [bs[k_][j] for j in I_T], "twin_own": [bs[k_][j] for j in I_F], "true_wrong": [bsw[k_][j] for j in I_T],
+                                           "twin_true_own": [bs[k_][p["true_index"]] for p in fps], "best_single": max(bs[k_][j] for j in I_T)} for k_ in NORMS}
         order = list(rng.permutation(nt)); pad_src = list(rng.permutation(min(nt, len(I_P))))
         for var in variants:
             r = {"set": score(I_T, var), "shuffled": score(I_O, var) if I_O else float("nan"),
@@ -151,7 +191,9 @@ def main():
     for var in variants:
         R = [r["by"][var] for r in rows]; K = min(a.kmax, min(len(r["greedy"]) for r in R))
         gm = [float(np.mean([r["greedy"][k] for r in R if len(r["greedy"]) > k])) for k in range(max(len(r["greedy"]) for r in R))]
-        bb = (lambda rw: rw["bank"]["best_single_bank"]) if var.endswith("_bank") else (lambda rw: rw["best_single"])
+        bb = ((lambda rw: rw["bank"]["best_single_bank"]) if var.endswith("_bank") else (lambda rw: rw["bank"]["best_single_bank100"]) if var.endswith("_bank100")
+              else (lambda rw: rw["bank"]["best_single_pct"]) if var == "singles_pct"
+              else (lambda rw, k_=var.split(":")[1]: rw["bank_shared"][k_]["best_single"]) if ":" in var else (lambda rw: rw["best_single"]))
         s = {"set_mean": float(np.mean([r["set"] for r in R])), "set_ge_best_single_frac": float(np.mean([r["set"] >= bb(rw) for r, rw in zip(R, rows)])),
              "shuffled_mean": float(np.nanmean([r["shuffled"] for r in R])), "true_beats_shuffled": float(np.nanmean([r["set"] > r["shuffled"] for r in R])),
              "true_beats_one_twin_swap": float(np.mean([r["set"] > x for r in R for x in r["swaps"]])),
@@ -170,6 +212,18 @@ def main():
         summ["bank"] = {"N": a.bank, "log_N": math.log(a.bank), "true_own_pct": q(to), "twin_own_pct": q(tw), "true_wrong_pct": q(wr), "best_single_bank_mean": float(np.mean([r["bank"]["best_single_bank"] for r in rows])),
                         "paired_true_gt_twin": float(np.mean(pt > tw)), "true_own_gt_true_wrong": float(np.mean(to > wr)),
                         "lambda_table": {str(l): {"true_kept": float((to > l).mean()), "twin_kept": float((tw > l).mean()), "true_kept_wrong_activation": float((wr > l).mean())} for l in (0, 1, 2, 3, 4, 5)}}
+        for name, keys, lams in (("tau100", ("true_own100", "twin_own100", "true_wrong100", "twin_true_own100"), (-50, -20, 0, 20, 50)),
+                                 ("percentile", ("true_pct", "twin_pct", "true_wrong_pct", "twin_true_pct"), (0.5, 0.75, 0.9, 0.95, 0.99))):
+            to_, tw_, wr_, pt_ = (np.array([x for r in rows for x in r["bank"][k_]]) for k_ in keys)
+            summ["bank"][name] = {"true_own_pct": q(to_), "twin_own_pct": q(tw_), "true_wrong_pct": q(wr_), "paired_true_gt_twin": float(np.mean(pt_ > tw_)), "true_own_gt_true_wrong": float(np.mean(to_ > wr_)),
+                                  "lambda_table": {str(l): {"true_kept": float((to_ > l).mean()), "twin_kept": float((tw_ > l).mean()), "true_kept_wrong_activation": float((wr_ > l).mean())} for l in lams}}
+        if a.bank_shared:
+            summ["bank_shared"] = {}
+            for k_ in NORMS:
+                to_, tw_, wr_, pt_ = (np.array([x for r in rows for x in r["bank_shared"][k_][f_]]) for f_ in ("true_own", "twin_own", "true_wrong", "twin_true_own"))
+                lams = (-2, 0, 1, 2, 3, 4) if k_ in ("lse", "pct") else (-50, -20, 0, 20, 50)
+                summ["bank_shared"][k_] = {"true_own_pct": q(to_), "twin_own_pct": q(tw_), "true_wrong_pct": q(wr_), "paired_true_gt_twin": float(np.mean(pt_ > tw_)), "true_own_gt_true_wrong": float(np.mean(to_ > wr_)),
+                                           "lambda_table": {str(l): {"true_kept": float((to_ > l).mean()), "twin_kept": float((tw_ > l).mean()), "true_kept_wrong_activation": float((wr_ > l).mean())} for l in lams}}
         print(f"[variants {a.tag}] bank value (N {a.bank}, max log N = {math.log(a.bank):.2f}): true own median {np.median(to):+.2f}, twin own {np.median(tw):+.2f}, true on wrong activation {np.median(wr):+.2f}; "
               f"paired true > twin {summ['bank']['paired_true_gt_twin']:.3f}", flush=True)
     os.makedirs(OUT, exist_ok=True); json.dump({"summary": summ, "rows": rows}, open(f"{OUT}/compose_variants_{a.tag}.json", "w"), indent=1)

@@ -1,7 +1,10 @@
 """Claims = atomic-ish statements of an explanation, the unit of the compositional NLA.
 
-split_claims(expl): lines -> sentences (split after . ! ? ; when followed by a capital / quote / bracket), a line's section label ("Genre:",
-"Momentum:", ...) is kept inside the text of the claim it starts, fragments with < MIN_WORDS words are dropped.
+split_claims(expl): BULLET FORMAT (at least half of the non-empty lines start with "•", "-", "*", "·" or "1." / "1)"): exactly one claim per
+bullet, marker stripped, a trailing ";" stripped, unmarked lines after a bullet are continuations of it, nothing is re-split or dropped (the
+reward must see the claims the verbalizer wrote); unmarked lines before the first bullet are treated as prose. PROSE: lines -> sentences (split
+after . ! ? ; when followed by a capital / quote / bracket, not after an abbreviation), "X — Y" split only when both sides are claims, a line's
+section label ("Genre:", ...) is kept inside the claim it starts, fragments with < MIN_WORDS words are dropped.
 format_claims(claims): the conditioning string the claim-set conditioner is trained on ("• c1\\n• c2\\n…"); the empty set is the unconditional
 branch (condition dropout), never an empty string.
 sample_subset(claims, K, rng): k ~ Uniform{1..min(K, n)} claims without replacement, shuffled — the stage-1 training distribution."""
@@ -14,24 +17,36 @@ _DASH = re.compile(r"\s+[—–]\s+")   # em/en-dash clause boundary
 _BULLET = re.compile(r"^\s*(?:[-*•·]|\d+[.)])\s+")
 
 
+def _split_prose(line, out):
+    parts, buf = [], ""
+    for s in _SENT.split(line):                           # re-join splits that happened after an abbreviation ("e.g. Boots")
+        buf = f"{buf} {s}" if buf else s
+        if not _ABBR.search(buf.rstrip()): parts.append(buf); buf = ""
+    if buf: parts.append(buf)
+    for s in parts:
+        segs = _DASH.split(s)
+        if len(segs) > 1 and all(len(x.split()) >= MIN_WORDS for x in segs): pieces = segs   # split "X — Y" only when both sides are claims
+        else: pieces = [s]
+        for x in pieces:
+            x = x.strip().rstrip(";").strip()
+            if len(x.split()) >= MIN_WORDS: out.append(x)
+
+
 def split_claims(expl, max_claims=None):
     if not expl: return []
+    lines = [l.strip() for l in str(expl).splitlines() if l.strip()]
     out = []
-    for line in str(expl).splitlines():
-        line = _BULLET.sub("", line.strip())
-        if not line: continue
-        parts, buf = [], ""
-        for s in _SENT.split(line):                       # re-join splits that happened after an abbreviation ("e.g. Boots")
-            buf = f"{buf} {s}" if buf else s
-            if not _ABBR.search(buf.rstrip()): parts.append(buf); buf = ""
-        if buf: parts.append(buf)
-        for s in parts:
-            segs = _DASH.split(s)
-            if len(segs) > 1 and all(len(x.split()) >= MIN_WORDS for x in segs): pieces = segs   # split "X — Y" only when both sides are claims
-            else: pieces = [s]
-            for x in pieces:
-                x = x.strip().rstrip(";").strip()
-                if len(x.split()) >= MIN_WORDS: out.append(x)
+    if lines and 2 * sum(bool(_BULLET.match(l)) for l in lines) >= len(lines):   # bullet format: one claim per bullet, verbatim
+        cur = None
+        for l in lines:
+            if _BULLET.match(l):
+                if cur: out.append(cur)
+                cur = _BULLET.sub("", l).strip().rstrip(";").strip()
+            elif cur is not None: cur = f"{cur} {l}"
+            else: _split_prose(l, out)                     # preamble before the first bullet
+        if cur: out.append(cur)
+    else:
+        for l in lines: _split_prose(_BULLET.sub("", l), out)
     return out[:max_claims] if max_claims else out
 
 
