@@ -16,10 +16,10 @@ import numpy as np, pyarrow as pa, pyarrow.parquet as pq, torch
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--data", default=None, help="COLUMN MODE: parquet or glob with the activation columns"); ap.add_argument("--out-dir", required=True)
-ap.add_argument("--data-dir", default=None, help="PAIR MODE: store dir with splits.json and pairs_<split>.parquet"); ap.add_argument("--pairs-split", default="train"); ap.add_argument("--pairs-shards", default="", help="comma list of shard indices of that split")
+ap.add_argument("--data-dir", default=None, help="PAIR MODE: store dir with splits.json and pairs_<split>.parquet"); ap.add_argument("--writes-dir", default="/vol/q36/data/writes", help="pair mode: A_L*/M_L* prefix-sum store for the v_attn / v_mlp specs"); ap.add_argument("--pairs-split", default="train"); ap.add_argument("--pairs-shards", default="", help="comma list of shard indices of that split")
 ap.add_argument("--adapter", default=None, help="PEFT LoRA dir to merge into the served base (None = base model)")
 ap.add_argument("--prompt", default="bullets", choices=["bullets", "av"]); ap.add_argument("--k", type=int, default=4, help="bullets in the prompt")
-ap.add_argument("--specs", required=True, help="';'-separated: h_L24 | h_L42-h_L24 | v_i | v_j | v_delta")
+ap.add_argument("--specs", required=True, help="';'-separated: h_L24 | h_L42-h_L24 | v_i | v_j | v_delta | v_attn | v_mlp")
 ap.add_argument("--n-rows", type=int, default=0, help="0 = all rows"); ap.add_argument("--skip-rows", type=int, default=0)
 ap.add_argument("--n-samples", type=int, default=3); ap.add_argument("--no-greedy", action="store_true"); ap.add_argument("--max-tokens", type=int, default=80)
 ap.add_argument("--temperature", type=float, default=1.0); ap.add_argument("--top-p", type=float, default=1.0)
@@ -88,11 +88,19 @@ def main():
             def loader(f=f, si=si, split=split):
                 P_all = PAIRS[split]; P = P_all[P_all["shard"] == si].reset_index(drop=True)
                 if args.n_rows: P = P.iloc[args.skip_rows: args.skip_rows + args.n_rows].reset_index(drop=True)
-                layers = sorted(set(P["i"].tolist()) | set(P["j"].tolist())); tb = pq.read_table(f, columns=[f"h_L{L}" for L in layers] + ["row"])
-                rowpos = {int(r): k for k, r in enumerate(tb.column("row").to_numpy())}; ridx = [rowpos[int(r)] for r in P["row"]]
-                HL = {L: torch.tensor(fsl(tb, f"h_L{L}", D_MODEL, np.float32)) for L in layers}
-                vi = torch.stack([HL[int(L)][k] for L, k in zip(P["i"], ridx)]); vj = torch.stack([HL[int(L)][k] for L, k in zip(P["j"], ridx)])
-                return {"v_i": vi, "v_j": vj, "v_delta": vj - vi}, len(P), P["pair_id"].tolist()
+                layers = sorted(set(P["i"].tolist()) | set(P["j"].tolist())); COL = {}
+                need_h = any(s_ in ("v_i", "v_j", "v_delta") for s_ in specs); need_w = any(s_ in ("v_attn", "v_mlp") for s_ in specs)
+                if need_h:
+                    tb = pq.read_table(f, columns=[f"h_L{L}" for L in layers] + ["row"]); rowpos = {int(r): k for k, r in enumerate(tb.column("row").to_numpy())}; ridx = [rowpos[int(r)] for r in P["row"]]
+                    HL = {L: torch.tensor(fsl(tb, f"h_L{L}", D_MODEL, np.float32)) for L in layers}
+                    vi = torch.stack([HL[int(L)][k] for L, k in zip(P["i"], ridx)]); vj = torch.stack([HL[int(L)][k] for L, k in zip(P["j"], ridx)]); COL.update({"v_i": vi, "v_j": vj, "v_delta": vj - vi}); del HL
+                if need_w:                                                                    # pooled attention / MLP writes between i and j: prefix sums from the writes store
+                    wf = os.path.join(args.writes_dir, os.path.basename(f)); assert os.path.exists(wf), f"no writes file {wf}"
+                    tw = pq.read_table(wf, columns=[f"{p_}_L{L}" for p_ in ("A", "M") for L in layers] + ["row"]); rowpos = {int(r): k for k, r in enumerate(tw.column("row").to_numpy())}; ridx = [rowpos[int(r)] for r in P["row"]]
+                    for p_, name in (("A", "v_attn"), ("M", "v_mlp")):
+                        W = {L: torch.tensor(fsl(tw, f"{p_}_L{L}", D_MODEL, np.float32)) for L in layers}
+                        COL[name] = torch.stack([W[int(L)][k] for L, k in zip(P["j"], ridx)]) - torch.stack([W[int(L)][k] for L, k in zip(P["i"], ridx)]); del W
+                return COL, len(P), P["pair_id"].tolist()
             jobs.append((f"{split}:shard{si}:{os.path.basename(f)}", od, loader))
     else:
         files = sorted(sum((glob.glob(x.strip()) for x in args.data.split(",")), [])); assert files, f"no files match {args.data}"
