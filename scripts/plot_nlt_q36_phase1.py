@@ -66,7 +66,11 @@ def main():
         lab, val, err = [], [], []
         for tl, tw in T["twins"].items():
             for var, r in tw["variants"].items(): lab.append(f"{var}"); val.append(r["p_true_gt_twin"]); err.append(None)
-        fig, ax = plt.subplots(figsize=(7, 4.4)); bars(ax, lab, val, None, C3, "Does the critic notice one swapped claim? P(true text > twin)", "P(true > twin)", 0.5, "{:.2f}"); ax.axhline(0.65, color=CG, ls="--", lw=1); ax.set_ylim(0.3, 1.0)
+        NTW = {"dm_full": "whole text of another pair\n(same layers)", "twin_shift": "one Shift bullet\nswapped", "twin_new": "one 'Now present'\nbullet swapped", "twin_jlens": "one J-lens word\nflipped"}
+        one = [v for l_, v in zip(lab, val) if l_ != "dm_full"]; inverted = bool(one) and max(one) < 0.5
+        title = ("The judge PREFERS a text with one swapped claim (P < 0.5):\nit reads topic, not claims" if inverted else "Does the critic notice one swapped claim? P(true text > twin)") + f" - critic {a.tag}"
+        fig, ax = plt.subplots(figsize=(7.5, 5)); bars(ax, [NTW.get(l_, l_) for l_ in lab], val, None, C3, title, "P(true text > twin), paired exact bits", 0.5, "{:.2f}"); ax.axhline(0.65, color=CG, ls="--", lw=1); ax.set_ylim(0.0, 1.0)
+        ax.set_xticklabels([NTW.get(l_, l_) for l_ in lab], rotation=0, ha="center", fontsize=10); ax.text(0.99, 0.66, "0.65 = 'sees the claim' bar", ha="right", va="bottom", fontsize=9, color=CG, transform=ax.get_yaxis_transform())
         fig.tight_layout(); savefig(fig, f"fig_phase1_twins_{a.tag}")
     # ---- fig 3: verbalizer vs teacher on the same rows
     vk = [k for k in ("teacher", "teacher_trunc176", "teacher_trunc96", "verbalizer", f"verbalizer_{a.tag}b", "base_control") if k in S]
