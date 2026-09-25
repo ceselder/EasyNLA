@@ -34,6 +34,7 @@ image_hf = (
     .apt_install("git")
     .pip_install("torch==2.8.0", "transformers==5.5.4", "peft==0.19.1", "accelerate", "safetensors", "sentencepiece", "pyarrow", "numpy", "pandas",
                  "wandb", "einops", "scipy", "pyyaml", "huggingface_hub[hf_transfer]", "flash-linear-attention", "matplotlib")
+    .pip_install("triton>=3.7.1")            # fla refuses the gated-DeltaNet BACKWARD on Hopper (H100/H200) with triton 3.4-3.7.0 (fla #640); torch 2.8 + triton 3.7.1 validated on the H100 playground box
     .env(ENV)
     .add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=IGNORE)
 )
