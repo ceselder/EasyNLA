@@ -23,24 +23,39 @@ VEL = {"mean": lambda t, m: 1.0 / m, "sum": lambda t, m: 1.0, "lin": lambda t, m
 HEAD = "Claims about a text:\n"
 
 
-class LM:
-    def __init__(self, name, dev):
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        self.tok = AutoTokenizer.from_pretrained(name, token=os.environ.get("HF_TOKEN")); self.dev = dev
-        self.m = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, token=os.environ.get("HF_TOKEN")).to(dev).eval()
-        self.nh = len(self.tok(HEAD, add_special_tokens=False)["input_ids"]); self.cache = {}
+from nla.flow.claim_lm import ClaimLM as LM, HEAD   # the SAME redundancy computation as the RL reward (--claim-reward singles_red)
 
-    @torch.no_grad()
-    def logp(self, sets):
-        """sets: list of tuples of claims -> log p (nats) of the bullet lines after the header, cached"""
-        todo = [s for s in dict.fromkeys(sets) if s not in self.cache]
-        for i in range(0, len(todo), 48):
-            ch = todo[i:i + 48]; texts = [HEAD + "".join(f"• {c}\n" for c in s) for s in ch]
-            enc = self.tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(self.dev)
-            lp = torch.log_softmax(self.m(**enc).logits[:, :-1].float(), -1).gather(-1, enc["input_ids"][:, 1:, None])[..., 0]
-            mask = enc["attention_mask"][:, 1:].clone(); mask[:, : self.nh - 1] = 0
-            for s, v in zip(ch, (lp * mask).sum(1).tolist()): self.cache[s] = v
-        return [self.cache[s] for s in sets]
+
+PREC = {"amp": True, "delta": torch.float16}   # eval numerics (tests switch to fp32: amp False, delta float32)
+
+
+def row_setup(fb, act, row, D, dev):
+    """the eval's per-row noise and unconditional pass: E [D, d] seeded by the row, x_t over D draws x the t grid"""
+    tt = torch.tensor(TS, device=dev); T = len(TS); x0 = fb.norm.normalize(act[None].to(dev)).float(); d = x0.shape[1]
+    E = torch.randn(D, d, device=dev, generator=torch.Generator(device=dev).manual_seed(1_000_003 + row))
+    xt = ((1 - tt)[None, :, None] * x0[None] + tt[None, :, None] * E[:, None, :]).reshape(D * T, d); tv = tt.repeat(D)
+    tgt = (E[:, None, :] - x0[None]).expand(D, T, d).reshape(D * T, d)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=PREC["amp"]): v0 = fb.model(xt, tv).float()
+    return x0, E, xt, tv, tgt, v0, ((v0 - tgt) ** 2).mean(-1)
+
+
+def claim_deltas(fb, pool, xt, tv, v0, bullet, chunk):
+    """per-claim velocity deltas v(x_t | c) - v0 over the row's D x T points -> [pool, D*T, d] fp16"""
+    from nla.flow.claims import format_claims
+    Dl, d = [], xt.shape[1]
+    with torch.no_grad():
+        for i in range(0, len(pool), chunk):
+            cc = pool[i:i + chunk]; G = len(cc); enc, mk, cv = fb.cond([format_claims([c]) if bullet else c for c in cc]); R_ = xt.shape[0]
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=PREC["amp"]):
+                v = fb.model(xt.repeat(G, 1), tv.repeat(G), enc.repeat_interleave(R_, 0), mk.repeat_interleave(R_, 0), cv.repeat_interleave(R_, 0) if cv is not None else None).float()
+            Dl.append((v.view(G, R_, d) - v0[None]).to(PREC["delta"]))
+    return torch.cat(Dl)
+
+
+def single_pmis(Dl, v0, tgt, Lu):
+    """single-claim PMI (nats) of every claim from its cached delta: (d/2) mean[ L(v0) - L(v0 + delta) ]"""
+    d = v0.shape[1]
+    return [float((d / 2) * (Lu - ((v0 + Dl[j].float() - tgt) ** 2).mean(-1)).mean()) for j in range(len(Dl))]
 
 
 def spearman(x, y):
@@ -80,24 +95,12 @@ def main():
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16): LUB = ((fb.model(XTB, TVB).float() - TGB) ** 2).mean(-1)
         LUB = LUB.view(len(brow), T)
     for n, it in enumerate(C):
-        row = it["row"]; x0 = fb.norm.normalize(acts[row][None].to(dev)).float()
-        E = torch.randn(a.D, d, device=dev, generator=torch.Generator(device=dev).manual_seed(1_000_003 + row))
-        xt = ((1 - tt)[None, :, None] * x0[None] + tt[None, :, None] * E[:, None, :]).reshape(a.D * T, d); tv = tt.repeat(a.D)
-        tgt = (E[:, None, :] - x0[None]).expand(a.D, T, d).reshape(a.D * T, d)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16): v0 = fb.model(xt, tv).float()
-        Lu = ((v0 - tgt) ** 2).mean(-1)                                                                      # [D*T]
+        row = it["row"]; x0, E, xt, tv, tgt, v0, Lu = row_setup(fb, acts[row], row, a.D, dev)             # Lu [D*T]
         tc = [c["claim"] for c in it["true_claims"]]; fps = it["false_pairs"]; pp = PP.get(row) or []
         other = C[(n + 1 + int(rng.integers(len(C) - 1))) % len(C)]; oc = [c["claim"] for c in other["true_claims"]][: len(tc)]
         pool = tc + [p["false_claim"] for p in fps] + oc + pp; nt, nf, no = len(tc), len(fps), len(oc)
         I_T = list(range(nt)); I_F = list(range(nt, nt + nf)); I_O = list(range(nt + nf, nt + nf + no)); I_P = list(range(nt + nf + no, len(pool)))
-        Dl = []
-        with torch.no_grad():
-            for i in range(0, len(pool), a.chunk):
-                cc = pool[i:i + a.chunk]; G = len(cc); enc, mk, cv = fb.cond([format_claims([c]) if bullet else c for c in cc]); R_ = xt.shape[0]
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    v = fb.model(xt.repeat(G, 1), tv.repeat(G), enc.repeat_interleave(R_, 0), mk.repeat_interleave(R_, 0), cv.repeat_interleave(R_, 0) if cv is not None else None).float()
-                Dl.append((v.view(G, R_, d) - v0[None]).half())
-        Dl = torch.cat(Dl)                                                                                   # [pool, D*T, d] fp16
+        Dl = claim_deltas(fb, pool, xt, tv, v0, bullet, a.chunk)                                          # [pool, D*T, d] fp16
         bankv = own1 = wrong1 = None
         if a.bank:
             keep = [k for k, r_ in enumerate(brow) if r_ != row][: a.bank]; kb = torch.tensor(keep, device=dev); nb = len(keep)
@@ -142,12 +145,9 @@ def main():
             if not idx: return 0.0
             S = Dl[idx].float().sum(0); m = len(idx); w = torch.tensor([VEL[var](float(x), m) for x in tv.tolist()], device=dev)
             L = ((v0 + w[:, None] * S - tgt) ** 2).mean(-1); return float((d / 2) * (Lu - L).mean())
-        single = [vel([j], "mean") for j in range(len(pool))]
-        lps = dict(zip([(c,) for c in pool], lm.logp([(c,) for c in pool])))
-        def red(idx):
-            if len(idx) <= 1: return 0.0
-            s = tuple(pool[j] for j in idx); j1, j2 = lm.logp([s, s[::-1]])
-            return 0.5 * (j1 + j2) - sum(lps[(pool[j],)] for j in idx)
+        single = single_pmis(Dl, v0, tgt, Lu)                                                              # = vel([j], "mean")
+        lm.logp([(c,) for c in pool])
+        def red(idx): return lm.redundancy([pool[j] for j in idx])
         def score(idx, var):
             if var == "singles_red": return sum(single[j] for j in idx) - red(idx)
             if var == "singles_bank": return sum(bankv[j] for j in idx)

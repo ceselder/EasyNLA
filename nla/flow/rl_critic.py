@@ -232,7 +232,7 @@ class FlowCritic:
               f"trainable {sum(p.numel() for p in self.trainable)/1e6:.0f}M ({opt_name}); t grid {self.t_grid}; encoder = actor (adapters off) @ layer {enc_layer}", flush=True)
 
     def _ac(self):
-        return torch.autocast(device_type=self.dev_type, dtype=torch.bfloat16)
+        return torch.autocast(device_type=self.dev_type, dtype=torch.bfloat16, enabled=getattr(self, "amp", True))   # amp False: fp32 scoring (equivalence tests)
 
     # ------------------------------------------------------------------ encoder (frozen base = actor with adapters disabled)
     def _layers(self):
@@ -367,13 +367,14 @@ class FlowCritic:
 
     @torch.no_grad()
     def score_claims(self, explanations, activations, groups, seed: int = 0, cost: float = 40.0, claim_max: int = 12, loo_rows=(), single_rows=(),
-                     reward: str = "set", set_encode: bool | None = None):
+                     reward: str = "set", set_encode: bool | None = None, lm=None, claim_value: str = "pmi"):
         """Compositional-NLA reward from a claim-set conditioner (nla.flow.train_cond --claim-subsets [--set-encode]).
         claims = nla.flow.claims.split_claims(explanation); the first claim_max are scored.
           PMI(h; S) [nats] = (d/2) * mean_{t, eps}[ L_uncond - L_cond(S) ]     (FM-loss proxy of log p(h|S) - log p(h))
-          reward "set"        = PMI(h; C) - cost * n_claims
-          reward "singles_red"= sum_i PMI(c_i) - redundancy - cost * n_claims,  redundancy = max(0, sum_i PMI(c_i) - PMI(h; C))
-                                (= min(sum of singles, set PMI) - cost * n; unclipped it would be identical to "set")
+          reward "set"          = PMI(h; C) - cost * n_claims
+          reward "singles_red"  = sum_i value(c_i) - R_LM(C) - cost * n_claims   (value = single-claim PMI; R_LM = nla.flow.claim_lm text-LM
+                                  redundancy, the SAME function as the eval's singles_red; needs lm=ClaimLM); LOO credit_j = value(c_j) - [R_LM(C) - R_LM(C minus c_j)]
+          reward "min_composed" = min(sum_i PMI(c_i), PMI(h; C)) - cost * n_claims   (the stage-0 definition: redundancy from the critic's own composition)
         Every claim is charged, also those beyond claim_max. eps is SHARED by the whole group AND the unconditional pass (common random numbers).
         Set-encoded critics (adapter args set_encode, or set_encode=True): each claim is encoded ONCE per call and every subset's memory is the
         concatenation of its claims' token states (exactly order-free; singles / leave-one-out re-use the cache). Otherwise the subset is one
@@ -382,6 +383,8 @@ class FlowCritic:
         -> dict(reward, pmi, n_claims, claims, vr, preds, credits {i: [..]}, singles {i: [..]}); None where no claim could be parsed."""
         from nla.flow.claims import split_claims, format_claims
         from nla.flow.claimset import memories
+        assert claim_value == "pmi", "bank-normalised claim values are not implemented in the RL path yet (the normaliser is still being chosen)"
+        assert reward != "singles_red" or lm is not None, "--claim-reward singles_red needs the text LM (nla.flow.claim_lm.ClaimLM)"
         from nla.schema import normalize_activation
         assert not self.use_trunk, "score_claims: token/AR-conditioned critics only"
         se = bool(self.adapter_args.get("set_encode", False)) if set_encode is None else set_encode
@@ -425,16 +428,21 @@ class FlowCritic:
         for i, p in zip(valid, pmi):
             if math.isfinite(p): out["pmi"][i] = p
         # single-claim PMIs (all rows for "singles_red", else the requested rows)
-        want_s = [i for i in (valid if reward == "singles_red" else single_rows) if out["pmi"][i] is not None]
+        want_s = [i for i in (valid if reward in ("singles_red", "min_composed") else single_rows) if out["pmi"][i] is not None]
         rows, sets = [], []
         for i in want_s:
             for c in cl[i][:claim_max]: rows.append(i); sets.append([c])
         if rows:
             for i, p in zip(rows, cond_pmi(rows, sets)): out["singles"].setdefault(i, []).append(p)
+        red = {}
+        if reward == "singles_red":
+            ok_ = [i for i in valid if out["pmi"][i] is not None and i in out["singles"]]
+            red = dict(zip(ok_, lm.redundancies([cl[i][:claim_max] for i in ok_])))
         for i in valid:
             if out["pmi"][i] is None: continue
-            if reward == "singles_red" and i in out["singles"]:
-                ss = sum(out["singles"][i]); out["reward"][i] = ss - max(0.0, ss - out["pmi"][i]) - cost * len(cl[i])
+            if reward == "singles_red" and i in red: out["reward"][i] = sum(out["singles"][i]) - red[i] - cost * len(cl[i])
+            elif reward == "min_composed" and i in out["singles"]:
+                ss = sum(out["singles"][i]); out["reward"][i] = min(ss, out["pmi"][i]) - cost * len(cl[i])
             else: out["reward"][i] = out["pmi"][i] - cost * len(cl[i])
         for cs in range(0, len(valid), self.micro_batch):          # FVE curve: x0-prediction at fve_t under the claim set (same as score())
             ch = valid[cs: cs + self.micro_batch]; B = len(ch)
@@ -449,8 +457,13 @@ class FlowCritic:
             mse = ((normalize_activation(x0_hat, self.msf) - normalize_activation(gold, self.msf)) ** 2).mean(1)
             for r, i in enumerate(ch):
                 if math.isfinite(mse[r].item()): out["vr"][i] = -mse[r].item(); out["preds"][i] = x0_hat[r].detach().float().cpu()
-        # leave-one-out credit
+        # leave-one-out credit (singles_red: value(c_j) - [R_LM(C) - R_LM(C minus c_j)], consistent with the reward; else composed PMI(C) - PMI(C minus c_j))
         rows, sets, own = [], [], []
+        if reward == "singles_red":
+            for i in loo_rows:
+                if out["pmi"][i] is None or i not in out["singles"]: continue
+                out["credits"][i] = [v - r for v, r in zip(out["singles"][i], lm.loo(cl[i][:claim_max]))]
+            loo_rows = ()
         for i in loo_rows:
             if out["pmi"][i] is None: continue
             s_ = cl[i][:claim_max]
@@ -470,17 +483,24 @@ class FlowCritic:
 
     @torch.no_grad()
     def score_claims_composed(self, explanations, activations, groups, seed: int = 0, cost: float = 40.0, claim_max: int = 12, loo_rows=(),
-                              reward: str = "set", weight: str = "mean", rows_per_chunk: int = 32):
+                              reward: str = "set", weight: str = "mean", rows_per_chunk: int = 32, lm=None, claim_value: str = "pmi", eps_fn=None):
         """Compositional-NLA reward from a SINGLE-CLAIM conditioner (train_cond --claim-subsets 1), composing claims in velocity space:
           v(x, t | C) = v0(x, t) + w(m) * sum_i [ v(x, t | c_i) - v0(x, t) ]      w = 1/m ('mean', default) | m^-0.5 ('sqrt') | 1 ('sum')
           PMI(h; C) [nats] = (d/2) * mean_{t, eps}[ L(v0) - L(v(.|C)) ],  L = per-dim MSE to the flow target (eps - h)
-          reward "set" = PMI(h; C) - cost * n_claims ;  "singles_red" = min(sum_i PMI(h; c_i), PMI(h; C)) - cost * n_claims
+          reward "set"          = PMI(h; C) - cost * n_claims
+          reward "singles_red"  = sum_i value(c_i) - R_LM(C) - cost * n_claims,  value = single-claim PMI (w = 1), R_LM = nla.flow.claim_lm text-LM
+                                  redundancy over the scored claims (the SAME function as the eval's singles_red; needs lm=ClaimLM);
+                                  LOO credit_j = value(c_j) - [R_LM(C) - R_LM(C minus c_j)]
+          reward "min_composed" = min(sum_i PMI(h; c_i), PMI(h; C)) - cost * n_claims   (stage-0 definition; under 'mean' composition this is ~the mean
+                                  reward and cannot pay for more claims: kept only for comparison)
         Each claim is encoded once and its velocity computed once per (t, eps); singles (w = 1 for one claim) and leave-one-out compositions
-        (credit_j = PMI(C) - PMI(C minus c_j), same w rule for m-1 claims) are combinations of the cached deltas: no extra forward passes.
-        eps is shared by the whole group AND the unconditional pass. -> same dict as score_claims (+ singles for every row)."""
+        (set / min_composed credit_j = PMI(C) - PMI(C minus c_j), same w rule for m-1 claims) are combinations of the cached deltas: no extra passes.
+        eps is shared by the whole group AND the unconditional pass (eps_fn(group, k) overrides it, for tests). -> same dict as score_claims."""
         from nla.flow.claims import split_claims
         from nla.schema import normalize_activation
         assert not self.use_trunk and (self.use_enc or self.use_tokens), "velocity composition needs a cross-read (token) conditioner"
+        assert claim_value == "pmi", "bank-normalised claim values are not implemented in the RL path yet (the normaliser is still being chosen)"
+        assert reward != "singles_red" or lm is not None, "--claim-reward singles_red needs the text LM (nla.flow.claim_lm.ClaimLM)"
         n = len(explanations); out = {k: [None] * n for k in ("reward", "pmi", "n_claims", "claims", "vr", "preds")}; out["credits"] = {}; out["singles"] = {}
         cl = [split_claims(z) if (z is not None and z.strip()) else [] for z in explanations]
         for i in range(n): out["n_claims"][i] = len(cl[i]); out["claims"][i] = cl[i]
@@ -489,6 +509,7 @@ class FlowCritic:
         gens = {}
         def eps_for(g, k=0):
             if (g, k) not in gens:
+                if eps_fn is not None: gens[(g, k)] = eps_fn(g, k).to(self.device).float(); return gens[(g, k)]
                 gen = torch.Generator(device=self.device).manual_seed(int(seed) * 1_000_003 + int(g) * 31 + int(k))
                 gens[(g, k)] = torch.randn(self.d, generator=gen, device=self.device)
             return gens[(g, k)]
@@ -534,10 +555,15 @@ class FlowCritic:
             for r, i in enumerate(ch):
                 if not math.isfinite(pf[r]): continue
                 out["pmi"][i] = pf[r]; sg = [ps[j] for j, (rj, _) in enumerate(rows) if rj == r]; out["singles"][i] = sg
-                if i in loo_set: out["credits"][i] = [out["pmi"][i]] if ms[r] == 1 else [cr[j] for j, (rj, _) in enumerate(rows) if rj == r]
-                ss = sum(sg); out["reward"][i] = (min(ss, pf[r]) if reward == "singles_red" else pf[r]) - cost * len(cl[i])
+                if i in loo_set and reward != "singles_red": out["credits"][i] = [out["pmi"][i]] if ms[r] == 1 else [cr[j] for j, (rj, _) in enumerate(rows) if rj == r]
+                if reward == "min_composed": out["reward"][i] = min(sum(sg), pf[r]) - cost * len(cl[i])
+                elif reward == "set": out["reward"][i] = pf[r] - cost * len(cl[i])
                 if math.isfinite(mse[r]): out["vr"][i] = -mse[r]; out["preds"][i] = x0_hat[r].detach().float().cpu()
         del C_enc, C_mk
+        if reward == "singles_red":   # one batched text-LM pass for the whole call
+            ok_ = [i for i in valid if out["singles"].get(i) is not None]
+            for i, r_ in zip(ok_, lm.redundancies([cl[i][:claim_max] for i in ok_])): out["reward"][i] = sum(out["singles"][i]) - r_ - cost * len(cl[i])
+            for i in [i for i in ok_ if i in loo_set]: out["credits"][i] = [v - r_ for v, r_ in zip(out["singles"][i], lm.loo(cl[i][:claim_max]))]
         if self.dev_type == "cuda": torch.cuda.empty_cache()
         return out
 

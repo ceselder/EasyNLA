@@ -1917,13 +1917,19 @@ def main():
                    help="claims mode. mean (DEFAULT): SINGLE-CLAIM critic, claims composed in velocity space v = v0 + w * sum_i (v(c_i) - v0) "
                         "(--compose-weight; FlowCritic.score_claims_composed). joint: the claim set is ONE condition of a claim-set critic")
     p.add_argument("--compose-weight", default="mean", help="w of the velocity composition: mean (1/m, default) | sqrt (m^-0.5) | sum (1, product of experts) | a number")
-    p.add_argument("--claim-reward", choices=["set", "singles_red"], default="set",
-                   help="set: PMI(h; C) - cost*|C|. singles_red (stage-0 recommendation): sum_i PMI(h; c_i) - redundancy - cost*|C| with redundancy = "
-                        "max(0, sum_i PMI(c_i) - PMI(h; C)) from the same critic (= min(sum of singles, set PMI) - cost*|C|; unclipped it equals 'set')")
+    p.add_argument("--claim-reward", choices=["set", "singles_red", "min_composed"], default="set",
+                   help="set: PMI(h; C) - cost*|C|. singles_red: sum_i value(c_i) - R_LM(C) - cost*|C|, value = single-claim PMI, R_LM = text-LM redundancy "
+                        "1/2[log p(C) + log p(rev C)] - sum_i log p(c_i) under --claim-lm (nla.flow.claim_lm, the same function as the composition eval); "
+                        "LOO credit_j = value(c_j) - [R_LM(C) - R_LM(C minus c_j)]. min_composed: the stage-0 definition min(sum_i PMI(c_i), PMI(h; C)) - cost*|C| "
+                        "(under --compose mean ~ the mean reward, cannot pay for more claims; comparison only)")
+    p.add_argument("--claim-lm", default="Qwen/Qwen3-8B-Base", help="text LM of the singles_red redundancy term")
+    p.add_argument("--claim-lm-device", default=None, help="device of --claim-lm (default: --flow-enc-device, else the flow device); bf16 8B = ~17 GB")
+    p.add_argument("--claim-value", choices=["pmi"], default="pmi", help="per-claim value in singles_red: raw single-claim PMI (bank-normalised values for contrastive critics: pending)")
     p.add_argument("--claim-set-encode", choices=["auto", "on", "off"], default="auto",
                    help="claim-set condition as concatenated per-claim memories (auto = what the critic adapter was trained with)")
     p.add_argument("--claim-credit", choices=["none", "loo", "singles"], default="none",
-                   help="loo: leave-one-out credit credit_j = PMI(C) - PMI(C minus c_j) for EVERY rollout, and the sequence advantage is "
+                   help="loo: leave-one-out credit for EVERY rollout, credit_j = PMI(C) - PMI(C minus c_j) (set / min_composed) or value(c_j) - [R_LM(C) - R_LM(C minus c_j)] "
+                        "(singles_red, consistent with its reward), and the sequence advantage is "
                         "redistributed over the claims' tokens by (credit_j - claim_cost) (zero-mean within the rollout, --claim-credit-beta). "
                         "singles: the same redistribution with credit_j = single-claim PMI(h; c_j). "
                         "none: sequence-level reward only; credits still computed on --claim-credit-log-n rollouts per rank for logging")
@@ -2391,6 +2397,12 @@ def main():
                           grounded_shards=(args.flow_grounded_shards if args.flow_cotrain != "rollouts" else None), grounded_n=args.flow_grounded_n,
                           grounded_skip=args.flow_grounded_n * int(os.environ.get("RANK", 0)), ar_sft_lora_dir=args.flow_ar_sft_lora, base_path=args.av_ckpt, enc_device=(torch.device(args.flow_enc_device) if args.flow_enc_device else None), cotrain_max_pairs=args.flow_cotrain_max_pairs)
         if args.flow_cotrain != "rollouts": assert flow.pool is not None, "--flow-cotrain grounded/mix needs --flow-grounded-shards"
+        claim_lm = None
+        if args.reward_mode == "claims" and args.claim_reward == "singles_red":
+            from nla.flow.claim_lm import ClaimLM
+            _lm_dev = args.claim_lm_device or args.flow_enc_device or str(_flow_dev)
+            claim_lm = ClaimLM(args.claim_lm, _lm_dev)
+            print(f"[flow] singles_red text LM {args.claim_lm} on {_lm_dev} (nla.flow.claim_lm, same redundancy as the composition eval)", flush=True)
         _flow_latest = Path(args.save_dir) / "flow_latest" / "adapter_latest.pt"
         if args.resume_from_lora is not None and _flow_latest.exists():
             print(f"[flow] RESUMING co-trained flow adapter from {_flow_latest} (rl step {flow.load(str(_flow_latest))})", flush=True)
@@ -3152,12 +3164,12 @@ def main():
                     if args.compose == "mean":   # single-claim critic, velocity composition (singles + leave-one-out come free from the cached deltas)
                         claim_res = flow.score_claims_composed(all_explanations, all_activations, all_prompt_group, seed=step, cost=args.claim_cost,
                                                                claim_max=args.claim_max, loo_rows=[i for i in _loo if not all_truncated[i]],
-                                                               reward=args.claim_reward, weight=args.compose_weight)
+                                                               reward=args.claim_reward, weight=args.compose_weight, lm=claim_lm, claim_value=args.claim_value)
                     else:
                         claim_res = flow.score_claims(all_explanations, all_activations, all_prompt_group, seed=step, cost=args.claim_cost,
                                                       claim_max=args.claim_max, loo_rows=[i for i in _loo if not all_truncated[i]],
                                                       single_rows=[i for i in _sgl if not all_truncated[i]], reward=args.claim_reward,
-                                                      set_encode={"auto": None, "on": True, "off": False}[args.claim_set_encode])
+                                                      set_encode={"auto": None, "on": True, "off": False}[args.claim_set_encode], lm=claim_lm, claim_value=args.claim_value)
                     flow_rewards, rewards, recon_preds = claim_res["reward"], claim_res["vr"], claim_res["preds"]
                 elif flow is not None:
                     # flow reward (shared eps per group, fixed t grid) + vector-MSE of the x0-prediction @ t=0.9 (the FVE curve)

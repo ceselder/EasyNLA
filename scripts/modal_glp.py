@@ -355,6 +355,20 @@ def fit_whiten_unitnorm(extra: str = ""):
 
 
 @app.function(gpu="B200", timeout=4 * 3600, **COMMON)
+def claims_gate_rl(adapter: str, tag: str, extra: str = ""):
+    """120-row gates through the RL reward (FlowCritic.score_claims_composed singles_red; scripts/claims_gate_rl.py)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/claims_gate_rl.py", "--adapter", adapter, "--tag", tag] + extra.split())
+
+
+@app.function(gpu="B200:2", timeout=2 * 3600, **COMMON)
+def test_claims_reward(adapter: str, extra: str = ""):
+    """GPU equivalence test: RL singles_red reward == the composition eval's singles_red (scripts/test_claims_reward_equiv.py; 2 GPUs)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/test_claims_reward_equiv.py", "--adapter", adapter] + extra.split())
+
+
+@app.function(gpu="B200", timeout=4 * 3600, **COMMON)
 def claims_g2eval(adapter: str, tag: str, extra: str = ""):
     """programmatic-twin benchmark + specificity-ladder calibration on the peer session's g2 positions (read only; scripts/claims_g2eval.py)"""
     vol_glp.reload()
@@ -498,6 +512,10 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", claims_compose_variants.remote(ckpt, tag, extra))
     elif task == "fit_whiten_unitnorm":
         print("rc", fit_whiten_unitnorm.remote(extra))
+    elif task == "claims_gate_rl":
+        print("rc", claims_gate_rl.remote(ckpt, tag, extra))
+    elif task == "test_claims_reward":
+        print("rc", test_claims_reward.remote(ckpt, extra))
     elif task == "claims_g2eval":
         print("rc", claims_g2eval.remote(ckpt, tag, extra))
     elif task == "claims_hubness":
