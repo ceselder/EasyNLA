@@ -26,6 +26,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--data-dir", required=True); ap.add_argument("--stats", default=None); ap.add_argument("--out", required=True); ap.add_argument("--band", default=None)
 ap.add_argument("--policy", required=True, help="SFT adapter dir (PEFT); 'none' = fresh zero LoRA (mechanics smoke only)"); ap.add_argument("--critic", required=True, help="critic ckpt (train_critic.py); 'none' = random init (mechanics smoke only)"); ap.add_argument("--frozen-critic", default=None, help="ckpt for the FROZEN guard critic (default: a copy of --critic); use the best-calibrated checkpoint, not the lowest-FM-loss one")
 ap.add_argument("--ref-text", default=None, help="glob(s) of the teacher text (val) -> teacher pmi/content on the held-out pairs under both critics at every eval (reference + collusion check)"); ap.add_argument("--replay-text", default=None, help="glob(s) of the warm-start trace pool (train split) for critic replay"); ap.add_argument("--twins", default=None, help="glob of val twins__*.parquet for the twin-P guard")
+ap.add_argument("--prompt-shards", default=None, help="comma list / ranges of TRAIN store shard indices to draw RL prompts from (e.g. '12-25': the harvest shards the judge never saw text for); default all")
+ap.add_argument("--replay-no-replacement", action="store_true", help="draw replay rows WITHOUT replacement across the run (one pass max; each rank walks a permutation of its interleaved share; replay stops when exhausted; passes logged)")
 ap.add_argument("--steps", type=int, default=200); ap.add_argument("--batch", type=int, default=16, help="prompts per rank"); ap.add_argument("--group", type=int, default=8); ap.add_argument("--n-tok", type=int, default=176); ap.add_argument("--temp", type=float, default=1.0)
 ap.add_argument("--lr", type=float, default=1e-5); ap.add_argument("--critic-lr", type=float, default=3e-5); ap.add_argument("--kl", type=float, default=0.02); ap.add_argument("--lam", type=float, default=-1.0, help="per-token cost in FM-loss units; < 0 = calibrate at step 1 (20% of the group std at the median length)"); ap.add_argument("--depth-penalty", type=float, default=0.05, help="FM-loss units subtracted per text with a depth word / empty text (the FM loss is O(1) per dim; group stds are ~1e-3..1e-2)")
 ap.add_argument("--cispo-eps-max", type=float, default=5.0); ap.add_argument("--no-cotrain", action="store_true"); ap.add_argument("--replay-frac", type=float, default=0.5); ap.add_argument("--critic-micro", type=int, default=64)
@@ -93,6 +95,9 @@ REPLAY = None
 if args.replay_text and not args.no_cotrain:
     files = sorted(sum((glob.glob(g) for g in args.replay_text.split(",")), [])); df = load_text_pairs(files, os.path.join(args.data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of) & df["i"].isin(band) & df["j"].isin(band)].reset_index(drop=True)
     REPLAY = {"rows": store.rows_for(df["pos_idx"].values), "i": torch.tensor(df["i"].values.astype(np.int64)), "j": torch.tensor(df["j"].values.astype(np.int64)), "text": df["text"].astype(str).tolist()}; P(f"[rl] replay pool {len(df)} rows from {len(files)} files")
+    if args.replay_no_replacement:                                                 # each rank owns an interleaved share and walks ONE permutation of it
+        _mine = torch.arange(RANK, len(df), WORLD); REPLAY["perm"] = _mine[torch.randperm(len(_mine), generator=gen_t)]; REPLAY["cursor"] = 0; REPLAY["drawn"] = 0
+        P(f"[rl] replay WITHOUT replacement: rank {RANK} owns {len(_mine)} rows (one pass = {len(_mine)} draws)")
 REF = None
 if args.ref_text:
     dfr = load_text_pairs(sorted(sum((glob.glob(g) for g in args.ref_text.split(",")), [])), os.path.join(args.data_dir, "pairs_val.parquet"), pools_verbose=False)
@@ -109,9 +114,16 @@ if args.twins:
     if com:
         TWINS = {"rows": store_val.rows_for(vpa.loc[com, "pos_idx"].values), "i": torch.tensor(vpa.loc[com, "i"].values.astype(np.int64)), "j": torch.tensor(vpa.loc[com, "j"].values.astype(np.int64)), "true": tru.loc[com].tolist(), "twin": twn.loc[com].tolist()}; P(f"[rl] twins: {len(com)} val pairs (true vs twin_shift)")
 rng = np.random.default_rng(args.seed + 17 * RANK); gen_t = torch.Generator(device="cpu").manual_seed(args.seed + 101 * RANK)
+PROMPT_ROWS = None
+if args.prompt_shards:
+    _sh = set()
+    for tok_ in args.prompt_shards.split(","):
+        a_, _, b_ = tok_.partition("-"); _sh |= set(range(int(a_), int(b_ or a_) + 1))
+    PROMPT_ROWS = torch.tensor([r for r, sh in enumerate(store.meta["shard"]) if sh in _sh], dtype=torch.long); P(f"[rl] prompts restricted to store shards {sorted(_sh)}: {len(PROMPT_ROWS)} positions of {store.N}")
 def sample_batch(B):
-    """random positions, i<j uniform over the band -> (rows, i, j)"""
-    rows = torch.randint(0, store.N, (B,), generator=gen_t); Ls = torch.tensor(sorted(band)); a = torch.randint(0, len(Ls), (B,), generator=gen_t); b = torch.randint(0, len(Ls) - 1, (B,), generator=gen_t); b = b + (b >= a).long()
+    """random positions (optionally from --prompt-shards), i<j uniform over the band -> (rows, i, j)"""
+    rows = torch.randint(0, store.N, (B,), generator=gen_t) if PROMPT_ROWS is None else PROMPT_ROWS[torch.randint(0, len(PROMPT_ROWS), (B,), generator=gen_t)]
+    Ls = torch.tensor(sorted(band)); a = torch.randint(0, len(Ls), (B,), generator=gen_t); b = torch.randint(0, len(Ls) - 1, (B,), generator=gen_t); b = b + (b >= a).long()
     return rows, Ls[torch.minimum(a, b)], Ls[torch.maximum(a, b)]
 def vecs_for(st, rows, i, j):
     u_i = dirs.unit(st.gather(rows, i, dev), i); u_j = dirs.unit(st.gather(rows, j, dev), j); return torch.stack([u_i, u_j], 1), dirs.source(st.gather(rows, i, dev), i), u_j
@@ -202,8 +214,14 @@ def critic_step(src, u_j, texts, G):
     if args.no_cotrain: return float("nan")
     N = len(texts); n_rep = int(N * args.replay_frac / (1 - args.replay_frac)) if REPLAY is not None else 0
     S, Y, T = [src], [u_j], list(texts)
-    if n_rep:
+    if n_rep and REPLAY.get("perm") is not None:
+        c0 = REPLAY["cursor"]; idx = REPLAY["perm"][c0:c0 + n_rep]; REPLAY["cursor"] = c0 + len(idx); REPLAY["drawn"] += len(idx)
+        if len(idx) < n_rep and not REPLAY.get("exhausted"): REPLAY["exhausted"] = True; P(f"[rl] replay pool EXHAUSTED after one pass ({REPLAY['drawn']} rows); continuing without replay")
+        n_rep = len(idx)
+        if n_rep: _, s_r, y_r = vecs_for(store, REPLAY["rows"][idx], REPLAY["i"][idx], REPLAY["j"][idx]); S.append(s_r); Y.append(y_r); T += [REPLAY["text"][k] for k in idx.tolist()]
+    elif n_rep:
         idx = torch.randint(0, len(REPLAY["text"]), (n_rep,), generator=gen_t); _, s_r, y_r = vecs_for(store, REPLAY["rows"][idx], REPLAY["i"][idx], REPLAY["j"][idx]); S.append(s_r); Y.append(y_r); T += [REPLAY["text"][k] for k in idx.tolist()]
+        REPLAY["drawn"] = REPLAY.get("drawn", 0) + n_rep
     S = torch.cat(S); Y = torch.cat(Y); y = dirs.sqrt_d * Y * torch.exp(dirs.sigma_r * torch.randn(Y.shape[0], device=dev))[:, None] if dirs.radial != "fixed" else dirs.sqrt_d * Y + dirs.sigma_iso * torch.randn_like(Y)
     keep = torch.rand(len(T), device=dev) >= 0.1; tot = 0.0; c_opt.zero_grad(set_to_none=True); n_all = len(T)
     for s0 in range(0, n_all, args.critic_micro):

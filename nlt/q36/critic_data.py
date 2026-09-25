@@ -128,6 +128,12 @@ def load_text_pairs(paths, pairs_parquet, pools_verbose=True):
             dfs.append(df[[c for c in ("pair_id", "text", "source", "sample") if c in df]])
     if not dfs: return pd.DataFrame(columns=["pair_id", "text", "source", "pos_idx", "i", "j"])
     tx = pd.concat(dfs, ignore_index=True); tx = tx[tx["text"].astype(str).str.strip().str.len() > 0]
+    # pair_id = "<split>:<pos_idx>:<i>:<j>" carries (pos_idx, i, j) itself, so pairs that are not in the pairs file (the harvest's delta / extra pairs) still resolve;
+    # the pairs-file merge is only the fallback for ids of another shape
+    parts = tx["pair_id"].astype(str).str.split(":", expand=True)
+    ok = parts.shape[1] >= 4 and parts[1].str.isnumeric().all() and parts[2].str.isnumeric().all() and parts[3].str.isnumeric().all()
+    if ok:
+        tx = tx.assign(pos_idx=parts[1].astype("int64"), i=parts[2].astype("int32"), j=parts[3].astype("int32")); return tx.reset_index(drop=True)
     return tx.merge(pairs, on="pair_id", how="inner")
 
 
