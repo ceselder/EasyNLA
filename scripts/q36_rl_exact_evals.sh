@@ -33,7 +33,11 @@ print(f\"teacher {t['content_bits']['mean']:.1f}±{t['content_bits']['sem']:.1f}
     fi; (cd /home/celeste/shared/reports/nlt-27b-olens && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); fi
   A=$(grep -oE "ap-[A-Za-z0-9]+" $APPFILE 2>/dev/null | head -1); L=$(app_list)
   if [ -n "$A" ] && [ -n "$L" ]; then if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); fi; fi     # an empty list is a transient read, not an absence
-  [ ${miss:-0} -ge 3 ] && { log "RL app $A absent from 3 consecutive app lists; final pass done"; break; }
+  if [ ${miss:-0} -ge 3 ]; then     # app gone: keep pulling until every enqueued exact eval has its result (the step-40 verdict is computed from them), then stop
+    pend=0; for out in "${!Q[@]}"; do [ -f $D/$out.json ] || pend=$((pend + 1)); done
+    if [ $pend -eq 0 ]; then log "RL app $A ended and all $((${#Q[@]})) exact evals pulled; final pass done"; break; fi
+    after=$((${after:-0} + 1)); [ $after -ge 24 ] && { log "RL app $A ended; $pend exact evals still missing after 2 h -> giving up on them"; break; }; log "RL app ended; waiting for $pend exact eval result(s)"
+  fi
   sleep 300
 done
 log "RLEXACT DONE"
