@@ -14,6 +14,8 @@ for i in $(seq 1 400); do
     sp=${tok%%:*}; si=${tok##*:}; [ -n "${DONE[$tok]:-}" ] && continue; f=$(shard_name $sp $si)
     if [ "$(timeout 120 modal volume ls nlt q36/text/v3/$sp 2>/dev/null | grep -c "stats__$f.json")" -ge 1 ]; then DONE[$tok]=1; log "crafted $tok ($f)"; continue; fi
     todo=1; [ -n "${LAUNCHED[$tok]:-}" ] && continue
+    # a craft launched by an earlier incarnation of this chain (restart) that is still live -> do not launch a second one (12:47: shard13 was crafted twice for 1 min)
+    prev=$(grep -E "^\[craft3_${sp}_${si}\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+"); if [ -n "$prev" ] && app_live "$prev"; then LAUNCHED[$tok]=1; log "craft of $tok already running ($prev) from an earlier chain"; continue; fi
     n=$(timeout 120 modal volume ls nlt q36/rollouts_layers/$sp/$f 2>/dev/null | grep -c "h_L.*\.parquet$"); m=$(timeout 120 modal volume ls nlt q36/rollouts_delta/$sp/$f 2>/dev/null | grep -c "v_delta.parquet")
     [ "$n" -ge 16 ] && [ "$m" -ge 1 ] || continue
     PRIO=1 wait_gpu 1 || exit 1                                                   # crafting feeds critic v4 (the main next judge): same priority as its gate evals
