@@ -30,8 +30,10 @@ def main():
     cfve42 = [g(s, "h42", "greedy", "cfve") for s in layer_specs]; cfve_own = [g(s, s, "greedy", "cfve") for s in layer_specs]
     ref_p = p42_g[Ls.index(ref)] if ref in Ls else np.nan
     band = [L for L, p in zip(Ls, p42_g) if p >= a.thresh or p >= ref_p - a.within]
+    ref_cf = cfve42[Ls.index(ref)] if ref in Ls else np.nan
+    band_cf10 = [L for L, c in zip(Ls, cfve42) if c >= 0.9 * ref_cf]; band_cf20 = [L for L, c in zip(Ls, cfve42) if c >= 0.8 * ref_cf]
     table = {"layers": Ls, "p_own_gt_other_h42_greedy": p42_g, "p_own_gt_other_h42_samples": p42_s, "p_own_gt_other_h42_pooled16": p42_p, "p_own_gt_other_samelayer_greedy": pown_g,
-             "cfve_h42_greedy": cfve42, "cfve_samelayer_greedy": cfve_own, "ref_layer": ref, "ref_p": ref_p, "threshold": a.thresh, "within": a.within, "band": band,
+             "cfve_h42_greedy": cfve42, "cfve_samelayer_greedy": cfve_own, "ref_layer": ref, "ref_p": ref_p, "threshold": a.thresh, "within": a.within, "band": band, "ref_cfve": ref_cf, "band_cfve_within10pct": band_cf10, "band_cfve_within20pct": band_cf20,
              "unique_bullet_share": [S[s]["degeneracy"]["unique_bullet_share"] for s in layer_specs], "top_bullet_row_share": [S[s]["degeneracy"]["top_bullet_row_share"] for s in layer_specs],
              "malformed_share": [S[s]["degeneracy"]["malformed_share"] for s in layer_specs], "distinct2": [S[s]["degeneracy"]["distinct2"] for s in layer_specs],
              "bullet_agreement_p": [S[s].get("bullet_agreement_with_ref", {}).get("p_same_gt_other", np.nan) for s in layer_specs],
@@ -59,11 +61,14 @@ def main():
     ax.axhline(0.5, color="k", lw=0.8); ax.axvline(ref, color=C3, lw=1, alpha=0.5)
     for L in band: ax.axvspan(L - 1, L + 1, color=C3, alpha=0.08)
     ax.set_xlabel("layer the lens reads (block output)"); ax.set_ylabel("P(own position > other positions)"); ax.set_ylim(0.4, 1.0)
-    ax.set_title("Where the L42 oracle lens still reads its own position", fontsize=13); ax.legend(loc="lower left", frameon=False, fontsize=9)
+    ax.set_title("Position specificity (AUC) saturates at every layer", fontsize=13); ax.legend(loc="lower left", frameon=False, fontsize=9)
     ax = axes[1]
     ax.plot(Ls, cfve42, "o-", color=C1, lw=2, label="vs h42 (centred FVE, NNLS-4)"); ax.plot(Ls, cfve_own, "o-", color=C2, lw=2, label="vs own-layer h")
     ax.axhline(0, color="k", lw=0.8); ax.axvline(ref, color=C3, lw=1, alpha=0.5)
-    ax.set_xlabel("layer the lens reads (block output)"); ax.set_ylabel("centred FVE of the 4-bullet reconstruction"); ax.set_title("Reconstruction through the span→h42 reconstructor", fontsize=13); ax.legend(frameon=False, fontsize=9)
+    for L in band_cf20: ax.axvspan(L - 1, L + 1, color=C2, alpha=0.06)
+    for L in band_cf10: ax.axvspan(L - 1, L + 1, color=C3, alpha=0.12)
+    ax.axhline(0.9 * ref_cf, color=C3, ls=":", lw=1); ax.text(Ls[0], 0.9 * ref_cf + 0.004, "90% of L42", color=C3, fontsize=10); ax.axhline(0.8 * ref_cf, color=C2, ls=":", lw=1); ax.text(Ls[0], 0.8 * ref_cf + 0.004, "80% of L42", color=C2, fontsize=10)
+    ax.set_xlabel("layer the lens reads (block output)"); ax.set_ylabel("centred FVE of the 4-bullet reconstruction"); ax.set_title("Explained variance is graded: L36–L48 within 10% of L42", fontsize=13); ax.legend(frameon=False, fontsize=9, loc="lower right")
     fig.suptitle(f"Transfer test: oracle lens (trained on L42) applied at other layers, {M['n_rows']} fresh positions", fontsize=14, y=1.02)
     savefig(fig, "fig_phase0_band")
 
@@ -91,7 +96,7 @@ def main():
     ax.axhline(0.5, color="k", lw=0.8); ax.axvline(ref, color=C3, lw=1, alpha=0.5); ax.set_ylim(0, 1.02); ax.set_xlabel("layer"); ax.set_title(f"J-lens top-20 at layer ℓ vs at L{ref}", fontsize=13); ax.legend(frameon=False, fontsize=9)
     fig.suptitle("Readout quality across layers (greedy oracle-lens readouts, same positions)", fontsize=14, y=1.0); fig.tight_layout()
     savefig(fig, "fig_phase0_quality")
-    print(json.dumps({"band": band, "ref_p": ref_p, "p42_greedy": dict(zip(Ls, np.round(p42_g, 3).tolist()))}, indent=1))
+    print(json.dumps({"band_rule": band, "band_cfve_within10pct": band_cf10, "band_cfve_within20pct": band_cf20, "ref_p": ref_p, "ref_cfve": ref_cf, "cfve42": dict(zip(Ls, np.round(cfve42, 3).tolist()))}, indent=1))
 
 
 if __name__ == "__main__":
