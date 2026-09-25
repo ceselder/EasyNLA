@@ -50,6 +50,7 @@ PY
   run train_critic.py "--data-dir /vol/q36/data --out /vol/q36/critic/$TAG --tag critic_${TAG}_s$stage --pools '$SPEC' --val-sets '$VALS' --band $BAND --width 1536 --depth 16 --heads 16 --param v --uncond-steps 0 --uncond-frac 0.10 --steps $STEPS --keep-every 500 --max-passes 1 --batch 1024 --micro-batch 128 --eval-every 500 --eval-n 256 --spot-exact-n 64 --spot-ode-steps 16 --max-hours 8.0 $RESUME $EXTRA" critic_${TAG}_s$stage
   grep -q "critic_${TAG}_s$stage\] SPAWNED" $LOGD/apps.txt || { log "stage $stage launch FAILED; retrying in 5 min"; sleep 300; continue; }
   cp /tmp/q36_v4_stage.json $D/critic_${TAG}_stage$stage.json; echo "stage $stage $(date -u +%H:%M)" >> $USED; for f in $new; do echo $f >> $USED; done
+  printf 'SPEC=%q\nVALS=%q\nSTEPS=%q\n' "$SPEC" "$VALS" "$STEPS" > $LOGD/critic_${TAG}_s${stage}.launch          # exact launch config for sibling runs (v3c mirrors stage 1)
   A=$(grep -E "^\[critic_${TAG}_s$stage\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+"); log "stage $stage launched: $A"
   miss=0; for i in $(seq 1 600); do L=$(timeout 90 modal app list 2>/dev/null); if [ -z "$L" ]; then sleep 60; continue; fi; if echo "$L" | grep -vE "stopped|stopping" | grep -q "$A"; then miss=0; else miss=$((miss + 1)); [ $miss -ge 3 ] && break; fi; sleep 300; done; log "stage $stage app ended (3 consecutive absences)"
   stage=$((stage + 1))

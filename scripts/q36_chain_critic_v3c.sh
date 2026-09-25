@@ -10,8 +10,10 @@ run(){ out=$(spawn_retry env NLT_Q36_GPU=H100 timeout 900 modal run --detach scr
 for i in $(seq 1 600); do grep -q "^\[critic_v4_s1\] SPAWNED" $LOGD/apps.txt && [ -f $D/critic_v4_stage1.json ] && break; [ $((i % 6)) -eq 0 ] && log "waiting for critic v4 stage 1 to launch"; sleep 300; done
 A4=$(grep -E "^\[critic_v4_s1\] https" $LOGD/apps.txt | tail -n 1 | grep -oE "ap-[A-Za-z0-9]+")
 # same pools / val sets as v4 stage 1 (read back from its launch line)
-LINE=$(grep -E "^\[critic_v4_s1\] SPAWNED" $LOGD/apps.txt | tail -n 1); SPEC=$(timeout 120 modal app logs $A4 2>&1 | grep -oE "\-\-pools '[^']+'" | head -n 1 | sed -E "s/^--pools '//; s/'$//"); VALS=$(timeout 120 modal app logs $A4 2>&1 | grep -oE "\-\-val-sets '[^']+'" | head -n 1 | sed -E "s/^--val-sets '//; s/'$//"); STEPS=$(timeout 120 modal app logs $A4 2>&1 | grep -oE "\-\-steps [0-9]+" | head -n 1 | awk '{print $2}')
-[ -z "$SPEC" ] && { log "could not read v4's pools from its log; abort"; exit 1; }
+for i in $(seq 1 30); do [ -s $LOGD/critic_v4_s1.launch ] && break; sleep 60; done
+[ -s $LOGD/critic_v4_s1.launch ] || { log "no critic_v4_s1.launch file; abort"; exit 1; }
+eval "$(cat $LOGD/critic_v4_s1.launch)"
+[ -z "${SPEC:-}" ] && { log "empty SPEC in the launch file; abort"; exit 1; }
 log "v3c = v4 stage-1 pools ($(echo "$SPEC" | tr ',' '\n' | wc -l) pools), steps $STEPS, + hinge anchor w 0.1 m 0.02 warm-up 300, guard 5% vs v1b"
 # orchestrator 09:00: v3c alongside v4 in the FIRST free slot; if the cap makes that impossible, pause one more harvest engine (highest running slot) rather than delay v3c
 if [ $(( $(gpus_in_use) + 1 )) -gt $(cap_now) ]; then
