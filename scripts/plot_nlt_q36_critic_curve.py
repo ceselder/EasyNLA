@@ -30,13 +30,20 @@ def main():
         R.append(row)
     # reference critic v1b at its matched save (orchestrator 08:05): cos with text must not fall below v1b's, and the text path is scored against v1b's NULL path as a sanity column
     v1b_ref = None
-    for cand in ("bits_v1b_val_000500.json", "bits_v1bbest_main.json", "bits_v1b_main.json"):
+    for cand in ("bits_v1bs500_main.json", "bits_v1b_val_000500.json", "bits_v1bbest_main.json", "bits_v1b_main.json"):
         if os.path.exists(f"{REP}/data/{cand}"):
             dd = json.load(open(f"{REP}/data/{cand}")); ss = dd["sets"]["craft_full"]; D_ = 5120
             v1b_ref = {"file": cand, "cos_c": (ss.get("cos_condmean") or {}).get("c"), "cos_u": (ss.get("cos_condmean") or {}).get("u"), "logp_null_bits": -float(ss["uncond_nll_bits_per_dim"]) * D_ if ss.get("uncond_nll_bits_per_dim") is not None else None, "content": ss["content_bits"]["mean"], "p_dm": ss["p_z_gt_dm"]}
             break
+    if v1b_ref is None and os.path.exists(f"{REP}/data/critic_v1b_ref_evals.json"):            # fallback: v1b's trainer spot evals (Heun 16, n 64) at the matched step
+        RE = json.load(open(f"{REP}/data/critic_v1b_ref_evals.json")); v1b_ref = {"file": "critic_v1b_ref_evals.json (spot evals)", "by_step": RE}
     for r in R:
-        r["pass_cos"] = bool(v1b_ref and r.get("cos_c") is not None and v1b_ref.get("cos_c") is not None and r["cos_c"] >= v1b_ref["cos_c"] - 0.01)
+        if v1b_ref and "by_step" in v1b_ref:
+            k = str(r["step"]) if str(r["step"]) in v1b_ref["by_step"] else min(v1b_ref["by_step"], key=lambda kk: abs(int(kk) - r["step"]))
+            r["v1b_ref_cos_c"] = v1b_ref["by_step"][k]["cos_c"]; r["v1b_ref_step"] = int(k)
+        elif v1b_ref: r["v1b_ref_cos_c"] = v1b_ref.get("cos_c")
+    for r in R:
+        r["pass_cos"] = bool(r.get("cos_c") is not None and r.get("v1b_ref_cos_c") is not None and r["cos_c"] >= r["v1b_ref_cos_c"] - 0.01)
         if v1b_ref and v1b_ref.get("logp_null_bits") is not None and r.get("uncond_nll_bits_per_dim") is not None:
             r["logp_text_bits"] = r["pmi"] - float(r["uncond_nll_bits_per_dim"]) * 5120          # log p_v3b(u_j | z) in bits (pmi + own log p(u_j | null))
             r["text_vs_v1b_null_bits"] = r["logp_text_bits"] - v1b_ref["logp_null_bits"]        # (c): positive = the anchored text path beats v1b's plain unconditional density
@@ -78,7 +85,7 @@ def main():
     ax.axhline(0, color="k", lw=0.8); ax.set_xlabel("training step"); ax.set_ylabel("content(own) − content(neighbour), bits"); ax.set_title("Position specificity: own state vs a neighbour's", fontsize=13); ax.legend(frameon=False, fontsize=8)
     fig.suptitle(f"Critic {a.tag} (activation-anchored contrast) over its saved checkpoints - verdict so far: {out['verdict']}", fontsize=14, y=1.0); fig.tight_layout()
     fig.savefig(f"{REP}/fig_critic_{a.tag}_curve.png", dpi=150, bbox_inches="tight"); fig.savefig(f"{REP}/fig_critic_{a.tag}_curve.pdf", bbox_inches="tight"); print("saved", f"fig_critic_{a.tag}_curve", "|", out["verdict"])
-    for r in R: print(f"step {r['step']}: content {r['content']:.1f} P {r['p_dm']:.3f} twin_shift {r['twins'].get('twin_shift', {}).get('p')} twin_new {r['twins'].get('twin_new', {}).get('p')} | cos_c {r.get('cos_c')} (v1b {v1b_ref and v1b_ref.get('cos_c')}) | text-vs-v1b-null {r.get('text_vs_v1b_null_bits')} | twins-pass {r['pass_twins']} cos-pass {r['pass_cos']} -> {'PASS' if r['pass'] else ('contrast-only' if r.get('contrast_learned_reconstruction_lost') else 'no')}")
+    for r in R: print(f"step {r['step']}: content {r['content']:.1f} P {r['p_dm']:.3f} twin_shift {r['twins'].get('twin_shift', {}).get('p')} twin_new {r['twins'].get('twin_new', {}).get('p')} | cos_c {r.get('cos_c')} (v1b {r.get('v1b_ref_cos_c')}) | text-vs-v1b-null {r.get('text_vs_v1b_null_bits')} | twins-pass {r['pass_twins']} cos-pass {r['pass_cos']} -> {'PASS' if r['pass'] else ('contrast-only' if r.get('contrast_learned_reconstruction_lost') else 'no')}")
 
 
 if __name__ == "__main__":
