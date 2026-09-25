@@ -62,13 +62,19 @@ USER_TMPL_B = """The passage the model was reading ends with (the states were ta
 """ + USER_TMPL_A
 
 
+def _lst(xs):
+    if xs is None: return []
+    try: return list(xs.tolist()) if hasattr(xs, "tolist") else list(xs)
+    except Exception: return []
+
+
 def fmt_list(xs, none="(none)"):
-    xs = [str(x).strip() for x in (xs or []) if str(x).strip()]
+    xs = [str(x).strip() for x in _lst(xs) if str(x).strip()]
     return "; ".join(f"'{x}'" for x in xs) if xs else none
 
 
 def fmt_samples(xs):
-    xs = [str(x).strip() for x in (xs or []) if str(x).strip()]
+    xs = [str(x).strip() for x in _lst(xs) if str(x).strip()]
     return (" | extra sampled phrases: " + "; ".join(f"'{x}'" for x in xs)) if xs else ""
 
 
