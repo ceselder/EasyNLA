@@ -48,7 +48,15 @@ def main():
         # AMENDED CRITERION (orchestrator 2026-09-25 09:25 UTC, before any v4 / v3c number): ALL of (a) a one-claim twin >= 0.60 in BOTH views, (b) held-out P(z > no text) >= 0.80, (c) content >= 25,
         # (d) passes over every pool <= 1 at the checkpoint, (e) train - held-out PMI gap < 20 bits (small train-row eval bits_<tag>_stepNNNNNN_train.json)
         tw = r["twins"]; best_var = max(("twin_shift", "twin_new"), key=lambda v: (tw.get(v, {}).get("p") or 0))
-        r["a_twins_both_views"] = bool((tw.get(best_var, {}).get("p") or 0) >= PASS_TWIN and (tw.get(best_var, {}).get("proxy_p") or 0) >= PASS_TWIN)
+        # orchestrator 13:50: (a) is decided on the LARGE distinct-position twin set with position-bootstrap CIs (bits_<tag>_stepN_twinsL.json): point >= .60 AND lower CI > .55 in BOTH views; the small gate-set twins are provisional
+        lf = f"{REP}/data/bits_{a.tag}_step{r['step']:06d}_twinsL.json"; r["twinsL"] = None
+        if os.path.exists(lf):
+            LV = json.load(open(lf)).get("twins", {}).get("craft_twins", {}).get("variants", {})
+            r["twinsL"] = {v: {"p": x.get("p_true_gt_twin"), "ci": x.get("ci95_p"), "fm": x.get("proxy_p_true_gt_twin"), "fm_ci": x.get("proxy_ci95_p"), "n_pos": x.get("n_positions")} for v, x in LV.items()}
+            def okL(x): return x and x["p"] is not None and x["ci"] and x["ci"][0] is not None and x["p"] >= PASS_TWIN and x["ci"][0] > 0.55 and x["fm"] is not None and x["fm_ci"] and x["fm_ci"][0] is not None and x["fm"] >= PASS_TWIN and x["fm_ci"][0] > 0.55
+            r["a_twins_both_views"] = bool(any(okL(r["twinsL"].get(v)) for v in ("twin_shift", "twin_new"))); r["a_source"] = "large set + CIs"
+        else:
+            r["a_twins_both_views"] = bool((tw.get(best_var, {}).get("p") or 0) >= PASS_TWIN and (tw.get(best_var, {}).get("proxy_p") or 0) >= PASS_TWIN); r["a_source"] = "small gate set (provisional)"
         r["b_calibrated"] = bool(r.get("p_null") is not None and r["p_null"] >= 0.80)
         r["c_content"] = bool(r["content"] >= PASS_CONTENT)
         ps = [v for k, v in PASSES.items() if int(k) <= r["step"]]; r["passes_max"] = max(ps) if ps else None; r["d_one_pass"] = bool(r["passes_max"] is not None and r["passes_max"] <= 1.0)

@@ -59,6 +59,8 @@ def main():
     p.add_argument("--n", type=int, default=512); p.add_argument("--n-fixed", type=int, default=2048); p.add_argument("--batch", type=int, default=32); p.add_argument("--ode-steps", type=int, default=64); p.add_argument("--probes", type=int, default=1)
     p.add_argument("--n-samples", type=int, default=4); p.add_argument("--sample-steps", type=int, default=32); p.add_argument("--skip-samples", action="store_true"); p.add_argument("--skip-sw", action="store_true")
     p.add_argument("--fixed-from-texts", action="store_true", help="build the fixed test set from the FIRST --sets glob's own rows (seeded shuffle, then --n-fixed) instead of pairs_<split>.parquet: needed for harvested text/v3 rows whose pair ids (split:pos_idx:i:j) are not in the pairs file (train-row memorisation probe for the one-pass critics)")
+    p.add_argument("--fixed-from-twins", action="store_true", help="orchestrator 13:50: build the fixed set from the --twins manifests with <= 1 pair per POSITION (pairs carrying every variant first), seeded; use with --twins-n = --n-fixed >= 1024")
+    p.add_argument("--twins-n", type=int, default=0, help="pairs scored in the twins block (0 = --n)"); p.add_argument("--boot", type=int, default=2000, help="bootstrap resamples, clustered by position, for the twin CIs")
     p.add_argument("--pair-ids-file", default=None, help="with --fixed-from-texts: restrict the probe to these pair ids (one per line) = the slice a pair-capped critic trained on (train_critic writes <out>/pair_slice_<s>.txt)")
     p.add_argument("--seed", type=int, default=0); p.add_argument("--data-device", default="cuda"); p.add_argument("--split", default="val", help="val (held-out, default) or train: score TRAIN rows with train text globs (over-epoching diagnostic)")
     p.add_argument("--neighbors", default=None, help="dir of extract_neighbors.py outputs: score each text against the SAME document's (h_i, h_j) at positions t-k (k in the file) -> content(own) - content(neighbour)")
@@ -96,7 +98,17 @@ def main():
             out[q] = NB["H"][(int(layer_vec[q]), k)][n_]; ok[q] = True
         return out, ok
     encoder = TextEncoder(aa.get("enc_model", "Qwen/Qwen3-0.6B"), int(aa.get("enc_layer", 20)), dev, int(aa.get("enc_max_len", 192)))
-    if a.fixed_from_texts:
+    if a.fixed_from_twins:
+        import glob as _g, pandas as pd
+        twf = [f for item in a.twins.split(",") if item.strip() for pat in item.split(":", 1)[1].split(";") for f in sorted(_g.glob(pat))]
+        twd = pd.concat([pq.read_table(f, columns=["pair_id", "variant"]).to_pandas() for f in twf], ignore_index=True)
+        have = twd.groupby("pair_id")["variant"].apply(set); full = {"true", "twin_new", "twin_shift", "twin_jlens", "dm_full"}
+        cand = pd.DataFrame({"pair_id": have.index, "nvar": [len(v) for v in have.values], "full": [full <= v for v in have.values]})
+        parts = cand["pair_id"].str.split(":", expand=True); cand["pos_idx"] = parts[1].astype("int64"); cand["i"] = parts[2].astype("int32"); cand["j"] = parts[3].astype("int32")
+        cand = cand[cand["pos_idx"].isin(store.row_of)].sample(frac=1.0, random_state=a.seed).sort_values(["full", "nvar"], ascending=False, kind="stable")
+        vp = cand.drop_duplicates("pos_idx").sample(frac=1.0, random_state=a.seed + 1).iloc[: a.n_fixed].reset_index(drop=True)[["pair_id", "pos_idx", "i", "j"]]; NF = len(vp)
+        print(f"[bits] fixed set from twins: {NF} pairs over {vp['pos_idx'].nunique()} distinct positions ({int(cand.drop_duplicates('pos_idx')['full'].sum())} positions carry every variant; {len(twf)} manifests)", flush=True)
+    elif a.fixed_from_texts:
         first = [s_ for s_ in a.sets.split(",") if s_.strip()][0].split(":", 1)[1]
         vp = load_text_pairs(first.split(";"), os.path.join(a.data_dir, f"pairs_{a.split}.parquet"), pools_verbose=False)
         if a.pair_ids_file:
@@ -194,9 +206,19 @@ def main():
     # ---- twins: P(true > variant), paired ----
     for item in [s for s in a.twins.split(",") if s.strip()]:
         label, path = item.split(":", 1); import glob as _g, pandas as pd
-        tw = pd.concat([pq.read_table(f).to_pandas() for f in sorted(_g.glob(path))], ignore_index=True); tw = tw[tw["pair_id"].isin(set(pid_all))]
+        tw = pd.concat([pq.read_table(f).to_pandas() for pat in path.split(";") for f in sorted(_g.glob(pat))], ignore_index=True); tw = tw[tw["pair_id"].isin(set(pid_all))]
         by_pid = {pid: k for k, pid in enumerate(pid_all)}; tw["k"] = tw["pair_id"].map(by_pid); tw = tw.sort_values(["k", "variant"]).reset_index(drop=True)
-        pids = [pid for pid in tw["pair_id"].drop_duplicates().tolist()][: a.n]; tw = tw[tw["pair_id"].isin(set(pids))].reset_index(drop=True); n = len(tw); lp = np.zeros(n); fm = np.zeros(n); t0 = time.time()
+        pids = [pid for pid in tw["pair_id"].drop_duplicates().tolist()][: (a.twins_n or a.n)]; tw = tw[tw["pair_id"].isin(set(pids))].reset_index(drop=True); n = len(tw); lp = np.zeros(n); fm = np.zeros(n); t0 = time.time()
+        pos_of = {pid: int(pid.split(":")[1]) for pid in pids}
+        def boot_ci(vals, clusters, B=a.boot, seed=a.seed + 11):
+            """95% bootstrap CI of P(v > 0) and mean(v), resampling POSITIONS (clusters) with replacement (orchestrator 13:50: twins share positions, the naive sem understates)"""
+            vals = np.asarray(vals, dtype=np.float64); clusters = np.asarray(clusters); uniq, inv = np.unique(clusters, return_inverse=True); C = len(uniq)
+            if C < 2: return {"ci95_p": [None, None], "ci95_bits": [None, None], "n_positions": int(C)}
+            sums = np.zeros(C); cnts = np.zeros(C); pos = np.zeros(C); np.add.at(sums, inv, vals); np.add.at(cnts, inv, 1); np.add.at(pos, inv, (vals > 0).astype(np.float64))
+            rng_ = np.random.default_rng(seed); idx = rng_.integers(0, C, size=(B, C)); w = np.zeros((B, C)); 
+            for b_ in range(B): np.add.at(w[b_], idx[b_], 1)
+            den = w @ cnts; p_ = (w @ pos) / den; m_ = (w @ sums) / den
+            return {"ci95_p": [float(np.percentile(p_, 2.5)), float(np.percentile(p_, 97.5))], "ci95_bits": [float(np.percentile(m_, 2.5)), float(np.percentile(m_, 97.5))], "n_positions": int(C)}
         T_PROXY = [0.1, 0.3, 0.5, 0.7, 0.9]
         def proxy_fm(kk, texts):
             # the RL reward's view: flow-matching loss on a fixed t grid with the pair's fixed eps (common random numbers across the variants of one pair)
@@ -218,6 +240,9 @@ def main():
             dlt = (tru.loc[com].values - sub.loc[com, "logp"].values) / math.log(2); dfm = sub.loc[com, "fm"].values - tru_fm.loc[com].values      # dfm > 0: the true text has the LOWER FM loss (= higher RL reward)
             res["variants"][var] = {"n": len(com), "p_true_gt_twin": float((dlt > 0).mean()), "mean_bits_true_minus_twin": float(dlt.mean()), "sem": float(dlt.std() / math.sqrt(max(1, len(dlt)))),
                                     "proxy_p_true_gt_twin": float((dfm > 0).mean()), "proxy_fm_twin_minus_true": float(dfm.mean()), "proxy_sem": float(dfm.std() / math.sqrt(max(1, len(dfm))))}
+            cl = [pos_of[pid] for pid in com]; bx = boot_ci(dlt, cl); bf = boot_ci(dfm, cl)
+            res["variants"][var].update({"ci95_p": bx["ci95_p"], "ci95_bits": bx["ci95_bits"], "proxy_ci95_p": bf["ci95_p"], "proxy_ci95_fm": bf["ci95_bits"], "n_positions": bx["n_positions"], "boot": a.boot})
+            print(f"[twins] {label}/{var}: CI95(P) exact {res['variants'][var]['ci95_p']} FM {res['variants'][var]['proxy_ci95_p']} over {res['variants'][var]['n_positions']} positions", flush=True)
             print(f"[twins] {label}/{var}: P(true > twin) {res['variants'][var]['p_true_gt_twin']:.3f} | true - twin {dlt.mean():.2f} +- {res['variants'][var]['sem']:.2f} bits (n {len(com)}) | FM-loss (RL reward) view: P(true better) {res['variants'][var]['proxy_p_true_gt_twin']:.3f}, twin - true {dfm.mean():.4f} +- {res['variants'][var]['proxy_sem']:.4f}", flush=True)
         results["twins"][label] = res; json.dump(results, open(a.out, "w"), indent=1)
     results["elapsed_min"] = (time.time() - t_all) / 60; json.dump(results, open(a.out, "w"), indent=1)

@@ -29,6 +29,9 @@ for i in $(seq 1 400); do
     [ "$TAG" = v5 ] && STG=$D/critic_v5_stage*.json
     if [ "$TAG" = v4 ] || [ "$TAG" = v3c ] || [ "$TAG" = v5 ]; then TRAIN_GLOB=$(python3 -c "import json,glob; sh=sorted({s for f in glob.glob('$STG') for s in json.load(open(f))['shards']}); print(';'.join(f'/vol/q36/text/v3/train/craft_full__{s}.parquet' for s in sh))"); FFT="--fixed-from-texts"; else TRAIN_GLOB=${TRAIN_GLOB:-$TX1/train/craft_full__*.parquet}; FFT=""; fi
     [ "$TAG" = v5 ] && FFT="$FFT --pair-ids-file /vol/q36/critic/$TAG/pair_ids_trained.txt"     # pair-capped critic: probe only the pairs it trained on (chain merges every stage's slice file)
+    # orchestrator 13:50: the decisive twin statistic = >= 1024 pairs with DISTINCT positions (<= 1 per position, pairs carrying every variant first) from the held-out twin manifests (v1 val shards 29-31 + the fresh v3 val shard 32),
+    # exact Heun 32 + FM view, 95% CIs bootstrapped by position; (a) = point >= .60 AND lower CI > .55 in BOTH views. twins-only spec (no sets), prio 1, ~20 min/checkpoint.
+    run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --out /vol/q36/results/bits_${TAG}_${st}_twinsL.json --sets '' --twins 'craft_twins:$TX1/val/twins__*.parquet;/vol/q36/text/v3/val/twins__*.parquet' --fixed-from-twins --n-fixed 1024 --twins-n 1024 --ode-steps 32 --skip-samples --skip-sw" ${TAG}eval_${st}_twinsL
     run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --split train --out /vol/q36/results/bits_${TAG}_${st}_train.json --sets 'craft_full:$TRAIN_GLOB' --n 128 --n-fixed 512 --ode-steps 64 --skip-samples --skip-sw $FFT" ${TAG}eval_${st}_train
     if grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt || grep -q "\[${TAG}eval_$st\] QUEUED" $LOGD/evalq.txt; then launched[$st]=1; log "gate eval launched/queued for $st"; else log "gate eval launch for $st FAILED (retry next round)"; fi
   done
@@ -45,9 +48,11 @@ for l in sys.stdin:
     if m and x: e[int(m.group(1))] = {'per_position_mean': float(x.group(1)), 'per_position_seen_mean': float(x.group(2)), 'per_position_max': float(x.group(3)), 'per_pos_j_mean': float(x.group(4))}
 json.dump(d, open('$D/critic_${TAG}_passes.json', 'w')); json.dump(e, open('$D/critic_${TAG}_exposures.json', 'w'))" 2>/dev/null
   new=0
-  for f in $(timeout 120 modal volume ls nlt q36/results 2>/dev/null | grep -oE "bits_${TAG}_step[0-9]+(_train|_pools)?\.json" | sort -u); do
+  for f in $(timeout 120 modal volume ls nlt q36/results 2>/dev/null | grep -oE "bits_${TAG}_step[0-9]+(_train|_pools|_twinsL)?\.json" | sort -u); do
     [ -f $D/$f ] && continue; timeout 180 modal volume get nlt q36/results/$f /tmp/q36_$f --force >/dev/null 2>&1; grep -q '"elapsed_min"' /tmp/q36_$f 2>/dev/null || continue; cp /tmp/q36_$f $D/$f; new=1
-    case "$f" in *_train.json) log "pulled $f (train rows)"; continue;; *_pools.json) log "pulled $f (per-pool held-out content)"; continue;; esac
+    case "$f" in *_train.json) log "pulled $f (train rows)"; continue;; *_pools.json) log "pulled $f (per-pool held-out content)"; continue;; *_twinsL.json) log "pulled $f (twins, >= 1024 distinct positions, CIs): $(python3 -c "
+import json; d=json.load(open('$D/$f')); v=d['twins']['craft_twins']['variants']
+print(' | '.join(f"{k}: P {x['p_true_gt_twin']:.3f} CI [{x['ci95_p'][0]:.3f},{x['ci95_p'][1]:.3f}] / FM {x['proxy_p_true_gt_twin']:.3f} CI [{x['proxy_ci95_p'][0]:.3f},{x['proxy_ci95_p'][1]:.3f}] n {x['n_positions']}" for k, x in v.items() if k in ('twin_shift', 'twin_new')))" 2>/dev/null)"; new=1; continue;; esac
     log "pulled $f: $(python3 -c "
 import json; d=json.load(open('$D/$f')); s=d['sets']['craft_full']; tw=d.get('twins',{}).get('craft_twins',{}).get('variants',{})
 m=lambda x: x['mean'] if isinstance(x, dict) else x
