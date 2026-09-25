@@ -89,6 +89,31 @@ def run_mod(module: str, args: str = ""):
     return _run(f"cd {REPO_REMOTE} && python -m {module} {args}", module.split(".")[-1])
 
 
+@app.function(image=image_hf, gpu=gpu_spec(1), volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS, cpu=16, memory=128 * 1024)
+def run_evalq(idle_min: int = 20, worker: str = "w0"):
+    """EVAL QUEUE WORKER (orchestrator 09:12: one long-lived app instead of an app per eval; the workspace has a 100-ephemeral-app limit shared with other users).
+    Loops over /vol/q36/evalq/<prio>_<time>_<label>.json specs {label, args, script?}: claims the first (priority order = filename order) by renaming it, runs the script
+    (default eval_bits.py) with _run (log tee'd to /vol/q36/logs, volume committed at the end), marks it .done<rc>.json, repeats; exits after idle_min minutes without work."""
+    import glob, json, time as _t
+    q = "/vol/q36/evalq"; os.makedirs(q, exist_ok=True); idle = 0.0; n = 0
+    print(f"[evalq] worker {worker} up; queue {q}", flush=True)
+    while idle < idle_min * 60:
+        try: vol.reload()
+        except Exception as e: print(f"[evalq] reload failed: {e}", flush=True)
+        specs = sorted(f for f in glob.glob(f"{q}/*.json") if ".running" not in f and ".done" not in f)
+        if not specs: _t.sleep(60); idle += 60; continue
+        spec = specs[0]; claimed = spec[:-5] + f".running.{worker}.json"
+        try: os.rename(spec, claimed); vol.commit()
+        except Exception as e: print(f"[evalq] claim of {os.path.basename(spec)} failed ({e}); retrying", flush=True); _t.sleep(5); continue
+        job = json.load(open(claimed)); idle = 0.0; n += 1
+        print(f"[evalq] {worker} job {n}: {job['label']} :: {job['args'][:160]}", flush=True)
+        rc = _run(f"python {Q36}/{job.get('script', 'eval_bits.py')} {job['args']}", f"evalq_{job['label']}")
+        try: os.rename(claimed, spec[:-5] + f".done{rc}.json"); vol.commit()
+        except Exception as e: print(f"[evalq] done-mark failed: {e}", flush=True)
+        print(f"[evalq] {worker} finished {job['label']} rc {rc}", flush=True)
+    print(f"[evalq] worker {worker} idle {idle_min} min after {n} jobs -> exit", flush=True)
+
+
 @app.function(image=image_vllm, gpu=gpu_spec(1), volumes=VOLS, timeout=23 * 60 * 60, secrets=SECRETS, cpu=16, memory=128 * 1024)
 def run_vllm(script: str, args: str = ""):
     return _run(f"python {Q36}/{script} {args}", script.replace(".py", ""))
@@ -124,5 +149,7 @@ def main(task: str, script: str = "", args: str = "", code: str = "", gpus: int 
         h = run_cpu.spawn(script, args); print(f"SPAWNED {h.object_id} :: {args[:90]}", flush=True)
     elif task == "pyrun":
         h = pyrun.spawn(code); print(f"SPAWNED {h.object_id}", flush=True)
+    elif task == "evalq":
+        fn = run_evalq.with_options(gpu=gpu_spec(1)); h = fn.spawn(int(args or 20), module or "w0"); print(f"SPAWNED {h.object_id} :: evalq worker {module or 'w0'} idle {args or 20} min", flush=True)
     else:
         raise SystemExit(f"unknown task {task}")
