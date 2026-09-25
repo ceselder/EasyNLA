@@ -28,7 +28,8 @@ for i in $(seq 1 400); do
     a=$(cat $LOGD/harvest_app_$p.txt 2>/dev/null || true)
     if [ -n "$a" ] && echo "$live" | grep -q "$a"; then alldone=0; continue; fi                       # running
     if done_p $p; then continue; fi                                                                    # finished
-    alldone=0; wait_gpu 1 || exit 1; launch $p
+    alldone=0; [ -f $LOGD/harvest_pause_$p ] && { log "engine $p paused ($LOGD/harvest_pause_$p exists)"; continue; }   # orchestrator 07:57: one engine paused for the eval queue
+    PRIO=0 wait_gpu 1 || exit 1; launch $p
   done
   [ $alldone -eq 1 ] && { log "HARVEST DONE"; touch $LOGD/.harvest_done; break; }
   sleep 600

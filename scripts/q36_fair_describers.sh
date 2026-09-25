@@ -11,14 +11,14 @@ SAME="describer_sonnet_A:$TX/val/describer_sonnet5_A__*.parquet,describer_sonnet
 WITHW="describer_sonnet_A:$TX/val/describer_sonnet5_A__*.parquet,describer_sonnet_W:$TX2/val/describer_sonnet5_W__*.parquet,craft_full_same:$TX/val/craft_full__*.parquet,raw_all_same:$TX/val/raw_all__*.parquet"
 # judge checkpoints (orchestrator 06:15): the best-CALIBRATED checkpoint, not the lowest-FM-loss final. v1: ckpt_best = step 3500 (no 2500/3000 saved). v2: ckpt_step3000.pt if captured, else ckpt_best. v1b: ckpt_best.
 for i in $(seq 1 400); do grep -q "bits_verb_v1b\] SPAWNED" $LOGD/apps.txt && grep -q "rl_v3\] SPAWNED" $LOGD/apps.txt && break; sleep 120; done; log "RL v3 and bits_v1b_verbalizer have their GPUs; queueing behind them"
-( if [ "${SKIP_V1BEST_LAUNCH:-0}" != 1 ]; then GT=H100 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/v1/ckpt_best.pt --out /vol/q36/results/bits_v1best_describers.json --sets '$SAME' --n 300 --ode-steps 64 --skip-samples" bits_desc_v1best; fi
+( if [ "${SKIP_V1BEST_LAUNCH:-0}" != 1 ]; then GT=H100 PRIO=4 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/v1/ckpt_best.pt --out /vol/q36/results/bits_v1best_describers.json --sets '$SAME' --n 300 --ode-steps 64 --skip-samples" bits_desc_v1best; fi
   wait_bits bits_v1best_describers || exit 1; cp /tmp/q36_chk_bits_v1best_describers.json $D/bits_v1best_describers.json; log "v1best describer comparison pulled" ) &
 for V in v2 v1b; do
   ( PAT='ckpt_final.pt'; [ "$V" = v2 ] && PAT='ckpt_step3000.pt|ckpt_final.pt'      # v2's judge is the captured step-3000 checkpoint: no need to wait for its final
     for i in $(seq 1 400); do [ "$(nfiles q36/critic/$V "$PAT")" -ge 1 ] && break; [ $((i % 10)) -eq 0 ] && log "waiting for critic $V ($PAT)"; sleep 180; done; log "critic $V judge checkpoint exists"
     CKP=/vol/q36/critic/$V/ckpt_best.pt; [ "$V" = v2 ] && [ "$(nfiles q36/critic/v2 'ckpt_step3000.pt')" -ge 1 ] && CKP=/vol/q36/critic/v2/ckpt_step3000.pt; log "judge for $V: $CKP"
-    GT=H100 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt $CKP --out /vol/q36/results/bits_${V}_describers.json --sets '$SAME' --twins 'craft_twins:$TX/val/twins__*.parquet' --n 300 --ode-steps 64 --skip-samples" bits_desc_$V
-    GT=H100 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt $CKP --out /vol/q36/results/bits_${V}_describersW.json --sets '$WITHW' --n 512 --ode-steps 64 --skip-samples" bits_descW_$V
+    GT=H100 PRIO=4 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt $CKP --out /vol/q36/results/bits_${V}_describers.json --sets '$SAME' --twins 'craft_twins:$TX/val/twins__*.parquet' --n 300 --ode-steps 64 --skip-samples" bits_desc_$V
+    GT=H100 PRIO=4 wait_gpu 1 || exit 1; run "--data-dir /vol/q36/data --ckpt $CKP --out /vol/q36/results/bits_${V}_describersW.json --sets '$WITHW' --n 512 --ode-steps 64 --skip-samples" bits_descW_$V
     wait_bits bits_${V}_describers bits_${V}_describersW || exit 1
     for n in describers describersW; do cp /tmp/q36_chk_bits_${V}_$n.json $D/bits_${V}_$n.json; done; log "$V describer comparisons pulled" ) &
 done

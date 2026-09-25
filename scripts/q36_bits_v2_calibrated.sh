@@ -11,9 +11,9 @@ jobs_for(){ CK=$1; OUT=$2
 pull(){ OUT=$1; wait_bits bits_${OUT}_sources bits_${OUT}_loo bits_${OUT}_singles || return 1; for f in sources loo singles; do cp /tmp/q36_chk_bits_${OUT}_$f.json $D/bits_${OUT}_$f.json; done; log "bits_$OUT pulled"; }
 # judge 1: the calibrated step-3000 checkpoint (do not wait for the RL launch: the RL launcher takes 4 of the 8, these take 3 -> wait_gpu keeps the sum <= 8)
 for i in $(seq 1 400); do grep -q "bits_verb_v1b\] SPAWNED" $LOGD/apps.txt && grep -q "rl_v3\] SPAWNED" $LOGD/apps.txt && break; sleep 120; done; log "RL v3 and bits_v1b_verbalizer have their GPUs; queueing behind them"
-wait_gpu 3 || exit 1; run "$(jobs_for /vol/q36/critic/v2/ckpt_step3000.pt v2)" bits2_s3000
+PRIO=5 wait_gpu 3 || exit 1; run "$(jobs_for /vol/q36/critic/v2/ckpt_step3000.pt v2)" bits2_s3000
 pull v2 && { timeout 120 modal volume get nlt q36/critic/v2/eval_latest.json $D/critic_v2_eval_latest.json --force >/dev/null 2>&1; systemd-run --user --scope -q -p MemoryMax=2G python3 scripts/plot_nlt_q36_phase1.py --tag v2 2>&1 | tail -3; (cd /home/celeste/shared/reports/nlt-27b-olens && systemd-run --user --scope -q -p MemoryMax=1G python3 build_html.py >/dev/null 2>&1); log "v2 (step 3000 judge) plotted + report built"; }
 # judge 2: ckpt_final (sensitivity), only after the calibrated one is in
 for i in $(seq 1 400); do [ "$(nfiles q36/critic/v2 'ckpt_final.pt')" -ge 1 ] && break; sleep 180; done
-wait_gpu 3 || exit 1; run "$(jobs_for /vol/q36/critic/v2/ckpt_final.pt v2final)" bits2_final
+PRIO=5 wait_gpu 3 || exit 1; run "$(jobs_for /vol/q36/critic/v2/ckpt_final.pt v2final)" bits2_final
 pull v2final; log "BITS V2 DONE"

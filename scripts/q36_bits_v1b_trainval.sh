@@ -6,7 +6,7 @@ TX=/vol/q36/text/v1; LOGD=/home/celeste/nlt-q36-logs; D=/home/celeste/shared/rep
 log(){ echo "[trainval] $(date -u +%H:%M) $*"; }
 run(){ out=$(NLT_Q36_GPU=H100 timeout 900 modal run --detach scripts/modal_nlt_q36.py --task hf --gpus 1 --script eval_bits.py --args "$1" 2>&1 | grep -E "SPAWNED|modal.com/apps|rror"); echo "$out" | sed "s/^/[$2] /" | tee -a $LOGD/apps.txt; ledger_add "$out" 1 "$2"; }
 for ST in 000500 001500; do for SP in train val; do
-  wait_gpu 1 || exit 1
+  PRIO=3 wait_gpu 1 || exit 1
   run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/v1b/ckpt_step$ST.pt --split $SP --out /vol/q36/results/bits_v1b_${SP}_$ST.json --sets 'craft_full:$TX/$SP/craft_full__*.parquet' --n 256 --n-fixed 1024 --ode-steps 64 --skip-samples --skip-sw" v1b_${SP}_$ST
 done; done
 wait_bits bits_v1b_train_000500 bits_v1b_val_000500 bits_v1b_train_001500 bits_v1b_val_001500 || exit 1

@@ -7,7 +7,14 @@ ledger_add(){ id=$(echo "$1" | grep -oE "ap-[A-Za-z0-9]+" | head -1); [ -n "$id"
 LOCK=/home/celeste/nlt-q36-logs/gpu_launch.lock
 harvest_active(){ for p_ in 0 1 2 3 4 5; do a_=$(cat /home/celeste/nlt-q36-logs/harvest_app_$p_.txt 2>/dev/null || true); [ -n "$a_" ] && timeout 90 modal app list 2>/dev/null | grep -vE "stopped|stopping" | grep -q "$a_" && return 0; done; pgrep -f "bash .*harvest\.sh" >/dev/null 2>&1 && [ ! -f /home/celeste/nlt-q36-logs/.harvest_done ]; }
 cap_now(){ if harvest_active; then echo 12; else echo 8; fi; }   # orchestrator 08:05: cap 12 until the HARVEST is done (6 engines also during RL v4); 8 after
-wait_gpu(){ need=${1:-1}; cap=${2:-$(cap_now)}; exec 9>$LOCK; flock 9; for i in $(seq 1 900); do g=$(gpus_in_use); [ $((g + need)) -le $cap ] && { echo "[gpu] $(date -u +%H:%M) headroom: $g in use (cap $cap), launching $need"; return 0; }; [ $((i % 5)) -eq 0 ] && echo "[gpu] $(date -u +%H:%M) waiting: $g in use (cap $cap), need $need"; flock -u 9; sleep 120; flock 9; done; flock -u 9; return 1; }
+# PRIORITY (orchestrator 07:57): a waiter with a lower PRIO number goes first. While waiting, each chain advertises $LOGD/gpu_want_<PRIO>_<pid>; a waiter yields whenever a LIVE higher-priority waiter exists.
+#   PRIO 0 harvest engines | 1 v3b gate evals | 2 v1b twins+neighbours (RL v4 judge) | 3 v1b train-vs-val | 4 fair describers | 5 v2 LOO/singles | 9 default
+PRIO=${PRIO:-9}; WANTDIR=/home/celeste/nlt-q36-logs/gpu_want; mkdir -p $WANTDIR
+higher_waiting(){ for f in $WANTDIR/want_*; do [ -e "$f" ] || continue; b=$(basename $f); pr=${b#want_}; pr=${pr%%_*}; pid=${b##*_}; kill -0 $pid 2>/dev/null || { rm -f $f; continue; }; [ "$pr" -lt "$PRIO" ] && return 0; done; return 1; }
+wait_gpu(){ need=${1:-1}; cap=${2:-$(cap_now)}; touch $WANTDIR/want_${PRIO}_$$; trap 'rm -f $WANTDIR/want_${PRIO}_$$' EXIT
+  exec 9>$LOCK; flock 9; for i in $(seq 1 900); do g=$(gpus_in_use); cap=${2:-$(cap_now)}
+    if [ $((g + need)) -le $cap ] && ! higher_waiting; then rm -f $WANTDIR/want_${PRIO}_$$; echo "[gpu] $(date -u +%H:%M) headroom: $g in use (cap $cap), launching $need (prio $PRIO)"; return 0; fi
+    [ $((i % 5)) -eq 0 ] && echo "[gpu] $(date -u +%H:%M) waiting: $g in use (cap $cap), need $need, prio $PRIO$(higher_waiting && echo ' (yielding to a higher-priority waiter)')"; flock -u 9; sleep 120; flock 9; done; flock -u 9; rm -f $WANTDIR/want_${PRIO}_$$; return 1; }
 # release_gpu_lock: call right AFTER the launch has been ledgered (the lock is held from a successful wait_gpu until then, so a second waiter sees the new app in the ledger)
 release_gpu_lock(){ flock -u 9 2>/dev/null || true; }
 # completeness of an eval_bits result: the JSON is rewritten after every set, `elapsed_min` is only present once the whole job finished

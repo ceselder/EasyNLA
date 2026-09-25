@@ -12,7 +12,7 @@ for i in $(seq 1 400); do
     st=${ck#ckpt_}; st=${st%.pt}; stn=$((10#${st#step})); [ $stn -lt $MINSTEP ] && continue; [ -n "${launched[$st]:-}" ] && continue
     [ -f $D/bits_${TAG}_$st.json ] && { launched[$st]=1; continue; }
     grep -q "${TAG}eval_$st\] SPAWNED" $LOGD/apps.txt && { launched[$st]=1; continue; }        # already launched by an earlier incarnation of this watcher
-    wait_gpu 1 || exit 1
+    PRIO=1 wait_gpu 1 || exit 1
     run "--data-dir /vol/q36/data --ckpt /vol/q36/critic/$TAG/$ck --out /vol/q36/results/bits_${TAG}_$st.json --sets 'craft_full:$TX/val/craft_full__*.parquet,describer_A:$TX1/val/describer_sonnet5_A__*.parquet' --twins 'craft_twins:$TX/val/twins__*.parquet' --neighbors /vol/q36/data/neigh --neighbor-n 256 --n 256 --ode-steps 64 --skip-samples" ${TAG}eval_$st
     launched[$st]=1; log "gate eval launched for $st"
   done

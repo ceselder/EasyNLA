@@ -12,14 +12,14 @@ LAST=$(timeout 120 modal volume ls nlt q36/rl/rl_v3 2>/dev/null | grep -oE "step
 log "last saved RL v3 policy: $LAST"
 DUMP=/vol/q36/dumps/rl_v3_$LAST.parquet
 if [ "$(nfiles q36/dumps "rl_v3_$LAST.parquet")" -lt 1 ]; then
-  wait_gpu 1 || exit 1
+  PRIO=4 wait_gpu 1 || exit 1
   run dump_verbalizer.py "--data-dir /vol/q36/data --adapter /vol/q36/rl/rl_v3/$LAST --pairs-text '$TX/val/craft_full__*.parquet' --n 512 --batch 64 --band $BAND --max-new 208 --out $DUMP" dump_rlv3_$LAST
   for i in $(seq 1 60); do [ "$(nfiles q36/dumps "rl_v3_$LAST.parquet")" -ge 1 ] && break; sleep 120; done
 fi
 SETS="teacher:$TX/val/craft_full__*.parquet,rl_step0:/vol/q36/dumps/verbalizer_v1b.parquet,rl_$LAST:$DUMP"
 declare -A JUDGES=([v2s3000]=/vol/q36/critic/v2/ckpt_step3000.pt [v1bjudge]=$JUDGE_V1B [v1best]=/vol/q36/critic/v1/ckpt_best.pt)
 for J in v2s3000 v1bjudge v1best; do
-  wait_gpu 1 || exit 1
+  PRIO=4 wait_gpu 1 || exit 1
   run eval_bits.py "--data-dir /vol/q36/data --ckpt ${JUDGES[$J]} --out /vol/q36/results/bits_crossjudge_rlv3_$J.json --sets '$SETS' --twins 'craft_twins:$TX/val/twins__*.parquet' --n 256 --ode-steps 64 --skip-samples" cross_$J
 done
 wait_bits bits_crossjudge_rlv3_v2s3000 bits_crossjudge_rlv3_v1bjudge bits_crossjudge_rlv3_v1best || exit 1
