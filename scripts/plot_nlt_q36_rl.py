@@ -25,7 +25,7 @@ def main():
     train = []
     if a.log and os.path.exists(a.log):
         for line in open(a.log, errors="replace"):
-            m = re.match(r"step (\d+) \| reward ([-\d.]+) \| pmi ([-\d.]+) bits \| tokens (\d+) \| depth-hits ([\d.]+)% \| groups (\d+)/(\d+) \| kl ([\d.]+) \| critic ([\d.na]+)", line)
+            m = re.match(r"step (\d+) \| reward ([-\d.]+) \| -fm ([-\d.]+) \| tokens (\d+) \| depth-hits ([\d.]+)% \| groups (\d+)/(\d+) \| kl ([\d.]+) \| critic ([\d.na]+)", line)
             if m: train.append({"step": int(m.group(1)), "reward": float(m.group(2)), "pmi": float(m.group(3)), "tokens": int(m.group(4)), "kl": float(m.group(8))})
     curves["train"] = train
     os.makedirs(f"{REP}/data", exist_ok=True); json.dump(curves, open(f"{REP}/data/rl_{a.tag}.json", "w"), indent=1)

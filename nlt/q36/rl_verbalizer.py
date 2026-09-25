@@ -1,8 +1,9 @@
 """RL co-training of the two-activation CHANGE verbalizer and the direction critic (NLA-style), Qwen3.6-27B.
 
 Policy  = Qwen3.6-27B + LoRA (the SFT verbalizer, common.change_prompt, u_i / u_j injected norm-matched at the two ㈜ markers after block 1).
-Reward  = the critic's flow-matching likelihood-gain PROXY for u_j given u_i and the text: bits = (d/2) * mean_t [ L_FM(no text) - L_FM(text) ] / ln 2 with the
-          SAME (t, eps) for every sample of a group (common random numbers), minus lam * tokens, minus a hard penalty for depth words (regex).
+Reward  = MINUS the co-trained critic's flow-matching loss on u_j given u_i and the rollout text, mean over a fixed t grid, with the SAME (t, eps) for every
+          sample of a group (common random numbers; the no-text term cancels in the group advantage), minus lam * tokens (lam calibrated to 20% of the
+          group std at the median length), minus a penalty for depth words (regex). Exact ODE bits are EVAL only (frozen critic, held-out dumps, twins, rp).
 Critic  = co-trained every step on the policy's rollouts (true u_j) mixed 50/50 with replay rows of the warm-start trace pool (text dropout 0.1 keeps the
           unconditional path calibrated). A FROZEN copy of the warm-start critic scores the held-out greedy dumps every --eval-every steps (collusion guard),
           together with claim-twin P(true > twin) and random-pair bits under both critics.
@@ -26,9 +27,9 @@ ap.add_argument("--data-dir", required=True); ap.add_argument("--stats", default
 ap.add_argument("--policy", required=True, help="SFT adapter dir (PEFT); 'none' = fresh zero LoRA (mechanics smoke only)"); ap.add_argument("--critic", required=True, help="critic ckpt (train_critic.py); 'none' = random init (mechanics smoke only)")
 ap.add_argument("--replay-text", default=None, help="glob(s) of the warm-start trace pool (train split) for critic replay"); ap.add_argument("--twins", default=None, help="glob of val twins__*.parquet for the twin-P guard")
 ap.add_argument("--steps", type=int, default=200); ap.add_argument("--batch", type=int, default=16, help="prompts per rank"); ap.add_argument("--group", type=int, default=8); ap.add_argument("--n-tok", type=int, default=96); ap.add_argument("--temp", type=float, default=1.0)
-ap.add_argument("--lr", type=float, default=1e-5); ap.add_argument("--critic-lr", type=float, default=3e-5); ap.add_argument("--kl", type=float, default=0.02); ap.add_argument("--lam", type=float, default=0.05, help="bits per token penalty"); ap.add_argument("--depth-penalty", type=float, default=10.0, help="bits subtracted per text with a depth-word hit")
+ap.add_argument("--lr", type=float, default=1e-5); ap.add_argument("--critic-lr", type=float, default=3e-5); ap.add_argument("--kl", type=float, default=0.02); ap.add_argument("--lam", type=float, default=-1.0, help="per-token cost in FM-loss units; < 0 = calibrate at step 1 (20% of the group std at the median length)"); ap.add_argument("--depth-penalty", type=float, default=0.05, help="FM-loss units subtracted per text with a depth word / empty text (the FM loss is O(1) per dim; group stds are ~1e-3..1e-2)")
 ap.add_argument("--cispo-eps-max", type=float, default=5.0); ap.add_argument("--no-cotrain", action="store_true"); ap.add_argument("--replay-frac", type=float, default=0.5); ap.add_argument("--critic-micro", type=int, default=64)
-ap.add_argument("--t-grid", default="0.1,0.3,0.5,0.7,0.9"); ap.add_argument("--eval-every", type=int, default=10); ap.add_argument("--heldout", type=int, default=128); ap.add_argument("--save-every", type=int, default=50)
+ap.add_argument("--t-grid", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9"); ap.add_argument("--eval-every", type=int, default=10); ap.add_argument("--heldout", type=int, default=128); ap.add_argument("--save-every", type=int, default=50)
 ap.add_argument("--gen-chunk", type=int, default=32); ap.add_argument("--bwd-chunk", type=int, default=8); ap.add_argument("--max-train-pos", type=int, default=None); ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--wandb-project", default="nlt-qwen36-27b"); ap.add_argument("--wandb-entity", default="octahedral-systems"); ap.add_argument("--wandb-name", default=None); ap.add_argument("--no-wandb", action="store_true")
 args = ap.parse_args()
@@ -146,15 +147,30 @@ def decode(samp):
         out.append(tok.decode(ids).strip())
     return out
 
-# ---- reward ----
+# ---- reward: the flow-matching loss itself (user: "just use the flow loss as reward") ----
+@torch.no_grad()
+def fm_loss_text(model, src, y, texts, eps_bank):
+    """mean over the t grid of the per-row FM loss (velocity MSE, mean over dims) of the critic given the text; eps_bank: list over t of [N, d]"""
+    N = y.shape[0]; L = torch.zeros(len(T_GRID), N, device=dev)
+    with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts)
+    for ti, t in enumerate(T_GRID):
+        tt = torch.full((N,), float(t), device=dev); x_t = (1 - tt)[:, None] * y + tt[:, None] * eps_bank[ti]; tgt = eps_bank[ti] - y
+        with torch.autocast("cuda", dtype=torch.bfloat16): v = model(x_t, tt, src, enc=enc, enc_mask=mask).float()
+        L[ti] = ((v - tgt) ** 2).mean(-1)
+    return L.mean(0)
+LAM = [args.lam]                                            # calibrated at step 1 when --lam < 0: 20% of the group std at the median length
 def rewards_for(src, u_j, texts, G, seed):
-    """texts grouped by prompt (B*G, prompt-major); shared eps per PROMPT (repeated over the group) -> bits, tokens, hits"""
+    """texts grouped by prompt (B*G, prompt-major); the SAME (t grid, eps) for every rollout of a prompt (common random numbers) -> reward = -FM loss - lam*tokens - depth penalty.
+    The no-text term is a constant within a group (shared noise) and cancels in the group-normalised advantage, so it is not computed."""
     N = len(texts); Bp = N // G; eps_p = eps_for(Bp, D_MODEL, seed); eps_bank = [e.repeat_interleave(G, 0) for e in eps_p]
-    pmi, _ = proxy_bits(critic.eval(), src, u_j, [t if t else " " for t in texts], eps_bank); critic.train()
+    fm = fm_loss_text(critic.eval(), src, u_j, [t if t else " " for t in texts], eps_bank); critic.train()
     ntok = torch.tensor([len(tok(t, add_special_tokens=False).input_ids) for t in texts], device=dev, dtype=torch.float32); hits = torch.tensor([float(depth_hit(t)) for t in texts], device=dev)
     empty = torch.tensor([float(not t.strip()) for t in texts], device=dev)
-    r = pmi - args.lam * ntok - args.depth_penalty * hits - args.depth_penalty * empty
-    return r, pmi, ntok, hits
+    if LAM[0] < 0:
+        gstd = float((-fm).view(Bp, G).std(1).mean()); med = float(ntok.median().clamp_min(1)); LAM[0] = 0.2 * gstd / med
+        P(f"[rl] lambda calibrated: group std of -FM {gstd:.4f}, median tokens {med:.0f} -> lam {LAM[0]:.6f} per token (20% of the group std at the median length)")
+    r = -fm - LAM[0] * ntok - args.depth_penalty * hits - args.depth_penalty * empty
+    return r, -fm, ntok, hits
 
 # ---- critic co-training step ----
 def critic_step(src, u_j, texts, G):
@@ -229,8 +245,8 @@ for step in range(1, args.steps + 1):
     gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); optim.step()
     c_loss = critic_step(sG, yG, texts, G)
     if is_main:
-        log = {"step": step, "reward": rew.mean().item(), "pmi_bits": pmi.mean().item(), "tokens": ntok.mean().item(), "depth_hit_rate": hits.mean().item(), "groups_kept": int(nz.sum()), "kl_k3": kl_tot / max(1, (B * G) // args.bwd_chunk), "grad_norm": float(gn), "critic_loss": c_loss, "min": (time.time() - t0) / 60}
-        print(f"step {step:04d} | reward {log['reward']:.2f} | pmi {log['pmi_bits']:.2f} bits | tokens {log['tokens']:.0f} | depth-hits {log['depth_hit_rate']:.1%} | groups {log['groups_kept']}/{B} | kl {log['kl_k3']:.4f} | critic {c_loss:.4f} | gn {float(gn):.2f} | {log['min']:.1f} min", flush=True)
+        log = {"step": step, "reward": rew.mean().item(), "neg_fm_loss": pmi.mean().item(), "lam": LAM[0], "tokens": ntok.mean().item(), "depth_hit_rate": hits.mean().item(), "groups_kept": int(nz.sum()), "kl_k3": kl_tot / max(1, (B * G) // args.bwd_chunk), "grad_norm": float(gn), "critic_loss": c_loss, "min": (time.time() - t0) / 60}
+        print(f"step {step:04d} | reward {log['reward']:.4f} | -fm {log['neg_fm_loss']:.4f} | tokens {log['tokens']:.0f} | depth-hits {log['depth_hit_rate']:.1%} | groups {log['groups_kept']}/{B} | kl {log['kl_k3']:.4f} | critic {c_loss:.4f} | gn {float(gn):.2f} | {log['min']:.1f} min", flush=True)
         if wb: wb.log(log)
         if step % args.eval_every == 0:
             ev = evaluate(step); json.dump(ev, open(f"{args.out}/eval_{step:04d}.json", "w"), indent=1)
