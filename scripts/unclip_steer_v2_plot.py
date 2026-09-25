@@ -69,18 +69,18 @@ def frontier_fig(res, T, subset=False, stem="unclip_steer_v2_frontier"):
 
 
 def embed_fig(res):
-    pdm = res["prompt_diag_mean"]; fig, ax = plt.subplots(figsize=(9, 5.5))
+    pdm = res["prompt_diag_mean"]; fig, ax = plt.subplots(figsize=(10, 6))
     labels, vals, cols = [], [], []
     for T, tl in (("A", "A: word swap in the full explanation"), ("B", "B: concept-centred pair")):
         for key, kl, col in ((f"{T}_cos_gz_gze", "pooled g(z) → g(z′)", AQUA), (f"{T}_cos_mz_mze", "prior-read m(z) → m(z′)", VIOLET)):
             if key in pdm: labels.append(f"{tl}\n{kl}"); vals.append(1 - pdm[key]); cols.append(col)
     y = np.arange(len(labels))[::-1]; ax.barh(y, vals, color=cols, height=0.7, edgecolor="white")
     for yi, v in zip(y, vals): ax.text(v + max(vals) * 0.01, yi, f"{v:.3f}", va="center", fontsize=11, color=INK2)
-    ax.set_yticks(y); ax.set_yticklabels(labels, fontsize=10.5); ax.set_xlabel("embedding movement of the concept swap: 1 − cos(embedding(z), embedding(z′))"); ax.grid(axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
+    ax.set_yticks(y); ax.set_yticklabels(labels, fontsize=10.5); ax.set_xlabel("movement of the explanation embedding under the concept swap: 1 − cos"); ax.set_xlim(0, max(vals) * 1.15); ax.grid(axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
     for sp in ("top", "right"): ax.spines[sp].set_visible(False)
     a_, b_ = pdm.get("A_cos_gz_gze"), pdm.get("B_cos_gz_gze"); ratio = (1 - b_) / max(1 - a_, 1e-6) if a_ is not None and b_ is not None else None
-    ax.set_title((f"Concept-centred explanations move the text embedding {ratio:.0f}× more than a word swap inside the full explanation" if ratio else "Embedding movement per text-edit type") + f"\n(mean over {res['n']} prompts; pooled CLIP text head vs prior-read conditional mean)", loc="left", fontsize=13)
-    fig.tight_layout()
+    fig.suptitle((f"A concept-centred explanation moves the text embedding {ratio:.0f}× more\nthan swapping the word inside the full explanation" if ratio else "Embedding movement per text-edit type") + f"\n(mean over {res['n']} prompts; pooled CLIP text head vs prior-read conditional mean)", fontsize=14, x=0.02, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
     for ext in ("png", "pdf"): fig.savefig(f"{REP}/unclip_steer_v2_embed.{ext}", dpi=150)
     plt.close(fig); return ratio
 
