@@ -12,7 +12,7 @@ import modal
 APP_NAME = "nlt-q36-describe"
 MODEL = os.environ.get("NLT_DESC_MODEL", "Qwen/Qwen3-32B")
 MODEL_TAG = os.environ.get("NLT_DESC_TAG", "qwen3-32b")
-GPU = os.environ.get("NLT_GPU", "B200")
+GPU = os.environ.get("NLT_Q36_GPU", os.environ.get("NLT_GPU", "H100"))
 REPO_LOCAL = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); REPO_REMOTE = "/root/easyNLA"
 IGNORE = [".git", ".venv", "__pycache__", "*.pyc", "*.parquet", "*.log", "**/logs/**", "logs", "*.npy", "*.pt", "*.jsonl", "*.out", "wandb"]
 image = (
