@@ -61,14 +61,14 @@ def main():
     ax.axhline(0.5, color="k", lw=0.8); ax.axvline(ref, color=C3, lw=1, alpha=0.5)
     for L in band: ax.axvspan(L - 1, L + 1, color=C3, alpha=0.08)
     ax.set_xlabel("layer the lens reads (block output)"); ax.set_ylabel("P(own position > other positions)"); ax.set_ylim(0.4, 1.0)
-    ax.set_title("Position specificity (AUC) saturates at every layer", fontsize=13); ax.legend(loc="lower left", frameon=False, fontsize=9)
+    ax.set_title("AUC saturates at every layer", fontsize=13); ax.legend(loc="lower left", frameon=False, fontsize=9)
     ax = axes[1]
     ax.plot(Ls, cfve42, "o-", color=C1, lw=2, label="vs h42 (centred FVE, NNLS-4)"); ax.plot(Ls, cfve_own, "o-", color=C2, lw=2, label="vs own-layer h")
     ax.axhline(0, color="k", lw=0.8); ax.axvline(ref, color=C3, lw=1, alpha=0.5)
     for L in band_cf20: ax.axvspan(L - 1, L + 1, color=C2, alpha=0.06)
     for L in band_cf10: ax.axvspan(L - 1, L + 1, color=C3, alpha=0.12)
     ax.axhline(0.9 * ref_cf, color=C3, ls=":", lw=1); ax.text(Ls[0], 0.9 * ref_cf + 0.004, "90% of L42", color=C3, fontsize=10); ax.axhline(0.8 * ref_cf, color=C2, ls=":", lw=1); ax.text(Ls[0], 0.8 * ref_cf + 0.004, "80% of L42", color=C2, fontsize=10)
-    ax.set_xlabel("layer the lens reads (block output)"); ax.set_ylabel("centred FVE of the 4-bullet reconstruction"); ax.set_title("Explained variance is graded: L36–L48 within 10% of L42", fontsize=13); ax.legend(frameon=False, fontsize=9, loc="lower right")
+    ax.set_xlabel("layer the lens reads (block output)"); ax.set_ylabel("centred FVE of the 4-bullet reconstruction"); ax.set_title(f"FVE is graded: L{band_cf10[0]}–L{band_cf10[-1]} within 10% of L{ref}", fontsize=13); ax.legend(frameon=False, fontsize=9, loc="lower right")
     fig.suptitle(f"Transfer test: oracle lens (trained on L42) applied at other layers, {M['n_rows']} fresh positions", fontsize=14, y=1.02)
     savefig(fig, "fig_phase0_band")
 
