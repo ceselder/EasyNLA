@@ -71,12 +71,13 @@ def main():
     # ---- fig 3: verbalizer vs teacher on the same rows
     vk = [k for k in ("teacher", "teacher_trunc176", "teacher_trunc96", "verbalizer", f"verbalizer_{a.tag}b", "base_control") if k in S]
     if vk:
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
-        bars(axes[0], [NICE.get(k, k) for k in vk], [S[k]["content"] for k in vk], [S[k]["content_sem"] for k in vk], C1, "Content bits: distilled verbalizer vs its crafted teacher (same pairs)", "content bits", 0)
+        fig, axes = plt.subplots(1, 2, figsize=(11, 5.2))
+        share = f"{100 * S['verbalizer']['content'] / S['teacher']['content']:.0f}% of the teacher's bits" if "verbalizer" in S and "teacher" in S and S["teacher"]["content"] > 0 else "vs its crafted teacher"
+        bars(axes[0], [NICE.get(k, k) for k in vk], [S[k]["content"] for k in vk], [S[k]["content_sem"] for k in vk], C1, f"The distilled verbalizer carries {share}\n(same held-out pairs, one judge)", "content bits", 0)
         ax = axes[1]; x = np.arange(len(vk)); w = 0.25
         ax.bar(x - w, [S[k]["cos_condmean"]["u"] for k in vk], w, color=CG, label="no text")
         ax.bar(x, [S[k]["cos_condmean"]["c"] for k in vk], w, color=C1, label="true text"); ax.bar(x + w, [S[k]["cos_condmean"]["dm"] for k in vk], w, color=C2, label="depth-matched wrong text")
-        ax.set_xticks(x); ax.set_xticklabels([NICE.get(k, k) for k in vk], rotation=20, ha="right", fontsize=10); ax.set_title("Centred cos of the critic's conditional mean with the true u_j", fontsize=13); ax.set_ylabel("cos(E[u_j | u_i, z], u_j)"); ax.legend(frameon=False, fontsize=9)
+        ax.set_xticks(x); ax.set_xticklabels([NICE.get(k, k) for k in vk], rotation=20, ha="right", fontsize=10); ax.set_title("The critic's conditional mean moves toward the true u_j\nonly with the right text (centred cos)", fontsize=13); ax.set_ylabel("cos(E[u_j | u_i, z], u_j)"); ax.set_ylim(0.55, 0.66); ax.legend(frameon=False, fontsize=9, loc="upper right", ncol=3)
         fig.tight_layout(); savefig(fig, f"fig_phase1_verbalizer_{a.tag}")
     # ---- fig 4: the text-source search (one judge, identical rows): sources + leave-one-source-out
     src_keys = [k for k in ("raw_all", "raw_all_w", "craft_full", "describer_A", "describer", "describer_W", "describer_qwen32b", "skiplens_jd") if k in S]
