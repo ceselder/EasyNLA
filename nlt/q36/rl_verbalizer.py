@@ -96,7 +96,8 @@ if args.replay_text and not args.no_cotrain:
     files = sorted(sum((glob.glob(g) for g in args.replay_text.split(",")), [])); df = load_text_pairs(files, os.path.join(args.data_dir, "pairs_train.parquet")); df = df[df["pos_idx"].isin(store.row_of) & df["i"].isin(band) & df["j"].isin(band)].reset_index(drop=True)
     REPLAY = {"rows": store.rows_for(df["pos_idx"].values), "i": torch.tensor(df["i"].values.astype(np.int64)), "j": torch.tensor(df["j"].values.astype(np.int64)), "text": df["text"].astype(str).tolist()}; P(f"[rl] replay pool {len(df)} rows from {len(files)} files")
     if args.replay_no_replacement:                                                 # each rank owns an interleaved share and walks ONE permutation of it
-        _mine = torch.arange(RANK, len(df), WORLD); REPLAY["perm"] = _mine[torch.randperm(len(_mine), generator=gen_t)]; REPLAY["cursor"] = 0; REPLAY["drawn"] = 0
+        _g = torch.Generator(device="cpu").manual_seed(args.seed + 977 * RANK + 13)                # local generator: gen_t is defined further down (module order)
+        _mine = torch.arange(RANK, len(df), WORLD); REPLAY["perm"] = _mine[torch.randperm(len(_mine), generator=_g)]; REPLAY["cursor"] = 0; REPLAY["drawn"] = 0
         P(f"[rl] replay WITHOUT replacement: rank {RANK} owns {len(_mine)} rows (one pass = {len(_mine)} draws)")
 REF = None
 if args.ref_text:
