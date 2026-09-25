@@ -114,6 +114,26 @@ def craft_shard(shard_index):
         return [b for b, m in zip(bj, M.max(1).values.tolist()) if m < args.tau], [b for b, m in zip(bi, M.max(0).values.tolist()) if m < args.tau]
     POOLS = {k: [] for k in ("craft_full", "craft_nojl", "craft_delta", "craft_newfaded", "jlens", "olens_j", "olens_i")}
     TW = []; stats = {"n": n, "new_mean": 0.0, "faded_mean": 0.0, "shift_mean": 0.0, "empty_full": 0}
+    # ---- describer inputs (for the LLM-written change descriptions, describe.py): every readout source per pair + the passage tail (variant B only).
+    #      i / j are stored for bookkeeping and are NEVER put in a prompt.
+    jl_top = {L: tb_jl.column(f"jl_L{L}").to_pylist() for L in layers} if (tb_jl := pq.read_table(acts_file, columns=[f"jl_L{L}" for L in layers] + ["ctx_tail"])) is not None else {}
+    tails = tb_jl.column("ctx_tail").to_pylist()
+    def jl_words(ids, k=12):
+        out, seen = [], set()
+        for t_ in ids:
+            w = tok.decode([int(t_)]).strip()
+            if w and w.lower() not in seen and not any(c in w for c in "�"): seen.add(w.lower()); out.append(w)
+            if len(out) >= k: break
+        return out
+    DI = {"pair_id": [], "i": [], "j": [], "bullets_i": [], "bullets_j": [], "bullets_delta": [], "bullets_i_s": [], "bullets_j_s": [], "bullets_delta_s": [], "jl_i": [], "jl_j": [], "rise": [], "fall": [], "passage_tail": []}
+    for r in range(n):
+        pid = pairs["pair_id"][r]; lean = LEAN[r]
+        DI["pair_id"].append(pid); DI["i"].append(int(pairs["i"][r])); DI["j"].append(int(pairs["j"][r]))
+        DI["bullets_i"].append(RO["v_i"].get(r, {}).get(0, [])); DI["bullets_j"].append(RO["v_j"].get(r, {}).get(0, [])); DI["bullets_delta"].append(RO["v_delta"].get(r, {}).get(0, []))
+        DI["bullets_i_s"].append([b for s_ in range(1, n_samp) for b in RO["v_i"].get(r, {}).get(s_, [])]); DI["bullets_j_s"].append([b for s_ in range(1, n_samp) for b in RO["v_j"].get(r, {}).get(s_, [])]); DI["bullets_delta_s"].append([b for s_ in range(1, n_samp) for b in RO["v_delta"].get(r, {}).get(s_, [])])
+        DI["jl_i"].append(jl_words(jl_top[int(pairs["i"][r])][rows[r]])); DI["jl_j"].append(jl_words(jl_top[int(pairs["j"][r])][rows[r]])); DI["rise"].append(list(lean[0]) if lean else []); DI["fall"].append(list(lean[1]) if lean else [])
+        DI["passage_tail"].append(tok.decode(tails[rows[r]][-40:]))
+    pq.write_table(pa.table(DI), os.path.join(args.out_dir, f"describer_inputs__{tag}.parquet"))
     for r in range(n):
         pid = pairs["pair_id"][r]; lean = LEAN[r]
         for s in range(n_samp):
