@@ -68,7 +68,7 @@ if [ "$(nfiles q36/critic/$TAG 'ckpt_final.pt')" -lt 1 ]; then
   wait_gpu $(( 1 * 1 )) || exit 1; run hf 1 train_critic.py "--data-dir /vol/q36/data --out /vol/q36/critic/$TAG --tag critic_$TAG --pools '$POOLS' --val-sets '$VALS' --band $BAND --width 1536 --depth 16 --heads 16 --param v --uncond-steps $UNCOND_STEPS --steps $CRITIC_STEPS --batch 1024 --micro-batch 128 --eval-every 500 --eval-n 256 --spot-exact-n 64 --spot-ode-steps 16 --max-hours 3.5" critic
 fi
 if [ "$(nfiles q36/verbalizer/$TAG/final 'adapter_model')" -lt 1 ]; then
-  wait_gpu $(( 3 * 1 )) || exit 1; GT="$GPUS_BIG" run hf 3 sft_verbalizer.py "--data-dir /vol/q36/data --text '$TX/train/craft_full__*.parquet' --val-text '$TX/val/craft_full__*.parquet' --out /vol/q36/verbalizer/$TAG --band $BAND --steps $SFT_STEPS --batch 8 --grad-accum 4 --lr 3e-5 --eval-every 100 --save-every 200 --wandb-name sft_$TAG" sft 3
+  wait_gpu $(( 3 * 1 )) || exit 1; GT="$GPUS_BIG" run hf 3 sft_verbalizer.py "--data-dir /vol/q36/data --text '$TX/train/craft_full__*.parquet' --val-text '$TX/val/craft_full__*.parquet' --out /vol/q36/verbalizer/$TAG --band $BAND --steps $SFT_STEPS --batch 4 --grad-accum 8 --lr 3e-5 --no-grad-ckpt --eval-every 100 --save-every 200 --wandb-name sft_$TAG" sft 3
 fi
 waitn q36/verbalizer/$TAG/final "adapter_model" 1 || exit 1
 # 6. dump the verbalizer on held-out pairs (greedy) + the base-model control

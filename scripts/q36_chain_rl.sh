@@ -17,7 +17,7 @@ waitn q36/critic/$TAG "ckpt_final.pt" 1 || exit 1
 waitn q36/rl/_smoke "eval_0003.json" 1 || { log "smoke did not finish; check ap logs"; exit 1; }
 if [ "$(nfiles q36/rl/$RL_TAG 'eval_0000.json')" -lt 1 ]; then
   wait_gpu $RL_GPUS || exit 1
-  GT="$GPUS_BIG" run hf $RL_GPUS rl_verbalizer.py "--data-dir /vol/q36/data --policy /vol/q36/verbalizer/$TAG/final --critic /vol/q36/critic/$TAG/ckpt_final.pt --replay-text '$TX/train/craft_full__*.parquet,$TX/train/describer_sonnet5_A__*.parquet' --twins '$TX/val/twins__*.parquet' --out /vol/q36/rl/$RL_TAG --band $BAND --max-train-pos 60000 --steps $STEPS --batch $BATCH --group $GROUP --n-tok 96 --lr 1e-5 --critic-lr 3e-5 --kl $KL --lam $LAM --eval-every 10 --save-every 25 --heldout 128 --gen-chunk 32 --bwd-chunk 8 --wandb-name $RL_TAG" rl $RL_GPUS
+  GT="$GPUS_BIG" run hf $RL_GPUS rl_verbalizer.py "--data-dir /vol/q36/data --policy /vol/q36/verbalizer/$TAG/final --critic /vol/q36/critic/$TAG/ckpt_final.pt --replay-text '$TX/train/craft_full__*.parquet,$TX/train/describer_sonnet5_A__*.parquet' --twins '$TX/val/twins__*.parquet' --out /vol/q36/rl/$RL_TAG --band $BAND --max-train-pos 60000 --steps $STEPS --batch $BATCH --group $GROUP --n-tok 96 --lr 1e-5 --critic-lr 3e-5 --kl $KL --lam $LAM --eval-every 10 --save-every 25 --heldout 128 --gen-chunk 32 --bwd-chunk 4 --no-grad-ckpt --wandb-name $RL_TAG" rl $RL_GPUS
 fi
 waitn q36/rl/$RL_TAG "eval_00(1|2|3|4|5|6|7|8|9)0.json" 1 || exit 1; log "RL running (first eval landed)"
 for i in $(seq 1 600); do n=$(nfiles q36/rl/$RL_TAG "eval_.*json"); log "RL evals: $n"; [ "$n" -ge $((STEPS / 10 + 1)) ] && break; sleep 300; done
