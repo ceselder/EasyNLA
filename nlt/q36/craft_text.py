@@ -112,7 +112,15 @@ def craft_shard(shard_index):
         if not bi or not bj: return list(bj), list(bi)
         Si = torch.stack([E[b] for b in bi]); Sj = torch.stack([E[b] for b in bj]); M = Sj @ Si.T
         return [b for b, m in zip(bj, M.max(1).values.tolist()) if m < args.tau], [b for b, m in zip(bi, M.max(0).values.tolist()) if m < args.tau]
-    POOLS = {k: [] for k in ("craft_full", "craft_nojl", "craft_delta", "craft_newfaded", "jlens", "olens_j", "olens_i")}
+    POOLS = {k: [] for k in ("craft_full", "craft_nojl", "craft_delta", "craft_newfaded", "jlens", "olens_j", "olens_i", "raw_all", "raw_no_i", "raw_no_j", "raw_no_delta", "raw_no_jl")}
+    def raw_lines(bi, bj, bd, lean, drop=None):
+        """plain concatenation of the readouts with plain labels (no filtering): the 'raw readouts' text-source arm; drop = one source left out"""
+        out = []
+        if drop != "i" and bi: out.append("Earlier: " + "; ".join(bi) + ".")
+        if drop != "j" and bj: out.append("Later: " + "; ".join(bj) + ".")
+        if drop != "delta" and bd: out.append("Change: " + "; ".join(bd) + ".")
+        if drop != "jl" and lean and (lean[0] or lean[1]): out.append(("Rising: " + ", ".join(lean[0]) + ". " if lean[0] else "") + ("Falling: " + ", ".join(lean[1]) + "." if lean[1] else ""))
+        return "\n".join(out)
     TW = []; stats = {"n": n, "new_mean": 0.0, "faded_mean": 0.0, "shift_mean": 0.0, "empty_full": 0}
     # ---- describer inputs (for the LLM-written change descriptions, describe.py): every readout source per pair + the passage tail (variant B only).
     #      i / j are stored for bookkeeping and are NEVER put in a prompt.
@@ -142,7 +150,8 @@ def craft_shard(shard_index):
             if s == 0: stats["new_mean"] += len(new) / n; stats["faded_mean"] += len(faded) / n; stats["shift_mean"] += len(bd) / n
             full = lines(new, faded, bd, lean); nojl = lines(new, faded, bd, lean, jl=False); delta = lines([], [], bd, None, jl=False); nf = lines(new, faded, [], None, jl=False); jlt = lines([], [], [], lean)
             if s == 0 and not full: stats["empty_full"] += 1
-            for k_, t_ in (("craft_full", full), ("craft_nojl", nojl), ("craft_delta", delta), ("craft_newfaded", nf), ("jlens", jlt), ("olens_j", "Present: " + "; ".join(bj) + "." if bj else ""), ("olens_i", "Present: " + "; ".join(bi) + "." if bi else "")):
+            for k_, t_ in (("craft_full", full), ("craft_nojl", nojl), ("craft_delta", delta), ("craft_newfaded", nf), ("jlens", jlt), ("olens_j", "Present: " + "; ".join(bj) + "." if bj else ""), ("olens_i", "Present: " + "; ".join(bi) + "." if bi else ""),
+                          ("raw_all", raw_lines(bi, bj, bd, lean)), ("raw_no_i", raw_lines(bi, bj, bd, lean, "i")), ("raw_no_j", raw_lines(bi, bj, bd, lean, "j")), ("raw_no_delta", raw_lines(bi, bj, bd, lean, "delta")), ("raw_no_jl", raw_lines(bi, bj, bd, lean, "jl"))):
                 if t_: POOLS[k_].append((pid, t_, k_, s))
             if args.twins and s == 0 and full:
                 TW.append((pid, "true", full))
