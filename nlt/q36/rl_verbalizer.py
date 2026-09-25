@@ -31,7 +31,9 @@ ap.add_argument("--replay-no-replacement", action="store_true", help="draw repla
 ap.add_argument("--steps", type=int, default=200); ap.add_argument("--batch", type=int, default=16, help="prompts per rank"); ap.add_argument("--group", type=int, default=8); ap.add_argument("--n-tok", type=int, default=176); ap.add_argument("--temp", type=float, default=1.0)
 ap.add_argument("--lr", type=float, default=1e-5); ap.add_argument("--critic-lr", type=float, default=3e-5); ap.add_argument("--kl", type=float, default=0.02); ap.add_argument("--lam", type=float, default=-1.0, help="per-token cost in FM-loss units; < 0 = calibrate at step 1 (20% of the group std at the median length)"); ap.add_argument("--depth-penalty", type=float, default=0.05, help="FM-loss units subtracted per text with a depth word / empty text (the FM loss is O(1) per dim; group stds are ~1e-3..1e-2)")
 ap.add_argument("--cispo-eps-max", type=float, default=5.0); ap.add_argument("--no-cotrain", action="store_true"); ap.add_argument("--replay-frac", type=float, default=0.5); ap.add_argument("--critic-micro", type=int, default=64)
-ap.add_argument("--t-grid", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9"); ap.add_argument("--eval-every", type=int, default=10); ap.add_argument("--heldout", type=int, default=128); ap.add_argument("--save-every", type=int, default=50)
+ap.add_argument("--t-grid", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9"); ap.add_argument("--t-weights", default=None, help="RL v6: comma weights over --t-grid for the REWARD's FM loss (default uniform); from the judge's t-band twin table")
+ap.add_argument("--eps-draws", type=int, default=1, help="RL v6: noise draws per t for the reward (shared across a prompt's rollouts)"); ap.add_argument("--bullet-beta", type=float, default=0.0, help="RL v6: per-bullet credit - token advantage += beta * z(leave-one-bullet-out FM gain) on the bullet's tokens; 0 = off")
+ap.add_argument("--bullet-lines", default="Now present,Faded,Shift", help="RL v6: line labels whose ';'-separated items are credited bullets"); ap.add_argument("--eval-every", type=int, default=10); ap.add_argument("--heldout", type=int, default=128); ap.add_argument("--save-every", type=int, default=50)
 ap.add_argument("--gen-chunk", type=int, default=32); ap.add_argument("--bwd-chunk", type=int, default=8); ap.add_argument("--no-grad-ckpt", action="store_true", help="disable gradient checkpointing on the policy (on by default: a 27B backward over 8 x 170 tokens OOMs a 140 GB H200 without it)"); ap.add_argument("--max-train-pos", type=int, default=None); ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--wandb-project", default="nlt-qwen36-27b"); ap.add_argument("--wandb-entity", default="octahedral-systems"); ap.add_argument("--wandb-name", default=None); ap.add_argument("--no-wandb", action="store_true")
 args = ap.parse_args()
@@ -41,6 +43,9 @@ dev = f"cuda:{LRANK}"; torch.cuda.set_device(dev); torch.manual_seed(args.seed +
 def P(*a):
     if is_main: print(*a, flush=True)
 T_GRID = [float(x) for x in args.t_grid.split(",")]; PAD = tok.eos_token_id; EOT = tok.convert_tokens_to_ids("<|im_end|>")
+T_W = [float(x) for x in args.t_weights.split(",")] if args.t_weights else [1.0] * len(T_GRID); assert len(T_W) == len(T_GRID); T_W = [w / sum(T_W) for w in T_W]
+EVAL_T = [0.1, 0.3, 0.5, 0.7, 0.9]                        # the eval's FM view keeps the uniform grid (comparable across runs) whatever the reward grid is
+TK = [(t, k) for t in T_GRID for k in range(args.eps_draws)]   # reward noise bank index: (t, draw)
 PROMPT = change_prompt(tok); PLEN = len(PROMPT); PROMPT_T = torch.tensor([PROMPT], device=dev)
 
 # ---- policy: "default" = trainable, "ref" = frozen SFT copy (KL reference) ----
@@ -141,12 +146,12 @@ with torch.no_grad():
 
 # ---- critic scoring: proxy bits with shared (t, eps) ----
 @torch.no_grad()
-def proxy_bits(model, src, y, texts, eps_bank, dm_texts=None):
-    """-> bits(text) [N] = (d/2) mean_t [L(no text) - L(text)] / ln2 ; eps_bank: list over t of [N, d]. Optional dm_texts -> content bits too."""
-    d = y.shape[-1]; N = y.shape[0]; Lc = torch.zeros(len(T_GRID), N, device=dev); Lu = torch.zeros_like(Lc); Ld = torch.zeros_like(Lc)
+def proxy_bits(model, src, y, texts, eps_bank, dm_texts=None, grid=None):
+    """-> bits(text) [N] = (d/2) mean_t [L(no text) - L(text)] / ln2 ; eps_bank: list over t of [N, d]. Optional dm_texts -> content bits too. grid: the t values (default EVAL_T)."""
+    grid = grid or EVAL_T; d = y.shape[-1]; N = y.shape[0]; Lc = torch.zeros(len(grid), N, device=dev); Lu = torch.zeros_like(Lc); Ld = torch.zeros_like(Lc)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         enc, mask = encoder(texts); enc_d, mask_d = encoder(dm_texts) if dm_texts is not None else (None, None)
-    for ti, t in enumerate(T_GRID):
+    for ti, t in enumerate(grid):
         tt = torch.full((N,), float(t), device=dev); x_t = (1 - tt)[:, None] * y + tt[:, None] * eps_bank[ti]; tgt = eps_bank[ti] - y
         with torch.autocast("cuda", dtype=torch.bfloat16):
             vc = model(x_t, tt, src, enc=enc, enc_mask=mask).float(); vu = model(x_t, tt, src).float()
@@ -154,8 +159,9 @@ def proxy_bits(model, src, y, texts, eps_bank, dm_texts=None):
             if enc_d is not None: Ld[ti] = ((model(x_t, tt, src, enc=enc_d, enc_mask=mask_d).float() - tgt) ** 2).mean(-1)
     pmi = (d / 2) * (Lu - Lc).mean(0) / math.log(2); cont = (d / 2) * (Ld - Lc).mean(0) / math.log(2) if enc_d is not None else None
     return pmi, cont
-def eps_for(N, d, seed):
-    g = torch.Generator(device=dev).manual_seed(int(seed)); return [torch.randn(N, d, generator=g, device=dev) for _ in T_GRID]
+def eps_for(N, d, seed, n=None):
+    """n noise tensors [N, d] (default: one per EVAL_T entry; the reward asks for len(TK))"""
+    g = torch.Generator(device=dev).manual_seed(int(seed)); return [torch.randn(N, d, generator=g, device=dev) for _ in range(n or len(EVAL_T))]
 
 # ---- policy sampling / log-probs ----
 def gen(vecs, temperature):
@@ -175,39 +181,89 @@ def seq_logp(vecs, samp, adapter="default"):
     try: out = policy(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False)
     finally: INJ.off(); policy.set_adapter("default")
     lg = out.logits[:, PLEN - 1:PLEN - 1 + samp.shape[1]].float(); return torch.log_softmax(lg, -1).gather(-1, samp[..., None])[..., 0]
-def decode(samp):
+def decode(samp, strip=True):
     out = []
     for row in samp.tolist():
         ids = []
         for t in row:
             if t in (PAD, EOT): break
             ids.append(t)
-        out.append(tok.decode(ids).strip())
+        d_ = tok.decode(ids); out.append(d_.strip() if strip else d_)
     return out
 
 # ---- reward: the flow-matching loss itself (user: "just use the flow loss as reward") ----
 @torch.no_grad()
 def fm_loss_text(model, src, y, texts, eps_bank):
-    """mean over the t grid of the per-row FM loss (velocity MSE, mean over dims) of the critic given the text; eps_bank: list over t of [N, d]"""
-    N = y.shape[0]; L = torch.zeros(len(T_GRID), N, device=dev)
+    """REWARD view: sum_t w_t * mean_k FM_{t,k}(text) (velocity MSE, mean over dims); eps_bank: list over TK = (t, draw) of [N, d]. v5 defaults (uniform w, 1 draw) = the plain grid mean."""
+    N = y.shape[0]; L = torch.zeros(N, device=dev)
     with torch.autocast("cuda", dtype=torch.bfloat16): enc, mask = encoder(texts)
-    for ti, t in enumerate(T_GRID):
-        tt = torch.full((N,), float(t), device=dev); x_t = (1 - tt)[:, None] * y + tt[:, None] * eps_bank[ti]; tgt = eps_bank[ti] - y
+    for q, (t, k) in enumerate(TK):
+        tt = torch.full((N,), float(t), device=dev); x_t = (1 - tt)[:, None] * y + tt[:, None] * eps_bank[q]; tgt = eps_bank[q] - y
         with torch.autocast("cuda", dtype=torch.bfloat16): v = model(x_t, tt, src, enc=enc, enc_mask=mask).float()
-        L[ti] = ((v - tgt) ** 2).mean(-1)
-    return L.mean(0)
+        L = L + (T_W[T_GRID.index(t)] / args.eps_draws) * ((v - tgt) ** 2).mean(-1)
+    return L
+
+# ---- RL v6: per-bullet credit (orchestrator 15:50; the user's crux idea as reward shaping) ----
+import re as _re
+BULLET_LINES = [x.strip() for x in args.bullet_lines.split(",") if x.strip()]
+def bullet_spans(raw):
+    """char spans [s, e) of every ';'-separated item of the credited lines in the RAW decoded text (labels, separators and other lines excluded) -> list of (s, e, line_label)"""
+    out = []; pos = 0
+    for ln in raw.split("\n"):
+        for lab in BULLET_LINES:
+            if ln.startswith(lab + ":"):
+                body_start = pos + len(lab) + 1; body = ln[len(lab) + 1:]
+                c = 0
+                for item in body.split(";"):
+                    st = c; en = c + len(item); it = item.rstrip("."); lead = len(item) - len(item.lstrip()); trail = len(it) - len(it.rstrip())
+                    if it.strip(): out.append((body_start + st + lead, body_start + en - (len(item) - len(it)) - trail, lab))
+                    c = en + 1
+                break
+        pos += len(ln) + 1
+    return out
+def without_span(raw, s, e):
+    """the raw text with bullet [s, e) removed together with ONE adjacent '; ' separator (or the whole line when it was the only item)"""
+    if raw[e:e + 1] == ";": e2 = e + 1; e2 += (raw[e2:e2 + 1] == " "); return raw[:s] + raw[e2:]
+    k = raw.rfind(";", 0, s)
+    if k >= 0 and raw.rfind("\n", 0, s) < k: return raw[:k] + raw[e:]
+    ls = raw.rfind("\n", 0, s) + 1; le = raw.find("\n", e); le = len(raw) if le < 0 else le + 1; return raw[:ls] + raw[le:]
+def token_spans(ids, spans):
+    """map char spans of the raw decode of `ids` to token index ranges [a, b) via prefix decoding (tok.decode is monotone in the prefix)"""
+    ends = []; L = 0
+    for k in range(len(ids)): L = len(tok.decode(ids[:k + 1])); ends.append(L)
+    out = []
+    for s, e, lab in spans:
+        a = next((k for k, x in enumerate(ends) if x > s), len(ids)); b = next((k for k, x in enumerate(ends) if x >= e), len(ids) - 1) + 1; out.append((a, max(b, a + 1), lab))
+    return out
+@torch.no_grad()
+def bullet_credit(samp, texts_raw, src, y, eps_bank, r_full):
+    """per rollout: [(tok_a, tok_b, gain)] with gain = reward(full) - reward(without bullet) under the SAME noise; one batched critic pass over all leave-one-out texts"""
+    jobs = []; meta = []
+    for n, raw in enumerate(texts_raw):
+        ids = []
+        for t in samp[n].tolist():
+            if t in (PAD, EOT): break
+            ids.append(t)
+        sp = bullet_spans(raw); tsp = token_spans(ids, sp) if sp else []
+        for (s, e, lab), (a, b, _) in zip(sp, tsp): jobs.append((n, without_span(raw, s, e).strip() or " ")); meta.append((n, a, b))
+    if not jobs: return [[] for _ in texts_raw], 0.0, 0.0
+    idx = torch.tensor([n for n, _ in jobs], device=dev); fm = torch.cat([fm_loss_text(critic.eval(), src[idx[a:a + 128]], y[idx[a:a + 128]], [j[1] for j in jobs[a:a + 128]], [e[idx[a:a + 128]] for e in eps_bank]) for a in range(0, len(jobs), 128)]); critic.train()
+    gains = (r_full[idx] - (-fm)).tolist()                 # r_full excludes the lam/depth terms' change (a removed bullet also shortens the text; we credit the FM part only)
+    out = [[] for _ in texts_raw]
+    for (n, a, b), g_ in zip(meta, gains): out[n].append((a, b, g_))
+    return out, float(np.mean(gains)), float(np.mean([g_ > 0 for g_ in gains]))
 LAM = [args.lam]                                            # calibrated at step 1 when --lam < 0: 20% of the group std at the median length
 def rewards_for(src, u_j, texts, G, seed):
     """texts grouped by prompt (B*G, prompt-major); the SAME (t grid, eps) for every rollout of a prompt (common random numbers) -> reward = -FM loss - lam*tokens - depth penalty.
     The no-text term is a constant within a group (shared noise) and cancels in the group-normalised advantage, so it is not computed."""
-    N = len(texts); Bp = N // G; eps_p = eps_for(Bp, D_MODEL, seed); eps_bank = [e.repeat_interleave(G, 0) for e in eps_p]
-    fm = fm_loss_text(critic.eval(), src, u_j, [t if t else " " for t in texts], eps_bank); critic.train()
+    N = len(texts); Bp = N // G; eps_p = eps_for(Bp, D_MODEL, seed, n=len(TK)); eps_bank = [e.repeat_interleave(G, 0) for e in eps_p]
+    fm = fm_loss_text(critic.eval(), src, u_j, [t if t else " " for t in texts], eps_bank); critic.train(); rewards_for.last_eps = eps_bank
     ntok = torch.tensor([len(tok(t, add_special_tokens=False).input_ids) for t in texts], device=dev, dtype=torch.float32); hits = torch.tensor([float(depth_hit(t)) for t in texts], device=dev)
     empty = torch.tensor([float(not t.strip()) for t in texts], device=dev)
     if LAM[0] < 0:
         gstd = float((-fm).view(Bp, G).std(1).mean()); med = float(ntok.median().clamp_min(1)); LAM[0] = 0.2 * gstd / med
         P(f"[rl] lambda calibrated: group std of -FM {gstd:.4f}, median tokens {med:.0f} -> lam {LAM[0]:.6f} per token (20% of the group std at the median length)")
-    r = -fm - LAM[0] * ntok - args.depth_penalty * hits - args.depth_penalty * empty
+    r = -fm - LAM[0] * ntok - args.depth_penalty * hits - args.depth_penalty * empty; rewards_for.last_negfm = -fm
     return r, -fm, ntok, hits
 
 # ---- critic co-training step ----
@@ -277,6 +333,15 @@ for step in range(1, args.steps + 1):
         stats = torch.tensor([advf[keep].double().pow(2).sum().item(), advf[keep].double().sum().item(), float(keep.sum())], dtype=torch.float64, device=dev)
         if is_dist: dist.all_reduce(stats)
         n_all = stats[2].item(); std = math.sqrt(max(stats[0].item() / n_all - (stats[1].item() / n_all) ** 2, 0.0)) if n_all > 1 else 1.0; adv = (advf / (std + 1e-6)).view(-1)
+        A_tok = adv[:, None].expand(B * G, samp.shape[1]).clone(); b_gain = float("nan"); b_pos = float("nan"); b_n = 0
+        if args.bullet_beta > 0:                                                     # RL v6 per-bullet credit: + beta * z(leave-one-out gain) on the bullet's tokens (z over the prompt's group)
+            credits, b_gain, b_pos = bullet_credit(samp, decode(samp, strip=False), sG, yG, rewards_for.last_eps, rewards_for.last_negfm)
+            for bq in range(B):
+                gs = [g_ for n in range(bq * G, (bq + 1) * G) for (_, _, g_) in credits[n]]
+                if len(gs) < 2 or not keep[bq * G]: continue
+                mu_ = float(np.mean(gs)); sd_ = float(np.std(gs)) + 1e-6
+                for n in range(bq * G, (bq + 1) * G):
+                    for (a, b_, g_) in credits[n]: A_tok[n, a:b_] += args.bullet_beta * (g_ - mu_) / sd_; b_n += 1
         mask = sample_mask(samp) * keep.float()[:, None]; m3 = mask.view(B, G, -1); tok_g = m3.sum((1, 2)); n_eff_g = max(int((tok_g > 0).sum()), 1)
         w = (m3 / tok_g.clamp(min=1)[:, None, None] / n_eff_g).view(B * G, -1)
         old_lp = torch.cat([seq_logp(vG[a:a + args.bwd_chunk], samp[a:a + args.bwd_chunk]) for a in range(0, B * G, args.bwd_chunk)])
@@ -284,7 +349,7 @@ for step in range(1, args.steps + 1):
     optim.zero_grad(set_to_none=True); pg_tot = 0.0; kl_tot = 0.0
     for a in range(0, B * G, args.bwd_chunk):
         sl = slice(a, a + args.bwd_chunk); lp = seq_logp(vG[sl], samp[sl]); rho = torch.exp(lp.detach() - old_lp[sl]).clamp(max=args.cispo_eps_max)
-        loss_tok = -(rho * adv[sl, None] * lp)
+        loss_tok = -(rho * A_tok[sl] * lp)
         if ref_lp is not None:
             k3 = torch.exp(ref_lp[sl] - lp) - (ref_lp[sl] - lp) - 1; loss_tok = loss_tok + args.kl * k3; kl_tot += float((k3.detach() * mask[sl]).sum() / mask[sl].sum().clamp_min(1))
         pg = (loss_tok * w[sl]).sum(); pg.backward(); pg_tot += pg.item()
@@ -296,7 +361,7 @@ for step in range(1, args.steps + 1):
     gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0); optim.step()
     c_loss = critic_step(sG, uG, texts, G)
     if is_main:
-        log = {"step": step, "reward": rew.mean().item(), "neg_fm_loss": pmi.mean().item(), "lam": LAM[0], "tokens": ntok.mean().item(), "depth_hit_rate": hits.mean().item(), "groups_kept": int(nz.sum()), "kl_k3": kl_tot / max(1, (B * G) // args.bwd_chunk), "grad_norm": float(gn), "critic_loss": c_loss, "min": (time.time() - t0) / 60}
+        log = {"step": step, "reward": rew.mean().item(), "neg_fm_loss": pmi.mean().item(), "lam": LAM[0], "tokens": ntok.mean().item(), "depth_hit_rate": hits.mean().item(), "groups_kept": int(nz.sum()), "kl_k3": kl_tot / max(1, (B * G) // args.bwd_chunk), "grad_norm": float(gn), "critic_loss": c_loss, "bullet_gain_mean": b_gain, "bullet_gain_frac_pos": b_pos, "bullets_credited": b_n, "min": (time.time() - t0) / 60}
         print(f"step {step:04d} | reward {log['reward']:.4f} | -fm {log['neg_fm_loss']:.4f} | tokens {log['tokens']:.0f} | depth-hits {log['depth_hit_rate']:.1%} | groups {log['groups_kept']}/{B} | kl {log['kl_k3']:.4f} | critic {c_loss:.4f} | gn {float(gn):.2f} | {log['min']:.1f} min", flush=True)
         if wb: wb.log(log)
         if step % args.eval_every == 0:
