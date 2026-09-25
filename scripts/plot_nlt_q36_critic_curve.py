@@ -16,7 +16,7 @@ PASS_TWIN, PASS_CONTENT = 0.60, 25.0
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--tag", default="v3"); ap.add_argument("--ref", default="bits_v1best_main.json", help="reference judge file (critic v1 ckpt_best) for the dashed baselines"); ap.add_argument("--verdict", default=None, help="manual verdict override (e.g. a run stopped by hand at its gate)"); a = ap.parse_args()
-    files = sorted(glob.glob(f"{REP}/data/bits_{a.tag}_step*.json"), key=lambda f: int(re.search(r"step(\d+)", f).group(1)))
+    files = sorted((f for f in glob.glob(f"{REP}/data/bits_{a.tag}_step*.json") if re.fullmatch(r"bits_[^_]+_step\d+\.json", os.path.basename(f))), key=lambda f: int(re.search(r"step(\d+)", f).group(1)))   # gate files only (_train / _pools live beside them)
     R = []
     for f in files:
         d = json.load(open(f)); s = d["sets"]["craft_full"]; tw = d.get("twins", {}).get("craft_twins", {}).get("variants", {}); nb = s.get("neighbours") or {}
