@@ -19,7 +19,7 @@ ap.add_argument("--data", default=None, help="COLUMN MODE: parquet or glob with 
 ap.add_argument("--data-dir", default=None, help="PAIR MODE: store dir with splits.json and pairs_<split>.parquet"); ap.add_argument("--writes-dir", default="/vol/q36/data/writes", help="pair mode: A_L*/M_L* prefix-sum store for the v_attn / v_mlp specs"); ap.add_argument("--pairs-split", default="train"); ap.add_argument("--pairs-shards", default="", help="comma list of shard indices of that split")
 ap.add_argument("--adapter", default=None, help="PEFT LoRA dir to merge into the served base (None = base model)")
 ap.add_argument("--prompt", default="bullets", choices=["bullets", "av", "skiplens"]); ap.add_argument("--min-tokens", type=int, default=0); ap.add_argument("--k", type=int, default=4, help="bullets in the prompt")
-ap.add_argument("--specs", required=True, help="';'-separated: h_L24 | h_L42-h_L24 | v_i | v_j | v_delta | v_attn | v_mlp")
+ap.add_argument("--specs", default="", help="';'-separated: h_L24 | h_L42-h_L24 | v_i | v_j | v_delta | v_attn | v_mlp")
 ap.add_argument("--n-rows", type=int, default=0, help="0 = all rows"); ap.add_argument("--skip-rows", type=int, default=0)
 ap.add_argument("--n-samples", type=int, default=3); ap.add_argument("--no-greedy", action="store_true"); ap.add_argument("--max-tokens", type=int, default=80)
 ap.add_argument("--temperature", type=float, default=1.0); ap.add_argument("--top-p", type=float, default=1.0)
@@ -28,6 +28,9 @@ ap.add_argument("--max-num-seqs", type=int, default=512); ap.add_argument("--gpu
 ap.add_argument("--model", default=os.environ.get("OLENS_MODEL", "Qwen/Qwen3.6-27B")); ap.add_argument("--hf-extra", default="/vol/q36/hf_extra")
 ap.add_argument("--grammar", action="store_true", help="regex-constrained decoding: exactly --k ASCII bullets of --bullet-chars chars max (the RL sampled under an ascii + bullet-grammar + 16-token cap mask; plain decoding lets the lens run on)")
 ap.add_argument("--bullet-chars", type=int, default=70)
+ap.add_argument("--layer-specs", default="", help="HARVEST (pair mode): ';'-separated h_L<layer> specs read for EVERY position of each --pairs-shards shard (one greedy read per (position, layer); reused by all (i, j) pairs of the position) -> <out-dir>/<split>/<shard>/h_L<layer>.parquet with pos_idx")
+ap.add_argument("--delta-pairs", default=None, help="HARVEST (pair mode): pairs parquet (same schema as pairs_<split>.parquet, several (i, j) per position) -> v_delta reads for its pairs of each --pairs-shards shard -> <out-dir-delta>/<split>/<shard>/v_delta.parquet")
+ap.add_argument("--out-dir-delta", default=None, help="output root for --delta-pairs reads (default <out-dir>_delta)")
 args = ap.parse_args()
 D_MODEL = 5120
 
@@ -101,15 +104,33 @@ def main():
                         W = {L: torch.tensor(fsl(tw, f"{p_}_L{L}", D_MODEL, np.float32)) for L in layers}
                         COL[name] = torch.stack([W[int(L)][k] for L, k in zip(P["j"], ridx)]) - torch.stack([W[int(L)][k] for L, k in zip(P["i"], ridx)]); del W
                 return COL, len(P), P["pair_id"].tolist()
-            jobs.append((f"{split}:shard{si}:{os.path.basename(f)}", od, loader))
+            if specs and not args.layer_specs and not args.delta_pairs: jobs.append((f"{split}:shard{si}:{os.path.basename(f)}", od, loader, specs))
+            if args.layer_specs:                                                              # per-position reads at every listed layer (reused across all pairs of the position)
+                lspecs = [x.strip() for x in args.layer_specs.split(";") if x.strip()]
+                def lloader(f=f, si=si, split=split, lspecs=lspecs):
+                    tb = pq.read_table(f, columns=[x for x in lspecs] + ["row"]); rows = tb.column("row").to_numpy().astype(np.int64)
+                    COL = {x: torch.tensor(fsl(tb, x, D_MODEL, np.float32)) for x in lspecs}
+                    return COL, tb.num_rows, [f"{split}:{si * 1_000_000 + int(r)}" for r in rows]                   # 'pair_id' column = split:pos_idx (a position id here)
+                jobs.append((f"{split}:shard{si}:{os.path.basename(f)}:layers", od, lloader, lspecs))
+            if args.delta_pairs:                                                              # v_delta for K extra (i, j) pairs per position
+                odd = os.path.join(args.out_dir_delta or (args.out_dir.rstrip("/") + "_delta"), split, os.path.basename(f).replace(".parquet", ""))
+                if "delta" not in PAIRS: PAIRS["delta"] = pq.read_table(args.delta_pairs).to_pandas()
+                def dloader(f=f, si=si, split=split):
+                    P_all = PAIRS["delta"]; P = P_all[(P_all["shard"] == si) & (P_all["split"] == split)].reset_index(drop=True)
+                    layers = sorted(set(P["i"].tolist()) | set(P["j"].tolist()))
+                    tb = pq.read_table(f, columns=[f"h_L{L}" for L in layers] + ["row"]); rowpos = {int(r): k for k, r in enumerate(tb.column("row").to_numpy())}; ridx = [rowpos[int(r)] for r in P["row"]]
+                    HL = {L: torch.tensor(fsl(tb, f"h_L{L}", D_MODEL, np.float32)) for L in layers}
+                    vi = torch.stack([HL[int(L)][k] for L, k in zip(P["i"], ridx)]); vj = torch.stack([HL[int(L)][k] for L, k in zip(P["j"], ridx)]); del HL
+                    return {"v_delta": vj - vi}, len(P), P["pair_id"].tolist()
+                jobs.append((f"{split}:shard{si}:{os.path.basename(f)}:delta", odd, dloader, ["v_delta"]))
     else:
         files = sorted(sum((glob.glob(x.strip()) for x in args.data.split(",")), [])); assert files, f"no files match {args.data}"
         def loader():
             need_cols = sorted({c for s in specs for c in s.split("-")}); has_pid = all("pair_id" in pq.ParquetFile(f).schema_arrow.names for f in files)
             tb = pa.concat_tables([pq.ParquetFile(f).read(columns=need_cols + (["pair_id"] if has_pid else [])) for f in files]).slice(args.skip_rows, args.n_rows if args.n_rows else None)
             return {c: torch.tensor(fsl(tb, c, D_MODEL, np.float32)) for c in need_cols}, tb.num_rows, (tb.column("pair_id").to_pylist() if has_pid else None)
-        jobs.append(("columns", args.out_dir, loader))
-    todo = [(lab, od, ld) for lab, od, ld in jobs if any(not os.path.exists(os.path.join(od, spec_name(s) + ".parquet")) for s in specs)]
+        jobs.append(("columns", args.out_dir, loader, specs))
+    todo = [(lab, od, ld, sp) for lab, od, ld, sp in jobs if any(not os.path.exists(os.path.join(od, spec_name(s) + ".parquet")) for s in sp)]
     print(f"[rollout] {len(todo)}/{len(jobs)} jobs to do", flush=True)
     if not todo: print("ROLLOUT_DONE (nothing to do)", flush=True); return
 
@@ -148,9 +169,9 @@ def main():
             from vllm.sampling_params import GuidedDecodingParams; SO = {"guided_decoding": GuidedDecodingParams(regex=rx)}
         print(f"[rollout] grammar-constrained decoding: {rx}", flush=True)
     total = 0
-    for ji, (lab, od, ld) in enumerate(todo):
+    for ji, (lab, od, ld, jspecs) in enumerate(todo):
         COL, n, pair_ids = ld(); os.makedirs(od, exist_ok=True); print(f"[rollout] job {ji + 1}/{len(todo)} {lab}: {n} rows", flush=True)
-        for s in specs:
+        for s in jspecs:
             outp = os.path.join(od, spec_name(s) + ".parquet")
             if os.path.exists(outp): continue
             parts = s.split("-"); V = COL[parts[0]].clone()
