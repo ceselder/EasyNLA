@@ -14,8 +14,8 @@ DUMP=/vol/q36/dumps/rl_v3_$LAST.parquet
 if [ "$(nfiles q36/dumps "rl_v3_$LAST.parquet")" -lt 1 ]; then
   PRIO=4 wait_gpu 1 || exit 1
   run dump_verbalizer.py "--data-dir /vol/q36/data --adapter /vol/q36/rl/rl_v3/$LAST --pairs-text '$TX/val/craft_full__*.parquet' --n 512 --batch 64 --band $BAND --max-new 208 --out $DUMP" dump_rlv3_$LAST
-  for i in $(seq 1 60); do [ "$(nfiles q36/dumps "rl_v3_$LAST.parquet")" -ge 1 ] && break; sleep 120; done
 fi
+for i in $(seq 1 90); do [ "$(nfiles q36/dumps "rl_v3_$LAST.parquet")" -ge 1 ] && break; [ $((i % 5)) -eq 0 ] && log "waiting for the dump $DUMP"; sleep 120; done; log "dump present: $DUMP"
 SETS="teacher:$TX/val/craft_full__*.parquet,rl_step0:/vol/q36/dumps/verbalizer_v1b.parquet,rl_$LAST:$DUMP"
 declare -A JUDGES=([v2s3000]=/vol/q36/critic/v2/ckpt_step3000.pt [v1bjudge]=$JUDGE_V1B [v1best]=/vol/q36/critic/v1/ckpt_best.pt)
 for J in v2s3000 v1bjudge v1best; do

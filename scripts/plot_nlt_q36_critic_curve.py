@@ -42,12 +42,28 @@ def main():
             k = str(r["step"]) if str(r["step"]) in v1b_ref["by_step"] else min(v1b_ref["by_step"], key=lambda kk: abs(int(kk) - r["step"]))
             r["v1b_ref_cos_c"] = v1b_ref["by_step"][k]["cos_c"]; r["v1b_ref_step"] = int(k)
         elif v1b_ref: r["v1b_ref_cos_c"] = v1b_ref.get("cos_c")
+    PASSES = json.load(open(f"{REP}/data/critic_{a.tag}_passes.json")) if os.path.exists(f"{REP}/data/critic_{a.tag}_passes.json") else {}
     for r in R:
+        # AMENDED CRITERION (orchestrator 2026-09-25 09:25 UTC, before any v4 / v3c number): ALL of (a) a one-claim twin >= 0.60 in BOTH views, (b) held-out P(z > no text) >= 0.80, (c) content >= 25,
+        # (d) passes over every pool <= 1 at the checkpoint, (e) train - held-out PMI gap < 20 bits (small train-row eval bits_<tag>_stepNNNNNN_train.json)
+        tw = r["twins"]; best_var = max(("twin_shift", "twin_new"), key=lambda v: (tw.get(v, {}).get("p") or 0))
+        r["a_twins_both_views"] = bool((tw.get(best_var, {}).get("p") or 0) >= PASS_TWIN and (tw.get(best_var, {}).get("proxy_p") or 0) >= PASS_TWIN)
+        r["b_calibrated"] = bool(r.get("p_null") is not None and r["p_null"] >= 0.80)
+        r["c_content"] = bool(r["content"] >= PASS_CONTENT)
+        ps = [v for k, v in PASSES.items() if int(k) <= r["step"]]; r["passes_max"] = max(ps) if ps else None; r["d_one_pass"] = bool(r["passes_max"] is not None and r["passes_max"] <= 1.0)
+        tf = f"{REP}/data/bits_{a.tag}_step{r['step']:06d}_train.json"
+        if os.path.exists(tf):
+            st_ = json.load(open(tf))["sets"]["craft_full"]; r["pmi_train"] = st_["pmi_bits"]["mean"] if isinstance(st_["pmi_bits"], dict) else st_["pmi_bits"]; r["pmi_gap"] = r["pmi_train"] - r["pmi"]
+        else: r["pmi_train"] = None; r["pmi_gap"] = None
+        r["e_gap"] = bool(r["pmi_gap"] is not None and r["pmi_gap"] < 20)
         r["pass_cos"] = bool(r.get("cos_c") is not None and r.get("v1b_ref_cos_c") is not None and r["cos_c"] >= r["v1b_ref_cos_c"] - 0.01)
         if v1b_ref and v1b_ref.get("logp_null_bits") is not None and r.get("uncond_nll_bits_per_dim") is not None:
             r["logp_text_bits"] = r["pmi"] - float(r["uncond_nll_bits_per_dim"]) * 5120          # log p_v3b(u_j | z) in bits (pmi + own log p(u_j | null))
             r["text_vs_v1b_null_bits"] = r["logp_text_bits"] - v1b_ref["logp_null_bits"]        # (c): positive = the anchored text path beats v1b's plain unconditional density
-        r["pass"] = bool(r["pass_twins"] and r["pass_cos"]); r["contrast_learned_reconstruction_lost"] = bool(r["pass_twins"] and not r["pass_cos"])
+        r["pass_twins"] = r["a_twins_both_views"]
+        r["pass"] = bool(r["a_twins_both_views"] and r["b_calibrated"] and r["c_content"] and r["d_one_pass"] and r["e_gap"] and r["pass_cos"])
+        r["contrast_learned_reconstruction_lost"] = bool(r["a_twins_both_views"] and not r["pass_cos"])
+        r["fail_reasons"] = [k for k, ok in (("twins(both views)", r["a_twins_both_views"]), ("calibration P_null>=.8", r["b_calibrated"]), ("content>=25", r["c_content"]), ("passes<=1", r["d_one_pass"]), ("train-heldout gap<20", r["e_gap"]), ("cos>=v1b", r["pass_cos"])) if not ok]
     ref = None
     if os.path.exists(f"{REP}/data/{a.ref}"):
         d = json.load(open(f"{REP}/data/{a.ref}")); s = d["sets"]["craft_full"]; tw = d.get("twins", {}).get("craft_twins", {}).get("variants", {})
@@ -56,7 +72,7 @@ def main():
     verdict = "PASS" if any(r["pass"] for r in R) else ("CONTRAST LEARNED, RECONSTRUCTION LOST" if any(r.get("contrast_learned_reconstruction_lost") for r in R) and R and R[-1]["step"] >= final_step else ("FAIL" if R and R[-1]["step"] >= final_step else "pending"))
     if a.verdict: verdict = a.verdict
     elif os.path.exists(f"{REP}/data/critic_{a.tag}_verdict.txt"): verdict = open(f"{REP}/data/critic_{a.tag}_verdict.txt").read().strip()
-    out = {"tag": a.tag, "rule": {"twin_p_min": PASS_TWIN, "content_min": PASS_CONTENT, "text": "twin_shift or twin_new P(true > twin) >= 0.60 with craft_full content >= 25 bits at some saved checkpoint AND cos(conditional mean, u_j | text) not below critic v1b's (else 'contrast learned, reconstruction lost'); sanity column (c) = log p(u_j | z) under this critic minus log p(u_j | null) under v1b"},
+    out = {"tag": a.tag, "rule": {"twin_p_min": PASS_TWIN, "content_min": PASS_CONTENT, "text": "AMENDED 2026-09-25 09:25 UTC: ALL of (a) twin_new or twin_shift P >= 0.60 in BOTH the exact and the FM (reward) view, (b) held-out P(z > no text) >= 0.80, (c) content >= 25 bits, (d) passes over every pool <= 1 at the checkpoint, (e) train - held-out PMI gap < 20 bits; plus cos(E[u_j|z], u_j) with text not below critic v1b's (else 'contrast learned, reconstruction lost')"},
            "rows": R, "reference": ref, "v1b_reference": v1b_ref, "verdict": verdict}
     os.makedirs(f"{REP}/data", exist_ok=True); json.dump(out, open(f"{REP}/data/critic_{a.tag}_curve.json", "w"), indent=1)
     if not R: print("no checkpoint evals yet"); return
@@ -87,7 +103,7 @@ def main():
     ax.axhline(0, color="k", lw=0.8); ax.set_xlabel("training step"); ax.set_ylabel("content(own) − content(neighbour), bits"); ax.set_title("Position specificity: own state vs a neighbour's", fontsize=13); ax.legend(frameon=False, fontsize=8)
     fig.suptitle(f"Critic {a.tag} (activation-anchored contrast) over its saved checkpoints - verdict so far: {out['verdict']}", fontsize=14, y=1.0); fig.tight_layout()
     fig.savefig(f"{REP}/fig_critic_{a.tag}_curve.png", dpi=150, bbox_inches="tight"); fig.savefig(f"{REP}/fig_critic_{a.tag}_curve.pdf", bbox_inches="tight"); print("saved", f"fig_critic_{a.tag}_curve", "|", out["verdict"])
-    for r in R: print(f"step {r['step']}: content {r['content']:.1f} P {r['p_dm']:.3f} twin_shift {r['twins'].get('twin_shift', {}).get('p')} twin_new {r['twins'].get('twin_new', {}).get('p')} | cos_c {r.get('cos_c')} (v1b {r.get('v1b_ref_cos_c')}) | text-vs-v1b-null {r.get('text_vs_v1b_null_bits')} | twins-pass {r['pass_twins']} cos-pass {r['pass_cos']} -> {'PASS' if r['pass'] else ('contrast-only' if r.get('contrast_learned_reconstruction_lost') else 'no')}")
+    for r in R: print(f"step {r['step']}: content {r['content']:.1f} P {r['p_dm']:.3f} P_null {r.get('p_null')} twin_shift {r['twins'].get('twin_shift', {}).get('p')}/{r['twins'].get('twin_shift', {}).get('proxy_p')} twin_new {r['twins'].get('twin_new', {}).get('p')}/{r['twins'].get('twin_new', {}).get('proxy_p')} | cos_c {r.get('cos_c')} (v1b {r.get('v1b_ref_cos_c')}) | passes {r.get('passes_max')} | PMI train {r.get('pmi_train')} gap {r.get('pmi_gap')} -> {'PASS' if r['pass'] else ('contrast-only' if r.get('contrast_learned_reconstruction_lost') else 'no: ' + ', '.join(r['fail_reasons']))}")
 
 
 if __name__ == "__main__":
