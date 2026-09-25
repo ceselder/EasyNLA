@@ -24,7 +24,7 @@ from critic_data import Store, Directions, load_text_pairs, dm_partner
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--data-dir", required=True); ap.add_argument("--stats", default=None); ap.add_argument("--out", required=True); ap.add_argument("--band", default=None)
-ap.add_argument("--policy", required=True, help="SFT adapter dir (PEFT); 'none' = fresh zero LoRA (mechanics smoke only)"); ap.add_argument("--critic", required=True, help="critic ckpt (train_critic.py); 'none' = random init (mechanics smoke only)")
+ap.add_argument("--policy", required=True, help="SFT adapter dir (PEFT); 'none' = fresh zero LoRA (mechanics smoke only)"); ap.add_argument("--critic", required=True, help="critic ckpt (train_critic.py); 'none' = random init (mechanics smoke only)"); ap.add_argument("--frozen-critic", default=None, help="ckpt for the FROZEN guard critic (default: a copy of --critic); use the best-calibrated checkpoint, not the lowest-FM-loss one")
 ap.add_argument("--ref-text", default=None, help="glob(s) of the teacher text (val) -> teacher pmi/content on the held-out pairs under both critics at every eval (reference + collusion check)"); ap.add_argument("--replay-text", default=None, help="glob(s) of the warm-start trace pool (train split) for critic replay"); ap.add_argument("--twins", default=None, help="glob of val twins__*.parquet for the twin-P guard")
 ap.add_argument("--steps", type=int, default=200); ap.add_argument("--batch", type=int, default=16, help="prompts per rank"); ap.add_argument("--group", type=int, default=8); ap.add_argument("--n-tok", type=int, default=176); ap.add_argument("--temp", type=float, default=1.0)
 ap.add_argument("--lr", type=float, default=1e-5); ap.add_argument("--critic-lr", type=float, default=3e-5); ap.add_argument("--kl", type=float, default=0.02); ap.add_argument("--lam", type=float, default=-1.0, help="per-token cost in FM-loss units; < 0 = calibrate at step 1 (20% of the group std at the median length)"); ap.add_argument("--depth-penalty", type=float, default=0.05, help="FM-loss units subtracted per text with a depth word / empty text (the FM loss is O(1) per dim; group stds are ~1e-3..1e-2)")
@@ -69,7 +69,13 @@ if args.critic != "none":
     ck = torch.load(args.critic, map_location="cpu"); critic = build_prior(ck["config"]); critic.load_state_dict(ck["model"]); cargs = ck["args"]
 else:
     cargs = {"enc_model": "Qwen/Qwen3-0.6B", "enc_layer": 20, "enc_max_len": 192}; critic = DiffusionPrior(D_MODEL, 512, 4, 8, 8, 1024, 192, "v", 0.02, 0, 4, math.sqrt(D_MODEL))
-critic.to(dev).float(); frozen = copy.deepcopy(critic).eval().requires_grad_(False); critic.train()
+critic.to(dev).float()
+if args.frozen_critic and args.frozen_critic not in ("none", args.critic):
+    fck = torch.load(args.frozen_critic, map_location="cpu"); frozen = build_prior(fck["config"]); frozen.load_state_dict(fck["model"]); frozen = frozen.to(dev).float().eval().requires_grad_(False)
+    P(f"[rl] FROZEN guard critic = {args.frozen_critic} (step {fck.get('step')}); co-trained critic starts from {args.critic} (step {ck.get('step') if args.critic != 'none' else 'random'})")
+else:
+    frozen = copy.deepcopy(critic).eval().requires_grad_(False)
+critic.train()
 dirs.radial = cargs.get("radial", "lognormal"); dirs.sigma_iso = float(cargs.get("sigma_iso", 0.0)); dirs.sigma_r = float(cargs.get("sigma_r", dirs.sigma_r)); P(f"[rl] target convention: radial {dirs.radial} sigma_r {dirs.sigma_r} sigma_iso {dirs.sigma_iso}")
 from huggingface_hub import snapshot_download
 ENC_DIR = snapshot_download(cargs.get("enc_model", "Qwen/Qwen3-0.6B"), cache_dir="/vol/hf_cache/enc", token=os.environ.get("HF_TOKEN"))      # explicit cache_dir: HF_HOME points at the read-only 27B cache
