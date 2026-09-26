@@ -18,7 +18,8 @@ image = (modal.Image.from_registry("vllm/vllm-openai:v0.29.0", setup_dockerfile_
          .add_local_dir(REPO_LOCAL, REPO_REMOTE, copy=False, ignore=REPO_IGNORE))
 app = modal.App("nla-claims-gemma", image=image)
 ROOT = "/vol_glp/claims"; OUT = f"{ROOT}/gemma"
-KW = dict(volumes={"/vol_glp": vol_glp, "/vol_q36": vol_q36}, secrets=SECRETS, cpu=32, memory=256 * 1024)
+vol_exp = modal.Volume.from_name("nla-exp")   # read-only use here: mined verbalizer samples (best-of-N distillation)
+KW = dict(volumes={"/vol_glp": vol_glp, "/vol_q36": vol_q36, "/vol": vol_exp}, secrets=SECRETS, cpu=32, memory=256 * 1024)
 
 
 @app.function(gpu="B200:4", timeout=3 * 3600, **KW)
@@ -74,9 +75,20 @@ def ws_multi(names: str):
     return cw.run_multi(ROOT, cw.WS, [x for x in names.split(",") if x], commit=vol_glp.commit)
 
 
+@app.function(gpu="B200", timeout=12 * 3600, max_containers=8, **KW)
+def bon_verify(tag: str, samples_dir: str, shard: int, nshards: int):
+    """best-of-N distillation: Gemma verification + hedged rewrites of mined verbalizer samples (scripts/bon_distill.py verify)"""
+    import subprocess
+    vol_glp.reload()
+    rc = subprocess.call([sys.executable, f"{REPO_REMOTE}/scripts/bon_distill.py", "verify", "--tag", tag, "--samples-dir", samples_dir, "--shard", str(shard), "--nshards", str(nshards)], cwd=REPO_REMOTE)
+    vol_glp.commit(); return rc
+
+
 @app.local_entrypoint()
 def main(task: str = "bench", layouts: str = "", n: int = 20000, names: str = "", layout: str = "a_dp4", containers: int = 2, exclude: str = ""):
-    if task == "bench":
+    if task == "bon_verify":   # --names "<tag>|<samples dir>", --containers N
+        tg, sd = names.split("|"); print("rc", [c.get() for c in [bon_verify.spawn(tg, sd, i, containers) for i in range(containers)]])
+    elif task == "bench":
         print(bench.remote(layouts, n))
     elif task in ("gen", "gen1"):
         ns = [x for x in names.split(",") if x]; k = containers if task == "gen" else min(8, len(ns))

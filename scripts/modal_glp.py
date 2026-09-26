@@ -354,6 +354,20 @@ def fit_whiten_unitnorm(extra: str = ""):
     return _claims([f"{REPO_REMOTE}/scripts/fit_whitening_unitnorm.py"] + extra.split())
 
 
+@app.function(timeout=2 * 3600, volumes=VOLS, secrets=SECRETS, cpu=8, memory=128 * 1024)
+def bon_pool(extra: str = ""):
+    """best-of-N distillation pool (scripts/bon_distill.py pool)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/bon_distill.py", "pool"] + extra.split())
+
+
+@app.function(gpu="B200", timeout=8 * 3600, **COMMON)
+def bon_select(adapter: str, extra: str = ""):
+    """best-of-N distillation: critic-scored hedges + selection (scripts/bon_distill.py select)"""
+    vol_glp.reload()
+    return _claims([f"{REPO_REMOTE}/scripts/bon_distill.py", "select", "--adapter", adapter] + extra.split())
+
+
 @app.function(gpu="B200", timeout=4 * 3600, **COMMON)
 def rl_pmi_judge(adapter: str, extra: str = ""):
     """per-claim critic PMI vs claim-judge verdict on RL eval dumps (scripts/claims_rl_pmi_vs_judge.py)"""
@@ -532,6 +546,10 @@ def main(task: str = "smoke", tag: str = "", config: str = "", sets: str = "", c
         print("rc", claims_compose_variants.remote(ckpt, tag, extra))
     elif task == "fit_whiten_unitnorm":
         print("rc", fit_whiten_unitnorm.remote(extra))
+    elif task == "bon_pool":
+        print("rc", bon_pool.remote(extra))
+    elif task == "bon_select":
+        print("rc", bon_select.remote(ckpt, extra))
     elif task == "rl_pmi_judge":
         print("rc", rl_pmi_judge.remote(ckpt, extra))
     elif task == "claims_prebank":
