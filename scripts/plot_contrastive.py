@@ -33,6 +33,15 @@ def parse_log(tag):
     m = re.findall(r"\[eval_synth@(\d+)\] fm uncond [\d.]+ cond [\d.]+ shuf [\d.]+ \| gain ([\d.-]+) bits", txt)
     if m: out.update(gain_step=int(m[-1][0]), fm_gain_bits=float(m[-1][1]))
     out["done"] = "[cond] done" in txt
+    per = {}                                                                  # per-step values for matched-step comparisons
+    for s_, med in re.findall(r"\[health\] step (\d+): single-claim PMI of held-out true claims median ([+-][\d.]+)", txt): per.setdefault(int(s_), {})["health_pmi_median"] = float(med)
+    for s_, a_ in re.findall(r"\[eval_synth@(\d+)\] paired detection \(true claim vs false twin\) ([\d.]+)%", txt): per.setdefault(int(s_), {})["twin_paired"] = float(a_) / 100
+    for s_, i_, t_, se_ in re.findall(r"\[eval_synth@(\d+)\] paired detection .*?internal: (\d+)% .*?text: (\d+)% .*?semantic: (\d+)%", txt):
+        per.setdefault(int(s_), {}).update(twin_internal=int(i_) / 100, twin_text=int(t_) / 100, twin_semantic=int(se_) / 100)
+    for s_, g_ in re.findall(r"\[eval_synth@(\d+)\] fm uncond [\d.]+ cond [\d.]+ shuf [\d.]+ \| gain ([\d.-]+) bits", txt): per.setdefault(int(s_), {})["fm_gain_bits"] = float(g_)
+    for s_, h_ in re.findall(r"\[eval@(\d+)\] hard-negative detection ([\d.]+)%", txt): per.setdefault(int(s_), {})["wrong_detail"] = float(h_) / 100
+    out["per_step"] = {str(k): v for k, v in sorted(per.items())}
+    if "ConflictError" in txt or "spend limit" in txt: out["stopped"] = "Modal workspace spend limit"
     return out
 
 
@@ -81,10 +90,15 @@ def main():
             Fm, Km = matrices(rows, keys, metric); res = {}
             pools = {"J-lens direction": [k for k in keys if re.fullmatch(r"jadd_b[\d.]+", k)], "DiffMean, next-token positions": [k for k in keys if re.fullmatch(r"dmn_b[\d.]+", k)],
                      "DiffMean, whole passages": [k for k in keys if re.fullmatch(r"dmp_b[\d.]+", k)], "patch the real swapped-text activation": [k for k in keys if k.startswith("donor_")]}
+            for site in ("m", "mb"):   # references edited at the source mention (@m) / mention + anchor (@mb)
+                for nm_, pfx in (("J-lens direction", "jadd"), ("DiffMean, next-token positions", "dmn"), ("DiffMean, whole passages", "dmp")):
+                    pools[f"{nm_} @{site}"] = [k for k in keys if re.fullmatch(rf"{pfx}@{site}_b[\d.]+", k)]
+                pools[f"patch the real swapped-text activation @{site}"] = [k for k in keys if k == f"donor@{site}"]
             for k in keys:
-                if k.count("|") == 2 and "@" not in k:
-                    T_, m_, meth = k.split("|"); core = re.sub(r"_b[\d.]+$", "", meth)
-                    if T_ in a.types.split(","): pools.setdefault(f"{m_}|{T_}|{core}", []).append(k)
+                if k.count("|") == 2:
+                    base_, _, site = k.partition("@"); T_, m_, meth = base_.split("|"); core = re.sub(r"_b[\d.]+$", "", meth)
+                    site = re.sub(r"_b[\d.]+$", "", site)
+                    if T_ in a.types.split(","): pools.setdefault(f"{m_}|{T_}|{core}" + (f"@{site}" if site else ""), []).append(k)
             for g, ks in pools.items():
                 if not ks: continue
                 idx = [kix[k] for k in ks]; pr = allp[~np.isnan(Fm[idx[0]])]
@@ -115,9 +129,82 @@ def main():
             ax.legend(loc="upper left", ncol=2, frameon=False); fig.tight_layout(rect=(0, 0, 1, 0.86))
             for ext in ("png", "pdf"): fig.savefig(f"{REP}/contrastive_steer.{ext}", dpi=150)
             plt.close(fig)
+        # figure 2: best method per critic at the anchor vs at mention + anchor (@mb), type S, install at KL <= 4
+        crit_m = [c for c in ORDER if any(g.startswith(f"{c}|S|") and g.endswith("@mb") for g in res)]
+        if crit_m:
+            fig, ax = plt.subplots(figsize=(12, 6.6)); site_tab = {}
+            for ci, c in enumerate(crit_m):
+                for si, (site, lab, col) in enumerate((("", "edit at the last position only", "#9a9893"), ("@mb", "edit at the source mention + last position", "#2a78d6"))):
+                    gs = [g for g in res if g.startswith(f"{c}|S|") and (g.endswith("@mb") if site else "@" not in g)]
+                    if not gs: continue
+                    g = max(gs, key=lambda x: res[x]["4.0"][0]); e, l, h = res[g]["4.0"]; site_tab[f"{c}{site or '@anchor'}"] = dict(pool=g, install=e, ci=[l, h])
+                    ax.bar(ci + (si - 0.5) * 0.38, e, width=0.36, color=col, yerr=[[e - l], [h - e]], capsize=3, error_kw=dict(lw=1, ecolor=INK2), label=lab if ci == 0 else None)
+                    ax.text(ci + (si - 0.5) * 0.38, h + 0.015, f"{100 * e:.0f}%", ha="center", fontsize=10)
+            refs = (("J-lens direction", "#2a78d6", "-", "J-lens, last position"), ("DiffMean, whole passages @mb", "#eb6834", "--", "DiffMean @mb"),
+                    ("patch the real swapped-text activation @mb", "#7a7974", "-.", "real swapped-text activation @mb"))
+            for ri, (g, col, ls, lab) in enumerate(refs):                   # labels alternate right/left and above/below so near-equal lines stay readable
+                if g in res:
+                    v = res[g]["4.0"][0]; ax.axhline(v, color=col, ls=ls, lw=1.6); site_tab[g] = res[g]["4.0"]
+                    ax.text(len(crit_m) - 0.5 if ri != 1 else -0.5, v + (0.012 if ri != 1 else -0.035), f"{lab} {100 * v:.0f}%", color=col, fontsize=10, ha="right" if ri != 1 else "left")
+            ax.set_xticks(range(len(crit_m))); ax.set_xticklabels([NAMES[c] for c in crit_m], fontsize=10); ax.set_ylim(0, 1); ax.grid(axis="y", color=GRID); ax.set_axisbelow(True)
+            ax.set_ylabel("target installed as top-1 next token\n(best method per critic, cross-fitted, KL ≤ 4, 95% CI)")
+            for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+            bm = max((k for k in site_tab if k.endswith("@mb") and "|" not in k and not k.startswith(("J-lens", "DiffMean", "patch"))), key=lambda k: site_tab[k]["install"], default=None)
+            ba_ = site_tab.get(f"{bm[:-3]}@anchor", {}).get("install") if bm else None
+            ttl = (f"Writing the edit at the source mention too, the best critic installs the target in {100 * site_tab[bm]['install']:.0f}% of prompts\n"
+                   f"({NAMES[bm[:-3]].replace(chr(10), ' ')}; {100 * ba_:.0f}% at the last position only)\n" if bm and ba_ is not None else "") + \
+                  "single claim 'The model expects the next word to be X' → X′; next-token concept swap, cross-fitted, KL ≤ 4"
+            fig.suptitle(ttl, fontsize=12.5, x=0.02, ha="left"); ax.legend(loc="upper left", frameon=False); fig.tight_layout(rect=(0, 0, 1, 0.86))
+            for ext in ("png", "pdf"): fig.savefig(f"{REP}/contrastive_sites.{ext}", dpi=150)
+            plt.close(fig); out["sites_best"] = site_tab
         for g in sorted(st["top1_tgt"]):
             v = st["top1_tgt"][g]; print(f"  {g:44s} install KL<=2 {100*v['2.0'][0]:3.0f}% KL<=4 {100*v['4.0'][0]:3.0f}% [{100*v['4.0'][1]:.0f},{100*v['4.0'][2]:.0f}] KL<=8 {100*v['8.0'][0]:3.0f}%")
+    out["arms_log"] = {t: parse_log(t) for t in ("ctr_fm0", "ctr_cmnce", "ctr_acfm")}
     json.dump(out, open(f"{D}/contrastive_summary.json", "w"), indent=1); print(f"-> {D}/contrastive_summary.json")
+    write_section(out, a)
+
+
+def write_section(out, a):
+    """report fragment -> <REP>/contrastive_section.html (included by build_html.py _contrastive_section()); prose from data/contrastive/reading.html"""
+    import html as H
+    pa, st, logs = out.get("popalign", {}), out.get("steer", {}).get("top1_tgt", {}), out.get("arms_log", {})
+    def best(c, site):
+        gs = [g for g in st if g.startswith(f"{c}|S|") and (g.endswith(site) if site else "@" not in g)]
+        if not gs: return None
+        g = max(gs, key=lambda x: st[x]["4.0"][0]); return g, st[g]["4.0"]
+    rows = ""
+    for c in ORDER:
+        if c not in pa and not any(g.startswith(c + "|") for g in st): continue
+        p_, lg = pa.get(c, {}), logs.get(c, {})
+        ba, bm = best(c, ""), best(c, "@mb")
+        f = lambda v, fmt: "—" if v is None else fmt.format(v)
+        ins = lambda b: "—" if b is None else f"{100 * b[1][0]:.0f}% [{100 * b[1][1]:.0f}, {100 * b[1][2]:.0f}]"
+        rows += (f"<tr><td>{H.escape(NAMES[c].replace(chr(10), ' '))}</td><td class='num'>{f(p_.get('cm_align_mean'), '{:+.2f}')}</td><td class='num'>{f((p_.get('dlt_align') or {}).get('0.1'), '{:+.2f}')}</td>"
+                 f"<td class='num'>{f(p_.get('cm_retrieval') and 100 * p_['cm_retrieval'], '{:.0f}%')}</td><td class='num'>{f(lg.get('health_pmi_median'), '{:+.0f}')}</td><td class='num'>{f(lg.get('exact_pmi_mean'), '{:.0f}')}</td>"
+                 f"<td class='num'>{f(lg.get('twin_paired') and 100 * lg['twin_paired'], '{:.0f}%')}</td><td class='num'>{ins(ba)}</td><td class='num'>{ins(bm)}</td></tr>")
+    tr_rows = ""
+    for t in ("ctr_fm0", "ctr_cmnce", "ctr_acfm"):
+        v = logs.get(t, {}).get("per_step", {}).get("1000", {})
+        if v: tr_rows += (f"<tr><td>{H.escape(NAMES[t].replace(chr(10), ' '))}</td><td class='num'>{v.get('health_pmi_median', float('nan')):+.0f}</td><td class='num'>{v.get('fm_gain_bits', float('nan')):.0f}</td>"
+                          f"<td class='num'>{100 * v.get('twin_paired', float('nan')):.1f}%</td><td class='num'>{100 * v.get('twin_internal', float('nan')):.0f} / {100 * v.get('twin_text', float('nan')):.0f} / {100 * v.get('twin_semantic', float('nan')):.0f}</td>"
+                          f"<td class='num'>{100 * v.get('wrong_detail', float('nan')):.1f}%</td></tr>")
+    tr_tab = ("<table><tr><th>arm (step 1000 of 4355, 256k claims)</th><th class='num'>held-out claim PMI (nats, median)</th><th class='num'>FM gain (bits)</th><th class='num'>twin detection, own h</th>"
+              "<th class='num'>internal / text / semantic</th><th class='num'>wrong-detail detection</th></tr>" + tr_rows + "</table>") if tr_rows else ""
+    refs = ""
+    for g in ("J-lens direction", "J-lens direction @mb", "DiffMean, next-token positions @mb", "DiffMean, whole passages @mb", "patch the real swapped-text activation @mb"):
+        if g in st: v = st[g]["4.0"]; refs += f"<tr><td>{H.escape(g)}</td><td class='num'>{100 * v[0]:.0f}% [{100 * v[1]:.0f}, {100 * v[2]:.0f}]</td></tr>"
+    reading = open(f"{D}/reading.html").read() if os.path.exists(f"{D}/reading.html") else ""
+    figs = "".join(f'<figure><img src="{n}.png" alt="{n}"></figure>' for n in ("contrastive_sites", "contrastive_steer", "contrastive_align") if os.path.exists(f"{REP}/{n}.png"))
+    sec = (f'<h2 id="contrastive">8f. Contrastive single-claim critics for steering (no steering objective)</h2>{reading}{figs}{tr_tab}'
+           "<table><tr><th>critic</th><th class='num'>cond.-mean alignment</th><th class='num'>edit-at-h alignment</th><th class='num'>zero-shot next-token retrieval</th>"
+           "<th class='num'>held-out claim PMI (nats, median)</th><th class='num'>exact PMI (bits)</th><th class='num'>twin detection (own h)</th>"
+           "<th class='num'>install, last position</th><th class='num'>install, mention + last</th></tr>" + rows + "</table>"
+           "<table><tr><th>reference</th><th class='num'>install (KL ≤ 4)</th></tr>" + refs + "</table>"
+           "<p class='small'>Alignment = cos with the population shift μ<sub>Y</sub> − μ<sub>X</sub> of held-out activations whose next token is Y vs X (63 words; scripts/pop_align.py). "
+           "Installs = the target becomes the top-1 next token, cross-fitted over method and strength (select on half the prompts, score on the other half), single claim "
+           "'The model expects the next word to be X' → X′, 48 prompts (40 with a source mention for the site column), best method per critic. Numbers: <code>data/contrastive/contrastive_summary.json</code>; "
+           "code: nla/flow/train_cond.py (--template-batches, --hardneg batch, --cmnce-*), scripts/pop_align.py, scripts/plot_contrastive.py.</p>")
+    open(f"{REP}/contrastive_section.html", "w").write(sec); print(f"-> {REP}/contrastive_section.html")
 
 
 if __name__ == "__main__":
