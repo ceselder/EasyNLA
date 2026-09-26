@@ -20,8 +20,11 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys
 import intervene_playground_app as pg
 import rhyme_plan_steer as R
 from axbench_v2_prep import chat
+from nla.flow.claims import split_claims, format_claims
 OUT = "/vol_glp/axbench"
 COND_TMPL = "The text is about {c}. The model expects the continuation to explicitly discuss {c}."
+CLAIMS_C = ["The text is about {c}.", "The next words will mention {c}.", "The answer will bring up {c}."]
+CLAIMS_NEU = ["The text is about the topic of the instruction.", "The next words will continue answering the instruction.", "The answer will stay on the instruction."]
 NEUTRAL = "The text is a generic answer to an instruction; the model expects the continuation to keep answering it."
 PROMPT_TMPL = "{instruction}\n\nIn your response, incorporate the following concept: {c}."
 unit = lambda d: d / d.norm(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -67,7 +70,7 @@ def main():
     p.add_argument("--family", required=True, choices=["refs", "flow"]); p.add_argument("--critic", default="", help="name=adapter_path (family flow)")
     p.add_argument("--pairs", default="rw,add,tmpl"); p.add_argument("--ts", default="0.1,0.3"); p.add_argument("--betas", default="0.25,0.5,1")
     p.add_argument("--prep", default=f"{OUT}/v2_prep"); p.add_argument("--rewrites", default=f"{OUT}/v2_rewrites.json"); p.add_argument("--tag", required=True)
-    p.add_argument("--skip-base", action="store_true", help="refs family: skip none/prompt (strength fill-in runs)"); p.add_argument("--start", type=int, default=0); p.add_argument("--end", type=int, default=10 ** 9); p.add_argument("--max-new-tokens", type=int, default=96)
+    p.add_argument("--cmean", action="store_true", help="family flow: also the h-independent conditional-mean direction per pair"); p.add_argument("--skip-refs", action="store_true", help="family refs: only the AR directions"); p.add_argument("--skip-base", action="store_true", help="refs family: skip none/prompt (strength fill-in runs)"); p.add_argument("--start", type=int, default=0); p.add_argument("--end", type=int, default=10 ** 9); p.add_argument("--max-new-tokens", type=int, default=96)
     a = p.parse_args(); betas = [float(x) for x in a.betas.split(",")]; ts = [float(x) for x in a.ts.split(",")]; pairs = [x for x in a.pairs.split(",") if x]
     if torch.cuda.device_count() == 1: pg.DEV1 = pg.DEV0                                          # one B200 holds the LM (54 GB) + a flow critic (~80 GB)
     t00 = time.time(); pg._load(); tok, lm, st = pg.S["tok"], pg.S["lm"], pg.S["st"]; tok.padding_side = "left"
@@ -79,12 +82,29 @@ def main():
     def texts(k, pair):
         pl = plan[k]; n = len(pl["instructions"]); c = pl["concept"]
         if pair == "tmpl": return [NEUTRAL] * n, [COND_TMPL.format(c=c)] * n
+        if pair in ("c1", "c3"):                                               # bullet claims, exactly the '• c' training format of the claim critics
+            m = 1 if pair == "c1" else 3
+            return [format_claims(CLAIMS_NEU[:m])] * n, [format_claims([x.format(c=c) for x in CLAIMS_C[:m]])] * n
         z0 = [rw[f"{k}:{j}"]["z"] for j in range(n)]; z1 = [rw[f"{k}:{j}"]["z_c" if pair == "rw" else "z_add"] for j in range(n)]; return z0, z1
     fb = crit = None
+    claim_critic = False
     if a.family == "flow":
-        cname, _, cpath = a.critic.partition("="); fb = load_flow(cpath); print(f"[axb2] flow critic {cname}: cond_mode {fb.cond_mode} ({time.time() - t00:.0f}s)", flush=True)
-    else:
-        crit = pg._critic(R.AR_NAME)
+        cname, _, cpath = a.critic.partition("="); fb = load_flow(cpath); claim_critic = int(fb.aa.get("claim_subsets") or 0) > 0
+        print(f"[axb2] flow critic {cname}: cond_mode {fb.cond_mode}, claim critic {claim_critic} ({time.time() - t00:.0f}s)", flush=True)
+    fmt = lambda z: z if (not claim_critic or z.lstrip().startswith("•")) else format_claims(split_claims(z) or [z])   # scripts/steer_delta.py FlowDen.fmt
+    @torch.no_grad()
+    def cmean_dir(z0, z1, K=8, seed=7):
+        """h-independent conditional-mean difference E[h|z1] - E[h|z0]: one-step x0 prediction from pure noise at t = 1, K shared draws, per text pair."""
+        out = []
+        for j, (x0t, x1t) in enumerate(zip(z0, z1)):
+            E = torch.randn(K, fb.norm.normalize(torch.zeros(1, P["h"].shape[-1], device=pg.DEV1)).shape[-1], device=pg.DEV1, generator=torch.Generator(device=pg.DEV1).manual_seed(seed + j)); mu = []
+            for tx in (x0t, x1t):
+                enc, mk, cv = fb.cond([tx]); rep = lambda x: None if x is None else x.expand(K, *x.shape[1:])
+                with torch.autocast("cuda", dtype=torch.bfloat16): v = fb.model(E, torch.ones(K, device=pg.DEV1), rep(enc), rep(mk), rep(cv)).float()
+                mu.append(fb.norm.denormalize((E - v).mean(0, keepdim=True))[0].float())
+            out.append((mu[1] - mu[0]).cpu())
+        return torch.stack(out)
+    if a.family == "refs": crit = pg._critic(R.AR_NAME)
     def generate(prompts, fn):
         enc = tok(prompts, return_tensors="pt", padding=True).to(pg.DEV0); T = enc["input_ids"].shape[1]
         st.update(cap=None, vec=None, prefill_fn=rows_fn(fn) if fn else None, prefill_idx=torch.tensor([T - 1], device=pg.DEV0), decode_fn=rows_fn(fn) if fn else None)
@@ -104,17 +124,19 @@ def main():
             t0 = time.time(); c = pl["concept"]; instrs = pl["instructions"]; prompts = [chat(tok, i) for i in instrs]; S = []
             if a.family == "refs":
                 if not a.skip_base: S += [("none", 0.0, prompts, None), ("prompt", 0.0, [chat(tok, PROMPT_TMPL.format(instruction=i, c=c)) for i in instrs], None)]
-                rnd = torch.randn(P["h"].shape[-1], generator=torch.Generator().manual_seed(777 + pl["concept_id"]))
-                S += [("random", b, prompts, dir_fn(rnd, b)) for b in betas]
-                S += [("diffmean", b, prompts, dir_fn(P["diffmean"][k], b)) for b in betas]
+                if not a.skip_refs:
+                    rnd = torch.randn(P["h"].shape[-1], generator=torch.Generator().manual_seed(777 + pl["concept_id"]))
+                    S += [("random", b, prompts, dir_fn(rnd, b)) for b in betas]
+                    S += [("diffmean", b, prompts, dir_fn(P["diffmean"][k], b)) for b in betas]
                 for pair in pairs:
                     z0, z1 = texts(k, pair); d = torch.stack([pg.ar_pred(crit, y) - pg.ar_pred(crit, x) for x, y in zip(z0, z1)])
                     S += [(f"ar_{pair}", b, prompts, dir_fn(d, b)) for b in betas]
             else:
                 for pair in pairs:
-                    z0, z1 = texts(k, pair)
+                    z0, z1 = texts(k, pair); z0, z1 = [fmt(x) for x in z0], [fmt(x) for x in z1]
                     with torch.no_grad(): c0, c1 = fb.cond(z0), fb.cond(z1)
                     for t in ts: S += [(f"{cname}_{pair}_t{t:g}", b, prompts, delta_fn(fb, c0, c1, t, b)) for b in betas]
+                    if a.cmean: dcm = cmean_dir(z0, z1); S += [(f"{cname}_cmean_{pair}", b, prompts, dir_fn(dcm, b)) for b in betas]
             for name, factor, pr, fn in S:
                 txt, nll = generate(pr, fn)
                 for j, (ins, t_, n_) in enumerate(zip(instrs, txt, nll)):
