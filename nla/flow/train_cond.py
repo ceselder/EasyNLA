@@ -396,7 +396,14 @@ def main():
     p.add_argument("--snap-pairs", default="", help="comma list of global pair counts (e.g. 64e3,128e3,...,8e6): at each, eval + save a loadable snapshot dir <out>/snap_<pairs>/ (adapter_latest.pt [+ prior_cotrained_latest.pt / ar_encoder_latest.pt] + eval.json)")
     p.add_argument("--render-pick", default="canonical", choices=["canonical", "random"], help="shards with k renderings per activation (g2): canonical column or one random QC-passing rendering per activation")
     p.add_argument("--resume-opt", action="store_true", help="also restore the AdamW state from <resume-from>/opt_latest.pt (replicated DDP / single GPU)")
-    p.add_argument("--hardneg", default=None, choices=["twin", "swap"], help="hard-negative source for the --neg-frac contrast: g2 wrong-exact twins swapped into the rendering (fallback: detail swap) or detail swaps only")
+    p.add_argument("--hardneg", default=None, choices=["twin", "swap", "batch"], help="hard-negative source for the --neg-frac contrast: g2 wrong-exact twins swapped into the rendering (fallback: detail swap) or detail swaps only; "
+                   "batch (claims mode): ACTIVATION-ANCHORED negatives = the claim of ANOTHER activation of the same template in this micro-batch (a real value from another anchor, no LLM-written twin), scored at the positive's (x_t, eps)")
+    p.add_argument("--template-batches", action="store_true", help="--one-claim --claims-dir: same-template micro-batches (the --ctr-template sampler: each activation drawn once) WITHOUT the density InfoNCE; "
+                   "gives --hardneg batch / --cmnce-weight same-template negatives")
+    p.add_argument("--cmnce-weight", type=float, default=0.0, help="conditional-mean InfoNCE (0 = off): m(c) = E_eps[eps - v(eps, t=1, c)], the model's h-independent conditional mean of the activation given "
+                   "the claim; symmetric multi-positive InfoNCE over cos(m(c_i), x0_j) / --cmnce-tau within the micro-batch (identical claim texts share positives), next to the FM loss")
+    p.add_argument("--cmnce-tau", type=float, default=0.05); p.add_argument("--cmnce-eps", type=int, default=2, help="noise draws averaged into m(c)")
+    p.add_argument("--cmnce-n", type=int, default=64, help="rows per step for --cmnce-weight (the first rows of the step's last micro-batch)")
     p.add_argument("--hardneg-mode", default="hinge", choices=["hinge", "cfm"], help="hinge on the paired loss gap, or CFM-style clipped repulsion of the negative-conditioned prediction from the true velocity")
     p.add_argument("--hardneg-rel-margin", type=float, default=0.0, help=">0: margin (hinge) / clip (cfm) relative to the positive loss, e.g. 0.05 = the negative must cost 5% more")
     p.add_argument("--lr-linear-to", type=float, default=None, help="anneal schedule: warm-up then LINEAR decay to this fraction of --lr at the last step")
@@ -844,8 +851,8 @@ def main():
         cursor = (a.start_step % bpp) * a.batch
         if is0: print(f"[cond] resuming at step {a.start_step} (cursor {cursor}/{N})", flush=True)
     neg_rng = _random.Random(a.seed + 17 + int(os.environ.get('RANK', 0)))
-    if a.ctr_template:   # same-template pools; each activation is drawn exactly once
-        assert tr_ty is not None and a.one_claim, "--ctr-template needs --one-claim --claims-dir"
+    if a.ctr_template or a.template_batches:   # same-template pools; each activation is drawn exactly once
+        assert tr_ty is not None and a.one_claim, "--ctr-template / --template-batches need --one-claim --claims-dir"
         from nla.flow.claims import FAMILY_SHARES as _FS
         pools = {}
         for i_, t_ in enumerate(tr_ty): pools.setdefault(t_, []).append(i_)
@@ -873,6 +880,20 @@ def main():
             for _ in range(a.start_step * a.grad_accum): next_ctr_batch(a.batch)
             if is0: print(f"[cond] same-template sampler replayed {a.start_step} steps; {sum(len(v) for v in pools.values())} fresh activations left on rank 0", flush=True)
     ctr_stats = {}
+    def batch_negs(txts, nb, chunks_, idx_list, rng_):
+        """--hardneg batch: for each of the first nb rows, the claim of another row of the SAME template (the row's template chunk under same-template
+        batching, else rows with the same tr_ty) whose text differs; (text, 'batch') or (None, None) when the micro-batch has no such row"""
+        ky = lambda z: z if isinstance(z, str) else "\n".join(z); out = []
+        chunk_of = {}
+        if chunks_:
+            for _, pos_ in chunks_:
+                for p_ in pos_: chunk_of[p_] = pos_
+        for k in range(nb):
+            cand = chunk_of.get(k) or [j for j in range(len(txts)) if tr_ty[idx_list[j]] == tr_ty[idx_list[k]]]
+            cand = [j for j in cand if j != k and ky(txts[j]) != ky(txts[k])]
+            if not cand: cand = [j for j in range(len(txts)) if j != k and ky(txts[j]) != ky(txts[k])]
+            out.append((txts[rng_.choice(cand)], "batch") if cand else (None, None))
+        return out
     @torch.no_grad()
     def health_eval():
         """density health on fixed held-out anchors (same noise every call): single-claim PMI proxy (d/2)(L_uncond - L_cond) of the anchor's own
@@ -906,7 +927,7 @@ def main():
         lr = a.lr * sched
         opt.zero_grad(set_to_none=True); loss_acc = 0.0
         for _acc in range(a.grad_accum):   # gradient accumulation: --grad-accum micro-batches of --batch pairs per optimizer step
-            if a.ctr_template:
+            if a.ctr_template or a.template_batches:
                 idx_l, chunks = next_ctr_batch(a.batch); assert idx_l, "same-template pools ran out of fresh activations"
                 idx = torch.tensor(idx_l, dtype=torch.long)
             else:
@@ -927,7 +948,9 @@ def main():
         closs = None; neg_stats = {}
         if a.neg_frac > 0:   # contrastive hard negatives: same activation, same (t, eps); the negative text must score WORSE by a margin
             nb = max(1, int(round(a.neg_frac * a.batch))); sel = idx[:nb].tolist()
-            if tr_claims is not None:   # claim-set mode: the positive is this step's drawn condition, the negative swaps one claim for its false twin
+            if tr_claims is not None and a.hardneg == "batch":   # activation-anchored: another activation's claim of the same template, same (x_t, eps) as the positive
+                zs_pos = _txt[:nb]; negs = batch_negs(_txt, nb, chunks if (a.ctr_template or a.template_batches) else None, idx.tolist(), neg_rng)
+            elif tr_claims is not None:   # claim-set mode: the positive is this step's drawn condition, the negative swaps one claim for its false twin
                 zs_pos = _txt[:nb]; negs = [neg_of(z, tr_z, neg_rng, tr_tw[i] if tr_tw else None, tr_claims[i]) for z, i in zip(zs_pos, sel)]
             elif a.hardneg == "twin" and tr_lad is not None:   # the rendering with one exact fact value swapped for its wrong-exact twin; else a detail swap
                 zs_pos = [tr_z[i] for i in sel]; negs = []
@@ -954,6 +977,26 @@ def main():
                 neg_stats = {"train/contrast_loss": closs.item(), "train/neg_gap": gap.mean().item(), "train/neg_win": (gap > 0).float().mean().item(), "train/neg_n": n2,
                              "train/neg_frac_number": sum(1 for k in keep_i if negs[k][1] == "number") / n2, "train/neg_frac_quote": sum(1 for k in keep_i if negs[k][1] == "quote") / n2,
                              "train/neg_frac_twin": sum(1 for k in keep_i if negs[k][1] == "twin") / n2, "train/neg_rel_gap": float((gap / lpos.clamp_min(1e-6)).mean())}
+        cm_stats = {}
+        if a.cmnce_weight > 0:   # conditional-mean InfoNCE: the h-independent conditional mean m(c) must pick out ITS activations among the micro-batch's
+            t_c = time.time(); n_ = min(a.cmnce_n, len(_txt)); K_ = max(1, a.cmnce_eps); d_x = x0.shape[1]
+            keys_ = [z if isinstance(z, str) else "\n".join(z) for z in _txt[:n_]]
+            e_, mk_, cv_ = enc_batch(_txt[:n_], grad=True); sel_ = torch.arange(n_, device=dev).repeat(K_); E_ = torch.randn(K_ * n_, d_x, device=dev)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                v_ = model(E_, torch.ones(K_ * n_, device=dev), e_[sel_] if e_ is not None else None, mk_[sel_] if mk_ is not None else None, cv_[sel_] if cv_ is not None else None)
+            m_ = (E_ - v_.float()).view(K_, n_, d_x).mean(0)                                   # x0-hat from pure noise at t = 1 = the model's E[x0 | c]
+            Sm = F.normalize(m_, dim=-1) @ F.normalize(x0[:n_].detach().float(), dim=-1).t() / a.cmnce_tau   # [claim i, activation j]
+            kid_ = {}; canon_ = torch.tensor([kid_.setdefault(k_, j_) for j_, k_ in enumerate(keys_)], device=dev); pos_ = canon_[:, None] == canon_[None, :]
+            ninf = float("-inf")
+            ce_r = (torch.logsumexp(Sm, 1) - torch.logsumexp(Sm.masked_fill(~pos_, ninf), 1)).mean()
+            ce_c = (torch.logsumexp(Sm.t(), 1) - torch.logsumexp(Sm.t().masked_fill(~pos_, ninf), 1)).mean()
+            ce_cm = 0.5 * (ce_r + ce_c); (a.cmnce_weight * ce_cm).backward()
+            with torch.no_grad():
+                cs_ = Sm * a.cmnce_tau
+                cm_stats = {"train/cmnce_ce": ce_cm.item(), "train/cmnce_acc_row": float(pos_.gather(1, Sm.argmax(1, keepdim=True)).float().mean()),
+                            "train/cmnce_acc_col": float(pos_.gather(1, Sm.t().argmax(1, keepdim=True)).float().mean()), "train/cmnce_pos_frac": float(pos_.float().mean()),
+                            "train/cmnce_uniq": len(kid_), "train/cmnce_cos_pos": float(cs_[pos_].mean()), "train/cmnce_cos_neg": float(cs_[~pos_].mean()) if bool((~pos_).any()) else 0.0,
+                            "train/cmnce_m_norm": float(m_.norm(dim=-1).mean() / d_x ** 0.5), "train/cmnce_seconds": time.time() - t_c}
         if a.ctr_template and a.ctr_gradcap:   # keep the FM gradient aside; the contrastive gradient is scaled to <= its norm below
             assert not a.unfreeze_prior, "--ctr-gradcap is implemented for replicated (non-FSDP) runs"
             _cap_p = [p_ for g_ in opt.param_groups for p_ in g_["params"] if p_.grad is not None and p_ is not log_tau]
@@ -1110,7 +1153,7 @@ def main():
             print(f"[cond] step {step} loss {loss.item():.4f} ({'cond' if used else 'uncond'}) lr {lr:.2e} gn {float(gn):.3f} {(time.time()-t0)/max(step - a.start_step, 1):.2f}s/step | peak mem {torch.cuda.max_memory_allocated()/2**30:.0f} GiB", flush=True)
             cfm_st = {f"train/cfm_{k}": float(v) for k, v in getattr(cond_fm_loss, "last", {}).items()} if a.cfm_lambda > 0 else {}
             if cfm_st and is0: print(f"  [cfm] fm {cfm_st['train/cfm_fm']:.4f} | distance to another sample's flow {cfm_st['train/cfm_cfm_neg']:.4f} (lambda {a.cfm_lambda})", flush=True)
-            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats, **cfm_st, **ctr_stats}, step=step)
+            if use_wandb: wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": float(gn), **neg_stats, **gstats, **cfm_st, **ctr_stats, **cm_stats}, step=step)
             if ctr_stats and is0 and a.ctr_global: print(f"  [ctr] InfoNCE row {ctr_stats['train/ctr_ce_row']:.3f} col {ctr_stats['train/ctr_ce_col']:.3f} (row chance {math.log(max(ctr_stats['train/ctr_answers'], 1)):.2f}) "
                                         f"acc row {100*ctr_stats['train/ctr_acc_row']:.1f}% col {100*ctr_stats['train/ctr_acc_col']:.1f}% (row chance {100*ctr_stats['train/ctr_chance']:.1f}%) | "
                                         f"{ctr_stats['train/ctr_groups']} global group(s) of {a.ctr_global}: {ctr_stats['train/ctr_unique']:.0f} activations, {ctr_stats['train/ctr_answers']:.0f} distinct answers | "
@@ -1119,6 +1162,9 @@ def main():
                                         f"(chance {100/(a.ctr_k + 1):.0f}%) | {ctr_stats['train/ctr_groups']} groups of <= {a.ctr_k + 1}, {ctr_stats['train/ctr_unique']} distinct answers, {ctr_stats['train/ctr_templates']} template chunks | "
                                         f"tau {ctr_stats['train/ctr_tau']:.1f} nats | {ctr_stats['train/ctr_seconds']:.2f}s", flush=True)
             if gstats and is0: print(f"  [samedoc] ce {gstats['train/samedoc_ce']:.3f} acc row {100*gstats['train/samedoc_acc_row']:.0f}% col {100*gstats['train/samedoc_acc_col']:.0f}% (chance {100/a.group_size:.0f}%)", flush=True)
+            if cm_stats and is0: print(f"  [cmnce] ce {cm_stats['train/cmnce_ce']:.3f} acc row {100*cm_stats['train/cmnce_acc_row']:.0f}% col {100*cm_stats['train/cmnce_acc_col']:.0f}% "
+                                       f"(positives {100*cm_stats['train/cmnce_pos_frac']:.1f}% of cells, {cm_stats['train/cmnce_uniq']} distinct claims) cos pos {cm_stats['train/cmnce_cos_pos']:.3f} neg {cm_stats['train/cmnce_cos_neg']:.3f} "
+                                       f"|m|/sqrt(d) {cm_stats['train/cmnce_m_norm']:.3f} | {cm_stats['train/cmnce_seconds']:.2f}s", flush=True)
             if neg_stats and is0: print(f"  [neg] contrast {neg_stats['train/contrast_loss']:.4f} gap {neg_stats['train/neg_gap']:.4f} win {100*neg_stats['train/neg_win']:.0f}% (n {neg_stats['train/neg_n']}, numbers {100*neg_stats['train/neg_frac_number']:.0f}%)", flush=True)
         pairs_seen = a.start_pairs + (step - a.start_step) * a.batch * a.grad_accum * world      # global (activation, text) draws so far
         snap_now = [q for q in snap_pairs if q <= pairs_seen and q not in snaps_done]
