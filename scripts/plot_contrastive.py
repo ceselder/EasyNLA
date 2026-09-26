@@ -194,7 +194,7 @@ def write_section(out, a):
     for g in ("J-lens direction", "J-lens direction @mb", "DiffMean, next-token positions @mb", "DiffMean, whole passages @mb", "patch the real swapped-text activation @mb"):
         if g in st: v = st[g]["4.0"]; refs += f"<tr><td>{H.escape(g)}</td><td class='num'>{100 * v[0]:.0f}% [{100 * v[1]:.0f}, {100 * v[2]:.0f}]</td></tr>"
     reading = open(f"{D}/reading.html").read() if os.path.exists(f"{D}/reading.html") else ""
-    figs = "".join(f'<figure><img src="{n}.png" alt="{n}"></figure>' for n in ("contrastive_sites", "contrastive_steer", "contrastive_align") if os.path.exists(f"{REP}/{n}.png"))
+    figs = "".join(f'<figure><img src="{n}.png" alt="{n}"></figure>' for n in ("contrastive_coherence", "contrastive_sites", "contrastive_steer", "contrastive_align") if os.path.exists(f"{REP}/{n}.png"))
     sec = (f'<h2 id="contrastive">8f. Contrastive single-claim critics for steering (no steering objective)</h2>{reading}{figs}{tr_tab}'
            "<table><tr><th>critic</th><th class='num'>cond.-mean alignment</th><th class='num'>edit-at-h alignment</th><th class='num'>zero-shot next-token retrieval</th>"
            "<th class='num'>held-out claim PMI (nats, median)</th><th class='num'>exact PMI (bits)</th><th class='num'>twin detection (own h)</th>"
